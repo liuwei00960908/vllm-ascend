@@ -2643,13 +2643,23 @@ class NPUModelRunner(GPUModelRunner):
         HW-VERIFY: the offloaded layers are the MLAAttention layers (DSA reuses MLA);
         confirm the count matches ``num_hidden_layers`` (the MTP layer may add one).
         """
+        # Import the sparse_offload package only when the feature (or its
+        # introspection probe) is on, so baseline serving never depends on it.
+        import vllm_ascend.envs as envs_ascend
+
+        self.dsa_offload_manager = None
+        if not (
+            envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
+            or envs_ascend.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT
+        ):
+            return
+
         from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
         from vllm_ascend.distributed.kv_transfer.sparse_offload.runner_integration import (
             config_from_vllm,
             build_manager,
         )
 
-        self.dsa_offload_manager = None
         mla_layers = get_layers_from_vllm_config(self.vllm_config, MLAAttention)
         layer_names = list(mla_layers.keys())
 

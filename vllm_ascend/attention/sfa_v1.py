@@ -1221,11 +1221,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
-        # DSA latent offload bring-up Round 1: read-only ground-truth dump (gated by
-        # VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT; no behavior change otherwise).
-        from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
+        # DSA latent offload bring-up Round 1: read-only ground-truth dump. Gate on the
+        # env flag BEFORE importing the package so baseline serving never depends on it.
+        if envs.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT:
+            from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
 
-        if _dsa_probe.enabled():
             _dsa_probe.probe_metadata_and_kv_cache(attn_metadata, kv_cache)
 
         topk_indices = self.indexer_select_post_process(
@@ -1239,7 +1239,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
 
-        if _dsa_probe.enabled():
+        if envs.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT:
+            from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
+
             _dsa_probe.probe_topk(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(
