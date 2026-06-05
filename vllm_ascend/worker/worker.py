@@ -353,6 +353,23 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+
+        # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
+        # buffers out of the KV budget *before* the scheduler splits it into blocks,
+        # so block counts shrink accordingly and the scheduler can never OOM us.
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.runner_integration import (
+            maybe_reserved_bytes,
+        )
+
+        dsa_offload_reserved_bytes = maybe_reserved_bytes(self.vllm_config)
+        if dsa_offload_reserved_bytes:
+            self.available_kv_cache_memory_bytes -= dsa_offload_reserved_bytes
+            logger.info_once(
+                "Reserved %.2f GiB for DSA latent offload buffers",
+                GiB(dsa_offload_reserved_bytes),
+                scope="local",
+            )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"

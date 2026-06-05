@@ -107,6 +107,45 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Enable DSA latent KV offload for GLM5.1 (GlmMoeDsa): at prefill end the MLA
+    # latent KV is offloaded to LMCache and only the indexer-selected top-k tokens
+    # are gathered back per decode step, while the indexer-key cache stays resident.
+    # Only effective for DSA / sparse-attention (SFA backend) models. Default off.
+    "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))
+    ),
+    # v1 cap on the number of decode-generated tokens whose latent is kept resident
+    # on the NPU per request (the decode-latent store). A request generating more
+    # than this raises; v2 lifts it by offloading decode tokens too. Valid: >= 1.
+    "VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS", "1024")
+    ),
+    # DSA latent offload staging gate (bring-up). 0 (Stage 1/2): keep the paged latent
+    # write so the offload path can be compared against native sparse attention.
+    # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode
+    # store) to actually free NPU memory. Default 0. Only effective with the offload
+    # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/INTEGRATION.md).
+    "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))
+    ),
+    # DSA latent offload parity check (bring-up). When 1, the SFA decode path runs both
+    # the scratch-gather and the native paged sparse attention and logs/asserts their
+    # outputs match. Use during Step 2 of bring-up; disable in production (it doubles
+    # the attention cost). Default 0.
+    "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))
+    ),
+    # DSA latent offload introspection (bring-up Round 1). When 1, read-only probes in
+    # the SFA forward / model runner dump the ground-truth facts we need to finalize
+    # the integration (metadata fields, kv_cache layout, topk_indices shape/sentinel,
+    # MLA layer count, input_batch fields). Safe / no behavior change. Default 0.
+    "VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT", "0"))
+    ),
+    # File the introspection probes append their report to.
+    "VLLM_ASCEND_DSA_INTROSPECT_FILE": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_INTROSPECT_FILE", "dsa_introspect.log"
+    ),
 }
 
 # end-env-vars-definition

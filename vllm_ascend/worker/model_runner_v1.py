@@ -2488,6 +2488,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                dsa_offload_manager=getattr(self, "dsa_offload_manager", None),
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -2628,8 +2629,44 @@ class NPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
+        self._maybe_init_dsa_latent_offload()
+
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _maybe_init_dsa_latent_offload(self) -> None:
+        """Build the DSA latent-offload manager (GLM5.1) when enabled.
+
+        Gated by ``VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD`` and a DSA model; a no-op
+        otherwise. Buffers are sized from the same config whose bytes were already
+        reserved out of the KV budget in ``determine_available_memory``, so they fit.
+        HW-VERIFY: the offloaded layers are the MLAAttention layers (DSA reuses MLA);
+        confirm the count matches ``num_hidden_layers`` (the MTP layer may add one).
+        """
+        from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.runner_integration import (
+            config_from_vllm,
+            build_manager,
+        )
+
+        self.dsa_offload_manager = None
+        mla_layers = get_layers_from_vllm_config(self.vllm_config, MLAAttention)
+        layer_names = list(mla_layers.keys())
+
+        if _dsa_probe.enabled():
+            _dsa_probe.probe_runner(
+                getattr(self, "input_batch", None),
+                layer_names,
+                self.model_config.hf_text_config.num_hidden_layers,
+            )
+
+        config = config_from_vllm(self.vllm_config, device=self.device)
+        if config is None:
+            return
+        # backend=None -> in-memory reference backend; swap for the LMCache adapter
+        # once it lands (no other change needed).
+        self.dsa_offload_manager = build_manager(config, layer_names, backend=None)
+        logger.info("DSA latent offload enabled for %d MLA layers", len(layer_names))
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()

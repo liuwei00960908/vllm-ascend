@@ -150,6 +150,15 @@ class AscendSFAMetadata:
     num_decode_tokens: int = 0
     num_prefills: int = 0
 
+    # DSA latent offload (GLM5.1): request ids and prompt lengths per request, used to
+    # key LMCache and to split the indexer top-k into prefill (LMCache) vs decode
+    # (resident) sources. None unless latent offload is enabled.
+    # HW-VERIFY: confirm the source — req_ids/prompt_lens live on the runner's
+    # input_batch, not on CommonAttentionMetadata; the runner may need to thread them
+    # in (see sparse_offload/INTEGRATION.md section B).
+    req_ids: list[str] | None = None
+    prompt_lens: torch.Tensor | None = None
+
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 
@@ -331,6 +340,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
+            # DSA latent offload: best-effort; getattr -> None when not threaded in yet
+            # (harmless unless the feature is enabled). HW-VERIFY the real source.
+            req_ids=getattr(common_attn_metadata, "request_ids", None),
+            prompt_lens=getattr(common_attn_metadata, "prompt_lens", None),
         )
 
     def build_for_graph_capture(
@@ -1208,6 +1221,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        # DSA latent offload bring-up Round 1: read-only ground-truth dump (gated by
+        # VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT; no behavior change otherwise).
+        from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
+
+        if _dsa_probe.enabled():
+            _dsa_probe.probe_metadata_and_kv_cache(attn_metadata, kv_cache)
+
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,
@@ -1218,6 +1238,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
+
+        if _dsa_probe.enabled():
+            _dsa_probe.probe_topk(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key

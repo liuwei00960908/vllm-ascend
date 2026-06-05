@@ -46,6 +46,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    dsa_offload_manager=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -66,6 +67,9 @@ def set_ascend_forward_context(
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
+        # DSA latent offload manager (None unless GLM5.1 latent offload is enabled);
+        # read by AscendSFAImpl to drive prefill store / decode gather.
+        forward_context.dsa_offload_manager = dsa_offload_manager
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
