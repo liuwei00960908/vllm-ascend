@@ -63,6 +63,7 @@ def gather_decode(
     req_ids: list[str],
     topk_indices: torch.Tensor,
     prompt_lens: torch.Tensor,
+    cur_positions: torch.Tensor,
     block_size: int,
     cur_k_nope: torch.Tensor,
     cur_k_pe: torch.Tensor,
@@ -70,18 +71,17 @@ def gather_decode(
     """Append the current decode token, then gather the selected latent into scratch.
 
     Args:
-        topk_indices: ``[num_decode_reqs, topk]`` indexer output (sequence positions).
+        topk_indices: ``[num_decode_reqs, topk]`` (or ``[*, 1, topk]``) indexer output,
+            absolute sequence positions, ``-1`` padded.
         prompt_lens:  ``[num_decode_reqs]`` prompt length per request (the prefill /
             decode boundary).
+        cur_positions: ``[num_decode_reqs]`` absolute position of this step's new token
+            per request (= seq_len - 1); the decode-store row is ``pos - prompt_len``.
         cur_k_nope / cur_k_pe: ``[num_decode_reqs, *]`` the current step's latent for
             this layer (one new token per decode request), kept resident on the NPU.
 
     Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table)`` for
     ``npu_sparse_flash_attention``.
-
-    NOTE: every layer writes the current token to the SAME decode-store row (same
-    position, different layer); the caller must advance the per-request row exactly
-    once per step, AFTER the final layer, via ``manager.advance_decode_step(req_id)``.
 
     The Ascend indexer emits ``topk_indices`` as ``[num_tokens, 1, topk]`` (confirmed
     on NPU); collapse the singleton middle dim to ``[num_decode_reqs, topk]``.
@@ -89,10 +89,12 @@ def gather_decode(
     if topk_indices.dim() == 3:
         topk_indices = topk_indices[:, 0, :]
 
-    # The new token must be visible to the gather if the indexer selected it.
+    # The new token must be visible to the gather if the indexer selected it. The row
+    # is the token's position relative to the prompt; every layer writes the same row.
+    rows = (cur_positions.to(torch.long) - prompt_lens.to(torch.long)).tolist()
     for b, req_id in enumerate(req_ids):
         manager.append_decode_token(
-            req_id, layer_name, cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
+            req_id, layer_name, rows[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
         )
     plan = build_gather_plan(
         topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req

@@ -47,6 +47,8 @@ def set_ascend_forward_context(
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
     dsa_offload_manager=None,
+    dsa_req_ids=None,
+    dsa_prompt_lens=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -68,8 +70,11 @@ def set_ascend_forward_context(
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
         # DSA latent offload manager (None unless GLM5.1 latent offload is enabled);
-        # read by AscendSFAImpl to drive prefill store / decode gather.
+        # read by AscendSFAImpl to drive prefill store / decode gather. req_ids and
+        # prompt_lens (per request, batch order) come from the runner's input_batch.
         forward_context.dsa_offload_manager = dsa_offload_manager
+        forward_context.dsa_req_ids = dsa_req_ids
+        forward_context.dsa_prompt_lens = dsa_prompt_lens
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

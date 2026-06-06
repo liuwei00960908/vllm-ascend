@@ -151,7 +151,7 @@ def test_manager_gather_mixed_sources_roundtrip():
     # One decode token already generated -> sequence pos 5 (decode-store row 0).
     dnope = torch.full((1, cfg.kv_lora_rank), 99.0)
     dpe = torch.full((1, cfg.qk_rope_head_dim), 88.0)
-    mgr.append_decode_token("r0", "L1", dnope, dpe)
+    mgr.append_decode_token("r0", "L1", 0, dnope, dpe)
 
     # Indexer selects prefill pos 3, decode pos 5, prefill pos 1, then padding.
     topk = torch.tensor([[3, 5, 1, INVALID_TOKEN_INDEX]])
@@ -202,8 +202,7 @@ def test_offload_path_attends_to_exactly_the_selected_tokens():
     dec_nope = torch.randn(2, cfg.kv_lora_rank)
     dec_pe = torch.randn(2, cfg.qk_rope_head_dim)
     for i in range(2):
-        mgr.append_decode_token("r0", "L0", dec_nope[i : i + 1], dec_pe[i : i + 1])
-        mgr.advance_decode_step("r0")
+        mgr.append_decode_token("r0", "L0", i, dec_nope[i : i + 1], dec_pe[i : i + 1])
 
     # Full resident latent (prefill + decode), the ground-truth source.
     full_nope = torch.cat([k_nope, dec_nope], dim=0)
@@ -240,10 +239,9 @@ def test_manager_decode_store_capacity_guard():
     mgr = _build(cfg)
     nope = torch.zeros((1, cfg.kv_lora_rank))
     pe = torch.zeros((1, cfg.qk_rope_head_dim))
-    mgr.append_decode_token("r0", "L0", nope, pe)
-    mgr.advance_decode_step("r0")
+    mgr.append_decode_token("r0", "L0", 0, nope, pe)
     try:
-        mgr.append_decode_token("r0", "L0", nope, pe)
+        mgr.append_decode_token("r0", "L0", 1, nope, pe)
         raised = False
     except RuntimeError:
         raised = True
@@ -255,10 +253,10 @@ def test_manager_free_request_recycles_slot():
     mgr = _build(cfg)
     nope = torch.zeros((1, cfg.kv_lora_rank))
     pe = torch.zeros((1, cfg.qk_rope_head_dim))
-    mgr.append_decode_token("r0", "L0", nope, pe)
+    mgr.append_decode_token("r0", "L0", 0, nope, pe)
     mgr.free_request("r0")
     # slot recycled -> a new request can take it without exhausting max_num_seqs.
-    mgr.append_decode_token("r1", "L0", nope, pe)
+    mgr.append_decode_token("r1", "L0", 0, nope, pe)
 
 
 def test_hooks_store_prefill_splits_requests_by_csr():
@@ -303,13 +301,13 @@ def test_hooks_gather_decode_full_step_two_layers():
         cur_nope = torch.randn(1, cfg.kv_lora_rank)
         cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
         sk, skp, si, bt = gather_decode(
-            mgr, ln, ["r0"], topk, torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
+            mgr, ln, ["r0"], topk, torch.tensor([prompt_len]),
+            torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
         )
         # the new token (decode-store row 0) landed in compact slot 1.
         assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[1], cur_nope[0])
         assert si[0].tolist()[:2] == [0, 1]
-    mgr.advance_decode_step("r0")  # once per step, after the final layer
-    assert mgr._decode_len["r0"] == 1
+    # explicit-row design: no advance call; the row came from cur_positions.
 
 
 def test_hooks_gather_decode_accepts_3d_topk():
@@ -330,7 +328,8 @@ def test_hooks_gather_decode_accepts_3d_topk():
     cur_nope = torch.randn(1, cfg.kv_lora_rank)
     cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
     sk, skp, si, bt = gather_decode(
-        mgr, "L0", ["r0"], topk_3d, torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
+        mgr, "L0", ["r0"], topk_3d, torch.tensor([prompt_len]),
+        torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
     )
     # slot 0 = prefill pos 2, slot 1 = prefill pos 0.
     assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[0], kn[2])

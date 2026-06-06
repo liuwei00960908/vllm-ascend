@@ -1363,6 +1363,17 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
+        # DSA latent offload (GLM5.1): pass the manager + per-request ids/prompt lengths
+        # (from input_batch, batch order) into the forward context so AscendSFAImpl can
+        # drive store/gather. No-op when the feature is off.
+        dsa_offload_manager = getattr(self, "dsa_offload_manager", None)
+        dsa_req_ids = None
+        dsa_prompt_lens = None
+        if dsa_offload_manager is not None:
+            num_reqs = self.input_batch.num_reqs
+            dsa_req_ids = self.input_batch.req_ids[:num_reqs]
+            dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
+
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
@@ -1378,6 +1389,9 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                dsa_offload_manager=dsa_offload_manager,
+                dsa_req_ids=dsa_req_ids,
+                dsa_prompt_lens=dsa_prompt_lens,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

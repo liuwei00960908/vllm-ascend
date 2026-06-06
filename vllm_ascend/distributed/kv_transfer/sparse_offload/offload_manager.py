@@ -226,8 +226,6 @@ class SparseLatentOffloadManager:
         # request slot bookkeeping for the decode store (small free-list).
         self._free_slots: list[int] = list(range(config.max_num_seqs))
         self._req_slot: dict[str, int] = {}
-        # number of decode tokens written per request (next write row).
-        self._decode_len: dict[str, int] = {}
 
     # ------------------------------------------------------------------ slots
     def _slot_for(self, req_id: str) -> int:
@@ -240,14 +238,12 @@ class SparseLatentOffloadManager:
                 )
             slot = self._free_slots.pop()
             self._req_slot[req_id] = slot
-            self._decode_len[req_id] = 0
         return slot
 
     def free_request(self, req_id: str) -> None:
         slot = self._req_slot.pop(req_id, None)
         if slot is not None:
             self._free_slots.append(slot)
-            self._decode_len.pop(req_id, None)
         self.backend.free_request(req_id)
 
     # ----------------------------------------------------------------- prefill
@@ -268,28 +264,27 @@ class SparseLatentOffloadManager:
         self,
         req_id: str,
         layer_name: str,
+        decode_row: int,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
     ) -> None:
-        """Write the current decode token's latent into the resident store.
+        """Write the current decode token's latent into the resident store at an
+        explicit row (= current absolute position - prompt_len).
 
         Must be called before :meth:`gather_decode_layer` for the same step so the
-        token is visible if the indexer selects it.
+        token is visible if the indexer selects it. Using an explicit row (rather than
+        an internal counter) means every layer writes the same row and there is no
+        per-step "advance" to time — the row is derived from the token position.
         """
-        slot = self._slot_for(req_id)
-        row = self._decode_len[req_id]
-        if row >= self.config.max_resident_decode_tokens:
+        if decode_row >= self.config.max_resident_decode_tokens:
             raise RuntimeError(
                 f"SparseLatentOffloadManager: request {req_id} exceeded "
                 f"max_resident_decode_tokens={self.config.max_resident_decode_tokens}; "
                 "v1 keeps decode latent resident on NPU."
             )
+        slot = self._slot_for(req_id)
         latent = self._pack(k_nope, k_pe)
-        self._decode_store[self._layer_id[layer_name], slot, row] = latent.squeeze(0)
-
-    def advance_decode_step(self, req_id: str) -> None:
-        """Bump the per-request decode length once per step (after the last layer)."""
-        self._decode_len[req_id] = self._decode_len.get(req_id, 0) + 1
+        self._decode_store[self._layer_id[layer_name], slot, decode_row] = latent.squeeze(0)
 
     def gather_decode_layer(
         self,
