@@ -126,7 +126,11 @@ class InMemoryLatentOffloadBackend:
                 continue
             dense = self._store[(req_id, layer_name)]
             idx = torch.tensor(selected_tokens[lo:hi], dtype=torch.long, device=self._device)
-            self._load_buffer[lo:hi] = dense.index_select(0, idx).to(self._load_buffer.dtype)
+            # store device may differ from the load buffer (e.g. CPU-offload mock ->
+            # NPU buffer); copy across devices into the registered destination.
+            self._load_buffer[lo:hi] = dense.index_select(0, idx).to(
+                self._load_buffer.device, self._load_buffer.dtype
+            )
 
     # Reference-only side channel: the real LMCache keys lookups internally; the
     # in-memory impl needs the batch's req_ids to resolve its per-req_id dict.

@@ -146,6 +146,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_INTROSPECT_FILE": lambda: os.getenv(
         "VLLM_ASCEND_DSA_INTROSPECT_FILE", "dsa_introspect.log"
     ),
+    # Storage device for the in-memory reference offload backend (the LMCache stand-in
+    # used until the real adapter lands). "npu" keeps latent in device memory (no
+    # memory relief, correctness-only); "cpu" stages latent in host RAM, simulating
+    # an off-NPU LMCache — pair with Stage 2 to actually free NPU memory. Default npu.
+    "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "npu"
+    ),
 }
 
 # end-env-vars-definition

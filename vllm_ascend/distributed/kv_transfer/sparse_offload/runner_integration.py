@@ -164,10 +164,14 @@ def build_manager(
     end-to-end before the real LMCache adapter is wired in.
     """
     if backend is None:
-        # Reference backend lives on the same device as the buffers so the in-memory
-        # bring-up path has no cross-device copies. NOT memory-relieving (holds latent
-        # in NPU memory) — swap for the LMCache adapter for the real memory win.
-        backend = InMemoryLatentOffloadBackend(device=config.device)
+        # Reference backend (LMCache stand-in). Device from env: "npu" (default) keeps
+        # latent in device memory (correctness-only); "cpu" stages it in host RAM to
+        # simulate off-NPU LMCache (pair with Stage 2 for real memory relief). Swap for
+        # the real LMCache adapter when available.
+        store_dev = envs.VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE
+        backend = InMemoryLatentOffloadBackend(
+            device=config.device if store_dev == "npu" else store_dev
+        )
     scratch_knope, scratch_kpe, decode_store, load_buffer = allocate_buffers(config)
     return SparseLatentOffloadManager(
         config=config,
