@@ -1315,11 +1315,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _kn,
                     _kp,
                 )
+                # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
                 scratch_out = self._execute_sparse_flash_attention_process(
                     ql_nope,
                     q_pe,
                     kv_cache,
-                    c_idx,
+                    c_idx.unsqueeze(1),
                     attn_metadata,
                     actual_seq_lengths_query,
                     s_kv,

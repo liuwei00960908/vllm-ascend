@@ -349,7 +349,8 @@ class SparseLatentOffloadManager:
                 knope_flat.index_copy_(0, dst, knope.to(dev))
                 kpe_flat.index_copy_(0, dst, kpe.to(dev))
 
-        # Match the native kernel arg dtypes (int32) to avoid a dtype mismatch.
+        # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here
+        # ([num_reqs, topk]); the caller adds the singleton head dim for the kernel.
         return (
             self._scratch_knope,
             self._scratch_kpe,
