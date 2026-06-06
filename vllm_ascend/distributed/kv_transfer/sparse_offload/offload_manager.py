@@ -349,12 +349,13 @@ class SparseLatentOffloadManager:
                 knope_flat.index_copy_(0, dst, knope.to(dev))
                 kpe_flat.index_copy_(0, dst, kpe.to(dev))
 
+        # Match the native kernel arg dtypes (int32) to avoid a dtype mismatch.
         return (
             self._scratch_knope,
             self._scratch_kpe,
-            plan.sparse_indices.to(dev),
-            plan.scratch_block_table.to(dev),
-            plan.seq_lens_kv.to(dev),  # per-req valid count -> actual_seq_lengths_kv
+            plan.sparse_indices.to(dev, torch.int32),
+            plan.scratch_block_table.to(dev, torch.int32),
+            plan.seq_lens_kv.to(dev, torch.int32),  # per-req valid count -> actual_seq_lengths_kv
         )
 
     # ------------------------------------------------------------------ packing

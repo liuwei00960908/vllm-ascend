@@ -91,7 +91,9 @@ def gather_decode(
 
     # The new token must be visible to the gather if the indexer selected it. The row
     # is the token's position relative to the prompt; every layer writes the same row.
-    rows = (cur_positions.to(torch.long) - prompt_lens.to(torch.long)).tolist()
+    # cur_positions is on NPU (from seq_lens), prompt_lens on CPU (from numpy); compute
+    # the decode rows on CPU (the .tolist() below forces a D2H sync anyway).
+    rows = (cur_positions.cpu().to(torch.long) - prompt_lens.cpu().to(torch.long)).tolist()
     for b, req_id in enumerate(req_ids):
         manager.append_decode_token(
             req_id, layer_name, rows[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
