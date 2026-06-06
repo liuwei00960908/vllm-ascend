@@ -1282,6 +1282,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             and not self.use_sparse_c8_indexer
             and _dsa_on_native_path
         )
+        if _dsa_mgr is not None and not _dsa_supported:
+            # One-time heads-up if offload is enabled but this path can't use it, so a
+            # missing [DSA-PARITY] log on the box is self-explanatory.
+            logger.warning_once(
+                "[DSA] latent offload enabled but inactive on this path "
+                f"(dsa_cp={self.enable_dsa_cp}, sparse_c8={self.use_sparse_c8_indexer}, "
+                f"mlapo_native={_dsa_on_native_path}); using native attention."
+            )
+
         attn_output = None
         if _dsa_supported:
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
