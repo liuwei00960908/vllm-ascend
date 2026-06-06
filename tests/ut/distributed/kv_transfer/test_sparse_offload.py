@@ -310,3 +310,28 @@ def test_hooks_gather_decode_full_step_two_layers():
         assert si[0].tolist()[:2] == [0, 1]
     mgr.advance_decode_step("r0")  # once per step, after the final layer
     assert mgr._decode_len["r0"] == 1
+
+
+def test_hooks_gather_decode_accepts_3d_topk():
+    # The Ascend indexer emits [num_tokens, 1, topk]; gather_decode must squeeze it.
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.sfa_hooks import (
+        gather_decode,
+        store_prefill,
+    )
+
+    cfg = _cpu_config(topk_tokens=4, block_size=4, max_num_seqs=1)
+    mgr = _build(cfg)
+    prompt_len = 5
+    kn = torch.randn(prompt_len, cfg.kv_lora_rank)
+    kp = torch.randn(prompt_len, cfg.qk_rope_head_dim)
+    store_prefill(mgr, "L0", ["r0"], torch.tensor([0, prompt_len]), torch.tensor([0]), kn, kp)
+
+    topk_3d = torch.tensor([[[2, 0, INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]]])  # [1,1,4]
+    cur_nope = torch.randn(1, cfg.kv_lora_rank)
+    cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
+    sk, skp, si, bt = gather_decode(
+        mgr, "L0", ["r0"], topk_3d, torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
+    )
+    # slot 0 = prefill pos 2, slot 1 = prefill pos 0.
+    assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[0], kn[2])
+    assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[1], kn[0])

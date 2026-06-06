@@ -82,7 +82,13 @@ def gather_decode(
     NOTE: every layer writes the current token to the SAME decode-store row (same
     position, different layer); the caller must advance the per-request row exactly
     once per step, AFTER the final layer, via ``manager.advance_decode_step(req_id)``.
+
+    The Ascend indexer emits ``topk_indices`` as ``[num_tokens, 1, topk]`` (confirmed
+    on NPU); collapse the singleton middle dim to ``[num_decode_reqs, topk]``.
     """
+    if topk_indices.dim() == 3:
+        topk_indices = topk_indices[:, 0, :]
+
     # The new token must be visible to the gather if the indexer selected it.
     for b, req_id in enumerate(req_ids):
         manager.append_decode_token(
