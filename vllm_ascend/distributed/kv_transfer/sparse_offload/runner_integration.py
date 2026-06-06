@@ -164,7 +164,10 @@ def build_manager(
     end-to-end before the real LMCache adapter is wired in.
     """
     if backend is None:
-        backend = InMemoryLatentOffloadBackend(device="cpu")
+        # Reference backend lives on the same device as the buffers so the in-memory
+        # bring-up path has no cross-device copies. NOT memory-relieving (holds latent
+        # in NPU memory) — swap for the LMCache adapter for the real memory win.
+        backend = InMemoryLatentOffloadBackend(device=config.device)
     scratch_knope, scratch_kpe, decode_store, load_buffer = allocate_buffers(config)
     return SparseLatentOffloadManager(
         config=config,

@@ -158,7 +158,7 @@ def test_manager_gather_mixed_sources_roundtrip():
     plan = build_gather_plan(
         topk, torch.tensor([prompt_len]), cfg.block_size, cfg.scratch_blocks_per_req
     )
-    s_knope, s_kpe, sparse_indices, block_table = mgr.gather_decode_layer("L1", ["r0"], plan)
+    s_knope, s_kpe, sparse_indices, block_table, seq_lens_kv = mgr.gather_decode_layer("L1", ["r0"], plan)
 
     knope_flat = s_knope.view(-1, cfg.kv_lora_rank)
     kpe_flat = s_kpe.view(-1, cfg.qk_rope_head_dim)
@@ -213,7 +213,7 @@ def test_offload_path_attends_to_exactly_the_selected_tokens():
     plan = build_gather_plan(
         topk, torch.tensor([prompt_len]), cfg.block_size, cfg.scratch_blocks_per_req
     )
-    s_knope, s_kpe, sparse_indices, block_table = mgr.gather_decode_layer("L0", ["r0"], plan)
+    s_knope, s_kpe, sparse_indices, block_table, _ = mgr.gather_decode_layer("L0", ["r0"], plan)
 
     got_nope, got_pe = resolve_scratch_gather(
         s_knope, s_kpe, sparse_indices, block_table, cfg.block_size, plan.seq_lens_kv
@@ -300,7 +300,7 @@ def test_hooks_gather_decode_full_step_two_layers():
     for ln in LAYER_NAMES:
         cur_nope = torch.randn(1, cfg.kv_lora_rank)
         cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
-        sk, skp, si, bt = gather_decode(
+        sk, skp, si, bt, sl = gather_decode(
             mgr, ln, ["r0"], topk, torch.tensor([prompt_len]),
             torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
         )
@@ -327,7 +327,7 @@ def test_hooks_gather_decode_accepts_3d_topk():
     topk_3d = torch.tensor([[[2, 0, INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]]])  # [1,1,4]
     cur_nope = torch.randn(1, cfg.kv_lora_rank)
     cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
-    sk, skp, si, bt = gather_decode(
+    sk, skp, si, bt, sl = gather_decode(
         mgr, "L0", ["r0"], topk_3d, torch.tensor([prompt_len]),
         torch.tensor([prompt_len]), cfg.block_size, cur_nope, cur_pe
     )

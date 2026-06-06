@@ -1020,11 +1020,29 @@ class AscendSFAImpl(MLAAttentionImpl):
         return topk_indices
 
     def _execute_sparse_flash_attention_process(
-        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        kv_override=None,
+        key_rope_override=None,
+        block_table_override=None,
     ):
-        block_table = attn_metadata.block_table
-        kv = kv_cache[0]
-        key_rope = kv_cache[1]
+        # DSA latent offload: when overrides are given, read latent from the A1 scratch
+        # (kv_override/key_rope_override) via the scratch block_table instead of the
+        # full paged latent cache. Used by the decode-gather path.
+        if kv_override is not None:
+            block_table = block_table_override
+            kv = kv_override
+            key_rope = key_rope_override
+        else:
+            block_table = attn_metadata.block_table
+            kv = kv_cache[0]
+            key_rope = kv_cache[1]
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
@@ -1244,9 +1262,83 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             _dsa_probe.probe_topk(topk_indices)
 
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
+        #   * prefill steps  -> store this layer's prompt latent, use native attention;
+        #   * DecodeOnly step -> gather indexer-selected latent into the A1 scratch and
+        #     run sparse attention against it. With ASSERT_PARITY, also run the native
+        #     path and log the max-abs output diff, driving generation with the native
+        #     result so a wrong scratch path can't corrupt output. Falls back to native
+        #     when disabled or on unsupported paths (CP / sparse-c8 / mlapo).
+        from vllm.forward_context import get_forward_context
+
+        _dsa_fc = get_forward_context()
+        _dsa_mgr = getattr(_dsa_fc, "dsa_offload_manager", None)
+        _dsa_on_native_path = not (
+            self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
         )
+        _dsa_supported = (
+            _dsa_mgr is not None
+            and not self.enable_dsa_cp
+            and not self.use_sparse_c8_indexer
+            and _dsa_on_native_path
+        )
+        attn_output = None
+        if _dsa_supported:
+            from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
+
+            _block_size = kv_cache[0].shape[1]
+            _kn = k_nope.reshape(k_nope.shape[0], -1)
+            _kp = k_pe.reshape(k_pe.shape[0], -1)
+            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
+                    _dsa_mgr,
+                    layer_name,
+                    _dsa_fc.dsa_req_ids,
+                    topk_indices,
+                    _dsa_fc.dsa_prompt_lens,
+                    _cur_pos,
+                    _block_size,
+                    _kn,
+                    _kp,
+                )
+                scratch_out = self._execute_sparse_flash_attention_process(
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    c_idx,
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    s_kv,
+                    kv_override=s_knope,
+                    key_rope_override=s_kpe,
+                    block_table_override=s_bt,
+                )
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+                    native_out = self._execute_sparse_flash_attention_process(
+                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                        actual_seq_lengths_query, actual_seq_lengths_key,
+                    )
+                    diff = (native_out.float() - scratch_out.float()).abs().max()
+                    logger.info("[DSA-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    attn_output = native_out  # safe: generation uses the native result
+                else:
+                    attn_output = scratch_out
+            else:
+                # prefill: store this layer's prompt latent once (per request).
+                _qsl = torch.cat(
+                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
+                )
+                _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
+                _dsa_hooks.store_prefill(
+                    _dsa_mgr, layer_name, _dsa_fc.dsa_req_ids, _qsl, _ctx, _kn, _kp
+                )
+
+        if attn_output is None:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                actual_seq_lengths_query, actual_seq_lengths_key,
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()

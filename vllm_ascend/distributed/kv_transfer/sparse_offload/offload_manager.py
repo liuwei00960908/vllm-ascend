@@ -354,6 +354,7 @@ class SparseLatentOffloadManager:
             self._scratch_kpe,
             plan.sparse_indices.to(dev),
             plan.scratch_block_table.to(dev),
+            plan.seq_lens_kv.to(dev),  # per-req valid count -> actual_seq_lengths_kv
         )
 
     # ------------------------------------------------------------------ packing
