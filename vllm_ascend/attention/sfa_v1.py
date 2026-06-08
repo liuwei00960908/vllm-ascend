@@ -1301,8 +1301,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         #     path and log the max-abs output diff, driving generation with the native
         #     result so a wrong scratch path can't corrupt output. Falls back to native
         #     when disabled or on unsupported paths (CP / sparse-c8 / mlapo).
-        from vllm.forward_context import get_forward_context
-
         _dsa_fc = get_forward_context()
         _dsa_mgr = getattr(_dsa_fc, "dsa_offload_manager", None)
         _dsa_on_native_path = not (
