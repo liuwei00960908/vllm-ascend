@@ -2820,14 +2820,25 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
-                    if self.use_sparse:
+                    dsa_k_tensor_size = None
+                    dsa_k_scale_tensor_size = None
+                    if self.use_sparse and self.dsa_free_paged:
+                        # DSA offload (M-B): the page holds ONLY the indexer key; the
+                        # latent k/v are 1-block dummies (exec_kv writes the
+                        # PagedLatentPool instead). This is what shrinks per-token memory.
+                        dtb = get_dtype_size(self.kv_cache_dtype)
+                        bs = current_kv_cache_spec.block_size
+                        k_tensor_size = bs * self.sparse_head_dim[0] * dtb  # 1-block dummy
+                        v_tensor_size = bs * self.sparse_head_dim[1] * dtb  # 1-block dummy
+                        dsa_k_tensor_size = int(kv_cache_tensor.size)  # whole page = indexer
+                    elif self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
-                        kv_cache_spec = layer_kv_cache_spec[layer_name]
-                        sparse_kv_cache_ratio = kv_cache_spec.sparse_kv_cache_ratio
-                        k_tensor_split_factor = sparse_kv_cache_ratio[0]
-                        v_tensor_split_factor = sparse_kv_cache_ratio[1]
-                        dsa_k_tensor_split_factor = sparse_kv_cache_ratio[2]
-                        dsa_k_scale_tensor_split_factor = sparse_kv_cache_ratio[3]
+                        sparse_kv_cache_ratio = layer_kv_cache_spec[layer_name].sparse_kv_cache_ratio
+                        k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[0])
+                        v_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[1])
+                        dsa_k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[2])
+                        if self.use_sparse_c8_indexer:
+                            dsa_k_scale_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[3])
                     else:
                         k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
                         assert k_dim > 0 and v_dim > 0
@@ -2841,16 +2852,8 @@ class NPUModelRunner(GPUModelRunner):
                             )
                         else:
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
-
-                    k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
-                    v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
-                    dsa_k_tensor_size = None
-                    dsa_k_scale_tensor_size = None
-                    #### for deepseek sparse attention
-                    if self.use_sparse:
-                        dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
-                    if self.use_sparse_c8_indexer:
-                        dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
+                        k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+                        v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
 
                     # for other attentions, e.g., self_attn, sliding window attn
                     if self.vllm_config.kv_transfer_config is None:
@@ -3009,14 +3012,17 @@ class NPUModelRunner(GPUModelRunner):
                         # k_cache: nope_cache    v_cache: rope_cache
                         mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
                         k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+                        # DSA offload (M-B): latent is in the PagedLatentPool, so the
+                        # paged k/v are 1-block dummies (the op writes the pool, not these).
+                        latent_blocks = 1 if self.dsa_free_paged else mla_num_blocks
                         k_shape = (
-                            mla_num_blocks,
+                            latent_blocks,
                             mla_block_size,
                             num_kv_heads,
                             k_dim,
                         )
                         v_shape = (
-                            mla_num_blocks,
+                            latent_blocks,
                             mla_block_size,
                             num_kv_heads,
                             v_dim,

@@ -8,6 +8,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -446,6 +447,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_rope_neox_style = False
             self.use_torch_npu_lightning_indexer = True
 
+        # DSA latent offload Route-1 pragmatic (M-B): latent written to the
+        # PagedLatentPool instead of the (shrunk) vLLM paged latent cache.
+        self.dsa_offload_free_paged = bool(
+            envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
+            and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
+        )
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1146,7 +1153,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert slot_mapping_cp is not None
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
             else:
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                _fc = get_forward_context()
+                _dsa_mgr_xkv = getattr(_fc, "dsa_offload_manager", None)
+                if self.dsa_offload_free_paged and _dsa_mgr_xkv is not None:
+                    # FREE_PAGED (prefill + decode): write latent into the PagedLatentPool
+                    # (not the 1-block dummy kv_cache[0]/[1]); the op writes
+                    # ckv_cache/k_cache at the pool's own slots. positions = arange(ctx,
+                    # ctx+qlen) per request handles both prefill chunks and decode (qlen=1).
+                    # HW-VERIFY: pool tensors are paged-layout for the op.
+                    _qsl = torch.cat(
+                        [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
+                    )
+                    _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
+                    _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
+                        layer_name, _fc.dsa_req_ids, _qsl, _ctx
+                    )
+                    k_pe, k_nope = self.exec_kv(
+                        kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata
+                    )
+                else:
+                    k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1335,7 +1361,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     key_rope_override=s_kpe,
                     block_table_override=s_bt,
                 )
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                         actual_seq_lengths_query, actual_seq_lengths_key,
@@ -1368,7 +1394,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query, actual_seq_lengths_key,
                     kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
                 )
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                         actual_seq_lengths_query, actual_seq_lengths_key,

@@ -233,6 +233,32 @@ class SparseLatentOffloadManager:
             positions = torch.arange(ctx[b], ctx[b] + (hi - lo))
             pool.store(req_id, layer_id, positions, kn[lo:hi], kp[lo:hi])
 
+    def pool_exec_kv_slots(
+        self,
+        layer_name: str,
+        req_ids: list[str],
+        query_start_loc: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reserve pool blocks for this step's tokens and return ``(pool_slots,
+        knope, kpe)`` so exec_kv's op writes latent into the pool (FREE_PAGED mode).
+        ``pool_slots`` is aligned with the packed token order (= the vLLM slot_mapping
+        order); knope/kpe are this layer's pool tensors (the op's ckv_cache/k_cache)."""
+        pool = self._paged_latent_pool
+        qsl = query_start_loc.to(torch.long).tolist()
+        ctx = context_lens.to(torch.long).tolist()
+        parts = []
+        for b, req_id in enumerate(req_ids):
+            lo, hi = qsl[b], qsl[b + 1]
+            if hi <= lo:
+                continue
+            positions = torch.arange(ctx[b], ctx[b] + (hi - lo))
+            pool.reserve(req_id, ctx[b] + (hi - lo))
+            parts.append(pool.slot_mapping(req_id, positions))
+        pool_slots = torch.cat(parts) if parts else torch.empty(0, dtype=torch.long)
+        knope, kpe = pool.layer_caches(self._layer_id[layer_name])
+        return pool_slots.to(knope.device), knope, kpe
+
     def pool_attn_args(
         self, layer_name: str, req_ids: list[str], max_blocks: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
