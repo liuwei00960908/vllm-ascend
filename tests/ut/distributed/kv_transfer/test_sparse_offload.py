@@ -220,6 +220,41 @@ def test_manager_free_request_delegates():
 
 
 # --------------------------------------------------------------- hooks
+def test_paged_latent_pool_write_read_and_free():
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.paged_latent_pool import (
+        PagedLatentPool,
+    )
+
+    pool = PagedLatentPool(
+        num_layers=2, num_blocks=4, block_size=2, kv_lora_rank=3, qk_rope_head_dim=2,
+        dtype=torch.float32, device="cpu",
+    )
+    # reserve for 3 tokens -> 2 blocks (size 2).
+    pool.reserve("r0", 3)
+    assert pool.num_free_blocks == 2
+
+    positions = torch.tensor([0, 1, 2])
+    slots = pool.slot_mapping("r0", positions)
+    # simulate the op writing latent at those slots for layer 1.
+    knope, kpe = pool.layer_caches(1)
+    vals_n = torch.randn(3, 3)
+    vals_p = torch.randn(3, 2)
+    knope.view(-1, 3)[slots] = vals_n
+    kpe.view(-1, 2)[slots] = vals_p
+
+    # read back via block_table + position resolution (mirrors the kernel).
+    bt = pool.block_table("r0", width=4)  # [4] padded
+    for i, p in enumerate(positions.tolist()):
+        slot = int(bt[p // pool.block_size]) * pool.block_size + p % pool.block_size
+        assert torch.equal(knope.view(-1, 3)[slot], vals_n[i])
+        assert torch.equal(kpe.view(-1, 2)[slot], vals_p[i])
+
+    # layer 0 untouched.
+    assert torch.count_nonzero(pool.layer_caches(0)[0]) == 0
+    pool.free_request("r0")
+    assert pool.num_free_blocks == 4  # recycled
+
+
 def test_hooks_store_prefill_splits_requests_by_csr():
     from vllm_ascend.distributed.kv_transfer.sparse_offload.sfa_hooks import store_prefill
 
