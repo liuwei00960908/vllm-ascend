@@ -1296,24 +1296,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
 
             _block_size = kv_cache[0].shape[1]
-            # exec_kv writes the latent into kv_cache[0]/[1] and returns None on the
-            # single-card (non-CP) path, so read the just-written latent back from the
-            # paged cache via slot_mapping (path-agnostic; aligns with token order).
-            _sm = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].to(torch.long)
-            _kn = kv_cache[0].reshape(-1, kv_cache[0].shape[-1]).index_select(0, _sm)
-            _kp = kv_cache[1].reshape(-1, kv_cache[1].shape[-1]).index_select(0, _sm)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                # decode-selected tokens (incl. this step's new one) are resident in the
+                # paged latent cache; gather them + prefill (LMCache) into the scratch.
                 s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
                     _dsa_mgr,
                     layer_name,
                     _dsa_fc.dsa_req_ids,
                     topk_indices,
                     _dsa_fc.dsa_prompt_lens,
-                    _cur_pos,
                     _block_size,
-                    _kn,
-                    _kp,
+                    (kv_cache[0], kv_cache[1]),
+                    attn_metadata.block_table,
                 )
                 # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
                 scratch_out = self._execute_sparse_flash_attention_process(
@@ -1339,7 +1333,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 else:
                     attn_output = scratch_out
             else:
-                # prefill: store this layer's prompt latent once (per request).
+                # prefill: store this layer's prompt latent once (per request). Read the
+                # just-written latent back from the paged cache via slot_mapping (exec_kv
+                # returns None on the single-card path).
+                _sm = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].to(torch.long)
+                _kn = kv_cache[0].reshape(-1, kv_cache[0].shape[-1]).index_select(0, _sm)
+                _kp = kv_cache[1].reshape(-1, kv_cache[1].shape[-1]).index_select(0, _sm)
                 _qsl = torch.cat(
                     [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
                 )

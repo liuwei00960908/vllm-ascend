@@ -63,25 +63,27 @@ def gather_decode(
     req_ids: list[str],
     topk_indices: torch.Tensor,
     prompt_lens: torch.Tensor,
-    cur_positions: torch.Tensor,
     block_size: int,
-    cur_k_nope: torch.Tensor,
-    cur_k_pe: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Append the current decode token, then gather the selected latent into scratch.
+    latent_caches: tuple[torch.Tensor, torch.Tensor],
+    block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather the indexer-selected latent for one layer into the A1 scratch.
+
+    Prefill-selected tokens come from the backend (LMCache); decode-selected tokens
+    (including this step's just-generated one) are read from the paged latent cache
+    (``latent_caches`` = kv_cache[0]/[1]) via the request's ``block_table`` — no
+    decode-store, no length cap.
 
     Args:
         topk_indices: ``[num_decode_reqs, topk]`` (or ``[*, 1, topk]``) indexer output,
             absolute sequence positions, ``-1`` padded.
-        prompt_lens:  ``[num_decode_reqs]`` prompt length per request (the prefill /
-            decode boundary).
-        cur_positions: ``[num_decode_reqs]`` absolute position of this step's new token
-            per request (= seq_len - 1); the decode-store row is ``pos - prompt_len``.
-        cur_k_nope / cur_k_pe: ``[num_decode_reqs, *]`` the current step's latent for
-            this layer (one new token per decode request), kept resident on the NPU.
+        prompt_lens:  ``[num_decode_reqs]`` prompt length per request (prefill/decode
+            boundary).
+        latent_caches: ``(kv_cache[0], kv_cache[1])`` paged latent tensors.
+        block_table:   ``[num_decode_reqs, max_blocks]`` paged block table.
 
-    Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table)`` for
-    ``npu_sparse_flash_attention``.
+    Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table,
+    seq_lens_kv)`` for ``npu_sparse_flash_attention``.
 
     The Ascend indexer emits ``topk_indices`` as ``[num_tokens, 1, topk]`` (confirmed
     on NPU); collapse the singleton middle dim to ``[num_decode_reqs, topk]``.
@@ -89,16 +91,9 @@ def gather_decode(
     if topk_indices.dim() == 3:
         topk_indices = topk_indices[:, 0, :]
 
-    # The new token must be visible to the gather if the indexer selected it. The row
-    # is the token's position relative to the prompt; every layer writes the same row.
-    # cur_positions is on NPU (from seq_lens), prompt_lens on CPU (from numpy); compute
-    # the decode rows on CPU (the .tolist() below forces a D2H sync anyway).
-    rows = (cur_positions.cpu().to(torch.long) - prompt_lens.cpu().to(torch.long)).tolist()
-    for b, req_id in enumerate(req_ids):
-        manager.append_decode_token(
-            req_id, layer_name, rows[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
-        )
     plan = build_gather_plan(
         topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req
     )
-    return manager.gather_decode_layer(layer_name, req_ids, plan)
+    return manager.gather_decode_layer(
+        layer_name, req_ids, plan, latent_caches, block_table, block_size
+    )

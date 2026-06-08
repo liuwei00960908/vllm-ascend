@@ -3,24 +3,25 @@
 """Worker-side manager for DSA latent KV offload (see DESIGN.md).
 
 Responsibilities:
-  * own the two NPU buffers reserved from the KV-cache budget:
-      - ``scratch``        : one-layer, reused within a forward (A1 read buffer),
-      - ``decode_store``   : persistent, all layers, holds decode-generated latent;
+  * own the ``scratch`` pool (one-layer, reused within a forward — the A1 read buffer)
+    and the ``load_buffer`` that LMCache writes loaded prefill latent into;
   * pack/unpack the MLA latent (k_nope + k_pe) for the layerwise LMCache backend;
   * at prefill end, push every prompt token's latent to the backend (once);
   * at each decode step/layer, split the indexer top-k into prefill (LMCache) and
-    decode (resident store) sources, gather both compactly into ``scratch``, and
-    build the kernel arguments (compact ``sparse_indices`` + scratch ``block_table``)
-    that point ``npu_sparse_flash_attention`` at the scratch instead of a full
-    paged latent cache.
+    decode sources, gather both compactly into ``scratch``, and build the kernel args
+    (compact ``sparse_indices`` + scratch ``block_table``) that point
+    ``npu_sparse_flash_attention`` at the scratch instead of the full paged latent.
 
-The index-planning core (:func:`build_gather_plan`) is pure tensor logic and is unit
-tested on CPU; the device writes around it are thin.
+Decode-generated tokens are NOT kept in a separate fixed-size store: their latent is
+already resident in the paged latent cache (``exec_kv`` writes it every step, vLLM
+manages its growth up to ``max_model_len``). So decode-selected tokens are read back
+directly from the paged cache via the request's ``block_table`` — no per-request
+length cap. The current step's just-generated token is likewise in the paged cache,
+so it needs no special handling.
 
-NOTE: the precise semantics of the indexer ``topk_indices`` (sentinel for empty
-slots, whether the current token is included) and of ``npu_sparse_flash_attention``'s
-``sparse_indices`` / ``block_table`` are validated on NPU hardware in task #5. Points
-that depend on on-hardware behavior are marked ``HW-VERIFY``.
+The index-planning core (:func:`build_gather_plan`) is pure tensor logic, unit tested
+on CPU. ``INVALID_TOKEN_INDEX`` (-1) is the indexer's padding sentinel (confirmed on
+NPU); the kernel index/block_table semantics are validated by the parity run.
 """
 
 from dataclasses import dataclass
@@ -32,7 +33,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_backend import (
 )
 
 # Sentinel marking an unused / padded entry in a top-k row produced by the indexer.
-# HW-VERIFY: confirm the value the Ascend indexer emits for padded slots.
 INVALID_TOKEN_INDEX = -1
 
 
@@ -42,9 +42,8 @@ class SparseOffloadConfig:
     kv_lora_rank: int  # head_size of k_nope (kv_cache[0])
     qk_rope_head_dim: int  # head_size of k_pe (kv_cache[1])
     block_size: int
-    max_num_seqs: int  # caps concurrent running requests -> scratch / store slots
-    topk_tokens: int  # indexer index_topk
-    max_resident_decode_tokens: int  # D: per-request decode-latent store capacity
+    max_num_seqs: int  # caps concurrent running requests -> scratch capacity
+    topk_tokens: int  # indexer index_topk (== single-layer resident size K)
     dtype: torch.dtype
     device: torch.device
 
@@ -66,18 +65,13 @@ class GatherPlan:
     """CPU-side plan for one decode batch (output of :func:`build_gather_plan`).
 
     All tensors are int64 on CPU. ``b`` indexes the decode requests in batch order.
+    Both ``prefill_positions`` and ``decode_positions`` hold *absolute* sequence
+    positions; they only differ in source (LMCache vs paged latent cache).
     """
 
-    # [b, topk] gather sources, row-aligned with the *compacted* output order:
-    #   prefill entries hold a sequence position (latent in LMCache),
-    #   decode entries hold a sequence position (latent in decode_store),
-    #   padded entries hold INVALID_TOKEN_INDEX.
-    prefill_positions: torch.Tensor  # prefill sources, -1 elsewhere
-    decode_positions: torch.Tensor  # decode sources, -1 elsewhere
-    # destination scratch slot for each selected token, row-aligned with the two
-    # arrays above (the compaction): [b, topk], -1 for padded entries.
-    dest_slot: torch.Tensor
-    # kernel args pointing at the scratch:
+    prefill_positions: torch.Tensor  # [b, topk] prefill sources (abs pos), -1 elsewhere
+    decode_positions: torch.Tensor  # [b, topk] decode sources (abs pos), -1 elsewhere
+    dest_slot: torch.Tensor  # [b, topk] compact scratch slot per selected token, -1 pad
     sparse_indices: torch.Tensor  # [b, topk] compact local indices [0..k_b-1], padded
     scratch_block_table: torch.Tensor  # [b, scratch_blocks_per_req] scratch block ids
     seq_lens_kv: torch.Tensor  # [b] number of valid selected tokens k_b
@@ -92,17 +86,13 @@ def build_gather_plan(
     """Plan the A1 compact gather for a decode batch. Pure / CPU-testable.
 
     Args:
-        topk_indices: int tensor ``[b, topk]`` of selected sequence positions per
-            decode query (one query per request at decode), ``INVALID_TOKEN_INDEX``
-            for unused slots.
+        topk_indices: int tensor ``[b, topk]`` of selected *absolute* sequence
+            positions per decode query, ``INVALID_TOKEN_INDEX`` for unused slots.
         prompt_lens: int tensor ``[b]`` prompt length per request; positions
             ``< prompt_len`` are prefill (LMCache), ``>= prompt_len`` are decode
-            (resident store, store-row = pos - prompt_len).
+            (read from the paged latent cache).
         block_size: paged block size of the scratch.
         scratch_blocks_per_req: contiguous scratch blocks reserved per request.
-
-    Returns:
-        GatherPlan with sources and the remapped kernel arguments.
     """
     topk_indices = topk_indices.to(torch.long).cpu()
     prompt_lens = prompt_lens.to(torch.long).cpu()
@@ -116,14 +106,10 @@ def build_gather_plan(
     is_decode = valid & (topk_indices >= prompt_lens.unsqueeze(1))
     is_prefill = valid & ~is_decode
 
-    prefill_positions = torch.where(
-        is_prefill, topk_indices, torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
-    )
-    decode_positions = torch.where(
-        is_decode,
-        topk_indices - prompt_lens.unsqueeze(1),
-        torch.full_like(topk_indices, INVALID_TOKEN_INDEX),
-    )
+    invalid = torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
+    # Both hold absolute positions; source distinguished by the masks.
+    prefill_positions = torch.where(is_prefill, topk_indices, invalid)
+    decode_positions = torch.where(is_decode, topk_indices, invalid)
 
     # Destination scratch slot = request's block region base + local_slot.
     region_base = (
@@ -131,16 +117,10 @@ def build_gather_plan(
         * scratch_blocks_per_req
         * block_size
     )
-    dest_slot = torch.where(
-        valid,
-        region_base + local_slot,
-        torch.full_like(topk_indices, INVALID_TOKEN_INDEX),
-    )
+    dest_slot = torch.where(valid, region_base + local_slot, invalid)
 
     # Compact local indices fed to the kernel (resolved against scratch_block_table).
-    sparse_indices = torch.where(
-        valid, local_slot, torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
-    )
+    sparse_indices = torch.where(valid, local_slot, invalid)
 
     block_ids = torch.arange(b * scratch_blocks_per_req, dtype=torch.long)
     scratch_block_table = block_ids.view(b, scratch_blocks_per_req)
@@ -167,13 +147,9 @@ def resolve_scratch_gather(
 
     For each request and each valid compact index ``i`` in ``sparse_indices``, the
     physical scratch slot is ``block_table[i // block_size] * block_size + i % block_size``
-    (``layout_kv="PA_BSND"``, ``sparse_block_size=1``). This reconstructs, per
-    request, the ``(k_nope, k_pe)`` rows the kernel would attend to, in attend order.
-
-    Used by tests to prove the A1 gather + remap feeds the kernel exactly the
-    originally-selected token latents. HW-VERIFY: this encodes our assumption about
-    the kernel's index/block_table semantics; confirmed against the real kernel on
-    NPU in task #5.
+    (``layout_kv="PA_BSND"``, ``sparse_block_size=1``). Reconstructs, per request, the
+    ``(k_nope, k_pe)`` rows the kernel attends to, in order. Used by tests to prove the
+    A1 gather + remap feeds the kernel exactly the originally-selected token latents.
     """
     knope_flat = scratch_knope.reshape(-1, scratch_knope.shape[-1])
     kpe_flat = scratch_kpe.reshape(-1, scratch_kpe.shape[-1])
@@ -190,7 +166,7 @@ def resolve_scratch_gather(
 
 
 class SparseLatentOffloadManager:
-    """Owns the scratch / decode-store buffers and drives store + gather."""
+    """Owns the scratch / load buffers and drives prefill store + decode gather."""
 
     def __init__(
         self,
@@ -199,18 +175,14 @@ class SparseLatentOffloadManager:
         layer_names: list[str],
         scratch_knope: torch.Tensor,
         scratch_kpe: torch.Tensor,
-        decode_store: torch.Tensor,
         load_buffer: torch.Tensor,
     ) -> None:
-        """Buffers are allocated by the model runner (from the reserved KV budget)
-        and handed in here so this manager never allocates device memory itself.
+        """Buffers are allocated by the model runner (from the reserved KV budget) and
+        handed in here so this manager never allocates device memory itself.
 
-        Args:
-            layer_names: ordered SFA attention layer names; the position in this list
-                is the contiguous ``layer_id`` used to index ``decode_store``.
+        Shapes:
             scratch_knope: [scratch_num_blocks, block_size, 1, kv_lora_rank]
             scratch_kpe:   [scratch_num_blocks, block_size, 1, qk_rope_head_dim]
-            decode_store:  [num_layers, max_num_seqs, D, latent_dim]
             load_buffer:   [max_num_seqs * topk_tokens, latent_dim] — LMCache writes
                 loaded prefill latent here (registered with the backend).
         """
@@ -219,31 +191,10 @@ class SparseLatentOffloadManager:
         self._layer_id = {name: i for i, name in enumerate(layer_names)}
         self._scratch_knope = scratch_knope
         self._scratch_kpe = scratch_kpe
-        self._decode_store = decode_store
         self._load_buffer = load_buffer
         backend.register_load_buffer(load_buffer)
 
-        # request slot bookkeeping for the decode store (small free-list).
-        self._free_slots: list[int] = list(range(config.max_num_seqs))
-        self._req_slot: dict[str, int] = {}
-
-    # ------------------------------------------------------------------ slots
-    def _slot_for(self, req_id: str) -> int:
-        slot = self._req_slot.get(req_id)
-        if slot is None:
-            if not self._free_slots:
-                raise RuntimeError(
-                    "SparseLatentOffloadManager: no free decode-store slot; "
-                    "running requests exceeded max_num_seqs."
-                )
-            slot = self._free_slots.pop()
-            self._req_slot[req_id] = slot
-        return slot
-
     def free_request(self, req_id: str) -> None:
-        slot = self._req_slot.pop(req_id, None)
-        if slot is not None:
-            self._free_slots.append(slot)
         self.backend.free_request(req_id)
 
     # ----------------------------------------------------------------- prefill
@@ -260,56 +211,35 @@ class SparseLatentOffloadManager:
         self.backend.save_layer(layer_name, req_id, token_positions, latent)
 
     # ------------------------------------------------------------------ decode
-    def append_decode_token(
-        self,
-        req_id: str,
-        layer_name: str,
-        decode_row: int,
-        k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
-    ) -> None:
-        """Write the current decode token's latent into the resident store at an
-        explicit row (= current absolute position - prompt_len).
-
-        Must be called before :meth:`gather_decode_layer` for the same step so the
-        token is visible if the indexer selects it. Using an explicit row (rather than
-        an internal counter) means every layer writes the same row and there is no
-        per-step "advance" to time — the row is derived from the token position.
-        """
-        if decode_row >= self.config.max_resident_decode_tokens:
-            raise RuntimeError(
-                f"SparseLatentOffloadManager: request {req_id} exceeded "
-                f"max_resident_decode_tokens={self.config.max_resident_decode_tokens}; "
-                "v1 keeps decode latent resident on NPU."
-            )
-        slot = self._slot_for(req_id)
-        latent = self._pack(k_nope, k_pe)
-        self._decode_store[self._layer_id[layer_name], slot, decode_row] = latent.squeeze(0)
-
     def gather_decode_layer(
         self,
         layer_name: str,
         req_ids: list[str],
         plan: GatherPlan,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        latent_caches: tuple[torch.Tensor, torch.Tensor],
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Materialize the selected latent for one layer into the scratch.
 
-        Loads all requests' selected prefill tokens for this layer with a single
-        batched ``wait_for_layer_load`` (into the registered load buffer), then copies
-        the loaded prefill latent + resident decode latent into the block-aligned A1
-        scratch. Returns ``(scratch_knope, scratch_kpe, sparse_indices,
-        scratch_block_table)`` ready to feed ``npu_sparse_flash_attention``.
+        Prefill-selected tokens are loaded from the backend (LMCache) via a single
+        batched ``wait_for_layer_load`` into the registered load buffer; decode-selected
+        tokens are read from the paged latent cache (``latent_caches`` = kv_cache[0]/[1])
+        at slots resolved through the request's ``block_table``. Both are copied into the
+        block-aligned A1 scratch.
+
+        Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table,
+        seq_lens_kv)`` for ``npu_sparse_flash_attention``.
         """
         cfg = self.config
-        layer_id = self._layer_id[layer_name]
+        dev = self._scratch_knope.device
+        kv0_flat = latent_caches[0].reshape(-1, cfg.kv_lora_rank)
+        kv1_flat = latent_caches[1].reshape(-1, cfg.qk_rope_head_dim)
 
         # --- 1. Build the batched LMCache load request (flat prefill positions). ---
-        # plan tensors are on CPU (build_gather_plan moved them), so .tolist() here is
-        # cheap (no device sync). The one unavoidable sync is moving topk_indices to
-        # CPU once per layer inside build_gather_plan.
+        # plan tensors are on CPU, so .tolist() is cheap (no extra device sync).
         flat_selected: list[int] = []
         token_start_index: list[int] = []
-        # cache per-request masks/slots for the copy phase below.
         per_req = []
         for b, req_id in enumerate(req_ids):
             dest = plan.dest_slot[b]
@@ -319,19 +249,17 @@ class SparseLatentOffloadManager:
             is_pref = valid & (pref_pos != INVALID_TOKEN_INDEX)
             is_dec = valid & (dec_pos != INVALID_TOKEN_INDEX)
             token_start_index.append(len(flat_selected))
-            pref_positions = pref_pos[is_pref].tolist()
-            flat_selected.extend(pref_positions)
-            per_req.append((req_id, dest, is_pref, is_dec, pref_pos, dec_pos))
+            flat_selected.extend(pref_pos[is_pref].tolist())
+            per_req.append((b, req_id, dest, is_pref, is_dec, dec_pos))
 
         if hasattr(self.backend, "set_load_req_ids"):  # in-memory reference backend
             self.backend.set_load_req_ids(req_ids)
         self.backend.wait_for_layer_load(layer_name, flat_selected, token_start_index)
 
-        # --- 2. Copy loaded prefill + resident decode latent into the scratch. ---
+        # --- 2. Copy loaded prefill (backend) + decode (paged) latent into scratch. ---
         knope_flat = self._scratch_knope.view(-1, cfg.kv_lora_rank)
         kpe_flat = self._scratch_kpe.view(-1, cfg.qk_rope_head_dim)
-        dev = self._scratch_knope.device
-        for b, (req_id, dest, is_pref, is_dec, pref_pos, dec_pos) in enumerate(per_req):
+        for b, req_id, dest, is_pref, is_dec, dec_pos in per_req:
             lo = token_start_index[b]
             n_pref = int(is_pref.sum())
             if n_pref:
@@ -341,22 +269,25 @@ class SparseLatentOffloadManager:
                 knope_flat.index_copy_(0, dst, knope.to(dev))
                 kpe_flat.index_copy_(0, dst, kpe.to(dev))
             if bool(is_dec.any()):
-                slot = self._req_slot[req_id]
-                rows = dec_pos[is_dec].to(self._decode_store.device)
-                dec_latent = self._decode_store[layer_id, slot].index_select(0, rows)
-                knope, kpe = self._unpack(dec_latent.to(cfg.dtype))
+                # decode-selected tokens are resident in the paged latent cache; resolve
+                # their absolute positions to paged slots via this request's block_table.
+                abs_pos = dec_pos[is_dec].to(dev)
+                bt_row = block_table[b].to(torch.long)
+                slots = bt_row[abs_pos // block_size] * block_size + abs_pos % block_size
+                knope = kv0_flat.index_select(0, slots).to(cfg.dtype)
+                kpe = kv1_flat.index_select(0, slots).to(cfg.dtype)
                 dst = dest[is_dec].to(dev)
-                knope_flat.index_copy_(0, dst, knope.to(dev))
-                kpe_flat.index_copy_(0, dst, kpe.to(dev))
+                knope_flat.index_copy_(0, dst, knope)
+                kpe_flat.index_copy_(0, dst, kpe)
 
-        # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here
-        # ([num_reqs, topk]); the caller adds the singleton head dim for the kernel.
+        # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here;
+        # the caller adds the singleton head dim for the kernel.
         return (
             self._scratch_knope,
             self._scratch_kpe,
             plan.sparse_indices.to(dev, torch.int32),
             plan.scratch_block_table.to(dev, torch.int32),
-            plan.seq_lens_kv.to(dev, torch.int32),  # per-req valid count -> actual_seq_lengths_kv
+            plan.seq_lens_kv.to(dev, torch.int32),
         )
 
     # ------------------------------------------------------------------ packing

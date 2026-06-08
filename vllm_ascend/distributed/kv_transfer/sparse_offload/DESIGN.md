@@ -49,6 +49,13 @@ a small scratch buffer and point the kernel at it.
 5. **Decode tokens not offloaded in v1** — `store` happens exactly once at prefill end.
    Newly generated decode tokens' latent stays on the NPU.
 
+> UPDATE (decode-store removed): decode-generated tokens are NOT kept in a separate
+> fixed-size store with a length cap. Their latent stays in the paged latent cache
+> (vLLM-managed, grows to `max_model_len`); decode-selected tokens are read back from
+> the paged cache via the request's `block_table`. So there is no `decode_store`, no
+> `D` / `max_resident_decode_tokens`. The sections below that mention a "decode-latent
+> store" / `D` describe the earlier design and are superseded by this note.
+
 ## Consequence of (5): the decode gather is mixed-source
 
 The indexer keys cover the *whole* sequence (prefill + decode), so the top-k it

@@ -104,5 +104,8 @@ diff <(jq -r '.choices[0].text' /tmp/dsa_base_out.json) <(jq -r '.choices[0].tex
 
 - `VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT=1`（+ `VLLM_ASCEND_DSA_INTROSPECT_FILE=/tmp/x.log`）：
   只读 ground-truth dump（Round 1 已用过）。
-- `VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS=N`：decode 常驻 token 上限（默认 1024）。
+- `VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE=cpu`：mock backend 把 latent 存主存（模拟离 NPU）。
 - `VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED=1`：Stage 2（拆 spec 真正省显存，需后续工作，暂勿用）。
+
+> 注：decode 生成的 token 不再有常驻上限——它们的 latent 留在 paged cache（vLLM 管理），
+> 被 indexer 选中时从 paged 读回。原 `VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS` 已移除。

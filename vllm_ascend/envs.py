@@ -114,12 +114,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))
     ),
-    # v1 cap on the number of decode-generated tokens whose latent is kept resident
-    # on the NPU per request (the decode-latent store). A request generating more
-    # than this raises; v2 lifts it by offloading decode tokens too. Valid: >= 1.
-    "VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS", "1024")
-    ),
     # DSA latent offload staging gate (bring-up). 0 (Stage 1/2): keep the paged latent
     # write so the offload path can be compared against native sparse attention.
     # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode

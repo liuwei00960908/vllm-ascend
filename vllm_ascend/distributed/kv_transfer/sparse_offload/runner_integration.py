@@ -72,7 +72,6 @@ def config_from_vllm(
         block_size=cache_config.block_size,
         max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
         topk_tokens=hf_config.index_topk,
-        max_resident_decode_tokens=envs.VLLM_ASCEND_DSA_MAX_RESIDENT_DECODE_TOKENS,
         dtype=dtype,
         device=torch.device(device),
     )
@@ -94,35 +93,29 @@ def _load_buffer_rows(config: SparseOffloadConfig) -> int:
 
 
 def compute_reserved_bytes(config: SparseOffloadConfig) -> int:
-    """Total NPU bytes to reserve for the scratch pool + decode store + load buffer.
+    """Total NPU bytes to reserve for the scratch pool + load buffer.
 
     scratch (one layer, reused):   scratch_num_blocks * block_size * latent_dim
-    decode store (all layers):     num_layers * max_num_seqs * D * latent_dim
     load buffer (one layer):       max_num_seqs * topk_tokens * latent_dim
+
+    Decode-generated latent is NOT reserved here — it stays in the paged latent cache
+    (vLLM-managed), so there is no fixed decode-store and no length cap.
     """
     elt = get_dtype_size(config.dtype)
     scratch_slots = config.scratch_num_blocks * config.block_size
     scratch_bytes = scratch_slots * config.latent_dim * elt
-    decode_store_bytes = (
-        config.num_layers
-        * config.max_num_seqs
-        * config.max_resident_decode_tokens
-        * config.latent_dim
-        * elt
-    )
     load_buffer_bytes = _load_buffer_rows(config) * config.latent_dim * elt
-    return scratch_bytes + decode_store_bytes + load_buffer_bytes
+    return scratch_bytes + load_buffer_bytes
 
 
 def allocate_buffers(
     config: SparseOffloadConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate scratch (k_nope, k_pe), decode-store, and the LMCache load buffer.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate scratch (k_nope, k_pe) and the LMCache load buffer.
 
     Shapes match what :class:`SparseLatentOffloadManager` expects:
         scratch_knope: [scratch_num_blocks, block_size, 1, kv_lora_rank]
         scratch_kpe:   [scratch_num_blocks, block_size, 1, qk_rope_head_dim]
-        decode_store:  [num_layers, max_num_seqs, D, latent_dim]
         load_buffer:   [max_num_seqs * topk_tokens, latent_dim]
     """
     scratch_knope = torch.zeros(
@@ -135,22 +128,12 @@ def allocate_buffers(
         dtype=config.dtype,
         device=config.device,
     )
-    decode_store = torch.zeros(
-        (
-            config.num_layers,
-            config.max_num_seqs,
-            config.max_resident_decode_tokens,
-            config.latent_dim,
-        ),
-        dtype=config.dtype,
-        device=config.device,
-    )
     load_buffer = torch.zeros(
         (_load_buffer_rows(config), config.latent_dim),
         dtype=config.dtype,
         device=config.device,
     )
-    return scratch_knope, scratch_kpe, decode_store, load_buffer
+    return scratch_knope, scratch_kpe, load_buffer
 
 
 def build_manager(
@@ -166,19 +149,17 @@ def build_manager(
     if backend is None:
         # Reference backend (LMCache stand-in). Device from env: "npu" (default) keeps
         # latent in device memory (correctness-only); "cpu" stages it in host RAM to
-        # simulate off-NPU LMCache (pair with Stage 2 for real memory relief). Swap for
-        # the real LMCache adapter when available.
+        # simulate off-NPU LMCache. Swap for the real LMCache adapter when available.
         store_dev = envs.VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE
         backend = InMemoryLatentOffloadBackend(
             device=config.device if store_dev == "npu" else store_dev
         )
-    scratch_knope, scratch_kpe, decode_store, load_buffer = allocate_buffers(config)
+    scratch_knope, scratch_kpe, load_buffer = allocate_buffers(config)
     return SparseLatentOffloadManager(
         config=config,
         backend=backend,
         layer_names=layer_names,
         scratch_knope=scratch_knope,
         scratch_kpe=scratch_kpe,
-        decode_store=decode_store,
         load_buffer=load_buffer,
     )
