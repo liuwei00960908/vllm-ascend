@@ -91,12 +91,12 @@ def gather_decode(
     if topk_indices.dim() == 3:
         topk_indices = topk_indices[:, 0, :]
 
-    # Store the new token so the gather can see it if the indexer selected it. The pool
-    # index is its position relative to the prompt; every layer writes the same index.
-    rows = (cur_positions.cpu().to(torch.long) - prompt_lens.cpu().to(torch.long)).tolist()
+    # Store the new token so the gather can see it if the indexer selected it. Stored at
+    # its ABSOLUTE position in the PagedLatentPool; every layer writes the same position.
+    positions = cur_positions.cpu().to(torch.long).tolist()
     for b, req_id in enumerate(req_ids):
         manager.store_decode_token(
-            req_id, layer_name, rows[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
+            req_id, layer_name, positions[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
         )
     plan = build_gather_plan(
         topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req

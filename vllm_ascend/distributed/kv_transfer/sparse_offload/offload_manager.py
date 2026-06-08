@@ -108,12 +108,10 @@ def build_gather_plan(
     is_prefill = valid & ~is_decode
 
     invalid = torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
-    # prefill: absolute position (LMCache key). decode: position relative to the prompt
-    # (= index into the growing decode-latent pool).
+    # Both hold ABSOLUTE positions; source differs: prefill -> LMCache (key=abs pos),
+    # decode -> PagedLatentPool (read at abs pos via the request's pool block table).
     prefill_positions = torch.where(is_prefill, topk_indices, invalid)
-    decode_positions = torch.where(
-        is_decode, topk_indices - prompt_lens.unsqueeze(1), invalid
-    )
+    decode_positions = torch.where(is_decode, topk_indices, invalid)
 
     # Destination scratch slot = request's block region base + local_slot.
     region_base = (
@@ -224,9 +222,6 @@ class SparseLatentOffloadManager:
         return; vLLM's paged latent is still written by the op (kept for parity)."""
         pool = self._paged_latent_pool
         layer_id = self._layer_id[layer_name]
-        knope_dst, kpe_dst = pool.layer_caches(layer_id)
-        knope_flat = knope_dst.reshape(-1, self.config.kv_lora_rank)
-        kpe_flat = kpe_dst.reshape(-1, self.config.qk_rope_head_dim)
         kn = k_nope.reshape(-1, self.config.kv_lora_rank)
         kp = k_pe.reshape(-1, self.config.qk_rope_head_dim)
         qsl = query_start_loc.to(torch.long).tolist()
@@ -236,10 +231,7 @@ class SparseLatentOffloadManager:
             if hi <= lo:
                 continue
             positions = torch.arange(ctx[b], ctx[b] + (hi - lo))
-            pool.reserve(req_id, ctx[b] + (hi - lo))
-            slots = pool.slot_mapping(req_id, positions).to(knope_flat.device)
-            knope_flat.index_copy_(0, slots, kn[lo:hi].to(knope_flat.dtype))
-            kpe_flat.index_copy_(0, slots, kp[lo:hi].to(kpe_flat.dtype))
+            pool.store(req_id, layer_id, positions, kn[lo:hi], kp[lo:hi])
 
     def pool_attn_args(
         self, layer_name: str, req_ids: list[str], max_blocks: int
@@ -269,18 +261,18 @@ class SparseLatentOffloadManager:
         self,
         req_id: str,
         layer_name: str,
-        decode_index: int,
+        position: int,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
     ) -> None:
-        """Write this step's generated token latent into the growing decode pool.
-
-        ``decode_index`` = absolute position - prompt_len (position within generation).
-        Called once per layer per step (before the gather for that layer).
-        """
-        latent = self._pack(k_nope, k_pe).reshape(-1)
-        self._decode_pool.append_token(
-            req_id, self._layer_id[layer_name], decode_index, latent
+        """Write this step's generated token latent into the PagedLatentPool at its
+        ABSOLUTE position. Called once per layer per step (before the gather)."""
+        self._paged_latent_pool.store(
+            req_id,
+            self._layer_id[layer_name],
+            torch.tensor([position], dtype=torch.long),
+            k_nope.reshape(1, -1),
+            k_pe.reshape(1, -1),
         )
 
     # ------------------------------------------------------------------ decode
@@ -337,13 +329,14 @@ class SparseLatentOffloadManager:
                 knope_flat.index_copy_(0, dst, knope.to(dev))
                 kpe_flat.index_copy_(0, dst, kpe.to(dev))
             if bool(is_dec.any()):
-                # decode-selected tokens live in the growing decode-latent pool, indexed
-                # by their position relative to the prompt.
-                dec_latent = self._decode_pool.gather(req_id, layer_id, dec_pos[is_dec])
-                knope, kpe = self._unpack(dec_latent.to(cfg.dtype))
+                # decode-selected tokens live in the PagedLatentPool at their absolute
+                # positions; read them via the request's pool block table.
+                knope, kpe = self._paged_latent_pool.gather(
+                    req_id, layer_id, dec_pos[is_dec]
+                )
                 dst = dest[is_dec].to(dev)
-                knope_flat.index_copy_(0, dst, knope.to(dev))
-                kpe_flat.index_copy_(0, dst, kpe.to(dev))
+                knope_flat.index_copy_(0, dst, knope.to(dev, cfg.dtype))
+                kpe_flat.index_copy_(0, dst, kpe.to(dev, cfg.dtype))
 
         # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here;
         # the caller adds the singleton head dim for the kernel.

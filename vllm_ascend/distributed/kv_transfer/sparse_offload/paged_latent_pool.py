@@ -89,6 +89,34 @@ class PagedLatentPool:
         pos = positions.to(torch.long)
         return blocks[pos // self.block_size] * self.block_size + pos % self.block_size
 
+    def gather(
+        self, req_id: str, layer_id: int, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read ``(knope, kpe)`` rows for a layer at the given sequence positions."""
+        slots = self.slot_mapping(req_id, positions).to(self.device)
+        knope = self.knope[layer_id].reshape(-1, self.knope.shape[-1]).index_select(0, slots)
+        kpe = self.kpe[layer_id].reshape(-1, self.kpe.shape[-1]).index_select(0, slots)
+        return knope, kpe
+
+    def store(
+        self,
+        req_id: str,
+        layer_id: int,
+        positions: torch.Tensor,
+        knope_rows: torch.Tensor,
+        kpe_rows: torch.Tensor,
+    ) -> None:
+        """Scatter ``(knope_rows, kpe_rows)`` for a layer at the given positions
+        (reserving blocks as needed). Used to populate the pool from exec_kv's return."""
+        self.reserve(req_id, int(positions.max().item()) + 1 if positions.numel() else 0)
+        slots = self.slot_mapping(req_id, positions).to(self.device)
+        self.knope[layer_id].reshape(-1, self.knope.shape[-1]).index_copy_(
+            0, slots, knope_rows.to(self.device, self.knope.dtype)
+        )
+        self.kpe[layer_id].reshape(-1, self.kpe.shape[-1]).index_copy_(
+            0, slots, kpe_rows.to(self.device, self.kpe.dtype)
+        )
+
     def block_table(self, req_id: str, width: int) -> torch.Tensor:
         """Padded ``[width]`` block-id row for the attention kernel."""
         blocks = self._req_blocks[req_id]

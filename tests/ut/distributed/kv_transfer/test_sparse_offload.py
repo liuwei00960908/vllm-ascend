@@ -38,6 +38,7 @@ def _cpu_config(**overrides):
         block_size=4,
         max_num_seqs=2,
         topk_tokens=4,
+        pool_num_blocks=16,
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
@@ -76,8 +77,8 @@ def test_gather_plan_splits_prefill_and_decode():
 
     assert plan.seq_lens_kv.tolist() == [3, 2]
     assert plan.prefill_positions[0].tolist() == [2, INVALID_TOKEN_INDEX, 5]
-    assert plan.decode_positions[0].tolist() == [INVALID_TOKEN_INDEX, 1, INVALID_TOKEN_INDEX]  # 11-10
-    assert plan.decode_positions[1].tolist() == [2, INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]  # 12-10
+    assert plan.decode_positions[0].tolist() == [INVALID_TOKEN_INDEX, 11, INVALID_TOKEN_INDEX]
+    assert plan.decode_positions[1].tolist() == [12, INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]
     assert plan.prefill_positions[1].tolist() == [INVALID_TOKEN_INDEX, 0, INVALID_TOKEN_INDEX]
     assert plan.sparse_indices[0].tolist() == [0, 1, 2]
     assert plan.dest_slot[1].tolist() == [4, 5, INVALID_TOKEN_INDEX]
@@ -95,8 +96,8 @@ def test_gather_plan_all_invalid_row():
 
 def test_compute_reserved_bytes():
     cfg = _cpu_config()
-    # scratch: 2 blocks * 4 * 6 * 4 = 192; load: 2*4*6*4 = 192; pool is NOT reserved.
-    assert compute_reserved_bytes(cfg) == 192 + 192
+    # scratch 192; load 192; pool: 2 layers*16 blocks*4*6*4 = 3072.
+    assert compute_reserved_bytes(cfg) == 192 + 192 + 3072
 
 
 # --------------------------------------------------------------- decode pool
@@ -146,7 +147,7 @@ def test_manager_gather_mixed_sources_roundtrip():
     # one decode token at abs pos 5 (rel 0) stored in the pool.
     dnope = torch.full((1, cfg.kv_lora_rank), 99.0)
     dpe = torch.full((1, cfg.qk_rope_head_dim), 88.0)
-    mgr.store_decode_token("r0", "L1", 0, dnope, dpe)
+    mgr.store_decode_token("r0", "L1", 5, dnope, dpe)
 
     topk = torch.tensor([[3, 5, 1, INVALID_TOKEN_INDEX]])  # prefill 3, decode 5, prefill 1
     plan = build_gather_plan(topk, torch.tensor([prompt_len]), cfg.block_size, cfg.scratch_blocks_per_req)
@@ -182,7 +183,7 @@ def test_offload_path_attends_to_exactly_the_selected_tokens():
     dec_nope = torch.randn(2, cfg.kv_lora_rank)
     dec_pe = torch.randn(2, cfg.qk_rope_head_dim)
     for i in range(2):  # decode tokens at abs 12,13 -> pool rel 0,1
-        mgr.store_decode_token("r0", "L0", i, dec_nope[i : i + 1], dec_pe[i : i + 1])
+        mgr.store_decode_token("r0", "L0", 12 + i, dec_nope[i : i + 1], dec_pe[i : i + 1])
 
     full_nope = torch.cat([k_nope, dec_nope], dim=0)
     full_pe = torch.cat([k_pe, dec_pe], dim=0)
@@ -216,7 +217,7 @@ def test_manager_free_request_delegates():
     mgr.store_decode_token("r0", "L0", 0, torch.randn(1, cfg.kv_lora_rank), torch.randn(1, cfg.qk_rope_head_dim))
     mgr.free_request("r0")
     assert ("r0", "L0") not in mgr.backend._store
-    assert "r0" not in mgr._decode_pool._req_blocks
+    assert "r0" not in mgr._paged_latent_pool._req_blocks
 
 
 # --------------------------------------------------------------- hooks
