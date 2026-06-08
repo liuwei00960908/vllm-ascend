@@ -189,6 +189,43 @@ for the same inputs (Stage 1) — if it diverges, the only thing to fix is how
   scratch contents; compare `resolve_scratch_gather(...)` against directly indexing
   the native paged latent at the topk positions — that isolates remap vs kernel.
 
+## M-B remaining: free prefill latent (the memory win) —施工图
+
+State: `self.dsa_free_paged` flag + SFA spec shrink (head_size -> index_head_dim)
+are committed (gated by `VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED`, default off). The
+remaining pieces below are NPU-coupled and startup-crash-prone; do them together,
+validate on NPU (boots? `GPU KV cache size` grows? output matches baseline?).
+
+1. **Allocation** (`model_runner_v1.py` `_allocate_kv_cache_tensors`, the
+   `if self.use_sparse:` block ~2823): when `self.dsa_free_paged`, do NOT use
+   `sparse_kv_cache_ratio` (it assumes 3 entries). Instead size:
+   - `dsa_k_tensor_size = kv_cache_tensor.size` (the whole page = indexer);
+   - `k_tensor_size = block_size * kv_lora_rank * dtype_bytes` (1-block dummy);
+   - `v_tensor_size = block_size * qk_rope_head_dim * dtype_bytes` (1-block dummy);
+   - no dsa_k_scale (c8 forced off).
+2. **Reshape** (`_reshape_kv_cache_tensors` ~3000): when `dsa_free_paged`, reshape the
+   latent k/v caches to a **1-block** shape `(1, block_size, 1, k_dim/v_dim)` (dummies),
+   and the indexer to `(num_blocks, block_size, 1, index_head_dim)` at the grown
+   num_blocks. Bind tuple = (dummy_knope, dummy_kpe, indexer[, scale]).
+3. **exec_kv -> pool** (`sfa_v1.py` forward, `dsa_free_paged` path): reserve pool blocks
+   for this step's positions, compute the pool slot_mapping, and call `exec_kv` with the
+   pool's (knope, kpe) layer tensors + pool slot_mapping so the op writes latent into
+   the pool (NOT the dummy kv_cache[0]/[1]). Then the existing prefill-attn-from-pool and
+   decode-gather-from-pool paths work unchanged. (No need for populate_pool_layer /
+   store_decode_token in this mode — the op writes the pool directly.)
+4. **Free after prefill**: after a request's prefill completes, free its pool latent
+   blocks (`PagedLatentPool.free_request` for the prefill range) — content is in LMCache;
+   decode reads prefill-selected from LMCache. Hook at the prefill->decode transition or
+   via the connector lifecycle.
+5. **Pool sizing**: `pool_num_blocks` should be derived from the freed budget; for
+   bring-up set `VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS` large enough for concurrent prefill.
+   NOTE the known gap (pragmatic, not scheduler-coordinated): if the pool can't fit the
+   concurrent prefill load it will raise "PagedLatentPool exhausted" (no backpressure);
+   that's the trade-off vs the proper KV-group route.
+
+Validate: baseline `GPU KV cache size: 1,643,264 tokens` should grow ~5.5x with
+FREE_PAGED=1; greedy output should match baseline.
+
 ## G. Interface check with the LMCache author
 
 `offload_backend.py` assumes `wait_for_layer_load` writes loaded latent into the
