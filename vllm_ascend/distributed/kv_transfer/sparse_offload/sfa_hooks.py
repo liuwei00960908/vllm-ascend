@@ -63,24 +63,24 @@ def gather_decode(
     req_ids: list[str],
     topk_indices: torch.Tensor,
     prompt_lens: torch.Tensor,
+    cur_positions: torch.Tensor,
     block_size: int,
-    latent_caches: tuple[torch.Tensor, torch.Tensor],
-    block_table: torch.Tensor,
+    cur_k_nope: torch.Tensor,
+    cur_k_pe: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather the indexer-selected latent for one layer into the A1 scratch.
+    """Store this step's token into the decode pool, then gather selected latent.
 
     Prefill-selected tokens come from the backend (LMCache); decode-selected tokens
-    (including this step's just-generated one) are read from the paged latent cache
-    (``latent_caches`` = kv_cache[0]/[1]) via the request's ``block_table`` — no
-    decode-store, no length cap.
+    (including this step's just-generated one) come from the growing decode-latent pool
+    — no fixed store, no length cap.
 
     Args:
         topk_indices: ``[num_decode_reqs, topk]`` (or ``[*, 1, topk]``) indexer output,
             absolute sequence positions, ``-1`` padded.
-        prompt_lens:  ``[num_decode_reqs]`` prompt length per request (prefill/decode
-            boundary).
-        latent_caches: ``(kv_cache[0], kv_cache[1])`` paged latent tensors.
-        block_table:   ``[num_decode_reqs, max_blocks]`` paged block table.
+        prompt_lens:  ``[num_decode_reqs]`` prompt length per request.
+        cur_positions: ``[num_decode_reqs]`` absolute position of this step's new token
+            (= seq_len - 1); pool index = pos - prompt_len.
+        cur_k_nope / cur_k_pe: ``[num_decode_reqs, *]`` this step's latent for this layer.
 
     Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table,
     seq_lens_kv)`` for ``npu_sparse_flash_attention``.
@@ -91,9 +91,14 @@ def gather_decode(
     if topk_indices.dim() == 3:
         topk_indices = topk_indices[:, 0, :]
 
+    # Store the new token so the gather can see it if the indexer selected it. The pool
+    # index is its position relative to the prompt; every layer writes the same index.
+    rows = (cur_positions.cpu().to(torch.long) - prompt_lens.cpu().to(torch.long)).tolist()
+    for b, req_id in enumerate(req_ids):
+        manager.store_decode_token(
+            req_id, layer_name, rows[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
+        )
     plan = build_gather_plan(
         topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req
     )
-    return manager.gather_decode_layer(
-        layer_name, req_ids, plan, latent_caches, block_table, block_size
-    )
+    return manager.gather_decode_layer(layer_name, req_ids, plan)

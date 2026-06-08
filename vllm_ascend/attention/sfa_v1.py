@@ -1297,17 +1297,23 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             _block_size = kv_cache[0].shape[1]
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                # decode-selected tokens (incl. this step's new one) are resident in the
-                # paged latent cache; gather them + prefill (LMCache) into the scratch.
+                # store this step's token into the growing decode pool, then gather the
+                # selected latent (prefill from LMCache, decode from pool) into scratch.
+                # Read this step's just-written latent back from the paged cache.
+                _sm = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].to(torch.long)
+                _kn = kv_cache[0].reshape(-1, kv_cache[0].shape[-1]).index_select(0, _sm)
+                _kp = kv_cache[1].reshape(-1, kv_cache[1].shape[-1]).index_select(0, _sm)
+                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
                 s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
                     _dsa_mgr,
                     layer_name,
                     _dsa_fc.dsa_req_ids,
                     topk_indices,
                     _dsa_fc.dsa_prompt_lens,
+                    _cur_pos,
                     _block_size,
-                    (kv_cache[0], kv_cache[1]),
-                    attn_metadata.block_table,
+                    _kn,
+                    _kp,
                 )
                 # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
                 scratch_out = self._execute_sparse_flash_attention_process(

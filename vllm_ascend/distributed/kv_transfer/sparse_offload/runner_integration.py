@@ -18,6 +18,9 @@ from vllm.config import VllmConfig
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
 from vllm_ascend import envs
+from vllm_ascend.distributed.kv_transfer.sparse_offload.decode_latent_pool import (
+    GrowingDecodeLatentPool,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_backend import (
     InMemoryLatentOffloadBackend,
     LatentOffloadBackend,
@@ -155,6 +158,14 @@ def build_manager(
             device=config.device if store_dev == "npu" else store_dev
         )
     scratch_knope, scratch_kpe, load_buffer = allocate_buffers(config)
+    decode_pool = GrowingDecodeLatentPool(
+        num_layers=len(layer_names),
+        block_size=config.block_size,
+        kv_lora_rank=config.kv_lora_rank,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+        dtype=config.dtype,
+        device=config.device,
+    )
     return SparseLatentOffloadManager(
         config=config,
         backend=backend,
@@ -162,4 +173,5 @@ def build_manager(
         scratch_knope=scratch_knope,
         scratch_kpe=scratch_kpe,
         load_buffer=load_buffer,
+        decode_pool=decode_pool,
     )

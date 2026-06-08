@@ -65,12 +65,12 @@ class GatherPlan:
     """CPU-side plan for one decode batch (output of :func:`build_gather_plan`).
 
     All tensors are int64 on CPU. ``b`` indexes the decode requests in batch order.
-    Both ``prefill_positions`` and ``decode_positions`` hold *absolute* sequence
-    positions; they only differ in source (LMCache vs paged latent cache).
+    ``prefill_positions`` holds *absolute* positions (LMCache keys); ``decode_positions``
+    holds positions *relative to the prompt* (indices into the decode-latent pool).
     """
 
     prefill_positions: torch.Tensor  # [b, topk] prefill sources (abs pos), -1 elsewhere
-    decode_positions: torch.Tensor  # [b, topk] decode sources (abs pos), -1 elsewhere
+    decode_positions: torch.Tensor  # [b, topk] decode sources (rel pos), -1 elsewhere
     dest_slot: torch.Tensor  # [b, topk] compact scratch slot per selected token, -1 pad
     sparse_indices: torch.Tensor  # [b, topk] compact local indices [0..k_b-1], padded
     scratch_block_table: torch.Tensor  # [b, scratch_blocks_per_req] scratch block ids
@@ -107,9 +107,12 @@ def build_gather_plan(
     is_prefill = valid & ~is_decode
 
     invalid = torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
-    # Both hold absolute positions; source distinguished by the masks.
+    # prefill: absolute position (LMCache key). decode: position relative to the prompt
+    # (= index into the growing decode-latent pool).
     prefill_positions = torch.where(is_prefill, topk_indices, invalid)
-    decode_positions = torch.where(is_decode, topk_indices, invalid)
+    decode_positions = torch.where(
+        is_decode, topk_indices - prompt_lens.unsqueeze(1), invalid
+    )
 
     # Destination scratch slot = request's block region base + local_slot.
     region_base = (
@@ -176,6 +179,7 @@ class SparseLatentOffloadManager:
         scratch_knope: torch.Tensor,
         scratch_kpe: torch.Tensor,
         load_buffer: torch.Tensor,
+        decode_pool,
     ) -> None:
         """Buffers are allocated by the model runner (from the reserved KV budget) and
         handed in here so this manager never allocates device memory itself.
@@ -185,6 +189,7 @@ class SparseLatentOffloadManager:
             scratch_kpe:   [scratch_num_blocks, block_size, 1, qk_rope_head_dim]
             load_buffer:   [max_num_seqs * topk_tokens, latent_dim] — LMCache writes
                 loaded prefill latent here (registered with the backend).
+            decode_pool:   GrowingDecodeLatentPool — on-demand store for decode latent.
         """
         self.config = config
         self.backend = backend
@@ -192,10 +197,12 @@ class SparseLatentOffloadManager:
         self._scratch_knope = scratch_knope
         self._scratch_kpe = scratch_kpe
         self._load_buffer = load_buffer
+        self._decode_pool = decode_pool
         backend.register_load_buffer(load_buffer)
 
     def free_request(self, req_id: str) -> None:
         self.backend.free_request(req_id)
+        self._decode_pool.free_request(req_id)
 
     # ----------------------------------------------------------------- prefill
     def store_prefill_layer(
@@ -211,21 +218,36 @@ class SparseLatentOffloadManager:
         self.backend.save_layer(layer_name, req_id, token_positions, latent)
 
     # ------------------------------------------------------------------ decode
+    def store_decode_token(
+        self,
+        req_id: str,
+        layer_name: str,
+        decode_index: int,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> None:
+        """Write this step's generated token latent into the growing decode pool.
+
+        ``decode_index`` = absolute position - prompt_len (position within generation).
+        Called once per layer per step (before the gather for that layer).
+        """
+        latent = self._pack(k_nope, k_pe).reshape(-1)
+        self._decode_pool.append_token(
+            req_id, self._layer_id[layer_name], decode_index, latent
+        )
+
+    # ------------------------------------------------------------------ decode
     def gather_decode_layer(
         self,
         layer_name: str,
         req_ids: list[str],
         plan: GatherPlan,
-        latent_caches: tuple[torch.Tensor, torch.Tensor],
-        block_table: torch.Tensor,
-        block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Materialize the selected latent for one layer into the scratch.
 
         Prefill-selected tokens are loaded from the backend (LMCache) via a single
         batched ``wait_for_layer_load`` into the registered load buffer; decode-selected
-        tokens are read from the paged latent cache (``latent_caches`` = kv_cache[0]/[1])
-        at slots resolved through the request's ``block_table``. Both are copied into the
+        tokens are read from the growing decode-latent pool. Both are copied into the
         block-aligned A1 scratch.
 
         Returns ``(scratch_knope, scratch_kpe, sparse_indices, scratch_block_table,
@@ -233,8 +255,7 @@ class SparseLatentOffloadManager:
         """
         cfg = self.config
         dev = self._scratch_knope.device
-        kv0_flat = latent_caches[0].reshape(-1, cfg.kv_lora_rank)
-        kv1_flat = latent_caches[1].reshape(-1, cfg.qk_rope_head_dim)
+        layer_id = self._layer_id[layer_name]
 
         # --- 1. Build the batched LMCache load request (flat prefill positions). ---
         # plan tensors are on CPU, so .tolist() is cheap (no extra device sync).
@@ -256,7 +277,7 @@ class SparseLatentOffloadManager:
             self.backend.set_load_req_ids(req_ids)
         self.backend.wait_for_layer_load(layer_name, flat_selected, token_start_index)
 
-        # --- 2. Copy loaded prefill (backend) + decode (paged) latent into scratch. ---
+        # --- 2. Copy loaded prefill (backend) + decode (pool) latent into scratch. ---
         knope_flat = self._scratch_knope.view(-1, cfg.kv_lora_rank)
         kpe_flat = self._scratch_kpe.view(-1, cfg.qk_rope_head_dim)
         for b, req_id, dest, is_pref, is_dec, dec_pos in per_req:
@@ -269,16 +290,13 @@ class SparseLatentOffloadManager:
                 knope_flat.index_copy_(0, dst, knope.to(dev))
                 kpe_flat.index_copy_(0, dst, kpe.to(dev))
             if bool(is_dec.any()):
-                # decode-selected tokens are resident in the paged latent cache; resolve
-                # their absolute positions to paged slots via this request's block_table.
-                abs_pos = dec_pos[is_dec].to(dev)
-                bt_row = block_table[b].to(torch.long)
-                slots = bt_row[abs_pos // block_size] * block_size + abs_pos % block_size
-                knope = kv0_flat.index_select(0, slots).to(cfg.dtype)
-                kpe = kv1_flat.index_select(0, slots).to(cfg.dtype)
+                # decode-selected tokens live in the growing decode-latent pool, indexed
+                # by their position relative to the prompt.
+                dec_latent = self._decode_pool.gather(req_id, layer_id, dec_pos[is_dec])
+                knope, kpe = self._unpack(dec_latent.to(cfg.dtype))
                 dst = dest[is_dec].to(dev)
-                knope_flat.index_copy_(0, dst, knope)
-                kpe_flat.index_copy_(0, dst, kpe)
+                knope_flat.index_copy_(0, dst, knope.to(dev))
+                kpe_flat.index_copy_(0, dst, kpe.to(dev))
 
         # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here;
         # the caller adds the singleton head dim for the kernel.
