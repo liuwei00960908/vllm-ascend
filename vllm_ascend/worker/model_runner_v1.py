@@ -288,6 +288,16 @@ class NPUModelRunner(GPUModelRunner):
                 self.model_config.hf_text_config.qk_rope_head_dim,
                 self.model_config.hf_text_config.index_head_dim,
             )
+        # DSA latent offload Route-1 pragmatic (M-B): when enabled, the SFA paged cache
+        # holds only the indexer key (latent goes to the self-managed PagedLatentPool),
+        # so the per-token page shrinks ~5.5x and GPU KV cache size grows.
+        import vllm_ascend.envs as envs_ascend
+
+        self.dsa_free_paged = bool(
+            self.use_sparse
+            and envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
+            and envs_ascend.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
+        )
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -3322,15 +3332,30 @@ class NPUModelRunner(GPUModelRunner):
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     # TODO(rjg-lyh): when kv_cache_spec's refactor is ready,
                     # implement it by creating a new kv_cache_spec class
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=sum(self.sparse_head_dim),
-                        sparse_head_dim=self.sparse_head_dim,
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_c8=self.use_sparse_c8_indexer,
-                    )
+                    if self.dsa_free_paged:
+                        # DSA offload (M-B): paged cache holds ONLY the indexer key;
+                        # latent lives in the PagedLatentPool. Per-token page shrinks
+                        # from sum(704) to index_head_dim -> ~5.5x more blocks.
+                        index_head_dim = self.sparse_head_dim[-1]
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=index_head_dim,
+                            sparse_head_dim=(index_head_dim,),
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_c8=False,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=sum(self.sparse_head_dim),
+                            sparse_head_dim=self.sparse_head_dim,
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_c8=self.use_sparse_c8_indexer,
+                        )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     assert isinstance(spec, MLAAttentionSpec)
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
