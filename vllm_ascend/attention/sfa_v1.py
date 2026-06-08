@@ -787,7 +787,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             return k_pe, k_nope
         else:
-            torch_npu.npu_kv_rmsnorm_rope_cache(
+            # is_output_kv=True returns the freshly-computed latent (k_pe, k_nope) in
+            # addition to caching it, so the DSA-offload forward can store/gather it
+            # without a paged read-back. The op still caches to kv_cache[0]/[1] here;
+            # suppressing that paged write is Stage2-B step 10b. Returning the latent is
+            # harmless to the non-offload path (it ignores the returns).
+            _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
                 self.kv_a_layernorm.weight,  # type: ignore[union-attr]
                 cos,
@@ -797,8 +802,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache[0],
                 epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                 cache_mode=cache_mode,
+                is_output_kv=True,
             )
-            return None, None
+            return k_pe, k_nope
 
     # Return `ql_nope`, `q_pe`
     def _q_proj_and_k_up_proj(self, x):
@@ -1296,13 +1302,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
 
             _block_size = kv_cache[0].shape[1]
+            # latent for this step's tokens comes straight from exec_kv's return
+            # (is_output_kv=True), aligned with token order — no paged read-back, so this
+            # no longer depends on the latent being resident in the paged cache (10b).
+            _kn = k_nope.reshape(-1, self.kv_lora_rank)
+            _kp = k_pe.reshape(-1, self.qk_rope_head_dim)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
-                # Read this step's just-written latent back from the paged cache.
-                _sm = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].to(torch.long)
-                _kn = kv_cache[0].reshape(-1, kv_cache[0].shape[-1]).index_select(0, _sm)
-                _kp = kv_cache[1].reshape(-1, kv_cache[1].shape[-1]).index_select(0, _sm)
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
                 s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
                     _dsa_mgr,
@@ -1339,12 +1346,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 else:
                     attn_output = scratch_out
             else:
-                # prefill: store this layer's prompt latent once (per request). Read the
-                # just-written latent back from the paged cache via slot_mapping (exec_kv
-                # returns None on the single-card path).
-                _sm = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].to(torch.long)
-                _kn = kv_cache[0].reshape(-1, kv_cache[0].shape[-1]).index_select(0, _sm)
-                _kp = kv_cache[1].reshape(-1, kv_cache[1].shape[-1]).index_select(0, _sm)
+                # prefill: store this layer's prompt latent once (per request), from the
+                # exec_kv return (_kn/_kp above).
                 _qsl = torch.cat(
                     [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
                 )
