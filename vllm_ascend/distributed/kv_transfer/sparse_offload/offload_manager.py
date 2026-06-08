@@ -46,6 +46,7 @@ class SparseOffloadConfig:
     topk_tokens: int  # indexer index_topk (== single-layer resident size K)
     dtype: torch.dtype
     device: torch.device
+    pool_num_blocks: int = 0  # PagedLatentPool size (Route 1); 0 -> derived default
 
     @property
     def latent_dim(self) -> int:
@@ -180,6 +181,7 @@ class SparseLatentOffloadManager:
         scratch_kpe: torch.Tensor,
         load_buffer: torch.Tensor,
         decode_pool,
+        paged_latent_pool=None,
     ) -> None:
         """Buffers are allocated by the model runner (from the reserved KV budget) and
         handed in here so this manager never allocates device memory itself.
@@ -198,11 +200,56 @@ class SparseLatentOffloadManager:
         self._scratch_kpe = scratch_kpe
         self._load_buffer = load_buffer
         self._decode_pool = decode_pool
+        self._paged_latent_pool = paged_latent_pool
         backend.register_load_buffer(load_buffer)
 
     def free_request(self, req_id: str) -> None:
         self.backend.free_request(req_id)
         self._decode_pool.free_request(req_id)
+        if self._paged_latent_pool is not None:
+            self._paged_latent_pool.free_request(req_id)
+
+    # ----------------------------------------- Route 1: paged latent pool (R1b)
+    def populate_pool_layer(
+        self,
+        req_ids: list[str],
+        layer_name: str,
+        query_start_loc: torch.Tensor,
+        context_lens: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> None:
+        """Scatter this prefill chunk's latent for one layer into the PagedLatentPool
+        (positionally), reserving pool blocks per request. Latent comes from exec_kv's
+        return; vLLM's paged latent is still written by the op (kept for parity)."""
+        pool = self._paged_latent_pool
+        layer_id = self._layer_id[layer_name]
+        knope_dst, kpe_dst = pool.layer_caches(layer_id)
+        knope_flat = knope_dst.reshape(-1, self.config.kv_lora_rank)
+        kpe_flat = kpe_dst.reshape(-1, self.config.qk_rope_head_dim)
+        kn = k_nope.reshape(-1, self.config.kv_lora_rank)
+        kp = k_pe.reshape(-1, self.config.qk_rope_head_dim)
+        qsl = query_start_loc.to(torch.long).tolist()
+        ctx = context_lens.to(torch.long).tolist()
+        for b, req_id in enumerate(req_ids):
+            lo, hi = qsl[b], qsl[b + 1]
+            if hi <= lo:
+                continue
+            positions = torch.arange(ctx[b], ctx[b] + (hi - lo))
+            pool.reserve(req_id, ctx[b] + (hi - lo))
+            slots = pool.slot_mapping(req_id, positions).to(knope_flat.device)
+            knope_flat.index_copy_(0, slots, kn[lo:hi].to(knope_flat.dtype))
+            kpe_flat.index_copy_(0, slots, kp[lo:hi].to(kpe_flat.dtype))
+
+    def pool_attn_args(
+        self, layer_name: str, req_ids: list[str], max_blocks: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(knope, kpe, block_table)`` for prefill attention over the pool.
+        ``block_table`` is ``[num_reqs, max_blocks]`` of pool block ids."""
+        pool = self._paged_latent_pool
+        knope, kpe = pool.layer_caches(self._layer_id[layer_name])
+        bt = torch.stack([pool.block_table(r, max_blocks) for r in req_ids])
+        return knope, kpe, bt
 
     # ----------------------------------------------------------------- prefill
     def store_prefill_layer(

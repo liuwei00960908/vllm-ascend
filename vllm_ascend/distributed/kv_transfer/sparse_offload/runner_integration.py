@@ -21,6 +21,9 @@ from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.sparse_offload.decode_latent_pool import (
     GrowingDecodeLatentPool,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.paged_latent_pool import (
+    PagedLatentPool,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_backend import (
     InMemoryLatentOffloadBackend,
     LatentOffloadBackend,
@@ -77,6 +80,10 @@ def config_from_vllm(
         topk_tokens=hf_config.index_topk,
         dtype=dtype,
         device=torch.device(device),
+        pool_num_blocks=(
+            envs.VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS
+            or vllm_config.scheduler_config.max_num_seqs * 8
+        ),
     )
 
 
@@ -108,7 +115,10 @@ def compute_reserved_bytes(config: SparseOffloadConfig) -> int:
     scratch_slots = config.scratch_num_blocks * config.block_size
     scratch_bytes = scratch_slots * config.latent_dim * elt
     load_buffer_bytes = _load_buffer_rows(config) * config.latent_dim * elt
-    return scratch_bytes + load_buffer_bytes
+    pool_bytes = (
+        config.num_layers * config.pool_num_blocks * config.block_size * config.latent_dim * elt
+    )
+    return scratch_bytes + load_buffer_bytes + pool_bytes
 
 
 def allocate_buffers(
@@ -166,6 +176,15 @@ def build_manager(
         dtype=config.dtype,
         device=config.device,
     )
+    paged_latent_pool = PagedLatentPool(
+        num_layers=len(layer_names),
+        num_blocks=config.pool_num_blocks,
+        block_size=config.block_size,
+        kv_lora_rank=config.kv_lora_rank,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+        dtype=config.dtype,
+        device=config.device,
+    )
     return SparseLatentOffloadManager(
         config=config,
         backend=backend,
@@ -174,4 +193,5 @@ def build_manager(
         scratch_kpe=scratch_kpe,
         load_buffer=load_buffer,
         decode_pool=decode_pool,
+        paged_latent_pool=paged_latent_pool,
     )

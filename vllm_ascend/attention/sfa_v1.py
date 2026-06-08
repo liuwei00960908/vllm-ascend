@@ -1346,8 +1346,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 else:
                     attn_output = scratch_out
             else:
-                # prefill: store this layer's prompt latent once (per request), from the
-                # exec_kv return (_kn/_kp above).
+                # prefill: (1) offload prompt latent to LMCache; (2) ALSO scatter it into
+                # the self-managed PagedLatentPool and run prefill attention from the pool
+                # (Route 1 / R1b). The vLLM paged latent is still written by the op, so
+                # the parity path can compare pool-attn vs native-paged-attn.
                 _qsl = torch.cat(
                     [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
                 )
@@ -1355,6 +1357,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dsa_hooks.store_prefill(
                     _dsa_mgr, layer_name, _dsa_fc.dsa_req_ids, _qsl, _ctx, _kn, _kp
                 )
+                _dsa_mgr.populate_pool_layer(
+                    _dsa_fc.dsa_req_ids, layer_name, _qsl, _ctx, _kn, _kp
+                )
+                _p_knope, _p_kpe, _p_bt = _dsa_mgr.pool_attn_args(
+                    layer_name, _dsa_fc.dsa_req_ids, attn_metadata.block_table.shape[1]
+                )
+                pool_out = self._execute_sparse_flash_attention_process(
+                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                    actual_seq_lengths_query, actual_seq_lengths_key,
+                    kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
+                )
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+                    native_out = self._execute_sparse_flash_attention_process(
+                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                        actual_seq_lengths_query, actual_seq_lengths_key,
+                    )
+                    diff = (native_out.float() - pool_out.float()).abs().max()
+                    logger.info("[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    attn_output = native_out  # safe: generation uses the native result
+                else:
+                    attn_output = pool_out
 
         if attn_output is None:
             attn_output = self._execute_sparse_flash_attention_process(

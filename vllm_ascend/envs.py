@@ -140,6 +140,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_INTROSPECT_FILE": lambda: os.getenv(
         "VLLM_ASCEND_DSA_INTROSPECT_FILE", "dsa_introspect.log"
     ),
+    # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
+    # default from max_num_seqs. The pool holds prefill latent during prefill (freed
+    # after) + decode latent, sized far below full-context. Tune up for long prompts.
+    "VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS", "0")
+    ),
     # Storage device for the in-memory reference offload backend (the LMCache stand-in
     # used until the real adapter lands). "npu" keeps latent in device memory (no
     # memory relief, correctness-only); "cpu" stages latent in host RAM, simulating

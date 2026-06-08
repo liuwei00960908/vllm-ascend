@@ -255,6 +255,28 @@ def test_paged_latent_pool_write_read_and_free():
     assert pool.num_free_blocks == 4  # recycled
 
 
+def test_manager_populate_pool_and_attn_args():
+    cfg = _cpu_config(block_size=2, pool_num_blocks=8)
+    mgr = _build(cfg)
+    # prefill one request of 3 tokens for layer 1; latent from "exec_kv return".
+    qsl = torch.tensor([0, 3])
+    ctx = torch.tensor([0])
+    kn = torch.randn(3, cfg.kv_lora_rank)
+    kp = torch.randn(3, cfg.qk_rope_head_dim)
+    mgr.populate_pool_layer(["r0"], "L1", qsl, ctx, kn, kp)
+
+    knope, kpe, bt = mgr.pool_attn_args("L1", ["r0"], max_blocks=4)
+    assert bt.shape == (1, 4)
+    # read back each position via the pool block_table (mirrors the kernel).
+    knope_flat = knope.reshape(-1, cfg.kv_lora_rank)
+    for p in range(3):
+        slot = int(bt[0][p // cfg.block_size]) * cfg.block_size + p % cfg.block_size
+        assert torch.equal(knope_flat[slot], kn[p])
+    # layer 0 of the pool is untouched.
+    knope0, _, _ = mgr.pool_attn_args("L0", ["r0"], max_blocks=4)
+    assert torch.count_nonzero(knope0) == 0
+
+
 def test_hooks_store_prefill_splits_requests_by_csr():
     from vllm_ascend.distributed.kv_transfer.sparse_offload.sfa_hooks import store_prefill
 
