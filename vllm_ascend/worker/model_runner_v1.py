@@ -2952,7 +2952,14 @@ class NPUModelRunner(GPUModelRunner):
                             raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[  # type: ignore
                                 layer_name]
                             assert raw_dsa_k_tensor is not None
-                            sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel() + raw_dsa_k_tensor.numel()
+                            if self.dsa_free_paged:
+                                # latent k/v are 1-block dummies (not part of the page);
+                                # the page = indexer only, so num_blocks derives from it.
+                                sum_page_size_bytes = raw_dsa_k_tensor.numel()
+                            else:
+                                sum_page_size_bytes = (
+                                    raw_k_tensor.numel() + raw_v_tensor.numel() + raw_dsa_k_tensor.numel()
+                                )
                     elif self.use_hybrid_blocks and self.hybrid_with_attn_and_mamba:
                         # Currently, we ensure that the same kvcache format is used even if there
                         # is no shared layer, such as the full attention mtp layer of qwen3.5, etc.
