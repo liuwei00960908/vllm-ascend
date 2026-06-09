@@ -2831,16 +2831,19 @@ class NPUModelRunner(GPUModelRunner):
                     unbundle_indexer = False
                     if self.dsa_unbundle and self.use_sparse:
                         # Proper route P1: each layer's tensor is allocated per its own
-                        # group spec — latent (k_nope + k_pe) or indexer (single vector).
-                        shd = current_kv_cache_spec.sparse_head_dim
-                        if len(shd) == 1:  # indexer group: one tensor = whole page
+                        # group — latent (k_nope + k_pe) or indexer (single vector).
+                        # Discriminate by LAYER NAME (grouping/merge may rewrite the
+                        # spec's sparse_head_dim, so don't rely on it); use model-level
+                        # sparse_head_dim constants for the split ratio.
+                        kv_lora_rank, qk_rope_head_dim, _ = self.sparse_head_dim
+                        if any("indexer" in ln for ln in kv_cache_tensor.shared_by):
                             unbundle_indexer = True
                             k_tensor_size = int(kv_cache_tensor.size)
                             v_tensor_size = 0
-                        else:  # latent group: split the page into k_nope + k_pe
-                            total = shd[0] + shd[1]
-                            k_tensor_size = int(kv_cache_tensor.size * shd[0] // total)
-                            v_tensor_size = int(kv_cache_tensor.size * shd[1] // total)
+                        else:
+                            total = kv_lora_rank + qk_rope_head_dim
+                            k_tensor_size = int(kv_cache_tensor.size * kv_lora_rank // total)
+                            v_tensor_size = int(kv_cache_tensor.size * qk_rope_head_dim // total)
                     elif self.use_sparse and self.dsa_free_paged:
                         # DSA offload (M-B): the page holds ONLY the indexer key; the
                         # latent k/v are 1-block dummies (exec_kv writes the
@@ -2963,19 +2966,19 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     spec = current_kv_cache_spec
                     raws = kv_cache_raw_tensors[layer_name]
-                    shd = spec.sparse_head_dim
-                    num_blocks = sum(t.numel() for t in raws) // spec.page_size_bytes
-                    assert num_blocks >= kv_cache_config.num_blocks
-                    if len(shd) == 1:  # indexer group: single vector cache
-                        shape = (num_blocks, spec.block_size, spec.num_kv_heads, shd[0])
-                        kv_caches[layer_name] = (raws[0].view(spec.dtype).view(shape),)
+                    bs, nh = spec.block_size, spec.num_kv_heads
+                    elt = get_dtype_size(spec.dtype)
+                    kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
+                    # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
+                    if "indexer" in layer_name:  # single vector cache
+                        nb = raws[0].numel() // (bs * nh * index_head_dim * elt)
+                        kv_caches[layer_name] = (
+                            raws[0].view(spec.dtype).view(nb, bs, nh, index_head_dim),
+                        )
                     else:  # latent group: (k_nope, k_pe)
-                        k_nope = raws[0].view(spec.dtype).view(
-                            num_blocks, spec.block_size, spec.num_kv_heads, shd[0]
-                        )
-                        k_pe = raws[1].view(spec.dtype).view(
-                            num_blocks, spec.block_size, spec.num_kv_heads, shd[1]
-                        )
+                        nb = raws[0].numel() // (bs * nh * kv_lora_rank * elt)
+                        k_nope = raws[0].view(spec.dtype).view(nb, bs, nh, kv_lora_rank)
+                        k_pe = raws[1].view(spec.dtype).view(nb, bs, nh, qk_rope_head_dim)
                         kv_caches[layer_name] = (k_nope, k_pe)
                     continue
 
