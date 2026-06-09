@@ -129,6 +129,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))
     ),
+    # DSA un-bundle (proper route P1). When 1, the SFA KV cache is split into TWO
+    # vLLM-managed KV cache groups: the MLA latent (k_nope+k_pe) and the indexer key,
+    # instead of the bundled 3-tuple. This is the prerequisite for freeing the latent
+    # blocks after prefill (P2) in a graph-compatible way. Default 0 (bundled path).
+    "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))
+    ),
     # DSA latent offload micro-profiler. When 1, the decode path brackets each added
     # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
     # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.

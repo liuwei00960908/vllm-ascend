@@ -298,6 +298,8 @@ class NPUModelRunner(GPUModelRunner):
             and envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
             and envs_ascend.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
+        # Proper route P1: split the SFA KV into latent + indexer KV cache groups.
+        self.dsa_unbundle = bool(self.use_sparse and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE)
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2822,7 +2824,20 @@ class NPUModelRunner(GPUModelRunner):
 
                     dsa_k_tensor_size = None
                     dsa_k_scale_tensor_size = None
-                    if self.use_sparse and self.dsa_free_paged:
+                    unbundle_indexer = False
+                    if self.dsa_unbundle and self.use_sparse:
+                        # Proper route P1: each layer's tensor is allocated per its own
+                        # group spec — latent (k_nope + k_pe) or indexer (single vector).
+                        shd = current_kv_cache_spec.sparse_head_dim
+                        if len(shd) == 1:  # indexer group: one tensor = whole page
+                            unbundle_indexer = True
+                            k_tensor_size = int(kv_cache_tensor.size)
+                            v_tensor_size = 0
+                        else:  # latent group: split the page into k_nope + k_pe
+                            total = shd[0] + shd[1]
+                            k_tensor_size = int(kv_cache_tensor.size * shd[0] // total)
+                            v_tensor_size = int(kv_cache_tensor.size * shd[1] // total)
+                    elif self.use_sparse and self.dsa_free_paged:
                         # DSA offload (M-B): the page holds ONLY the indexer key; the
                         # latent k/v are 1-block dummies (exec_kv writes the
                         # PagedLatentPool instead). This is what shrinks per-token memory.
@@ -2888,7 +2903,11 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the attn kvcache for all shared layers
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse:
+                            if self.dsa_unbundle and self.use_sparse:
+                                kv_cache_raw_tensors[layer_name_inner] = (
+                                    (k_tensor,) if unbundle_indexer else (k_tensor, v_tensor)
+                                )
+                            elif self.use_sparse:
                                 if self.use_sparse_c8_indexer:
                                     kv_cache_raw_tensors[layer_name_inner] = (
                                         k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor
@@ -2932,6 +2951,29 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                # Proper route P1: each layer is its own group (latent k_nope+k_pe, or
+                # indexer single vector) — reshape directly, no 3-tuple split.
+                if self.dsa_unbundle and self.use_sparse and isinstance(
+                    current_kv_cache_spec, AttentionSpec
+                ):
+                    spec = current_kv_cache_spec
+                    raws = kv_cache_raw_tensors[layer_name]
+                    shd = spec.sparse_head_dim
+                    num_blocks = sum(t.numel() for t in raws) // spec.page_size_bytes
+                    assert num_blocks >= kv_cache_config.num_blocks
+                    if len(shd) == 1:  # indexer group: single vector cache
+                        shape = (num_blocks, spec.block_size, spec.num_kv_heads, shd[0])
+                        kv_caches[layer_name] = (raws[0].view(spec.dtype).view(shape),)
+                    else:  # latent group: (k_nope, k_pe)
+                        k_nope = raws[0].view(spec.dtype).view(
+                            num_blocks, spec.block_size, spec.num_kv_heads, shd[0]
+                        )
+                        k_pe = raws[1].view(spec.dtype).view(
+                            num_blocks, spec.block_size, spec.num_kv_heads, shd[1]
+                        )
+                        kv_caches[layer_name] = (k_nope, k_pe)
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
@@ -3345,7 +3387,21 @@ class NPUModelRunner(GPUModelRunner):
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     # TODO(rjg-lyh): when kv_cache_spec's refactor is ready,
                     # implement it by creating a new kv_cache_spec class
-                    if self.dsa_free_paged:
+                    if self.dsa_unbundle:
+                        # Proper route P1: this MLA layer owns ONLY the latent
+                        # (k_nope + k_pe); the indexer key is a separate KV group
+                        # emitted from the DeepseekV32IndexerCache layer below.
+                        kv_lora_rank, qk_rope_head_dim = self.sparse_head_dim[:2]
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=kv_lora_rank + qk_rope_head_dim,
+                            sparse_head_dim=(kv_lora_rank, qk_rope_head_dim),
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_c8=False,
+                        )
+                    elif self.dsa_free_paged:
                         # DSA offload (M-B): paged cache holds ONLY the indexer key;
                         # latent lives in the PagedLatentPool. Per-token page shrinks
                         # from sum(704) to index_head_dim -> ~5.5x more blocks.
@@ -3384,6 +3440,21 @@ class NPUModelRunner(GPUModelRunner):
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
                     )
+
+            elif self.dsa_unbundle and type(attn_module).__name__ == "DeepseekV32IndexerCache":
+                # Proper route P1: the indexer key cache becomes its own KV group
+                # (so the latent group's blocks can be freed independently later).
+                from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
+                index_head_dim = self.sparse_head_dim[-1]
+                kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                    block_size=self.block_size,
+                    num_kv_heads=1,
+                    head_size=index_head_dim,
+                    sparse_head_dim=(index_head_dim,),
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    cache_sparse_c8=self.use_sparse_c8_indexer,
+                )
 
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
