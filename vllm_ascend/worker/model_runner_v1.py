@@ -3470,6 +3470,17 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        if self.dsa_unbundle:
+            from collections import Counter
+            hist = Counter(
+                getattr(s, "head_size", None) for s in kv_cache_spec.values()
+            )
+            logger.info(
+                "[DSA-UNBUNDLE] emitted %d specs by head_size: %s "
+                "(expect both a latent head_size and an indexer head_size if two groups)",
+                len(kv_cache_spec), dict(hist),
+            )
+
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
