@@ -1169,7 +1169,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
                     with _dsa_prof.section("exec_kv_slots"):
                         _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
-                            layer_name, _fc.dsa_req_ids, _qsl, _ctx
+                            layer_name, _fc.dsa_req_ids, _qsl, _ctx,
+                            decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
                         )
                     with _dsa_prof.section("exec_kv_op"):
                         k_pe, k_nope = self.exec_kv(

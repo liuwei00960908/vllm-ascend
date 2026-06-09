@@ -53,6 +53,12 @@ class PagedLatentPool:
         )
         self._free: list[int] = list(range(num_blocks))
         self._req_blocks: dict[str, list[int]] = {}
+        # Cached batched block table (rebuilt only when allocation changes), so the
+        # decode hot path doesn't reconstruct a per-request tensor from Python lists
+        # every layer.
+        self._bt_cache: torch.Tensor | None = None
+        self._bt_key: tuple | None = None
+        self._bt_dirty = True
 
     # ----------------------------------------------------------- per-layer view
     def layer_caches(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,9 +78,36 @@ class PagedLatentPool:
                     "requests (prefill blocks should be freed after prefill)."
                 )
             blocks.append(self._free.pop())
+            self._bt_dirty = True
 
     def free_request(self, req_id: str) -> None:
         self._free.extend(self._req_blocks.pop(req_id, []))
+        self._bt_dirty = True
+
+    def block_table_batched(self, req_ids: list[str], max_blocks: int) -> torch.Tensor:
+        """Cached ``[len(req_ids), max_blocks]`` block table; rebuilt from the Python
+        block lists only when allocation changed (``_bt_dirty``) or the batch changed."""
+        key = (tuple(req_ids), max_blocks)
+        if not self._bt_dirty and self._bt_key == key and self._bt_cache is not None:
+            return self._bt_cache
+        bt = torch.zeros((len(req_ids), max_blocks), dtype=torch.long, device=self.device)
+        for i, r in enumerate(req_ids):
+            bl = self._req_blocks.get(r, [])
+            if bl:
+                bt[i, : len(bl)] = torch.tensor(bl, dtype=torch.long, device=self.device)
+        self._bt_cache, self._bt_key, self._bt_dirty = bt, key, False
+        return bt
+
+    def decode_slots(
+        self, req_ids: list[str], positions: torch.Tensor, max_blocks: int
+    ) -> torch.Tensor:
+        """Vectorized flat pool slots for one decode position per request (no per-request
+        Python / tensor construction on the hot path)."""
+        bt = self.block_table_batched(req_ids, max_blocks)
+        pos = positions.to(self.device, torch.long)
+        ridx = torch.arange(len(req_ids), device=self.device)
+        blk = bt[ridx, pos // self.block_size]
+        return blk * self.block_size + pos % self.block_size
 
     @property
     def num_free_blocks(self) -> int:
@@ -113,11 +146,7 @@ class PagedLatentPool:
         if positions.numel() == 0:
             return knope_layer[:0], kpe_layer[:0]
         max_blocks = max((len(self._req_blocks.get(r, [])) for r in req_ids), default=1)
-        bt = torch.zeros((len(req_ids), max(max_blocks, 1)), dtype=torch.long, device=self.device)
-        for i, r in enumerate(req_ids):
-            bl = self._req_blocks.get(r, [])
-            if bl:
-                bt[i, : len(bl)] = torch.tensor(bl, dtype=torch.long, device=self.device)
+        bt = self.block_table_batched(req_ids, max(max_blocks, 1))
         pos = positions.to(self.device, torch.long)
         blk = bt[req_idx.to(self.device, torch.long), pos // self.block_size]
         slots = blk * self.block_size + pos % self.block_size
