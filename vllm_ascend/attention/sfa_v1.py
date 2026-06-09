@@ -12,6 +12,8 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
+
+_UNBUNDLE_IDX_LOGGED = [False]  # one-shot guard for the indexer-not-found diagnostic
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.triton_utils import HAS_TRITON
@@ -1103,10 +1105,31 @@ class AscendSFAImpl(MLAAttentionImpl):
             # share the request's block ids, so attn_metadata.block_table/slot_mapping
             # address both the latent (kv_cache[0]/[1]) and the indexer (kv_cache[2]).
             _fc_ub = get_forward_context()
-            _idx_layer = _fc_ub.no_compile_layers.get(layer_name + ".indexer.k_cache")
+            _idx_layer = None
+            for _d in (getattr(_fc_ub, "no_compile_layers", None),
+                       getattr(_fc_ub, "static_forward_context", None)):
+                if not _d:
+                    continue
+                _idx_layer = _d.get(layer_name + ".indexer.k_cache")
+                if _idx_layer is None:  # fall back: any key under this layer's prefix
+                    for _k, _v in _d.items():
+                        if _k.startswith(layer_name) and "indexer" in _k:
+                            _idx_layer = _v
+                            break
+                if _idx_layer is not None:
+                    break
+            if _idx_layer is None and not _UNBUNDLE_IDX_LOGGED[0]:
+                _UNBUNDLE_IDX_LOGGED[0] = True
+                _keys = list(getattr(_fc_ub, "no_compile_layers", {}) or {})
+                logger.warning(
+                    "[DSA-UNBUNDLE] indexer layer not found for %s; no_compile_layers "
+                    "indexer-ish keys=%s", layer_name,
+                    [k for k in _keys if "indexer" in k][:4],
+                )
             if _idx_layer is not None:
                 _idx_cache = _idx_layer.kv_cache[_fc_ub.virtual_engine]
-                kv_cache = (kv_cache[0], kv_cache[1], _idx_cache[0])
+                _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+                kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
