@@ -80,6 +80,30 @@ class GatherPlan:
     seq_lens_kv: torch.Tensor  # [b] number of valid selected tokens k_b
 
 
+_PLAN_STATIC_CACHE: dict = {}
+
+
+def _plan_static(
+    b: int, topk: int, scratch_blocks_per_req: int, block_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cache the batch-shape-only plan tensors (independent of the selected positions):
+    ``dest_full`` [b, topk] scratch slot for token (b, j); ``sparse_static`` [b, topk]
+    column indices; ``scratch_block_table`` [b, scratch_blocks_per_req]."""
+    key = (b, topk, scratch_blocks_per_req, block_size, str(device))
+    cached = _PLAN_STATIC_CACHE.get(key)
+    if cached is None:
+        col = torch.arange(topk, dtype=torch.long, device=device)
+        region = torch.arange(b, dtype=torch.long, device=device) * scratch_blocks_per_req * block_size
+        dest_full = region.unsqueeze(1) + col.unsqueeze(0)
+        sparse_static = col.unsqueeze(0).expand(b, topk).contiguous()
+        scratch_block_table = torch.arange(
+            b * scratch_blocks_per_req, dtype=torch.long, device=device
+        ).view(b, scratch_blocks_per_req)
+        cached = (dest_full, sparse_static, scratch_block_table)
+        _PLAN_STATIC_CACHE[key] = cached
+    return cached
+
+
 def build_gather_plan(
     topk_indices: torch.Tensor,
     prompt_lens: torch.Tensor,
@@ -105,33 +129,26 @@ def build_gather_plan(
     b, topk = topk_indices.shape
     _prof.log_topk_padding(topk_indices[0], INVALID_TOKEN_INDEX)
 
+    # The indexer's top-k is front-packed (valid first, -1 padding at the end — confirmed
+    # on NPU), so the compact local slot of a valid entry is just its column index. That
+    # makes the per-token destination/sparse-index layout STATIC (depends only on the
+    # batch shape, not the selected positions), so we cache it and skip the per-call
+    # cumsum/arange/where chain — only the cheap valid/decode masks stay dynamic.
+    dest_full, sparse_static, scratch_block_table = _plan_static(
+        b, topk, scratch_blocks_per_req, block_size, dev
+    )
+
     valid = topk_indices != INVALID_TOKEN_INDEX
-    # Compact each row: valid entries get local slots 0,1,2,... in selection order.
-    local_slot = torch.cumsum(valid.to(torch.long), dim=1) - 1  # [b, topk]
+    not_valid = ~valid
     seq_lens_kv = valid.sum(dim=1)  # [b], k_b
-
     is_decode = valid & (topk_indices >= prompt_lens.unsqueeze(1))
-    is_prefill = valid & ~is_decode
 
-    invalid = torch.full_like(topk_indices, INVALID_TOKEN_INDEX)
     # Both hold ABSOLUTE positions; source differs: prefill -> LMCache (key=abs pos),
     # decode -> PagedLatentPool (read at abs pos via the request's pool block table).
-    prefill_positions = torch.where(is_prefill, topk_indices, invalid)
-    decode_positions = torch.where(is_decode, topk_indices, invalid)
-
-    # Destination scratch slot = request's block region base + local_slot.
-    region_base = (
-        torch.arange(b, dtype=torch.long, device=dev).unsqueeze(1)
-        * scratch_blocks_per_req
-        * block_size
-    )
-    dest_slot = torch.where(valid, region_base + local_slot, invalid)
-
-    # Compact local indices fed to the kernel (resolved against scratch_block_table).
-    sparse_indices = torch.where(valid, local_slot, invalid)
-
-    block_ids = torch.arange(b * scratch_blocks_per_req, dtype=torch.long, device=dev)
-    scratch_block_table = block_ids.view(b, scratch_blocks_per_req)
+    prefill_positions = topk_indices.masked_fill(is_decode | not_valid, INVALID_TOKEN_INDEX)
+    decode_positions = topk_indices.masked_fill(~is_decode, INVALID_TOKEN_INDEX)
+    dest_slot = dest_full.masked_fill(not_valid, INVALID_TOKEN_INDEX)
+    sparse_indices = sparse_static.masked_fill(not_valid, INVALID_TOKEN_INDEX)
 
     return GatherPlan(
         prefill_positions=prefill_positions,
