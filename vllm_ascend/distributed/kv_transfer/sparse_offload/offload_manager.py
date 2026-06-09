@@ -103,6 +103,7 @@ def build_gather_plan(
     topk_indices = topk_indices.to(torch.long)
     prompt_lens = prompt_lens.to(dev, torch.long)
     b, topk = topk_indices.shape
+    _prof.log_topk_padding(topk_indices[0], INVALID_TOKEN_INDEX)
 
     valid = topk_indices != INVALID_TOKEN_INDEX
     # Compact each row: valid entries get local slots 0,1,2,... in selection order.

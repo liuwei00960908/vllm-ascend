@@ -44,6 +44,25 @@ class section:
             _n[self.name] += 1
 
 
+_padding_logged = [False]
+
+
+def log_topk_padding(topk_row: "torch.Tensor", invalid: int) -> None:
+    """One-shot: report whether a topk row is front-packed (valid first, -1 padding at
+    the end) — which would let us drop the compaction in build_gather_plan."""
+    if not ENABLED or _padding_logged[0]:
+        return
+    _padding_logged[0] = True
+    valid = topk_row != invalid
+    n_valid = int(valid.sum())
+    inv = (~valid).nonzero()
+    first_invalid = int(inv[0]) if inv.numel() else topk_row.numel()
+    logger.info(
+        "[DSA-PROF] topk padding: len=%d n_valid=%d first_invalid_idx=%d front_packed=%s",
+        topk_row.numel(), n_valid, first_invalid, n_valid == first_invalid,
+    )
+
+
 def step() -> None:
     """Call once per decode layer; periodically logs mean ms/call per section."""
     if not ENABLED:
