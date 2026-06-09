@@ -129,6 +129,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))
     ),
+    # DSA latent offload micro-profiler. When 1, the decode path brackets each added
+    # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
+    # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.
+    "VLLM_ASCEND_DSA_OFFLOAD_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_PROFILE", "0"))
+    ),
     # DSA latent offload introspection (bring-up Round 1). When 1, read-only probes in
     # the SFA forward / model runner dump the ground-truth facts we need to finalize
     # the integration (metadata fields, kv_cache layout, topk_indices shape/sentinel,

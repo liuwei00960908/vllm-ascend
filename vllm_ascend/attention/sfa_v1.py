@@ -10,6 +10,8 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
+
+from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.triton_utils import HAS_TRITON
@@ -1165,12 +1167,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
                     )
                     _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
-                    _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
-                        layer_name, _fc.dsa_req_ids, _qsl, _ctx
-                    )
-                    k_pe, k_nope = self.exec_kv(
-                        kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata
-                    )
+                    with _dsa_prof.section("exec_kv_slots"):
+                        _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
+                            layer_name, _fc.dsa_req_ids, _qsl, _ctx
+                        )
+                    with _dsa_prof.section("exec_kv_op"):
+                        k_pe, k_nope = self.exec_kv(
+                            kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata
+                        )
                 else:
                     k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
 
@@ -1335,31 +1339,34 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
-                    _dsa_mgr,
-                    layer_name,
-                    _dsa_fc.dsa_req_ids,
-                    topk_indices,
-                    _dsa_fc.dsa_prompt_lens,
-                    _cur_pos,
-                    _block_size,
-                    _kn,
-                    _kp,
-                    store_current=not self.dsa_offload_free_paged,
-                )
+                with _dsa_prof.section("gather"):
+                    s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
+                        _dsa_mgr,
+                        layer_name,
+                        _dsa_fc.dsa_req_ids,
+                        topk_indices,
+                        _dsa_fc.dsa_prompt_lens,
+                        _cur_pos,
+                        _block_size,
+                        _kn,
+                        _kp,
+                        store_current=not self.dsa_offload_free_paged,
+                    )
                 # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
-                scratch_out = self._execute_sparse_flash_attention_process(
-                    ql_nope,
-                    q_pe,
-                    kv_cache,
-                    c_idx.unsqueeze(1),
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    s_kv,
-                    kv_override=s_knope,
-                    key_rope_override=s_kpe,
-                    block_table_override=s_bt,
-                )
+                with _dsa_prof.section("kernel"):
+                    scratch_out = self._execute_sparse_flash_attention_process(
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        c_idx.unsqueeze(1),
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        s_kv,
+                        kv_override=s_knope,
+                        key_rope_override=s_kpe,
+                        block_table_override=s_bt,
+                    )
+                _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,

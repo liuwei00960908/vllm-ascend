@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_backend import (
     LatentOffloadBackend,
 )
@@ -333,34 +334,38 @@ class SparseLatentOffloadManager:
         # --- 1. Batched LMCache load request. The only host round-trips are the two
         # small lists the LMCache interface itself requires (selected positions +
         # per-request offsets) — i.e. load-prep, not bookkeeping. ---
-        n_pref = is_pref.sum(dim=1)  # [b]
-        token_start_index = torch.cat([n_pref.new_zeros(1), n_pref.cumsum(0)[:-1]]).tolist()
-        # prefill positions flattened in (b, topk) row-major order == load_buffer order.
-        flat_selected = plan.prefill_positions[is_pref].tolist()
+        with _prof.section("g_listprep"):
+            n_pref = is_pref.sum(dim=1)  # [b]
+            token_start_index = torch.cat([n_pref.new_zeros(1), n_pref.cumsum(0)[:-1]]).tolist()
+            # prefill positions flattened in (b, topk) row-major order == load_buffer order.
+            flat_selected = plan.prefill_positions[is_pref].tolist()
         if hasattr(self.backend, "set_load_req_ids"):  # in-memory reference backend
             self.backend.set_load_req_ids(req_ids)
-        self.backend.wait_for_layer_load(layer_name, flat_selected, token_start_index)
+        with _prof.section("g_load"):
+            self.backend.wait_for_layer_load(layer_name, flat_selected, token_start_index)
 
         # --- 2. Fill scratch, fully vectorized (no per-request Python / no .item()). ---
         knope_flat = self._scratch_knope.view(-1, cfg.kv_lora_rank)
         kpe_flat = self._scratch_kpe.view(-1, cfg.qk_rope_head_dim)
 
         # prefill: one index_copy; load_buffer rows align with dest_slot[is_pref] order.
-        pref_dest = plan.dest_slot[is_pref].to(dev)
-        if pref_dest.shape[0]:
-            knope_p, kpe_p = self._unpack(self._load_buffer[: pref_dest.shape[0]].to(cfg.dtype))
-            knope_flat.index_copy_(0, pref_dest, knope_p.to(dev))
-            kpe_flat.index_copy_(0, pref_dest, kpe_p.to(dev))
+        with _prof.section("g_fill_pref"):
+            pref_dest = plan.dest_slot[is_pref].to(dev)
+            if pref_dest.shape[0]:
+                knope_p, kpe_p = self._unpack(self._load_buffer[: pref_dest.shape[0]].to(cfg.dtype))
+                knope_flat.index_copy_(0, pref_dest, knope_p.to(dev))
+                kpe_flat.index_copy_(0, pref_dest, kpe_p.to(dev))
 
         # decode: one batched pool gather over all decode-selected tokens.
-        req_idx = torch.arange(b, device=plan.decode_positions.device).unsqueeze(1).expand(b, topk)
-        dec_dest = plan.dest_slot[is_dec].to(dev)
-        if dec_dest.shape[0]:
-            knope_d, kpe_d = self._paged_latent_pool.gather_batched(
-                req_ids, layer_id, req_idx[is_dec], plan.decode_positions[is_dec]
-            )
-            knope_flat.index_copy_(0, dec_dest, knope_d.to(dev, cfg.dtype))
-            kpe_flat.index_copy_(0, dec_dest, kpe_d.to(dev, cfg.dtype))
+        with _prof.section("g_fill_dec"):
+            req_idx = torch.arange(b, device=plan.decode_positions.device).unsqueeze(1).expand(b, topk)
+            dec_dest = plan.dest_slot[is_dec].to(dev)
+            if dec_dest.shape[0]:
+                knope_d, kpe_d = self._paged_latent_pool.gather_batched(
+                    req_ids, layer_id, req_idx[is_dec], plan.decode_positions[is_dec]
+                )
+                knope_flat.index_copy_(0, dec_dest, knope_d.to(dev, cfg.dtype))
+                kpe_flat.index_copy_(0, dec_dest, kpe_d.to(dev, cfg.dtype))
 
         # Match the native kernel arg dtypes (int32). sparse_indices stays 2-D here;
         # the caller adds the singleton head dim for the kernel.

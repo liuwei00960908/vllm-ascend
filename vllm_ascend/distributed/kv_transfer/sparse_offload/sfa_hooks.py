@@ -19,6 +19,7 @@ Ascend metadata layout).
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_manager import (
     SparseLatentOffloadManager,
     build_gather_plan,
@@ -102,7 +103,8 @@ def gather_decode(
             manager.store_decode_token(
                 req_id, layer_name, positions[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
             )
-    plan = build_gather_plan(
-        topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req
-    )
+    with _prof.section("g_build"):
+        plan = build_gather_plan(
+            topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req
+        )
     return manager.gather_decode_layer(layer_name, req_ids, plan)
