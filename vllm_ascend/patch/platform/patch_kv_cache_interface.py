@@ -124,6 +124,17 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len(cache_dtype_str_set) == 1, (
             "All attention layers in the same KV cache group must use the same quantization method."
         )
+        # Layers with different per-token sizes (e.g. DSA un-bundled latent head_size=576
+        # vs indexer head_size=128) must NOT collapse into one merged spec — otherwise the
+        # smaller page is applied to all layers, mis-sizing the larger ones and over-counting
+        # num_blocks. Asserting here makes is_kv_cache_spec_uniform() route them to the
+        # per-layer UniformTypeKVCacheSpecs path instead.
+        assert len({spec.head_size for spec in specs}) == 1, (
+            "All attention layers in the same KV cache group must have the same head_size."
+        )
+        assert len({spec.sparse_head_dim for spec in specs}) == 1, (
+            "All attention layers in the same KV cache group must have the same sparse_head_dim."
+        )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
