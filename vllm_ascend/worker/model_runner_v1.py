@@ -300,6 +300,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         # Proper route P1: split the SFA KV into latent + indexer KV cache groups.
         self.dsa_unbundle = bool(self.use_sparse and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE)
+        logger.info(
+            "[DSA-UNBUNDLE] init: use_sparse=%s env=%s -> dsa_unbundle=%s",
+            self.use_sparse, envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE, self.dsa_unbundle,
+        )
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
