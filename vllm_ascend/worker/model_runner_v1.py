@@ -2839,12 +2839,15 @@ class NPUModelRunner(GPUModelRunner):
                         kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
                         elt = get_dtype_size(self.kv_cache_dtype)
                         bs = current_kv_cache_spec.block_size
-                        nb = kv_cache_config.num_blocks
+                        # Use THIS tensor's allocated budget (kv_cache_tensor.size), not
+                        # kv_cache_config.num_blocks (over-counted across two groups of
+                        # different page sizes -> OOM). nb*page == size, so k+v fits.
                         if any("indexer" in ln for ln in kv_cache_tensor.shared_by):
                             unbundle_indexer = True
-                            k_tensor_size = nb * bs * index_head_dim * elt
+                            k_tensor_size = int(kv_cache_tensor.size)  # whole = indexer cache
                             v_tensor_size = 0
                         else:
+                            nb = int(kv_cache_tensor.size) // current_kv_cache_spec.page_size_bytes
                             k_tensor_size = nb * bs * kv_lora_rank * elt
                             v_tensor_size = nb * bs * qk_rope_head_dim * elt
                     elif self.use_sparse and self.dsa_free_paged:
