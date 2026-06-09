@@ -1105,15 +1105,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             # share the request's block ids, so attn_metadata.block_table/slot_mapping
             # address both the latent (kv_cache[0]/[1]) and the indexer (kv_cache[2]).
             _fc_ub = get_forward_context()
+            # layer_name is the inner MLAAttention name (e.g. ...self_attn.attn); the
+            # indexer cache is a sibling ...self_attn.indexer.k_cache. Strip the last
+            # component to get the shared self_attn prefix.
+            _self_attn_prefix = layer_name.rsplit(".", 1)[0]
+            _idx_name = _self_attn_prefix + ".indexer.k_cache"
             _idx_layer = None
             for _d in (getattr(_fc_ub, "no_compile_layers", None),
                        getattr(_fc_ub, "static_forward_context", None)):
                 if not _d:
                     continue
-                _idx_layer = _d.get(layer_name + ".indexer.k_cache")
-                if _idx_layer is None:  # fall back: any key under this layer's prefix
+                _idx_layer = _d.get(_idx_name)
+                if _idx_layer is None:  # fall back: any key under the self_attn prefix
                     for _k, _v in _d.items():
-                        if _k.startswith(layer_name) and "indexer" in _k:
+                        if _k.startswith(_self_attn_prefix) and "indexer" in _k:
                             _idx_layer = _v
                             break
                 if _idx_layer is not None:
@@ -1122,8 +1127,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _UNBUNDLE_IDX_LOGGED[0] = True
                 _keys = list(getattr(_fc_ub, "no_compile_layers", {}) or {})
                 logger.warning(
-                    "[DSA-UNBUNDLE] indexer layer not found for %s; no_compile_layers "
-                    "indexer-ish keys=%s", layer_name,
+                    "[DSA-UNBUNDLE] indexer layer not found for %s (tried %s); keys=%s",
+                    layer_name, _idx_name,
                     [k for k in _keys if "indexer" in k][:4],
                 )
             if _idx_layer is not None:
