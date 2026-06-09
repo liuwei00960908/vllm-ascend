@@ -300,10 +300,8 @@ class NPUModelRunner(GPUModelRunner):
         )
         # Proper route P1: split the SFA KV into latent + indexer KV cache groups.
         self.dsa_unbundle = bool(self.use_sparse and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE)
-        logger.info(
-            "[DSA-UNBUNDLE] init: use_sparse=%s env=%s -> dsa_unbundle=%s",
-            self.use_sparse, envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE, self.dsa_unbundle,
-        )
+        if self.dsa_unbundle:
+            logger.info("DSA un-bundle enabled: latent and indexer use separate KV cache groups.")
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2633,24 +2631,6 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
-        if self.dsa_unbundle:
-            logger.info(
-                "[DSA-UNBUNDLE] kv_cache_config: num_blocks=%s, %d tensors, %d groups",
-                kv_cache_config.num_blocks, len(kv_cache_config.kv_cache_tensors),
-                len(kv_cache_config.kv_cache_groups),
-            )
-            for _gi, _g in enumerate(kv_cache_config.kv_cache_groups):
-                _sp = _g.kv_cache_spec
-                logger.info(
-                    "[DSA-UNBUNDLE]   group %d: %d layers, spec=%s page_size_bytes=%s",
-                    _gi, len(_g.layer_names), type(_sp).__name__,
-                    getattr(_sp, "page_size_bytes", None),
-                )
-            for _ti, _t in enumerate(kv_cache_config.kv_cache_tensors[:4]):
-                logger.info(
-                    "[DSA-UNBUNDLE]   tensor %d: size=%s shared_by=%s",
-                    _ti, _t.size, _t.shared_by,
-                )
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
@@ -3504,17 +3484,6 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
-
-        if self.dsa_unbundle:
-            from collections import Counter
-            hist = Counter(
-                getattr(s, "head_size", None) for s in kv_cache_spec.values()
-            )
-            logger.info(
-                "[DSA-UNBUNDLE] emitted %d specs by head_size: %s "
-                "(expect both a latent head_size and an indexer head_size if two groups)",
-                len(kv_cache_spec), dict(hist),
-            )
 
         return kv_cache_spec
 

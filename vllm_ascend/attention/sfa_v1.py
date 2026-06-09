@@ -12,8 +12,6 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
-
-_UNBUNDLE_IDX_LOGGED = [False]  # one-shot guard for the indexer-not-found diagnostic
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.triton_utils import HAS_TRITON
@@ -1099,42 +1097,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             return output.fill_(0)
 
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
-            # Proper route P1: the indexer key lives in a SEPARATE KV group (the
-            # DeepseekV32IndexerCache layer). Fetch its cache and re-assemble a 3-tuple
-            # so the indexer read/write below (kv_cache[2]) work unchanged. Both groups
-            # share the request's block ids, so attn_metadata.block_table/slot_mapping
-            # address both the latent (kv_cache[0]/[1]) and the indexer (kv_cache[2]).
+            # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
+            # layer_name is the inner MLAAttention name (...self_attn.attn); the indexer
+            # cache is the sibling ...self_attn.indexer.k_cache. Re-assemble a 3-tuple so
+            # the indexer read/write (kv_cache[2]) work unchanged — both groups share the
+            # request's block ids, so attn_metadata.block_table/slot_mapping address both.
             _fc_ub = get_forward_context()
-            # layer_name is the inner MLAAttention name (e.g. ...self_attn.attn); the
-            # indexer cache is a sibling ...self_attn.indexer.k_cache. Strip the last
-            # component to get the shared self_attn prefix.
-            _self_attn_prefix = layer_name.rsplit(".", 1)[0]
-            _idx_name = _self_attn_prefix + ".indexer.k_cache"
-            _idx_layer = None
-            for _d in (getattr(_fc_ub, "no_compile_layers", None),
-                       getattr(_fc_ub, "static_forward_context", None)):
-                if not _d:
-                    continue
-                _idx_layer = _d.get(_idx_name)
-                if _idx_layer is None:  # fall back: any key under the self_attn prefix
-                    for _k, _v in _d.items():
-                        if _k.startswith(_self_attn_prefix) and "indexer" in _k:
-                            _idx_layer = _v
-                            break
-                if _idx_layer is not None:
-                    break
-            if _idx_layer is None and not _UNBUNDLE_IDX_LOGGED[0]:
-                _UNBUNDLE_IDX_LOGGED[0] = True
-                _keys = list(getattr(_fc_ub, "no_compile_layers", {}) or {})
-                logger.warning(
-                    "[DSA-UNBUNDLE] indexer layer not found for %s (tried %s); keys=%s",
-                    layer_name, _idx_name,
-                    [k for k in _keys if "indexer" in k][:4],
-                )
-            if _idx_layer is not None:
-                _idx_cache = _idx_layer.kv_cache[_fc_ub.virtual_engine]
-                _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
-                kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
+            _idx_name = layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+            _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
+            _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+            kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
