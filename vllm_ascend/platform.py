@@ -213,6 +213,22 @@ class NPUPlatform(Platform):
         return torch.npu.get_device_name(device_id)
 
     @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        # Used by the upstream DSA indexer metadata builder (DeepGEMM tiling on CUDA).
+        # Ascend's indexer runs via npu_lightning_indexer (DeepGEMM disabled), so this
+        # value is not used for tiling; report the AI Core count when available, else a
+        # sane default, so the builder initializes.
+        try:
+            props = torch.npu.get_device_properties(device_id)
+            for attr in ("multi_processor_count", "num_ai_core", "ai_core_num"):
+                val = getattr(props, attr, None)
+                if val:
+                    return int(val)
+        except Exception:
+            pass
+        return 20
+
+    @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:
         device_props = torch.npu.get_device_properties(device_id)
         if not hasattr(device_props, "uuid") or device_props.uuid is None:
