@@ -2832,18 +2832,21 @@ class NPUModelRunner(GPUModelRunner):
                     if self.dsa_unbundle and self.use_sparse:
                         # Proper route P1: each layer's tensor is allocated per its own
                         # group — latent (k_nope + k_pe) or indexer (single vector).
-                        # Discriminate by LAYER NAME (grouping/merge may rewrite the
-                        # spec's sparse_head_dim, so don't rely on it); use model-level
-                        # sparse_head_dim constants for the split ratio.
-                        kv_lora_rank, qk_rope_head_dim, _ = self.sparse_head_dim
+                        # Size from num_blocks * true per-block bytes (NOT a proportional
+                        # split of kv_cache_tensor.size, which carries page padding from
+                        # two groups of different page sizes -> odd, mis-aligned bytes).
+                        # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
+                        kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
+                        elt = get_dtype_size(self.kv_cache_dtype)
+                        bs = current_kv_cache_spec.block_size
+                        nb = kv_cache_config.num_blocks
                         if any("indexer" in ln for ln in kv_cache_tensor.shared_by):
                             unbundle_indexer = True
-                            k_tensor_size = int(kv_cache_tensor.size)
+                            k_tensor_size = nb * bs * index_head_dim * elt
                             v_tensor_size = 0
                         else:
-                            total = kv_lora_rank + qk_rope_head_dim
-                            k_tensor_size = int(kv_cache_tensor.size * kv_lora_rank // total)
-                            v_tensor_size = int(kv_cache_tensor.size * qk_rope_head_dim // total)
+                            k_tensor_size = nb * bs * kv_lora_rank * elt
+                            v_tensor_size = nb * bs * qk_rope_head_dim * elt
                     elif self.use_sparse and self.dsa_free_paged:
                         # DSA offload (M-B): the page holds ONLY the indexer key; the
                         # latent k/v are 1-block dummies (exec_kv writes the
