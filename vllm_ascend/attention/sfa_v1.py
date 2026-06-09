@@ -1345,6 +1345,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _block_size,
                     _kn,
                     _kp,
+                    store_current=not self.dsa_offload_free_paged,
                 )
                 # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
                 scratch_out = self._execute_sparse_flash_attention_process(

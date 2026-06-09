@@ -98,6 +98,31 @@ class PagedLatentPool:
         kpe = self.kpe[layer_id].reshape(-1, self.kpe.shape[-1]).index_select(0, slots)
         return knope, kpe
 
+    def gather_batched(
+        self,
+        req_ids: list[str],
+        layer_id: int,
+        req_idx: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized gather across requests: ``req_idx[i]`` indexes ``req_ids`` and
+        ``positions[i]`` is an absolute position; returns the ``(knope, kpe)`` rows for
+        all ``i`` in one shot (no per-request Python in the caller)."""
+        knope_layer = self.knope[layer_id].reshape(-1, self.knope.shape[-1])
+        kpe_layer = self.kpe[layer_id].reshape(-1, self.kpe.shape[-1])
+        if positions.numel() == 0:
+            return knope_layer[:0], kpe_layer[:0]
+        max_blocks = max((len(self._req_blocks.get(r, [])) for r in req_ids), default=1)
+        bt = torch.zeros((len(req_ids), max(max_blocks, 1)), dtype=torch.long, device=self.device)
+        for i, r in enumerate(req_ids):
+            bl = self._req_blocks.get(r, [])
+            if bl:
+                bt[i, : len(bl)] = torch.tensor(bl, dtype=torch.long, device=self.device)
+        pos = positions.to(self.device, torch.long)
+        blk = bt[req_idx.to(self.device, torch.long), pos // self.block_size]
+        slots = blk * self.block_size + pos % self.block_size
+        return knope_layer.index_select(0, slots), kpe_layer.index_select(0, slots)
+
     def store(
         self,
         req_id: str,

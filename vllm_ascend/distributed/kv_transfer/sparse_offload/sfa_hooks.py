@@ -67,6 +67,7 @@ def gather_decode(
     block_size: int,
     cur_k_nope: torch.Tensor,
     cur_k_pe: torch.Tensor,
+    store_current: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Store this step's token into the decode pool, then gather selected latent.
 
@@ -93,11 +94,14 @@ def gather_decode(
 
     # Store the new token so the gather can see it if the indexer selected it. Stored at
     # its ABSOLUTE position in the PagedLatentPool; every layer writes the same position.
-    positions = cur_positions.cpu().to(torch.long).tolist()
-    for b, req_id in enumerate(req_ids):
-        manager.store_decode_token(
-            req_id, layer_name, positions[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
-        )
+    # In FREE_PAGED mode exec_kv already wrote this token into the pool, so the caller
+    # passes store_current=False to skip this (and its cur_positions host sync).
+    if store_current:
+        positions = cur_positions.cpu().to(torch.long).tolist()
+        for b, req_id in enumerate(req_ids):
+            manager.store_decode_token(
+                req_id, layer_name, positions[b], cur_k_nope[b : b + 1], cur_k_pe[b : b + 1]
+            )
     plan = build_gather_plan(
         topk_indices, prompt_lens, block_size, manager.config.scratch_blocks_per_req
     )
