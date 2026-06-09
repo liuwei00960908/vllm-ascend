@@ -455,6 +455,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
             and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
+        self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1094,6 +1095,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if is_hidden_layer(layer):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
+
+        if self.dsa_offload_unbundle and len(kv_cache) < 3:
+            # Proper route P1: the indexer key lives in a SEPARATE KV group (the
+            # DeepseekV32IndexerCache layer). Fetch its cache and re-assemble a 3-tuple
+            # so the indexer read/write below (kv_cache[2]) work unchanged. Both groups
+            # share the request's block ids, so attn_metadata.block_table/slot_mapping
+            # address both the latent (kv_cache[0]/[1]) and the indexer (kv_cache[2]).
+            _fc_ub = get_forward_context()
+            _idx_layer = _fc_ub.no_compile_layers.get(layer_name + ".indexer.k_cache")
+            if _idx_layer is not None:
+                _idx_cache = _idx_layer.kv_cache[_fc_ub.virtual_engine]
+                kv_cache = (kv_cache[0], kv_cache[1], _idx_cache[0])
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
