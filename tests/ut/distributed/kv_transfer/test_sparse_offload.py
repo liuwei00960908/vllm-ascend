@@ -62,7 +62,7 @@ def test_in_memory_backend_save_load_roundtrip():
     load_buffer = torch.zeros((10, latent_dim))
     backend.register_load_buffer(load_buffer)
     backend.set_load_req_ids(["r0", "r1"])
-    backend.wait_for_layer_load("L0", [4, 0, 2], [0, 2])  # r0:[4,0], r1:[2]
+    backend.wait_for_layer_load("L0", torch.tensor([4, 0, 2]), [0, 2])  # r0:[4,0], r1:[2]
     assert torch.equal(load_buffer[0], latent[4])
     assert torch.equal(load_buffer[1], latent[0])
     assert torch.equal(load_buffer[2], latent[2] + 100)

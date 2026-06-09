@@ -356,7 +356,9 @@ class SparseLatentOffloadManager:
             n_pref = is_pref.sum(dim=1)  # [b]
             token_start_index = torch.cat([n_pref.new_zeros(1), n_pref.cumsum(0)[:-1]]).tolist()
             # prefill positions flattened in (b, topk) row-major order == load_buffer order.
-            flat_selected = plan.prefill_positions[is_pref].tolist()
+            # Kept as a device TENSOR (LMCache accepts a tensor) — no 2048-element .tolist()
+            # on the decode hot path; only the small per-request offsets stay a list.
+            flat_selected = plan.prefill_positions[is_pref]
         if hasattr(self.backend, "set_load_req_ids"):  # in-memory reference backend
             self.backend.set_load_req_ids(req_ids)
         with _prof.section("g_load"):

@@ -65,11 +65,16 @@ class LatentOffloadBackend(Protocol):
     def wait_for_layer_load(
         self,
         layer_name: str,
-        selected_tokens: list[int],
+        selected_tokens: torch.Tensor,
         token_start_index: list[int],
     ) -> None:
         """Gather ``selected_tokens`` for ``layer_name`` into the registered load
         buffer (tight, in ``selected_tokens`` order). Blocks until loaded.
+
+        ``selected_tokens`` is a 1-D device tensor of flat token positions (LMCache
+        accepts a tensor here, so the manager never has to ``.tolist()`` the ~topk*reqs
+        positions on the decode hot path); ``token_start_index`` stays a small per-request
+        offset list (length = num requests).
         """
         ...
 
@@ -111,7 +116,7 @@ class InMemoryLatentOffloadBackend:
     def wait_for_layer_load(
         self,
         layer_name: str,
-        selected_tokens: list[int],
+        selected_tokens: torch.Tensor,
         token_start_index: list[int],
     ) -> None:
         assert self._load_buffer is not None, "register_load_buffer first"
@@ -119,13 +124,15 @@ class InMemoryLatentOffloadBackend:
         # supplied out of band in this reference impl via _load_req_ids (set by the
         # manager just before the call) since the dict is keyed by req_id.
         req_ids = self._load_req_ids
-        starts = list(token_start_index) + [len(selected_tokens)]
+        starts = list(token_start_index) + [int(selected_tokens.shape[0])]
         for r, req_id in enumerate(req_ids):
             lo, hi = starts[r], starts[r + 1]
             if hi <= lo:
                 continue
             dense = self._store[(req_id, layer_name)]
-            idx = torch.tensor(selected_tokens[lo:hi], dtype=torch.long, device=self._device)
+            # selected_tokens is already a device tensor — slice it directly, no host
+            # round-trip / per-request tensor construction.
+            idx = selected_tokens[lo:hi].to(self._device, torch.long)
             # store device may differ from the load buffer (e.g. CPU-offload mock ->
             # NPU buffer); copy across devices into the registered destination.
             self._load_buffer[lo:hi] = dense.index_select(0, idx).to(
