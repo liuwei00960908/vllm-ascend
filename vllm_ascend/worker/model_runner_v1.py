@@ -2847,7 +2847,11 @@ class NPUModelRunner(GPUModelRunner):
                             k_tensor_size = int(kv_cache_tensor.size)  # whole = indexer cache
                             v_tensor_size = 0
                         else:
-                            nb = int(kv_cache_tensor.size) // current_kv_cache_spec.page_size_bytes
+                            # Derive nb from the TRUE latent page (block_size*(512+64)*elt),
+                            # NOT spec.page_size_bytes (grouping unifies it to the small
+                            # indexer page -> nb overcounted -> OOM).
+                            latent_page = bs * (kv_lora_rank + qk_rope_head_dim) * elt
+                            nb = int(kv_cache_tensor.size) // latent_page
                             k_tensor_size = nb * bs * kv_lora_rank * elt
                             v_tensor_size = nb * bs * qk_rope_head_dim * elt
                     elif self.use_sparse and self.dsa_free_paged:
