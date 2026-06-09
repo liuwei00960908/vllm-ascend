@@ -261,7 +261,11 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def wait_for_kv_layer_from_connector(layer_name: str):
+def wait_for_kv_layer_from_connector(
+    layer_name: str,
+    selected_tokens=None,
+    token_start_index=None,
+):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
@@ -272,7 +276,13 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.wait_for_layer_load(layer_name)
+    # DSA selective load: pass the indexer's top-k positions so LMCache loads only the
+    # selected prefill latent for this decode step. Falls back to a whole-layer load when
+    # not provided (prefill / non-sparse).
+    if selected_tokens is not None:
+        connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index)
+    else:
+        connector.wait_for_layer_load(layer_name)
 
 
 def maybe_save_kv_layer_to_connector(

@@ -1312,6 +1312,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             _dsa_probe.probe_topk(topk_indices)
 
+        # DSA selective load (un-bundled decode): the indexer just produced topk, so load
+        # exactly those prefill-latent tokens back from LMCache into the latent paged cache
+        # before sparse attention reads it. No-op when no KV connector is active; prefill
+        # writes latent fresh so it doesn't go through here.
+        if (
+            self.dsa_offload_unbundle
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        ):
+            _sel = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
+            wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel)
+
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
         #   * DecodeOnly step -> gather indexer-selected latent into the A1 scratch and
@@ -1466,6 +1477,12 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        # Offload to LMCache. Un-bundled: save ONLY the latent (k_nope, k_pe) — the
+        # indexer key (kv_cache[2]) stays resident on NPU (it scores every step), so it
+        # must not be offloaded. Bundled path saves the whole tuple as before.
+        if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+            maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+        else:
+            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
