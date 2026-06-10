@@ -147,3 +147,11 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
 
 vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
+
+# The upstream DeepseekV32IndexerBackend reports CUDA kernel block sizes ([64]).
+# On Ascend the indexer cache layout uses 128-token kernel blocks; in DSA
+# two-group mode the runner queries this to split logical blocks into kernel
+# blocks, so it must report 128 (single-group mode never queries it).
+import vllm.v1.attention.backends.mla.indexer as _vllm_dsv32_indexer  # noqa: E402
+
+_vllm_dsv32_indexer.DeepseekV32IndexerBackend.get_supported_kernel_block_sizes = staticmethod(lambda: [128])

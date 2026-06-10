@@ -147,6 +147,10 @@ class AscendSFAMetadata:
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
     dsa_cp_context: DSACPContext | None = None
+    # DSA two-group mode: the indexer KV group's own block table / slot mapping.
+    # None in single-group mode (indexer shares the latent's block ids).
+    indexer_block_table: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
     num_decodes: int = 0
@@ -243,6 +247,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+
+        # DSA two-group mode: mirror the indexer group's table/slots (same
+        # slicing as the latent's) so the impl can address the indexer cache.
+        indexer_block_table = None
+        indexer_slot_mapping = None
+        if common_attn_metadata.indexer_block_table_tensor is not None:
+            indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -343,6 +355,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
+            indexer_block_table=indexer_block_table,
+            indexer_slot_mapping=indexer_slot_mapping,
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -961,6 +975,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
+        # DSA two-group mode: the indexer cache has its own block ids; fall back
+        # to the (shared) latent block table in single-group mode.
+        indexer_block_table = (
+            attn_metadata.indexer_block_table
+            if attn_metadata.indexer_block_table is not None
+            else attn_metadata.block_table
+        )
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -999,7 +1020,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=indexer_block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -1014,7 +1035,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=indexer_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -1027,7 +1048,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=indexer_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -1111,6 +1132,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
+        # DSA two-group mode: the indexer cache write must use the indexer
+        # group's own slots; falls back to the shared slots in single-group mode.
+        idx_slot_mapping = (
+            attn_metadata.indexer_slot_mapping
+            if attn_metadata.indexer_slot_mapping is not None
+            else slot_mapping
+        )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
@@ -1276,14 +1304,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                kv_cache[2].view(-1, k_li.shape[-1]), idx_slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    idx_slot_mapping.view(-1, 1),
                     k_li_scale.view(-1, k_li_scale.shape[-1]),
                 )
             if self.is_kv_producer:

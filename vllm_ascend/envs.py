@@ -136,6 +136,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))
     ),
+    # DSA Step A: latent and indexer become two REAL KV cache groups with separate
+    # block tables and per-group block pools (the vLLM fork gates its side on the
+    # same variable, read as a raw env there). Requires VLLM_ASCEND_DSA_UNBUNDLE=1
+    # and --no-enable-prefix-caching. Prerequisite for freeing latent blocks at
+    # end of prefill (DSA latent offload P2). Default 0.
+    "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))
+    ),
     # DSA latent offload micro-profiler. When 1, the decode path brackets each added
     # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
     # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.

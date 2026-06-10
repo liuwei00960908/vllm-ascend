@@ -302,6 +302,15 @@ class NPUModelRunner(GPUModelRunner):
         self.dsa_unbundle = bool(self.use_sparse and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE)
         if self.dsa_unbundle:
             logger.info("DSA un-bundle enabled: latent and indexer use separate KV cache groups.")
+        # Step A: latent and indexer become two REAL KV cache groups with separate
+        # block tables and per-group block pools (the vLLM side is gated by the
+        # same env var). Requires UNBUNDLE. Prerequisite for freeing latent blocks
+        # at end of prefill while the indexer stays resident.
+        self.dsa_two_groups = bool(self.dsa_unbundle and envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS)
+        if self.dsa_two_groups:
+            logger.info("DSA two-group mode enabled: separate block tables/pools for latent and indexer.")
+        elif envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
+            logger.warning("VLLM_ASCEND_DSA_TWO_GROUPS requires VLLM_ASCEND_DSA_UNBUNDLE=1; ignoring.")
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2237,6 +2246,12 @@ class NPUModelRunner(GPUModelRunner):
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
+            elif self.dsa_two_groups and len(self.kv_cache_config.kv_cache_groups) == 2:
+                # DSA two-group mode: hand the indexer group's (group 1) table and
+                # slots to the latent (SFA) builder; it mirrors them into its
+                # metadata so the impl can read/write the indexer cache, which now
+                # has its own block ids.
+                cm.indexer_block_table_tensor, cm.indexer_slot_mapping = _get_block_table_and_slot_mapping(1)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
