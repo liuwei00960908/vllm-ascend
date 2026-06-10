@@ -319,3 +319,44 @@ def test_hooks_gather_decode_full_step():
     assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[1], cur_nope[0])  # decode 6 (pool)
     assert si[0].tolist()[:2] == [0, 1]
     assert sl[0] == 2
+
+
+class TestScratchRemap:
+    """Step B2: compact-scratch remap of decode top-k."""
+
+    def test_remap_splits_prefill_compact_and_decode_absolute(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        # req0: prompt 100; selected mixes prefill (5,7,99) and decode (100,103)
+        # req1: prompt 200; all prefill
+        topk = torch.tensor(
+            [[[5, 100, 7, 103, 99]],
+             [[10, 11, 12, 13, 14]]], dtype=torch.int32)
+        plen = torch.tensor([100, 200])
+        new_idx, packed = scratch_remap(topk, plen)
+
+        # prefill entries -> compact ranks in topk order; decode stay absolute
+        assert new_idx.tolist() == [[[0, 100, 1, 103, 2]],
+                                    [[0, 1, 2, 3, 4]]]
+        # packed rows: front-packed prefill positions (LMCache scatter order)
+        assert packed.tolist() == [[5, 7, 99, 0, 0],
+                                   [10, 11, 12, 13, 14]]
+        assert packed.dtype == torch.int32
+
+    def test_remap_padding_entries_untouched(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[[3, -1, 8, -1, 4]]], dtype=torch.int32)
+        plen = torch.tensor([10])
+        new_idx, packed = scratch_remap(topk, plen)
+        assert new_idx.tolist() == [[[0, -1, 1, -1, 2]]]
+        assert packed.tolist() == [[3, 8, 4, 0, 0]]
+
+    def test_remap_shape_2d_input(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[2, 50, 1]], dtype=torch.int32)
+        new_idx, packed = scratch_remap(topk, torch.tensor([40]))
+        assert new_idx.shape == topk.shape
+        assert new_idx.tolist() == [[0, 50, 1]]
+        assert packed.tolist() == [[2, 1, 0]]

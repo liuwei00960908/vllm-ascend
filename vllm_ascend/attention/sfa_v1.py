@@ -39,6 +39,7 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -470,6 +471,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
+        # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        )
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1190,7 +1195,15 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
 
-            wait_for_kv_layer_from_connector(layer_name)
+            # Step B2: in compact-scratch decode the connector load is driven by
+            # the post-indexer call (with selected_tokens). Calling here too
+            # would advance the per-request layerwise retriever TWICE per layer
+            # (this one with a dense arange) and desync it — skip.
+            if not (
+                self.dsa_shrink_latent
+                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            ):
+                wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -1340,16 +1353,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             _dsa_probe.probe_topk(topk_indices)
 
-        # DSA selective load (un-bundled decode): the indexer just produced topk, so load
-        # exactly those prefill-latent tokens back from LMCache into the latent paged cache
-        # before sparse attention reads it. No-op when no KV connector is active; prefill
-        # writes latent fresh so it doesn't go through here.
+        # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
+        # Remap prefill-selected entries to compact scratch rows [0..n_ret) (the
+        # request's first ceil(k/block_size) latent blocks) and have LMCache
+        # scatter exactly those tokens into the scratch; decode-selected entries
+        # keep their ABSOLUTE positions (>= prompt_len >= k, disjoint from the
+        # scratch row space) and are read in place via the same block table.
+        # All fixed-shape device math — no D2H sync. No-op without a connector.
         if (
-            self.dsa_offload_unbundle
+            self.dsa_shrink_latent
             and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and attn_metadata.prompt_lens is not None
         ):
-            _sel = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
-            wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel)
+            topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
+            wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel_packed)
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;

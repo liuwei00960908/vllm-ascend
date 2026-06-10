@@ -144,6 +144,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))
     ),
+    # DSA Step B staging. Requires TWO_GROUPS=1 + the LMCache connector.
+    # 1 (B2): decode reads prefill-selected latent from the compact scratch
+    #   (request's first ceil(k/block_size) latent blocks, filled by LMCache);
+    #   decode-selected latent is read in place (absolute positions). Latent
+    #   blocks are NOT freed yet — outputs must match the resident path.
+    # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
+    #   prefill (the actual memory saving). Default 0.
+    "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
+    ),
     # DSA latent offload micro-profiler. When 1, the decode path brackets each added
     # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
     # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.

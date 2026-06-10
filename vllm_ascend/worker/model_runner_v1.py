@@ -311,6 +311,13 @@ class NPUModelRunner(GPUModelRunner):
             logger.info("DSA two-group mode enabled: separate block tables/pools for latent and indexer.")
         elif envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
             logger.warning("VLLM_ASCEND_DSA_TWO_GROUPS requires VLLM_ASCEND_DSA_UNBUNDLE=1; ignoring.")
+        # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
+        self.dsa_shrink_latent = (
+            int(envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_two_groups else 0
+        )
+        if self.dsa_shrink_latent:
+            logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
+        self._dsa_short_prompt_warned = False
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2252,6 +2259,22 @@ class NPUModelRunner(GPUModelRunner):
                 # metadata so the impl can read/write the indexer cache, which now
                 # has its own block ids.
                 cm.indexer_block_table_tensor, cm.indexer_slot_mapping = _get_block_table_and_slot_mapping(1)
+                if self.dsa_shrink_latent:
+                    # B2 compact-scratch decode needs per-request prompt lengths
+                    # on device to split topk into prefill (scratch) vs decode
+                    # (in-place) entries. Small [num_reqs_padded] H2D per step.
+                    # Graph-mode padding rows get a huge prompt_len (their rows
+                    # are discarded anyway and must not alias real positions).
+                    plens_np = self.input_batch.num_prompt_tokens[:num_reqs]
+                    if not self._dsa_short_prompt_warned and (plens_np > 0).any() and plens_np[plens_np > 0].min() < 2048:
+                        logger.warning(
+                            "DSA shrink-latent: request with prompt_len < index_topk (2048) detected; "
+                            "the compact-scratch path does not support it yet (scratch rows would alias "
+                            "live decode positions). Expect wrong output for such requests.")
+                        self._dsa_short_prompt_warned = True
+                    plens_padded = np.full(num_reqs_padded, np.iinfo(np.int32).max, dtype=np.int32)
+                    plens_padded[:num_reqs] = plens_np
+                    cm.prompt_lens = torch.from_numpy(plens_padded).to(self.device, non_blocking=True)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
