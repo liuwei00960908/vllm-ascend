@@ -362,3 +362,15 @@ class TestScratchRemap:
         assert new_idx.shape == topk.shape
         assert new_idx.tolist() == [[0, 50, 1]]
         assert packed.tolist() == [[2, 1, 0]]
+
+    def test_remap_mixed_rows_plen_zero_untouched(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        # row0: decode row (plen 100) -> remapped; row1: prefill row (plen 0) -> untouched
+        topk = torch.tensor([[[5, 100, 7]],
+                             [[5, 100, 7]]], dtype=torch.int32)
+        plen = torch.tensor([100, 0])
+        new_idx, packed = scratch_remap(topk, plen)
+        assert new_idx.tolist() == [[[0, 100, 1]],
+                                    [[5, 100, 7]]]      # prefill row unchanged
+        assert packed.tolist()[0] == [5, 7, 0]

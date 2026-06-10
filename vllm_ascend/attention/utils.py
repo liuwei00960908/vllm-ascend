@@ -167,6 +167,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # separate groups). None in single-group mode.
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    # DSA shrink-latent: per-request prompt lengths (CPU, length num_reqs); the
+    # SFA builder expands them per ROW (decode rows -> plen, prefill/padding
+    # rows -> 0 = no remap).
+    prompt_lens_cpu: Any = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":

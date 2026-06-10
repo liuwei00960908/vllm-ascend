@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 import scipy  # type: ignore
+import numpy as np
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -257,6 +258,30 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
 
+        # DSA shrink-latent: expand per-request prompt lengths to per-ROW values
+        # for scratch_remap — decode rows (position >= prompt_len) get plen,
+        # prefill and padding rows get 0 (= left untouched by the remap). Works
+        # for both pure-decode and mixed chunked-prefill+decode steps.
+        prompt_lens_rows = None
+        num_decode_rows = 0
+        plens_cpu = common_attn_metadata.prompt_lens_cpu
+        if plens_cpu is not None:
+            rows = np.zeros(num_input_tokens, dtype=np.int32)
+            n_real = min(len(plens_cpu), num_reqs)
+            if common_attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                rows[:n_real] = plens_cpu[:n_real]
+            else:
+                qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
+                computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_cpu[r])
+                    first_decode = max(s, s + plen - int(computed[r]))
+                    if first_decode < e:
+                        rows[first_decode:e] = plen
+            num_decode_rows = int((rows > 0).sum())
+            prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
+
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
@@ -361,7 +386,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
-            prompt_lens=getattr(common_attn_metadata, "prompt_lens", None),
+            prompt_lens=prompt_lens_rows,
+            num_decode_tokens=num_decode_rows,
         )
 
     def build_for_graph_capture(
@@ -1195,14 +1221,12 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
 
-            # Step B2: in compact-scratch decode the connector load is driven by
+            # Step B2: in compact-scratch mode the connector load is driven by
             # the post-indexer call (with selected_tokens). Calling here too
             # would advance the per-request layerwise retriever TWICE per layer
-            # (this one with a dense arange) and desync it — skip.
-            if not (
-                self.dsa_shrink_latent
-                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            ):
+            # (this one with a dense arange) and desync it — skip whenever the
+            # batch has decode rows (mixed steps included).
+            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -1362,15 +1386,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         if (
             self.dsa_shrink_latent
-            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and attn_metadata.prompt_lens is not None
+            and attn_metadata.num_decode_tokens > 0
         ):
+            # prompt_lens is per ROW: decode rows carry their request's prompt
+            # length, prefill/padding rows carry 0 and stay untouched — so this
+            # also covers mixed chunked-prefill + decode steps.
             topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
             if self.dsa_shrink_latent != 3:
-                wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel_packed)
+                # decode rows come first in the reordered batch; the adapter
+                # iterates exactly the sparse-decode requests in row order.
+                wait_for_kv_layer_from_connector(
+                    layer_name,
+                    selected_tokens=_sel_packed[: attn_metadata.num_decode_tokens],
+                )
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;

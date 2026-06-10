@@ -2260,11 +2260,10 @@ class NPUModelRunner(GPUModelRunner):
                 # has its own block ids.
                 cm.indexer_block_table_tensor, cm.indexer_slot_mapping = _get_block_table_and_slot_mapping(1)
                 if self.dsa_shrink_latent:
-                    # B2 compact-scratch decode needs per-request prompt lengths
-                    # on device to split topk into prefill (scratch) vs decode
-                    # (in-place) entries. Small [num_reqs_padded] H2D per step.
-                    # Graph-mode padding rows get a huge prompt_len (their rows
-                    # are discarded anyway and must not alias real positions).
+                    # B2 compact-scratch decode: hand per-request prompt lengths
+                    # (CPU) to the SFA builder, which expands them to per-ROW
+                    # values (decode rows -> plen, prefill/padding rows -> 0 =
+                    # no remap) and ships them to device.
                     plens_np = self.input_batch.num_prompt_tokens[:num_reqs]
                     if not self._dsa_short_prompt_warned and (plens_np > 0).any() and plens_np[plens_np > 0].min() < 2048:
                         logger.warning(
@@ -2272,12 +2271,7 @@ class NPUModelRunner(GPUModelRunner):
                             "the compact-scratch path does not support it yet (scratch rows would alias "
                             "live decode positions). Expect wrong output for such requests.")
                         self._dsa_short_prompt_warned = True
-                    plens_padded = np.full(num_reqs_padded, np.iinfo(np.int32).max, dtype=np.int32)
-                    plens_padded[:num_reqs] = plens_np
-                    # NOTE: blocking copy — a non_blocking H2D from pageable host
-                    # memory may read freed bytes (the temp array dies right
-                    # after), yielding garbage prompt_lens -> wild sparse indices.
-                    cm.prompt_lens = torch.from_numpy(plens_padded).to(self.device)
+                    cm.prompt_lens_cpu = plens_np.copy()
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
