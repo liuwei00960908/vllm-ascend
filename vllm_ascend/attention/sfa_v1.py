@@ -1366,7 +1366,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.prompt_lens is not None
         ):
             topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
-            wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel_packed)
+            # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
+            # NO LMCache call. Output is expected wrong; only crash/no-crash
+            # matters (crash => our remap/FA, clean => LMCache transfer kernel).
+            if self.dsa_shrink_latent != 3:
+                wait_for_kv_layer_from_connector(layer_name, selected_tokens=_sel_packed)
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
