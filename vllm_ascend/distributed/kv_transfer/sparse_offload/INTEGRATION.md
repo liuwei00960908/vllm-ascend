@@ -273,3 +273,27 @@ eager-mode perf problem.
 Blocked on: colleague rebuild of LMCache-Ascend (undefined symbol
 kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse in c_ops.so) before any
 smoke test.
+
+## Step A — two-group mode: VERIFIED ON HW (2026-06-10)
+
+vllm fork branch `dsa-two-groups` @ 0d385ed49 + vllm-ascend sparse @ 3d1b1b25,
+flags UNBUNDLE=1 + TWO_GROUPS=1 (+ --no-enable-prefix-caching, no LMCache):
+  - "Per-group KV block pools: 2 pools x 12976 blocks each"
+  - GPU KV cache 1,660,928 tokens, concurrency 50.69x (== P1/base)
+  - TPOT 22.36 (base 22.5), seed-0 output token-identical to P1.
+
+Step B (next, the actual memory saving):
+  B1 vllm: at prefill end, shrink the request's LATENT blocks — keep the first
+     ceil(k/128)=16 blocks as the [retrieve|decode] scratch, swap the rest to
+     null_block and free them (same pattern as SlidingWindowManager.
+     remove_skipped_blocks; avoids double-free on request finish).
+  B2 ascend: decode FA reads the compact scratch — remap topk to compact
+     indices [0..k) (reuse pool A1 logic), scratch block_table (first 16
+     blocks), copy selected DECODE-token latent into scratch[n_retrieve..k),
+     LMCache wait_for_layer_load(selected) fills scratch[0..n_retrieve).
+  B3 integration point with colleague (LMCache): on sparse decode the
+     ReqMeta slot_mapping must be the SCRATCH slots (first 16 blocks => k
+     slots), not the full prefill expansion — else the length-mismatch
+     ValueError returns.
+  B4 sizing knob: shrink the latent pool (N_l < N_i) => the actual memory
+     number. Needs per-group num_blocks in KVCacheConfig.
