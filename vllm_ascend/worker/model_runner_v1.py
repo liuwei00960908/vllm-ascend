@@ -2274,7 +2274,10 @@ class NPUModelRunner(GPUModelRunner):
                         self._dsa_short_prompt_warned = True
                     plens_padded = np.full(num_reqs_padded, np.iinfo(np.int32).max, dtype=np.int32)
                     plens_padded[:num_reqs] = plens_np
-                    cm.prompt_lens = torch.from_numpy(plens_padded).to(self.device, non_blocking=True)
+                    # NOTE: blocking copy — a non_blocking H2D from pageable host
+                    # memory may read freed bytes (the temp array dies right
+                    # after), yielding garbage prompt_lens -> wild sparse indices.
+                    cm.prompt_lens = torch.from_numpy(plens_padded).to(self.device)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
