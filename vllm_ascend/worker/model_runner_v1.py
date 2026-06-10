@@ -2655,7 +2655,24 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            kv_caches_to_register = kv_caches
+            if self.dsa_unbundle:
+                # Un-bundled: the indexer layer registers a 1-tuple (key only, no
+                # value). The KV connector only offloads the latent, and LMCache's
+                # permute requires >=2 tensors per entry, so register latent layers
+                # only and keep the indexer out of the connector entirely.
+                kv_caches_to_register = {
+                    name: kv
+                    for name, kv in kv_caches.items()
+                    if not (isinstance(kv, (tuple, list)) and len(kv) < 2)
+                }
+                logger.info(
+                    "DSA un-bundle: registering %d/%d KV layers with the connector "
+                    "(latent only; indexer kept resident).",
+                    len(kv_caches_to_register),
+                    len(kv_caches),
+                )
+            get_kv_transfer_group().register_kv_caches(kv_caches_to_register)
 
         self._maybe_init_dsa_latent_offload()
 
