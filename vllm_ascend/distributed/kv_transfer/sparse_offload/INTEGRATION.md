@@ -232,3 +232,44 @@ FREE_PAGED=1; greedy output should match baseline.
 registered buffer **tightly in `selected_tokens` order**. Confirm; if it instead
 writes at `token_start_index`-based offsets, only `InMemoryLatentOffloadBackend` and
 the staging-copy offsets in `gather_decode_layer` change.
+
+## P2 — real LMCache offload (FINAL design, agreed)
+
+Connector: `LMCacheAscendConnectorV1Dynamic` (env: LMCACHE_ENABLE_SPARSE_ATTENTION=true,
+LMCACHE_USE_LAYERWISE=true, LMCACHE_CHUNK_SIZE=256; `--kv-transfer-config`). Requires
+P1 (`VLLM_ASCEND_DSA_UNBUNDLE=1`) so indexer is its own resident KV group.
+
+NPU memory layout (decode steady state):
+  - indexer: vLLM resident group (full context)               [P1, keep]
+  - latent prefill buffer: full context, for prefill FA; freed after prefill (may free
+    per chunked-prefill chunk). [ours]
+  - latent decode scratch: ONE fixed topk-compact paged buffer (k=index_topk), reused
+    per layer/step, structure [retrieve | decode]. [ours, registered with connector]
+
+Per-step decode flow (Model C, compact):
+  1. indexer -> topk (selected absolute positions).
+  2. start_load_kv builds retrieve_layer_head_token_wise(slot_mapping = OUR compact
+     slots into the scratch).
+  3. per layer: wait_for_layer_load(layer, selected_tokens=topk_prefill_positions,
+     token_start_index) -> LMCache scatters the selected PREFILL latent into
+     scratch[0 .. n_retrieve).
+  4. we append the selected DECODE-token latent (kept on NPU, id>=prompt_len) into
+     scratch[n_retrieve .. k).
+  5. kernel reads scratch with COMPACT sparse_indices [0..k).
+
+Division of labor:
+  - LMCache (colleague): save_kv_layer (offload latent to CPU), retrieve_layer_head_token_wise
+    (load selected into the scratch via slot_mapping), Ascend sparse transfer kernel.
+  - us (vllm-ascend): allocate+register the topk scratch as the latent layer's kv_cache;
+    construct the compact slot_mapping by scratch layout; feed selected_tokens=topk; fill
+    the decode segment; compact indices for the kernel; prefill full-buffer + free.
+
+Reuse from the pool work (already parity-validated): scratch buffer (allocate_buffers),
+build_gather_plan/resolve_scratch_gather (A1 compact indices), decode-latent store. The
+only change from the pool: the RETRIEVE segment is filled by the real LMCache connector
+(one fused transfer) instead of my eager per-request gather — which also removes the
+eager-mode perf problem.
+
+Blocked on: colleague rebuild of LMCache-Ascend (undefined symbol
+kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse in c_ops.so) before any
+smoke test.
