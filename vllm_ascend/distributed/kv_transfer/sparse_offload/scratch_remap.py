@@ -38,8 +38,10 @@ def scratch_remap(topk_indices: torch.Tensor, prompt_lens: torch.Tensor):
     plen = prompt_lens.reshape(-1, 1).to(sel.dtype)
 
     is_pref = (sel >= 0) & (sel < plen)
-    # Compact rank among prefill-selected entries, in top-k order.
-    rank = torch.cumsum(is_pref.to(sel.dtype), dim=1) - 1
+    # Compact rank among prefill-selected entries, in top-k order. NOTE:
+    # torch.cumsum promotes integer dtypes to int64 by default; the sparse FA
+    # kernel requires int32 indices, so pin the dtype explicitly.
+    rank = torch.cumsum(is_pref, dim=1, dtype=sel.dtype) - 1
     new_indices = torch.where(is_pref, rank, sel)
 
     # Front-pack the prefill-selected absolute positions into [bs, k] (+1

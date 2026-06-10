@@ -342,6 +342,8 @@ class TestScratchRemap:
         assert packed.tolist() == [[5, 7, 99, 0, 0],
                                    [10, 11, 12, 13, 14]]
         assert packed.dtype == torch.int32
+        # the FA kernel requires int32 sparse indices — dtype must be preserved
+        assert new_idx.dtype == topk.dtype
 
     def test_remap_padding_entries_untouched(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
