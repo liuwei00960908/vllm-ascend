@@ -136,14 +136,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))
     ),
-    # DSA decode selective-load: when 1 (and UNBUNDLE on), the decode path passes the
-    # indexer top-k to the connector's wait_for_layer_load(selected_tokens=...) so LMCache
-    # loads only the selected prefill latent. Requires a connector whose wait_for_layer_load
-    # accepts selected_tokens; the stock LMCacheConnectorV1Dynamic does not yet, so this is
-    # OFF by default and the save path can be validated independently first.
-    "VLLM_ASCEND_DSA_SELECTIVE_LOAD": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_SELECTIVE_LOAD", "0"))
-    ),
     # DSA latent offload micro-profiler. When 1, the decode path brackets each added
     # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
     # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.

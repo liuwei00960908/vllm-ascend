@@ -456,12 +456,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
-        # Decode selective-load via the connector. Off until the connector's
-        # wait_for_layer_load accepts selected_tokens; until then decode reads the
-        # (still-resident) latent and only the prefill save path is exercised.
-        self.dsa_selective_load = self.dsa_offload_unbundle and bool(
-            envs.VLLM_ASCEND_DSA_SELECTIVE_LOAD
-        )
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1323,7 +1317,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # before sparse attention reads it. No-op when no KV connector is active; prefill
         # writes latent fresh so it doesn't go through here.
         if (
-            self.dsa_selective_load
+            self.dsa_offload_unbundle
             and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
         ):
             _sel = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
