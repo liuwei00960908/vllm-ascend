@@ -1399,7 +1399,11 @@ class NPUModelRunner(GPUModelRunner):
         dsa_offload_manager = getattr(self, "dsa_offload_manager", None)
         dsa_req_ids = None
         dsa_prompt_lens = None
-        if dsa_offload_manager is not None:
+        # Thread per-request ids/prompt lengths (input_batch row order) into the
+        # forward context whenever a DSA sparse path needs them: the offload manager
+        # (Option A) AND the shrink-latent LMCache path, which keys its selected-token
+        # rows to requests by req_id.
+        if dsa_offload_manager is not None or self.dsa_shrink_latent:
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])

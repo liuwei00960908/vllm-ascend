@@ -290,7 +290,18 @@ def wait_for_kv_layer_from_connector(
     # selected prefill latent for this decode step. Falls back to a whole-layer load when
     # not provided (prefill / non-sparse).
     if selected_tokens is not None:
-        connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index)
+        # Per-row request identity, in the SAME order as `selected_tokens` (both are
+        # sliced from input_batch-row-ordered data). LMCache uses this to pair each
+        # decode request to its own selected-token row by req_id instead of by loop
+        # position, so a divergence between the connector-metadata order and the
+        # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
+        request_ids = None
+        dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+        if dsa_req_ids is not None:
+            request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+        connector.wait_for_layer_load(
+            layer_name, selected_tokens, token_start_index, request_ids
+        )
     else:
         connector.wait_for_layer_load(layer_name)
 
