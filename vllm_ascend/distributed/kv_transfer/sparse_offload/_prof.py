@@ -44,6 +44,25 @@ class section:
             _n[self.name] += 1
 
 
+def begin(name: str):
+    """Manual span start for code with early returns (pairs with end()). Returns a
+    token to pass to end(), or None when disabled."""
+    if not ENABLED:
+        return None
+    torch.npu.synchronize()
+    return (name, time.perf_counter())
+
+
+def end(token) -> None:
+    """Manual span stop; accumulates real device time into the named section."""
+    if not ENABLED or token is None:
+        return
+    torch.npu.synchronize()
+    name, t = token
+    _acc[name] += (time.perf_counter() - t) * 1000.0
+    _n[name] += 1
+
+
 _padding_logged = [False]
 
 

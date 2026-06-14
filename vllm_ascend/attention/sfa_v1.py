@@ -1148,6 +1148,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        _sfa_t = _dsa_prof.begin("sfa_fwd")
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
             # layer_name is the inner MLAAttention name (...self_attn.attn); the indexer
@@ -1549,6 +1550,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 should_shard_weight=full_gather_o_proj_enabled,
             )
             if not require_o_proj_forward:
+                _dsa_prof.end(_sfa_t)
                 return result
             attn_output = result
 
@@ -1572,4 +1574,5 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
+        _dsa_prof.end(_sfa_t)
         return output_padded
