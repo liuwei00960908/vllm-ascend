@@ -1361,16 +1361,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             _dsa_probe.probe_metadata_and_kv_cache(attn_metadata, kv_cache)
 
-        topk_indices = self.indexer_select_post_process(
-            x=hidden_states,
-            q_c=q_c,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            cos=cos,
-            sin=sin,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-        )
+        with _dsa_prof.section("indexer"):
+            topk_indices = self.indexer_select_post_process(
+                x=hidden_states,
+                q_c=q_c,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                cos=cos,
+                sin=sin,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+            )
 
         if envs.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT:
             from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
@@ -1399,10 +1400,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3:
                 # decode rows come first in the reordered batch; the adapter
                 # iterates exactly the sparse-decode requests in row order.
-                wait_for_kv_layer_from_connector(
-                    layer_name,
-                    selected_tokens=_sel_packed[: attn_metadata.num_decode_tokens],
-                )
+                with _dsa_prof.section("lmc_retrieve"):
+                    wait_for_kv_layer_from_connector(
+                        layer_name,
+                        selected_tokens=_sel_packed[: attn_metadata.num_decode_tokens],
+                    )
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
@@ -1518,10 +1520,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = pool_out
 
         if attn_output is None:
-            attn_output = self._execute_sparse_flash_attention_process(
-                ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                actual_seq_lengths_query, actual_seq_lengths_key,
-            )
+            with _dsa_prof.section("fa"):
+                attn_output = self._execute_sparse_flash_attention_process(
+                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                    actual_seq_lengths_query, actual_seq_lengths_key,
+                )
+            # one step per layer-call on the native (user) path so the profiler
+            # logs mean ms/layer-call periodically (mirrors the manager path).
+            _dsa_prof.step()
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
