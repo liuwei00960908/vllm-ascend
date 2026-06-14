@@ -1155,10 +1155,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             # cache is the sibling ...self_attn.indexer.k_cache. Re-assemble a 3-tuple so
             # the indexer read/write (kv_cache[2]) work unchanged — both groups share the
             # request's block ids, so attn_metadata.block_table/slot_mapping address both.
-            _fc_ub = get_forward_context()
-            _idx_name = layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
-            _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
-            _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+            # The indexer KV tensor is allocated once at startup; cache the ref to avoid a
+            # per-layer no_compile_layers dict lookup + tuple rebuild on the decode path.
+            _idx_t = getattr(self, "_dsa_idx_cache_t", None)
+            if _idx_t is None:
+                _fc_ub = get_forward_context()
+                _idx_name = layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
+                _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+                self._dsa_idx_cache_t = _idx_t
             kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
 
         cos = attn_metadata.cos
@@ -1569,10 +1574,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Offload to LMCache. Un-bundled: save ONLY the latent (k_nope, k_pe) — the
         # indexer key (kv_cache[2]) stays resident on NPU (it scores every step), so it
         # must not be offloaded. Bundled path saves the whole tuple as before.
-        if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-            maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
-        else:
-            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        # Shrink-latent: a pure-decode step's latent lives in the resident tail and is
+        # never reloaded from LMCache, so saving it every decode layer is redundant
+        # connector work (scales with batch). Skip save on steps with no prefill tokens
+        # — gated per STEP (num_prefills is shared by all layers), so the layerwise save
+        # generator is never created that step and wait_for_save tolerates its absence.
+        _skip_decode_save = bool(self.dsa_shrink_latent) and attn_metadata.num_prefills == 0
+        if not _skip_decode_save:
+            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+            else:
+                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         _dsa_prof.end(_sfa_t)
         return output_padded
