@@ -83,16 +83,24 @@ def log_topk_padding(topk_row: "torch.Tensor", invalid: int) -> None:
 
 
 def step() -> None:
-    """Call once per decode layer; periodically logs mean ms/call per section."""
+    """Call once per decode layer; periodically logs mean ms/call per section.
+
+    WINDOWED: stats are reset after each log so every line reflects only the last
+    _LOG_EVERY layer-calls. This keeps a few heavy prefill calls (16k tokens each)
+    from dominating the cumulative mean — once in steady decode, the latest lines
+    are pure-decode timings.
+    """
     if not ENABLED:
         return
     _calls[0] += 1
     if _calls[0] % _LOG_EVERY == 0:
         parts = "  ".join(
-            f"{k}={_acc[k] / _n[k]:.3f}" for k in sorted(_acc)
+            f"{k}={_acc[k] / _n[k]:.3f}" for k in sorted(_acc) if _n[k]
         )
-        total = sum(_acc[k] / _n[k] for k in _acc)
+        total = sum(_acc[k] / _n[k] for k in _acc if _n[k])
         logger.info(
-            "[DSA-PROF] mean ms/layer-call over %d calls: %s  (sum=%.3f)",
-            _calls[0], parts, total,
+            "[DSA-PROF] window mean ms/layer-call (last %d): %s  (sum=%.3f)",
+            _LOG_EVERY, parts, total,
         )
+        _acc.clear()
+        _n.clear()
