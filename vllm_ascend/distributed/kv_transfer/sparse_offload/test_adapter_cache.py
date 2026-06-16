@@ -20,12 +20,29 @@ import sys
 
 import torch
 
-# Make `kv_cache_adapter` (C:/Code/kv_cache_adapter) and this module importable.
+# Make `kv_cache_adapter` and this module importable WITHOUT installing the package
+# (its setup.py compiles NPU/CUDA .so; the CPU path here needs none of that).
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CODE_ROOT = r"C:\Code"
-for p in (_CODE_ROOT, _HERE):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+
+def _ensure_kv_cache_adapter_importable() -> None:
+    try:
+        import kv_cache_adapter  # noqa: F401
+        return
+    except ImportError:
+        pass
+    # Override with env var, else assume kv_cache_adapter sits next to the
+    # vllm-ascend repo root (…/<root>/kv_cache_adapter and …/<root>/vllm-ascend).
+    parent = os.environ.get("KV_CACHE_ADAPTER_PARENT")
+    if parent is None:
+        parent = os.path.abspath(os.path.join(_HERE, *([os.pardir] * 5)))
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+
+
+_ensure_kv_cache_adapter_importable()
 
 from adapter_cache import AdapterCacheConfig, AdapterLatentCache  # noqa: E402
 from kv_cache_adapter import InMemoryBlockStoreBackend  # noqa: E402
