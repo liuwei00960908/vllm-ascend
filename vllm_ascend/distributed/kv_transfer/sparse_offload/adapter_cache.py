@@ -34,16 +34,39 @@ vLLM or an NPU.
 from __future__ import annotations
 
 import math
+import os
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 
-from kv_cache_adapter import (  # type: ignore[import-not-found]
-    BlockStoreBackend,
-    InMemoryBlockStoreBackend,
-    KVCacheAdapter,
-)
+
+def _import_kv_cache_adapter():
+    """Import the ``kv_cache_adapter`` package, self-locating if it isn't on the path.
+
+    Assumes ``kv_cache_adapter`` sits next to the vllm-ascend repo root (the layout
+    here: ``<root>/kv_cache_adapter`` and ``<root>/vllm-ascend/...``). Falls back to
+    appending ``<root>`` to ``sys.path`` (or ``KV_CACHE_ADAPTER_PARENT``) so no
+    PYTHONPATH change is needed. Append-only: never disturbs other packages' paths.
+    """
+    try:
+        import kv_cache_adapter as _mod  # noqa: PLC0415
+        return _mod
+    except ImportError:
+        parent = os.environ.get("KV_CACHE_ADAPTER_PARENT") or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), *([os.pardir] * 5))
+        )
+        if parent not in sys.path:
+            sys.path.append(parent)
+        import kv_cache_adapter as _mod  # noqa: PLC0415
+        return _mod
+
+
+_kvca = _import_kv_cache_adapter()
+BlockStoreBackend = _kvca.BlockStoreBackend
+InMemoryBlockStoreBackend = _kvca.InMemoryBlockStoreBackend
+KVCacheAdapter = _kvca.KVCacheAdapter
 
 ID_DTYPE = torch.int64
 INVALID_POSITION = -1
@@ -359,20 +382,15 @@ class AdapterLatentCache:
 
 def is_adapter_cache_enabled(vllm_config) -> bool:
     """True iff the adapter-cache flag is on AND this is a DSA model."""
-    import os
-
     from vllm_ascend import envs as envs_ascend  # noqa: PLC0415
 
     if not getattr(envs_ascend, "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", 0):
         return False
-    del os
     return hasattr(vllm_config.model_config.hf_text_config, "index_topk")
 
 
 def config_from_vllm(vllm_config, layer_names: list[str], device) -> AdapterCacheConfig | None:
     """Build :class:`AdapterCacheConfig` from vLLM config + env knobs (or None)."""
-    import os
-
     from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE  # noqa: PLC0415
 
     from vllm_ascend import envs as envs_ascend  # noqa: PLC0415
