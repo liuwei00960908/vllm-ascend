@@ -373,6 +373,22 @@ class NPUWorker(WorkerBase):
                     scope="local",
                 )
 
+        # Adapter-backed latent hot cache (separate flag): reserve its per-layer pools
+        # out of the KV budget too, before the block split. No-op when off.
+        if envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE:
+            from vllm_ascend.distributed.kv_transfer.sparse_offload.adapter_cache import (
+                reserved_bytes_from_vllm,
+            )
+
+            adapter_reserved_bytes = reserved_bytes_from_vllm(self.vllm_config)
+            if adapter_reserved_bytes:
+                self.available_kv_cache_memory_bytes -= adapter_reserved_bytes
+                logger.info_once(
+                    "Reserved %.2f GiB for DSA adapter latent pools",
+                    GiB(adapter_reserved_bytes),
+                    scope="local",
+                )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"

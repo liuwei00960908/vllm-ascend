@@ -180,10 +180,80 @@ class AdapterLatentCache:
         self._req_slot_of.pop(req_id, None)
         self._free_req_slots.append(slot)
 
+    def req_slots_tensor(self, req_ids: list[str]) -> torch.Tensor:
+        """req-slot per row for the current batch; recycles slots of departed reqs.
+
+        v1 lifecycle without a model-runner finished-hook: any req previously seen
+        but absent from the current batch is treated as finished and freed. NOTE:
+        this also frees preempted/swapped-out requests (bring-up limitation); a
+        returning request gets a fresh slot and re-fetches from the backend.
+        """
+        present = set(req_ids)
+        for gone in [r for r in self._req_slot_of if r not in present]:
+            self.free_request(gone)
+        return torch.tensor([self.req_slot(r) for r in req_ids], dtype=ID_DTYPE, device=self.config.device)
+
     # ----------------------------------------------------------- logical ids
     def _logical(self, req_slot: int, positions: torch.Tensor) -> torch.Tensor:
         """absolute positions -> global logical block ids (request-scoped)."""
         return positions // self.config.block_size + req_slot * self.config.blocks_per_req
+
+    # --------------------------------------------------------------- prefill
+    def store_prefill(
+        self,
+        layer_name: str,
+        req_ids: list[str],
+        query_start_loc: torch.Tensor,  # [b+1] CSR offsets into packed k_nope/k_pe
+        context_lens: torch.Tensor,     # [b] tokens already computed (chunked prefill)
+        k_nope: torch.Tensor,           # [num_tokens, kv_lora_rank]
+        k_pe: torch.Tensor,             # [num_tokens, qk_rope_head_dim]
+    ) -> None:
+        """Assemble full blocks of this layer's prompt latent and save them into the
+        adapter backend so decode-time ``retrieve`` can fetch prefill-selected blocks.
+
+        Boundary block (the partial last block of a request) is stored as-is; decode
+        later appends to the same block in the pool. Limitation: if that block is
+        evicted before decode resumes, its prefill rows reload from here (correct) but
+        a brand-new ``insert`` would re-allocate an empty slot — keep the pool large
+        enough during bring-up so the boundary block stays resident.
+        """
+        cfg = self.config
+        bs = cfg.block_size
+        layer = self._layers[layer_name]
+        qsl = query_start_loc.to(torch.long).tolist()
+        ctx = context_lens.to(torch.long).tolist()
+        kn = k_nope.reshape(-1, cfg.kv_lora_rank)
+        kp = k_pe.reshape(-1, cfg.qk_rope_head_dim)
+
+        ids: list[int] = []
+        kn_blocks: list[torch.Tensor] = []
+        kp_blocks: list[torch.Tensor] = []
+        for b, req_id in enumerate(req_ids):
+            lo, hi = qsl[b], qsl[b + 1]
+            if hi <= lo:
+                continue
+            req_slot = self.req_slot(req_id)
+            blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            for tok in range(lo, hi):
+                pos = ctx[b] + (tok - lo)
+                blk, off = pos // bs, pos % bs
+                if blk not in blocks:
+                    blocks[blk] = (
+                        torch.zeros(bs, 1, cfg.kv_lora_rank, dtype=cfg.dtype, device=cfg.device),
+                        torch.zeros(bs, 1, cfg.qk_rope_head_dim, dtype=cfg.dtype, device=cfg.device),
+                    )
+                blocks[blk][0][off, 0] = kn[tok]
+                blocks[blk][1][off, 0] = kp[tok]
+            for blk, (knb, kpb) in blocks.items():
+                ids.append(blk + req_slot * cfg.blocks_per_req)
+                kn_blocks.append(knb)
+                kp_blocks.append(kpb)
+
+        if ids:
+            layer.backend.save_blocks(
+                torch.tensor(ids, dtype=ID_DTYPE, device=cfg.device),
+                [torch.stack(kn_blocks), torch.stack(kp_blocks)],
+            )
 
     # -------------------------------------------------------------- retrieve
     def retrieve(
@@ -278,3 +348,82 @@ class AdapterLatentCache:
         layer.knope_pool[slot, offset, 0, :] = k_nope.to(cfg.dtype)
         layer.kpe_pool[slot, offset, 0, :] = k_pe.to(cfg.dtype)
         return slot
+
+
+# ----------------------------------------------------------------------------
+# vLLM glue (imported lazily so the CPU parity test never needs vLLM installed).
+# ----------------------------------------------------------------------------
+
+def is_adapter_cache_enabled(vllm_config) -> bool:
+    """True iff the adapter-cache flag is on AND this is a DSA model."""
+    import os
+
+    from vllm_ascend import envs as envs_ascend  # noqa: PLC0415
+
+    if not getattr(envs_ascend, "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", 0):
+        return False
+    del os
+    return hasattr(vllm_config.model_config.hf_text_config, "index_topk")
+
+
+def config_from_vllm(vllm_config, layer_names: list[str], device) -> AdapterCacheConfig | None:
+    """Build :class:`AdapterCacheConfig` from vLLM config + env knobs (or None)."""
+    import os
+
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE  # noqa: PLC0415
+
+    from vllm_ascend import envs as envs_ascend  # noqa: PLC0415
+
+    if not is_adapter_cache_enabled(vllm_config):
+        return None
+    hf = vllm_config.model_config.hf_text_config
+    cache_config = vllm_config.cache_config
+    sched = vllm_config.scheduler_config
+
+    cache_dtype = cache_config.cache_dtype
+    dtype = vllm_config.model_config.dtype if cache_dtype == "auto" else STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+
+    # block_size aligned to the LMCache chunk (miss-fetch = one clean chunk).
+    block_size = int(os.getenv("LMCACHE_CHUNK_SIZE", str(cache_config.block_size)))
+    cap = envs_ascend.VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP or sched.max_num_seqs
+    ratio = envs_ascend.VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO
+
+    return AdapterCacheConfig(
+        layer_names=list(layer_names),
+        kv_lora_rank=hf.kv_lora_rank,
+        qk_rope_head_dim=hf.qk_rope_head_dim,
+        block_size=block_size,
+        topk=hf.index_topk,
+        max_model_len=vllm_config.model_config.max_model_len,
+        max_num_seqs=sched.max_num_seqs,
+        pool_concurrency_cap=int(cap),
+        pool_ratio=float(ratio),
+        dtype=dtype,
+        device=torch.device(device),
+    )
+
+
+def build_adapter_cache(vllm_config, layer_names: list[str], device) -> AdapterLatentCache | None:
+    """Construct the per-layer adapter cache (in-memory backend), or None if off."""
+    cfg = config_from_vllm(vllm_config, layer_names, device)
+    if cfg is None:
+        return None
+    return AdapterLatentCache(cfg)
+
+
+def reserved_bytes_from_vllm(vllm_config) -> int:
+    """KV-budget bytes to subtract for the adapter pools (0 if disabled).
+
+    Mirrors ``runner_integration.maybe_reserved_bytes``; layer count comes from
+    ``num_hidden_layers`` here (the per-layer pools are sized identically).
+    """
+    cfg = config_from_vllm(
+        vllm_config,
+        ["l"] * int(vllm_config.model_config.hf_text_config.num_hidden_layers),
+        device="cpu",
+    )
+    if cfg is None:
+        return 0
+    elt = torch.empty((), dtype=cfg.dtype).element_size()
+    per_layer = cfg.num_actual_blocks * cfg.block_size * cfg.latent_dim * elt
+    return per_layer * len(cfg.layer_names)

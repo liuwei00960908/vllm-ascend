@@ -1397,13 +1397,14 @@ class NPUModelRunner(GPUModelRunner):
         # (from input_batch, batch order) into the forward context so AscendSFAImpl can
         # drive store/gather. No-op when the feature is off.
         dsa_offload_manager = getattr(self, "dsa_offload_manager", None)
+        dsa_adapter_cache = getattr(self, "dsa_adapter_cache", None)
         dsa_req_ids = None
         dsa_prompt_lens = None
         # Thread per-request ids/prompt lengths (input_batch row order) into the
         # forward context whenever a DSA sparse path needs them: the offload manager
-        # (Option A) AND the shrink-latent LMCache path, which keys its selected-token
-        # rows to requests by req_id.
-        if dsa_offload_manager is not None or self.dsa_shrink_latent:
+        # (Option A), the shrink-latent LMCache path (keys selected-token rows by
+        # req_id), AND the adapter latent cache.
+        if dsa_offload_manager is not None or self.dsa_shrink_latent or dsa_adapter_cache is not None:
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
@@ -1426,6 +1427,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_offload_manager=dsa_offload_manager,
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
+                dsa_adapter_cache=dsa_adapter_cache,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2556,6 +2558,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
                 dsa_offload_manager=getattr(self, "dsa_offload_manager", None),
+                dsa_adapter_cache=getattr(self, "dsa_adapter_cache", None),
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -2732,6 +2735,25 @@ class NPUModelRunner(GPUModelRunner):
         import vllm_ascend.envs as envs_ascend
 
         self.dsa_offload_manager = None
+
+        # Adapter-backed latent hot cache: its OWN flag, independent of the offload
+        # manager below, so build it before that early return. Reachable as
+        # self.dsa_adapter_cache and threaded into the forward context.
+        self.dsa_adapter_cache = None
+        if envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE:
+            from vllm_ascend.distributed.kv_transfer.sparse_offload.adapter_cache import (
+                build_adapter_cache,
+            )
+
+            _mla = get_layers_from_vllm_config(self.vllm_config, MLAAttention)
+            self.dsa_adapter_cache = build_adapter_cache(
+                self.vllm_config, list(_mla.keys()), self.device
+            )
+            if self.dsa_adapter_cache is not None:
+                logger.info(
+                    "DSA adapter latent cache enabled for %d MLA layers", len(_mla)
+                )
+
         if not (
             envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
             or envs_ascend.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT

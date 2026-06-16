@@ -184,6 +184,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": lambda: os.getenv(
         "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "npu"
     ),
+    # Adapter-backed DSA latent hot cache (bring-up; default OFF). When on, decode
+    # retrieves selected latent from an on-NPU pool (KVCacheAdapter) read in place by
+    # the sparse-attn kernel, instead of the scratch-gather offload-manager path.
+    "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", "0"))
+    ),
+    # Adapter pool headroom over the per-step working set (>=1; larger -> more
+    # cross-step reuse and more NPU memory). See adapter_cache.py sizing notes.
+    "VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO": lambda: float(
+        os.getenv("VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO", "1.5")
+    ),
+    # Concurrency the adapter pool is sized for without thrash (0 -> max_num_seqs).
+    "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")
+    ),
 }
 
 # end-env-vars-definition

@@ -1421,11 +1421,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         #     when disabled or on unsupported paths (CP / sparse-c8 / mlapo).
         _dsa_fc = get_forward_context()
         _dsa_mgr = getattr(_dsa_fc, "dsa_offload_manager", None)
+        _dsa_adapter = getattr(_dsa_fc, "dsa_adapter_cache", None)
         _dsa_on_native_path = not (
             self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
         )
         _dsa_supported = (
             _dsa_mgr is not None
+            and not self.enable_dsa_cp
+            and not self.use_sparse_c8_indexer
+            and _dsa_on_native_path
+        )
+        # Adapter latent cache (separate flag). Needs per-request ids in the forward
+        # context (absent in dummy/profile runs -> skip -> native).
+        _adapter_supported = (
+            _dsa_adapter is not None
+            and getattr(_dsa_fc, "dsa_req_ids", None) is not None
             and not self.enable_dsa_cp
             and not self.use_sparse_c8_indexer
             and _dsa_on_native_path
@@ -1440,7 +1450,57 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
-        if _dsa_supported:
+        if _adapter_supported:
+            # Adapter-backed latent hot cache: FA reads the resident pool in place
+            # (zero-copy), the adapter owns residency (hit/miss) + eviction.
+            _ac = _dsa_adapter
+            _req_ids_a = _dsa_fc.dsa_req_ids
+            _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
+            _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
+            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
+                _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
+                _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
+                for _b in range(len(_req_ids_a)):
+                    # insert this step's generated token (one row per request)
+                    _ac.insert_decode_token(
+                        layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
+                    )
+                _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
+                adapter_out = self._execute_sparse_flash_attention_process(
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    _res_a.sparse_indices.unsqueeze(1),
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    _res_a.seq_lens,
+                    kv_override=_res_a.knope_pool,
+                    key_rope_override=_res_a.kpe_pool,
+                    block_table_override=_res_a.block_table,
+                )
+                _ac.release_after_fa(layer_name, _res_a.loaded_ids)
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+                    native_out = self._execute_sparse_flash_attention_process(
+                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                        actual_seq_lengths_query, actual_seq_lengths_key,
+                    )
+                    diff = (native_out.float() - adapter_out.float()).abs().max()
+                    logger.info("[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    attn_output = native_out  # generation uses the native result
+                else:
+                    attn_output = adapter_out
+            else:
+                # prefill: store this layer's prompt latent into the adapter backend so
+                # decode-time retrieve can fetch prefill-selected blocks; attention
+                # itself uses the native prefill path (attn_output stays None).
+                _qsl_a = torch.cat(
+                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
+                )
+                _ctx_a = attn_metadata.seq_lens - (_qsl_a[1:] - _qsl_a[:-1])
+                _ac.store_prefill(layer_name, _req_ids_a, _qsl_a, _ctx_a, _kn_a, _kp_a)
+
+        if attn_output is None and _dsa_supported:
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
 
             _block_size = kv_cache[0].shape[1]

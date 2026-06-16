@@ -49,6 +49,7 @@ def set_ascend_forward_context(
     dsa_offload_manager=None,
     dsa_req_ids=None,
     dsa_prompt_lens=None,
+    dsa_adapter_cache=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -75,6 +76,8 @@ def set_ascend_forward_context(
         forward_context.dsa_offload_manager = dsa_offload_manager
         forward_context.dsa_req_ids = dsa_req_ids
         forward_context.dsa_prompt_lens = dsa_prompt_lens
+        # Adapter-backed latent hot cache (None unless VLLM_ASCEND_DSA_USE_ADAPTER_CACHE).
+        forward_context.dsa_adapter_cache = dsa_adapter_cache
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

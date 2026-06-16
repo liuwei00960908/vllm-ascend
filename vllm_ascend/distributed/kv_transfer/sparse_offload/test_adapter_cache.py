@@ -228,10 +228,48 @@ def test_reserved_bytes_and_sizes():
           f"reserved={cache.reserved_bytes()} bytes")
 
 
+def test_store_prefill_via_cache_method():
+    """Populate through cache.store_prefill (not manual seeding), then retrieve."""
+    cfg = make_config()
+    cache, _ = build_with_shared_backends(cfg)
+    rsA = cache.req_slot("A")
+    n_tok = 9
+    kn = torch.stack([ref_knope(rsA, p, cfg.kv_lora_rank) for p in range(n_tok)])
+    kp = torch.stack([ref_kpe(rsA, p, cfg.qk_rope_head_dim) for p in range(n_tok)])
+    qsl = torch.tensor([0, n_tok], dtype=torch.int64)
+    ctx = torch.tensor([0], dtype=torch.int64)
+    for ln in cfg.layer_names:
+        cache.store_prefill(ln, ["A"], qsl, ctx, kn, kp)
+
+    req_slots = torch.tensor([rsA], dtype=torch.int64)
+    topk = torch.tensor([[0, 1, 4, 5, 8, -1]], dtype=torch.int64)
+    res = cache.retrieve("l0", req_slots, topk)
+    n = resolve_and_check(cfg, res, req_slots,
+                          lambda rs, p: ref_knope(rs, p, cfg.kv_lora_rank),
+                          lambda rs, p: ref_kpe(rs, p, cfg.qk_rope_head_dim), "store_prefill")
+    cache.release_after_fa("l0", res.loaded_ids)
+    print(f"  test_store_prefill_via_cache_method: {n} tokens verified via store_prefill")
+
+
+def test_req_slot_recycle():
+    cfg = make_config()
+    cache, _ = build_with_shared_backends(cfg)
+    s1 = cache.req_slots_tensor(["A", "B"])
+    assert len(cache._req_slot_of) == 2
+    # C and D arrive, A and B leave -> A/B slots recycled, map holds only C/D.
+    s2 = cache.req_slots_tensor(["C", "D"])
+    assert set(cache._req_slot_of) == {"C", "D"}, cache._req_slot_of
+    assert len(cache._free_req_slots) == cfg.max_num_seqs - 2
+    print(f"  test_req_slot_recycle: slots recycled on batch departure "
+          f"(A,B->{s1.tolist()}  C,D->{s2.tolist()})")
+
+
 if __name__ == "__main__":
     print("CPU parity tests for adapter_cache:")
     test_reserved_bytes_and_sizes()
     test_retrieve_prefill()
     test_insert_then_retrieve()
     test_hit_skips_refetch()
+    test_store_prefill_via_cache_method()
+    test_req_slot_recycle()
     print("ALL PASSED")
