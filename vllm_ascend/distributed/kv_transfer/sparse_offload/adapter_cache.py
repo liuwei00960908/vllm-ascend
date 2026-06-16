@@ -327,6 +327,9 @@ class AdapterLatentCache:
         block_local = position // cfg.block_size
         offset = position % cfg.block_size
         key = (req_id, layer_name)
+        logical = torch.tensor(
+            [block_local + req_slot * cfg.blocks_per_req], dtype=ID_DTYPE, device=cfg.device
+        )
 
         cached = self._decode_block.get(key)
         if cached is None or cached[0] != block_local:
@@ -337,9 +340,6 @@ class AdapterLatentCache:
                     [cached[0] + req_slot * cfg.blocks_per_req], dtype=ID_DTYPE, device=cfg.device
                 )
                 layer.adapter.release(prev_logical)
-            logical = torch.tensor(
-                [block_local + req_slot * cfg.blocks_per_req], dtype=ID_DTYPE, device=cfg.device
-            )
             slot = int(layer.adapter.load(logical, load_missing=False)[0])
             self._decode_block[key] = (block_local, slot)
         else:
@@ -347,6 +347,9 @@ class AdapterLatentCache:
 
         layer.knope_pool[slot, offset, 0, :] = k_nope.to(cfg.dtype)
         layer.kpe_pool[slot, offset, 0, :] = k_pe.to(cfg.dtype)
+        # Decode-written latent is NOT in the backend; mark the block dirty so eviction
+        # spills it to LMCache (clean prefill-fetched blocks stay droppable).
+        layer.adapter.mark_dirty(logical)
         return slot
 
 

@@ -264,6 +264,31 @@ def test_req_slot_recycle():
           f"(A,B->{s1.tolist()}  C,D->{s2.tolist()})")
 
 
+def test_dirty_decode_block_spilled():
+    """A decode-written (dirty) block must be spilled to the backend on eviction,
+    so a later topk that re-selects it can be fetched back (not silently dropped)."""
+    cfg = make_config()  # block_size=4, num_actual=12
+    cache, backends = build_with_shared_backends(cfg)
+    rsA = cache.req_slot("A")
+    # 64 decode tokens for A -> 16 blocks; pool holds 12 -> the earliest blocks evict.
+    for pos in range(64):
+        cache.insert_decode_token(
+            "l0", "A", pos,
+            ref_knope(rsA, pos, cfg.kv_lora_rank),
+            ref_kpe(rsA, pos, cfg.qk_rope_head_dim),
+        )
+    snap = backends["l0"].snapshot()
+    blk0_id = rsA * cfg.blocks_per_req + 0
+    assert blk0_id in snap, (
+        f"dirty decode block 0 was dropped, not spilled; present={sorted(snap)}"
+    )
+    knope_blk, kpe_blk = snap[blk0_id]
+    assert torch.allclose(knope_blk[0, 0], ref_knope(rsA, 0, cfg.kv_lora_rank)), "spilled knope wrong"
+    assert torch.allclose(kpe_blk[3, 0], ref_kpe(rsA, 3, cfg.qk_rope_head_dim)), "spilled kpe wrong"
+    print(f"  test_dirty_decode_block_spilled: evicted dirty block found in backend "
+          f"with correct data ({len(snap)} blocks spilled)")
+
+
 if __name__ == "__main__":
     print("CPU parity tests for adapter_cache:")
     test_reserved_bytes_and_sizes()
@@ -272,4 +297,5 @@ if __name__ == "__main__":
     test_hit_skips_refetch()
     test_store_prefill_via_cache_method()
     test_req_slot_recycle()
+    test_dirty_decode_block_spilled()
     print("ALL PASSED")
