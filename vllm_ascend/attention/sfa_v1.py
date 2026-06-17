@@ -1459,14 +1459,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 _adbg = envs.VLLM_ASCEND_DSA_ADAPTER_DEBUG
+                _sync_phases = (
+                    set(p.strip() for p in envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES.split(","))
+                    if envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES
+                    else set()
+                )
 
                 def _dbg(_phase):
-                    # Sync forces the device to catch up to here; if a prior phase's
-                    # kernel hung, THIS sync blocks and the previous _dbg line is the
-                    # last thing logged -> that phase is the culprit.
+                    # Sync (when DEBUG, or when this phase is in SYNC_PHASES) forces the
+                    # device to catch up here; under DEBUG also log. If a prior phase's
+                    # kernel hung, the sync blocks and the previous line is the last log.
+                    if (_adbg or _phase in _sync_phases) and hasattr(torch, "npu"):
+                        torch.npu.synchronize()
                     if _adbg:
-                        if hasattr(torch, "npu"):
-                            torch.npu.synchronize()
                         logger.info("[ADAPTER-DBG] layer=%s phase=%s", layer_name, _phase)
 
                 _dbg("begin")
@@ -1482,10 +1487,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dbg("insert_done")
                 _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
                 _dbg("retrieve_done")
-                if envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_FA and hasattr(torch, "npu"):
-                    # localization: ensure retrieve's block_table/pool writes are done
-                    # before the kernel reads them (suspected no-sync freeze cause).
-                    torch.npu.synchronize()
                 adapter_out = self._execute_sparse_flash_attention_process(
                     ql_nope,
                     q_pe,

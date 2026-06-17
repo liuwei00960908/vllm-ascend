@@ -204,11 +204,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_ADAPTER_DEBUG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_DEBUG", "0"))
     ),
-    # Localization knob: a single device sync right before the sparse-attn kernel
-    # (after retrieve builds block_table). Tests whether the retrieve->FA ordering is
-    # the missing dependency behind the no-sync freeze, without DEBUG's full flood.
-    "VLLM_ASCEND_DSA_ADAPTER_SYNC_FA": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_SYNC_FA", "0"))
+    # Localization knob: comma-separated decode phases to device-sync after (no log),
+    # to pin down the minimal sync that avoids the no-sync freeze. Phases:
+    # begin,cur_pos_done,insert_done,retrieve_done,fa_done,release_done.
+    # e.g. VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES=insert_done
+    "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES", ""
     ),
 }
 
