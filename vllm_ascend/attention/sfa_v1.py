@@ -1482,6 +1482,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dbg("insert_done")
                 _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
                 _dbg("retrieve_done")
+                if envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_FA and hasattr(torch, "npu"):
+                    # localization: ensure retrieve's block_table/pool writes are done
+                    # before the kernel reads them (suspected no-sync freeze cause).
+                    torch.npu.synchronize()
                 adapter_out = self._execute_sparse_flash_attention_process(
                     ql_nope,
                     q_pe,
