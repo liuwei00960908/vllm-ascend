@@ -1677,14 +1677,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.dsa_offload_unbundle,
             len(kv_cache),
         )
-        _skip_decode_save = bool(self.dsa_shrink_latent) and attn_metadata.num_prefills == 0
-        # [DSA-SAVE debug] keyed by branch -> prints once for SKIP and once for SAVE,
-        # so a run that only ever decodes shows only SKIP (no per-layer/per-step flood).
+        # NOTE: the SFA builder never populates attn_metadata.num_prefills (stays at
+        # its dataclass default 0 on every step, prefill included), so gating on it
+        # skipped the save unconditionally. Gate on attn_state instead, which the
+        # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
+        _is_pure_decode = attn_metadata.attn_state in (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        )
+        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode
+        # [DSA-SAVE debug] key on attn_state so prefill steps surface even after the
+        # warmup decode run already logged a SKIP (no per-layer/per-step flood).
         logger.info_once(
-            "[DSA-SAVE] branch=%s (skip_decode_save=%s, num_prefills=%s)",
+            "[DSA-SAVE] branch=%s attn_state=%s (skip=%s)",
             "SKIP" if _skip_decode_save else "SAVE",
+            attn_metadata.attn_state,
             _skip_decode_save,
-            attn_metadata.num_prefills,
         )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
