@@ -327,14 +327,19 @@ class AdapterLatentCache:
 
         # dense logical-id -> slot lookup (only loaded ids are valid).
         slot_of = torch.zeros(cfg.num_logical_blocks, dtype=ID_DTYPE, device=dev)
-        if unique_ids.numel() > 0:
-            slot_of[unique_ids] = slots.to(ID_DTYPE)
+        slot_of.index_put_((unique_ids,), slots.to(ID_DTYPE))  # empty index = no-op
 
-        block_table = torch.zeros(b, cfg.blocks_per_req, dtype=ID_DTYPE, device=dev)
-        if valid.any():
-            sel_slot = slot_of[logical.clamp(min=0)]            # [b, topk]
-            rows = torch.arange(b, device=dev)[:, None].expand(b, topk)
-            block_table[rows[valid], local_block[valid]] = sel_slot[valid]
+        # STATIC block_table build: scatter every (b, col) -> slot with no boolean
+        # masking and no valid.any() host read (both forced device syncs before).
+        # Invalid (padding) entries go to a throwaway trash column that is then sliced
+        # off, so they can't corrupt real block-table slots. Duplicate (b, col) pairs
+        # (multiple selected tokens in one block) write the same slot -> idempotent.
+        sel_slot = slot_of[logical.clamp(min=0)]                # [b, topk]
+        trash_col = cfg.blocks_per_req
+        col = torch.where(valid, local_block, torch.full_like(local_block, trash_col))
+        bt_ext = torch.zeros(b, cfg.blocks_per_req + 1, dtype=ID_DTYPE, device=dev)
+        bt_ext.scatter_(1, col, sel_slot)
+        block_table = bt_ext[:, : cfg.blocks_per_req]
 
         return RetrieveResult(
             knope_pool=layer.knope_pool,
