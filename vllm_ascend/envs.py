@@ -199,6 +199,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")
     ),
+    # Debug: sync + log each phase of the adapter decode path so a device-side stall
+    # localizes to the last printed phase. Floods the log; bring-up diagnosis only.
+    "VLLM_ASCEND_DSA_ADAPTER_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_DEBUG", "0"))
+    ),
 }
 
 # end-env-vars-definition

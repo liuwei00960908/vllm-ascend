@@ -264,6 +264,35 @@ def test_req_slot_recycle():
           f"(A,B->{s1.tolist()}  C,D->{s2.tolist()})")
 
 
+def test_store_prefill_chunked():
+    """Chunked prefill: two block-aligned chunks of the same request, then retrieve
+    across both. Exercises the vectorized ctx-offset / block-range path (the 120k
+    code path) without the per-token loop."""
+    cfg = make_config()  # block_size=4
+    cache, _ = build_with_shared_backends(cfg)
+    rsA = cache.req_slot("A")
+
+    def chunk(ctx_val, length):
+        kn = torch.stack([ref_knope(rsA, ctx_val + i, cfg.kv_lora_rank) for i in range(length)])
+        kp = torch.stack([ref_kpe(rsA, ctx_val + i, cfg.qk_rope_head_dim) for i in range(length)])
+        qsl = torch.tensor([0, length], dtype=torch.int64)
+        ctx = torch.tensor([ctx_val], dtype=torch.int64)
+        for ln in cfg.layer_names:
+            cache.store_prefill(ln, ["A"], qsl, ctx, kn, kp)
+
+    chunk(0, 8)   # blocks 0,1
+    chunk(8, 4)   # block 2 (ctx=8 is block-aligned: 8 == 2*4)
+
+    req_slots = torch.tensor([rsA], dtype=torch.int64)
+    topk = torch.tensor([[0, 3, 8, 11, -1, -1]], dtype=torch.int64)  # spans both chunks
+    res = cache.retrieve("l0", req_slots, topk)
+    n = resolve_and_check(cfg, res, req_slots,
+                          lambda rs, p: ref_knope(rs, p, cfg.kv_lora_rank),
+                          lambda rs, p: ref_kpe(rs, p, cfg.qk_rope_head_dim), "chunked")
+    cache.release_after_fa("l0", res.loaded_ids)
+    print(f"  test_store_prefill_chunked: {n} tokens verified across 2 prefill chunks")
+
+
 def test_dirty_decode_block_spilled():
     """A decode-written (dirty) block must be spilled to the backend on eviction,
     so a later topk that re-selects it can be fetched back (not silently dropped)."""
@@ -296,6 +325,7 @@ if __name__ == "__main__":
     test_insert_then_retrieve()
     test_hit_skips_refetch()
     test_store_prefill_via_cache_method()
+    test_store_prefill_chunked()
     test_req_slot_recycle()
     test_dirty_decode_block_spilled()
     print("ALL PASSED")

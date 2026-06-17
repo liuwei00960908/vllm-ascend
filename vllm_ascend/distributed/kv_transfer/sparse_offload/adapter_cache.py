@@ -248,34 +248,42 @@ class AdapterLatentCache:
         kn = k_nope.reshape(-1, cfg.kv_lora_rank)
         kp = k_pe.reshape(-1, cfg.qk_rope_head_dim)
 
-        ids: list[int] = []
-        kn_blocks: list[torch.Tensor] = []
-        kp_blocks: list[torch.Tensor] = []
+        # Vectorized per request: scatter this chunk's tokens into a block-aligned
+        # buffer and reshape into whole blocks — NO per-token Python loop (that made
+        # a 120k prefill launch ~prompt_len*num_layers tiny device ops and froze the
+        # engine). Assumes chunk starts are block-aligned (true when
+        # max_num_batched_tokens is a multiple of block_size), so blocks never split
+        # across chunks; the only partial block is the prompt's last one (zero-padded).
+        ids_all: list[torch.Tensor] = []
+        kn_blocks_all: list[torch.Tensor] = []
+        kp_blocks_all: list[torch.Tensor] = []
         for b, req_id in enumerate(req_ids):
             lo, hi = qsl[b], qsl[b + 1]
-            if hi <= lo:
+            length = hi - lo
+            if length <= 0:
                 continue
             req_slot = self.req_slot(req_id)
-            blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-            for tok in range(lo, hi):
-                pos = ctx[b] + (tok - lo)
-                blk, off = pos // bs, pos % bs
-                if blk not in blocks:
-                    blocks[blk] = (
-                        torch.zeros(bs, 1, cfg.kv_lora_rank, dtype=cfg.dtype, device=cfg.device),
-                        torch.zeros(bs, 1, cfg.qk_rope_head_dim, dtype=cfg.dtype, device=cfg.device),
-                    )
-                blocks[blk][0][off, 0] = kn[tok]
-                blocks[blk][1][off, 0] = kp[tok]
-            for blk, (knb, kpb) in blocks.items():
-                ids.append(blk + req_slot * cfg.blocks_per_req)
-                kn_blocks.append(knb)
-                kp_blocks.append(kpb)
+            c = ctx[b]
+            blk_lo = c // bs
+            blk_hi = (c + length - 1) // bs
+            n_blk = blk_hi - blk_lo + 1
+            start_off = c - blk_lo * bs  # first token's offset within the first block
 
-        if ids:
+            buf_kn = kn.new_zeros((n_blk * bs, cfg.kv_lora_rank))
+            buf_kp = kp.new_zeros((n_blk * bs, cfg.qk_rope_head_dim))
+            buf_kn[start_off : start_off + length] = kn[lo:hi]
+            buf_kp[start_off : start_off + length] = kp[lo:hi]
+
+            ids = torch.arange(blk_lo, blk_hi + 1, device=cfg.device, dtype=ID_DTYPE)
+            ids = ids + req_slot * cfg.blocks_per_req
+            ids_all.append(ids)
+            kn_blocks_all.append(buf_kn.view(n_blk, bs, 1, cfg.kv_lora_rank))
+            kp_blocks_all.append(buf_kp.view(n_blk, bs, 1, cfg.qk_rope_head_dim))
+
+        if ids_all:
             layer.backend.save_blocks(
-                torch.tensor(ids, dtype=ID_DTYPE, device=cfg.device),
-                [torch.stack(kn_blocks), torch.stack(kp_blocks)],
+                torch.cat(ids_all),
+                [torch.cat(kn_blocks_all), torch.cat(kp_blocks_all)],
             )
 
     # -------------------------------------------------------------- retrieve

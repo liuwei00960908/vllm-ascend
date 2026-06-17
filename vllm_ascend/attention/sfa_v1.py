@@ -1458,15 +1458,30 @@ class AscendSFAImpl(MLAAttentionImpl):
             _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
             _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                _adbg = envs.VLLM_ASCEND_DSA_ADAPTER_DEBUG
+
+                def _dbg(_phase):
+                    # Sync forces the device to catch up to here; if a prior phase's
+                    # kernel hung, THIS sync blocks and the previous _dbg line is the
+                    # last thing logged -> that phase is the culprit.
+                    if _adbg:
+                        if hasattr(torch, "npu"):
+                            torch.npu.synchronize()
+                        logger.info("[ADAPTER-DBG] layer=%s phase=%s", layer_name, _phase)
+
+                _dbg("begin")
                 _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
                 _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
                 _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
+                _dbg("cur_pos_done")
                 for _b in range(len(_req_ids_a)):
                     # insert this step's generated token (one row per request)
                     _ac.insert_decode_token(
                         layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
                     )
+                _dbg("insert_done")
                 _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
+                _dbg("retrieve_done")
                 adapter_out = self._execute_sparse_flash_attention_process(
                     ql_nope,
                     q_pe,
@@ -1479,7 +1494,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     key_rope_override=_res_a.kpe_pool,
                     block_table_override=_res_a.block_table,
                 )
+                _dbg("fa_done")
                 _ac.release_after_fa(layer_name, _res_a.loaded_ids)
+                _dbg("release_done")
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
