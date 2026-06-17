@@ -1670,11 +1670,28 @@ class AscendSFAImpl(MLAAttentionImpl):
         # connector work (scales with batch). Skip save on steps with no prefill tokens
         # — gated per STEP (num_prefills is shared by all layers), so the layerwise save
         # generator is never created that step and wait_for_save tolerates its absence.
+        logger.info_once(
+            "[DSA-SAVE] forward reached save block "
+            "(shrink_latent=%s, unbundle=%s, kv_cache_len=%s)",
+            self.dsa_shrink_latent,
+            self.dsa_offload_unbundle,
+            len(kv_cache),
+        )
         _skip_decode_save = bool(self.dsa_shrink_latent) and attn_metadata.num_prefills == 0
+        # [DSA-SAVE debug] keyed by branch -> prints once for SKIP and once for SAVE,
+        # so a run that only ever decodes shows only SKIP (no per-layer/per-step flood).
+        logger.info_once(
+            "[DSA-SAVE] branch=%s (skip_decode_save=%s, num_prefills=%s)",
+            "SKIP" if _skip_decode_save else "SAVE",
+            _skip_decode_save,
+            attn_metadata.num_prefills,
+        )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                logger.info_once("[DSA-SAVE] calling maybe_save (unbundled latent-only)")
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
             else:
+                logger.info_once("[DSA-SAVE] calling maybe_save (bundled full tuple)")
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         _dsa_prof.end(_sfa_t)
