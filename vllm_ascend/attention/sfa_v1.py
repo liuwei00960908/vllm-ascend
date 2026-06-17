@@ -1485,6 +1485,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                         layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
                     )
                 _dbg("insert_done")
+                # WORKAROUND (bring-up, verified by SYNC_PHASES=insert_done): the
+                # adapter's native metadata kernels (mark_dirty / load) don't order
+                # with retrieve's load on the device, so retrieve can read torn slot
+                # metadata -> bad slot -> block_table OOB -> device hang. Force insert's
+                # metadata writes to settle before retrieve reads them. Remove once the
+                # native kernels enforce their own device-side ordering (that fix also
+                # removes this sync's per-layer TPOT cost).
+                if hasattr(torch, "npu"):
+                    torch.npu.synchronize()
                 _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
                 _dbg("retrieve_done")
                 adapter_out = self._execute_sparse_flash_attention_process(
