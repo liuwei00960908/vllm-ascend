@@ -68,6 +68,18 @@ BlockStoreBackend = _kvca.BlockStoreBackend
 InMemoryBlockStoreBackend = _kvca.InMemoryBlockStoreBackend
 KVCacheAdapter = _kvca.KVCacheAdapter
 
+# Optional micro-profiler (shares VLLM_ASCEND_DSA_OFFLOAD_PROFILE). Guarded so the
+# CPU parity test, which has no vLLM, falls back to a no-op context.
+try:
+    from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _aprof  # noqa: PLC0415
+except Exception:  # pragma: no cover
+    import contextlib
+
+    class _aprof:  # type: ignore
+        @staticmethod
+        def section(_name):
+            return contextlib.nullcontext()
+
 ID_DTYPE = torch.int64
 INVALID_POSITION = -1
 
@@ -307,7 +319,8 @@ class AdapterLatentCache:
         valid_logical = logical[valid]
         if valid_logical.numel() > 0:
             unique_ids = torch.unique(valid_logical).to(ID_DTYPE)
-            slots = layer.adapter.load(unique_ids, load_missing=True)
+            with _aprof.section("ad_ret_load"):
+                slots = layer.adapter.load(unique_ids, load_missing=True)
         else:
             unique_ids = logical.new_zeros((0,), dtype=ID_DTYPE)
             slots = unique_ids.clone()
