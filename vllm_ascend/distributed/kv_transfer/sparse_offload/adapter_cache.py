@@ -345,30 +345,37 @@ class AdapterLatentCache:
         logical = local_block + req_slots[:, None] * cfg.blocks_per_req  # [b, topk]
         logical = torch.where(valid, logical, torch.full_like(logical, -1))
 
-        valid_logical = logical[valid]
-        if valid_logical.numel() > 0:
-            unique_ids = torch.unique(valid_logical).to(ID_DTYPE)
+        with _aprof.section("ad_ret_dedup"):
+            valid_logical = logical[valid]
+            has_valid = valid_logical.numel() > 0
+            unique_ids = (
+                torch.unique(valid_logical).to(ID_DTYPE)
+                if has_valid
+                else logical.new_zeros((0,), dtype=ID_DTYPE)
+            )
+        if has_valid:
             with _aprof.section("ad_ret_load"):
                 slots = layer.adapter.load(unique_ids, load_missing=True)
         else:
-            unique_ids = logical.new_zeros((0,), dtype=ID_DTYPE)
             slots = unique_ids.clone()
 
         # dense logical-id -> slot lookup (only loaded ids are valid).
-        slot_of = torch.zeros(cfg.num_logical_blocks, dtype=ID_DTYPE, device=dev)
-        slot_of.index_put_((unique_ids,), slots.to(ID_DTYPE))  # empty index = no-op
+        with _aprof.section("ad_ret_map"):
+            slot_of = torch.zeros(cfg.num_logical_blocks, dtype=ID_DTYPE, device=dev)
+            slot_of.index_put_((unique_ids,), slots.to(ID_DTYPE))  # empty index = no-op
+            sel_slot = slot_of[logical.clamp(min=0)]                # [b, topk]
 
         # STATIC block_table build: scatter every (b, col) -> slot with no boolean
         # masking and no valid.any() host read (both forced device syncs before).
         # Invalid (padding) entries go to a throwaway trash column that is then sliced
         # off, so they can't corrupt real block-table slots. Duplicate (b, col) pairs
         # (multiple selected tokens in one block) write the same slot -> idempotent.
-        sel_slot = slot_of[logical.clamp(min=0)]                # [b, topk]
-        trash_col = cfg.blocks_per_req
-        col = torch.where(valid, local_block, torch.full_like(local_block, trash_col))
-        bt_ext = torch.zeros(b, cfg.blocks_per_req + 1, dtype=ID_DTYPE, device=dev)
-        bt_ext.scatter_(1, col, sel_slot)
-        block_table = bt_ext[:, : cfg.blocks_per_req]
+        with _aprof.section("ad_ret_bt"):
+            trash_col = cfg.blocks_per_req
+            col = torch.where(valid, local_block, torch.full_like(local_block, trash_col))
+            bt_ext = torch.zeros(b, cfg.blocks_per_req + 1, dtype=ID_DTYPE, device=dev)
+            bt_ext.scatter_(1, col, sel_slot)
+            block_table = bt_ext[:, : cfg.blocks_per_req]
 
         return RetrieveResult(
             knope_pool=layer.knope_pool,
