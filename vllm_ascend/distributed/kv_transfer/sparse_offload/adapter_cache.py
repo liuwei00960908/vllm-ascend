@@ -157,6 +157,11 @@ class AdapterLatentCache:
         # remembers the slot of the decode block each request is currently filling,
         # so per-token writes don't re-allocate within a block.
         self._decode_block: dict[tuple[str, str], tuple[int, int]] = {}
+        # per-step memo (req_slots + cur positions) shared across the layers of a step,
+        # keyed by the attn_metadata object (same instance for all layers of a step).
+        self._prep_meta = None
+        self._prep_req_slots: torch.Tensor | None = None
+        self._prep_cur_pos: list[int] | None = None
 
         for layer_name in config.layer_names:
             knope_pool = torch.zeros(
@@ -214,6 +219,23 @@ class AdapterLatentCache:
                 layer.adapter.release(logical)
         self._req_slot_of.pop(req_id, None)
         self._free_req_slots.append(slot)
+
+    def step_prep(
+        self, step_key, req_ids: list[str], seq_lens: torch.Tensor
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Per-step (not per-layer) prep, memoized by the ``step_key`` object identity.
+
+        ``cur_pos = seq_lens - 1`` and the req-slot mapping are identical across all
+        layers of a decode step, so compute them once on the first layer and reuse for
+        the rest. This collapses the per-layer ``.tolist()`` host sync (10x/step) to
+        one. ``step_key`` is the attn_metadata instance (same object for every layer of
+        a step); a held reference + ``is`` check avoids id() reuse hazards.
+        """
+        if step_key is not self._prep_meta:
+            self._prep_req_slots = self.req_slots_tensor(req_ids)
+            self._prep_cur_pos = (seq_lens.to(torch.long) - 1).tolist()
+            self._prep_meta = step_key
+        return self._prep_req_slots, self._prep_cur_pos
 
     def req_slots_tensor(self, req_ids: list[str]) -> torch.Tensor:
         """req-slot per row for the current batch; recycles slots of departed reqs.
