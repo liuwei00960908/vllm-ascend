@@ -1148,6 +1148,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        _dsa_prof.set_step_kind(
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        )
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
@@ -1261,7 +1264,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                             kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata
                         )
                 else:
-                    k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                    with _dsa_prof.section("exec_kv"):
+                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1399,7 +1403,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             # prompt_lens is per ROW: decode rows carry their request's prompt
             # length, prefill/padding rows carry 0 and stay untouched — so this
             # also covers mixed chunked-prefill + decode steps.
-            topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
+            with _dsa_prof.section("scratch_remap"):
+                topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
