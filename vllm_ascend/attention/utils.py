@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend import envs
@@ -311,16 +310,7 @@ def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
 ):
-    logger.info_once(
-        "[DSA-SAVE] maybe_save_kv_layer_to_connector reached at least once"
-    )
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        logger.info_once(
-            "[DSA-SAVE] early return: no v1 kv_transfer_group "
-            "(has_group=%s, is_v1=%s)",
-            has_kv_transfer_group(),
-            is_v1_kv_transfer_group(),
-        )
         return
 
     connector = get_kv_transfer_group()
@@ -328,13 +318,8 @@ def maybe_save_kv_layer_to_connector(
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
-        logger.info_once("[DSA-SAVE] early return: attn_metadata is None")
         return
     # TODO: assert ascendMetadata
-    logger.info_once(
-        "[DSA-SAVE] calling connector.save_kv_layer (connector=%s)",
-        type(connector).__name__,
-    )
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 

@@ -1670,13 +1670,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         # connector work (scales with batch). Skip save on steps with no prefill tokens
         # — gated per STEP (num_prefills is shared by all layers), so the layerwise save
         # generator is never created that step and wait_for_save tolerates its absence.
-        logger.info_once(
-            "[DSA-SAVE] forward reached save block "
-            "(shrink_latent=%s, unbundle=%s, kv_cache_len=%s)",
-            self.dsa_shrink_latent,
-            self.dsa_offload_unbundle,
-            len(kv_cache),
-        )
         # NOTE: the SFA builder never populates attn_metadata.num_prefills (stays at
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
@@ -1686,20 +1679,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         )
         _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode
-        # [DSA-SAVE debug] key on attn_state so prefill steps surface even after the
-        # warmup decode run already logged a SKIP (no per-layer/per-step flood).
-        logger.info_once(
-            "[DSA-SAVE] branch=%s attn_state=%s (skip=%s)",
-            "SKIP" if _skip_decode_save else "SAVE",
-            attn_metadata.attn_state,
-            _skip_decode_save,
-        )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                logger.info_once("[DSA-SAVE] calling maybe_save (unbundled latent-only)")
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
             else:
-                logger.info_once("[DSA-SAVE] calling maybe_save (bundled full tuple)")
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         _dsa_prof.end(_sfa_t)
