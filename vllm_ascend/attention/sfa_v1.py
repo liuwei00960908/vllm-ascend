@@ -1479,7 +1479,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # per-step memo (shared across layers): one .tolist() host sync per
                     # step instead of one per layer.
                     _req_slots_a, _cur_pos_a = _ac.step_prep(
-                        attn_metadata, _req_ids_a, attn_metadata.seq_lens
+                        layer_name, _req_ids_a, attn_metadata.seq_lens
                     )
                     _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
                 _dbg("cur_pos_done")

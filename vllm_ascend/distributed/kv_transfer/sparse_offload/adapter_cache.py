@@ -157,9 +157,11 @@ class AdapterLatentCache:
         # remembers the slot of the decode block each request is currently filling,
         # so per-token writes don't re-allocate within a block.
         self._decode_block: dict[tuple[str, str], tuple[int, int]] = {}
-        # per-step memo (req_slots + cur positions) shared across the layers of a step,
-        # keyed by the attn_metadata object (same instance for all layers of a step).
-        self._prep_meta = None
+        # per-step memo (req_slots + cur positions) shared across the layers of a step.
+        # Keyed by "the first layer of a step", NOT the attn_metadata object: under ACL
+        # graph that object is reused in-place across steps, so its identity would
+        # return stale positions (-> mistracked decode blocks -> hang).
+        self._prep_first_layer: str | None = None
         self._prep_req_slots: torch.Tensor | None = None
         self._prep_cur_pos: list[int] | None = None
 
@@ -221,20 +223,25 @@ class AdapterLatentCache:
         self._free_req_slots.append(slot)
 
     def step_prep(
-        self, step_key, req_ids: list[str], seq_lens: torch.Tensor
+        self, layer_name: str, req_ids: list[str], seq_lens: torch.Tensor
     ) -> tuple[torch.Tensor, list[int]]:
-        """Per-step (not per-layer) prep, memoized by the ``step_key`` object identity.
+        """Per-step (not per-layer) prep, memoized across the layers of a decode step.
 
-        ``cur_pos = seq_lens - 1`` and the req-slot mapping are identical across all
-        layers of a decode step, so compute them once on the first layer and reuse for
-        the rest. This collapses the per-layer ``.tolist()`` host sync (10x/step) to
-        one. ``step_key`` is the attn_metadata instance (same object for every layer of
-        a step); a held reference + ``is`` check avoids id() reuse hazards.
+        ``cur_pos = seq_lens - 1`` and the req-slot mapping are identical for all layers
+        of a step, so compute once and reuse — collapsing the per-layer ``.tolist()``
+        host sync (10x/step) to one.
+
+        Step boundary = the first layer that calls this (forward processes layers in a
+        fixed order every step, so the same layer always starts a step). When that
+        layer recurs we recompute. We deliberately do NOT key on the attn_metadata
+        instance: under ACL graph it is reused in-place across steps, so its identity
+        would never change and we'd return the first step's stale positions forever.
         """
-        if step_key is not self._prep_meta:
+        if self._prep_first_layer is None:
+            self._prep_first_layer = layer_name
+        if layer_name == self._prep_first_layer:
             self._prep_req_slots = self.req_slots_tensor(req_ids)
             self._prep_cur_pos = (seq_lens.to(torch.long) - 1).tolist()
-            self._prep_meta = step_key
         return self._prep_req_slots, self._prep_cur_pos
 
     def req_slots_tensor(self, req_ids: list[str]) -> torch.Tensor:
