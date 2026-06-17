@@ -1481,20 +1481,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
                 _dbg("cur_pos_done")
                 with _dsa_prof.section("ad_insert"):
+                    _insert_meta_op = False
                     for _b in range(len(_req_ids_a)):
-                        # insert this step's generated token (one row per request)
-                        _ac.insert_decode_token(
+                        # insert this step's generated token (one row per request);
+                        # returns True only when it ran adapter metadata kernels (new
+                        # block: load + mark_dirty) -- the only thing that races.
+                        _insert_meta_op |= _ac.insert_decode_token(
                             layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
                         )
                 _dbg("insert_done")
-                # WORKAROUND (bring-up, verified by SYNC_PHASES=insert_done): the
-                # adapter's native metadata kernels (mark_dirty / load) don't order
-                # with retrieve's load on the device, so retrieve can read torn slot
-                # metadata -> bad slot -> block_table OOB -> device hang. Force insert's
-                # metadata writes to settle before retrieve reads them. Remove once the
-                # native kernels enforce their own device-side ordering (that fix also
-                # removes this sync's per-layer TPOT cost).
-                if hasattr(torch, "npu"):
+                # WORKAROUND (verified by SYNC_PHASES=insert_done): the adapter's native
+                # metadata kernels (mark_dirty / load) don't order with retrieve's load
+                # on the device -> retrieve reads torn slot metadata -> bad slot ->
+                # block_table OOB -> device hang. mark_dirty is once-per-block now, so
+                # only block-allocation steps run those kernels; sync ONLY then. Normal
+                # in-block steps do an ordered pool write and need no sync. Remove
+                # entirely once the native kernels enforce their own device-side order.
+                if _insert_meta_op and hasattr(torch, "npu"):
                     torch.npu.synchronize()
                 with _dsa_prof.section("ad_retrieve"):
                     _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)

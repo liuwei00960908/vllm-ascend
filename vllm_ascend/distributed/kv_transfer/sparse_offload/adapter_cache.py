@@ -363,12 +363,18 @@ class AdapterLatentCache:
         position: int,
         k_nope: torch.Tensor,   # (kv_lora_rank,)
         k_pe: torch.Tensor,     # (qk_rope_head_dim,)
-    ) -> int:
-        """Write one generated token's latent into the pool; return its slot.
+    ) -> bool:
+        """Write one generated token's latent into the pool.
 
-        A new block id is allocated lazily (``load_missing=False`` -> a free slot,
-        no backend fetch) when this token starts a fresh block; subsequent tokens
-        of the same block reuse the remembered slot.
+        Returns True iff this call ran adapter metadata kernels (it started a fresh
+        block: release prev + load + mark_dirty). On a normal in-block step it only
+        does an ordered pool write -- no metadata kernel -- so the caller can skip the
+        insert->retrieve sync on those steps.
+
+        ``mark_dirty`` is issued ONCE per block (at allocation), not per token: the
+        block is pinned for its whole fill window so it can't be evicted/refetched
+        mid-fill, the dirty bit persists, and every token write lands in the same
+        resident slot -- one mark covers the whole block's spill-on-eviction.
         """
         cfg = self.config
         layer = self._layers[layer_name]
@@ -376,12 +382,13 @@ class AdapterLatentCache:
         block_local = position // cfg.block_size
         offset = position % cfg.block_size
         key = (req_id, layer_name)
-        logical = torch.tensor(
-            [block_local + req_slot * cfg.blocks_per_req], dtype=ID_DTYPE, device=cfg.device
-        )
 
         cached = self._decode_block.get(key)
-        if cached is None or cached[0] != block_local:
+        new_block = cached is None or cached[0] != block_local
+        if new_block:
+            logical = torch.tensor(
+                [block_local + req_slot * cfg.blocks_per_req], dtype=ID_DTYPE, device=cfg.device
+            )
             # Starting a fresh block: unpin the previous (now-complete) block so it
             # becomes evictable, then allocate a slot for the new one (no fetch).
             if cached is not None:
@@ -391,15 +398,15 @@ class AdapterLatentCache:
                 layer.adapter.release(prev_logical)
             slot = int(layer.adapter.load(logical, load_missing=False)[0])
             self._decode_block[key] = (block_local, slot)
+            # Decode-written latent is NOT in the backend; mark the block dirty once at
+            # allocation so eviction spills it to LMCache (see docstring).
+            layer.adapter.mark_dirty(logical)
         else:
             slot = cached[1]
 
         layer.knope_pool[slot, offset, 0, :] = k_nope.to(cfg.dtype)
         layer.kpe_pool[slot, offset, 0, :] = k_pe.to(cfg.dtype)
-        # Decode-written latent is NOT in the backend; mark the block dirty so eviction
-        # spills it to LMCache (clean prefill-fetched blocks stay droppable).
-        layer.adapter.mark_dirty(logical)
-        return slot
+        return new_block
 
 
 # ----------------------------------------------------------------------------
