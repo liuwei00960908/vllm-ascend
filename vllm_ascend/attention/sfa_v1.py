@@ -1475,15 +1475,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                         logger.info("[ADAPTER-DBG] layer=%s phase=%s", layer_name, _phase)
 
                 _dbg("begin")
-                _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
-                _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
-                _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
+                with _dsa_prof.section("ad_prep"):
+                    _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
+                    _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
+                    _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
                 _dbg("cur_pos_done")
-                for _b in range(len(_req_ids_a)):
-                    # insert this step's generated token (one row per request)
-                    _ac.insert_decode_token(
-                        layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
-                    )
+                with _dsa_prof.section("ad_insert"):
+                    for _b in range(len(_req_ids_a)):
+                        # insert this step's generated token (one row per request)
+                        _ac.insert_decode_token(
+                            layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
+                        )
                 _dbg("insert_done")
                 # WORKAROUND (bring-up, verified by SYNC_PHASES=insert_done): the
                 # adapter's native metadata kernels (mark_dirty / load) don't order
@@ -1494,23 +1496,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # removes this sync's per-layer TPOT cost).
                 if hasattr(torch, "npu"):
                     torch.npu.synchronize()
-                _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
+                with _dsa_prof.section("ad_retrieve"):
+                    _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
                 _dbg("retrieve_done")
-                adapter_out = self._execute_sparse_flash_attention_process(
-                    ql_nope,
-                    q_pe,
-                    kv_cache,
-                    _res_a.sparse_indices.unsqueeze(1),
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    _res_a.seq_lens,
-                    kv_override=_res_a.knope_pool,
-                    key_rope_override=_res_a.kpe_pool,
-                    block_table_override=_res_a.block_table,
-                )
+                with _dsa_prof.section("ad_fa"):
+                    adapter_out = self._execute_sparse_flash_attention_process(
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        _res_a.sparse_indices.unsqueeze(1),
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        _res_a.seq_lens,
+                        kv_override=_res_a.knope_pool,
+                        key_rope_override=_res_a.kpe_pool,
+                        block_table_override=_res_a.block_table,
+                    )
                 _dbg("fa_done")
-                _ac.release_after_fa(layer_name, _res_a.loaded_ids)
+                with _dsa_prof.section("ad_release"):
+                    _ac.release_after_fa(layer_name, _res_a.loaded_ids)
                 _dbg("release_done")
+                _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
