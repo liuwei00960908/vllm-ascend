@@ -9,6 +9,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed.kv_transfer import has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
@@ -1403,12 +1404,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             # prompt_lens is per ROW: decode rows carry their request's prompt
             # length, prefill/padding rows carry 0 and stay untouched — so this
             # also covers mixed chunked-prefill + decode steps.
+            # The packed front-list only feeds LMCache's selected_tokens; skip building
+            # it (and its scatter) when no v1 connector will consume it (profiling /
+            # no-offload runs). Production with an LMCache connector is unchanged.
+            _need_packed = (
+                self.dsa_shrink_latent != 3
+                and has_kv_transfer_group()
+                and is_v1_kv_transfer_group()
+            )
             with _dsa_prof.section("scratch_remap"):
-                topk_indices, _sel_packed = scratch_remap(topk_indices, attn_metadata.prompt_lens)
+                topk_indices, _sel_packed = scratch_remap(
+                    topk_indices, attn_metadata.prompt_lens, need_packed=_need_packed
+                )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
-            if self.dsa_shrink_latent != 3:
+            if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 # decode rows come first in the reordered batch; the adapter
                 # iterates exactly the sparse-decode requests in row order.
                 with _dsa_prof.section("lmc_retrieve"):

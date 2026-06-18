@@ -14,7 +14,9 @@ Everything is fixed-shape tensor math: no D2H sync, graph-mode friendly.
 import torch
 
 
-def scratch_remap(topk_indices: torch.Tensor, prompt_lens: torch.Tensor):
+def scratch_remap(
+    topk_indices: torch.Tensor, prompt_lens: torch.Tensor, need_packed: bool = True
+):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
     Args:
@@ -43,6 +45,12 @@ def scratch_remap(topk_indices: torch.Tensor, prompt_lens: torch.Tensor):
     # kernel requires int32 indices, so pin the dtype explicitly.
     rank = torch.cumsum(is_pref, dim=1, dtype=sel.dtype) - 1
     new_indices = torch.where(is_pref, rank, sel)
+
+    if not need_packed:
+        # `packed` (the front-packed absolute positions) is only consumed by
+        # LMCache's selected_tokens; skip its scatter-based build (the heaviest op
+        # here) when no connector will read it.
+        return new_indices.reshape(orig_shape), None
 
     # Front-pack the prefill-selected absolute positions into [bs, k] (+1
     # trash column so non-prefill entries scatter harmlessly off the end).
