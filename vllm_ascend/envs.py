@@ -211,6 +211,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES": lambda: os.getenv(
         "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES", ""
     ),
+    # Back the adapter latent pool with LMCache (host KV store) instead of the
+    # in-memory reference backend. Default OFF: the in-memory backend keeps the CPU
+    # parity path and a no-LMCache A/B baseline. On -> evicted pool blocks spill to
+    # LMCache and misses reload from it (see adapter_cache.build_adapter_cache).
+    "VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND", "0"))
+    ),
+    # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
+    # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
+    # with headroom); set >0 to override. Total host = this x number of MLA layers.
+    "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(
+        os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")
+    ),
 }
 
 # end-env-vars-definition

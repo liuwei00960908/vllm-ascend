@@ -66,6 +66,7 @@ def _import_kv_cache_adapter():
 _kvca = _import_kv_cache_adapter()
 BlockStoreBackend = _kvca.BlockStoreBackend
 InMemoryBlockStoreBackend = _kvca.InMemoryBlockStoreBackend
+LMCacheBackend = _kvca.LMCacheBackend
 KVCacheAdapter = _kvca.KVCacheAdapter
 
 # Optional micro-profiler (shares VLLM_ASCEND_DSA_OFFLOAD_PROFILE). Guarded so the
@@ -322,7 +323,10 @@ class AdapterLatentCache:
             kp_blocks_all.append(buf_kp.view(n_blk, bs, 1, cfg.qk_rope_head_dim))
 
         if ids_all:
-            layer.backend.save_blocks(
+            # put_blocks(logical_ids, [knope_blocks, kpe_blocks]): store whole prompt
+            # blocks by logical id. Both backends (InMemory / LMCache) expose this;
+            # decode-time retrieve fetches these on a pool miss.
+            layer.backend.put_blocks(
                 torch.cat(ids_all),
                 [torch.cat(kn_blocks_all), torch.cat(kp_blocks_all)],
             )
@@ -494,11 +498,61 @@ def config_from_vllm(vllm_config, layer_names: list[str], device) -> AdapterCach
 
 
 def build_adapter_cache(vllm_config, layer_names: list[str], device) -> AdapterLatentCache | None:
-    """Construct the per-layer adapter cache (in-memory backend), or None if off."""
+    """Construct the per-layer adapter cache, or None if off.
+
+    Backend selection (env ``VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND``):
+      * off (default): in-memory reference backend — keeps the CPU parity path and a
+        no-LMCache A/B baseline.
+      * on: one ``LMCacheBackend`` per layer (host KV store). Evicted pool blocks
+        spill to LMCache and pool misses reload from it. Each layer gets its own
+        ``lmcache_instance_id`` so their key spaces never collide.
+    """
     cfg = config_from_vllm(vllm_config, layer_names, device)
     if cfg is None:
         return None
-    return AdapterLatentCache(cfg)
+
+    from vllm_ascend import envs as envs_ascend  # noqa: PLC0415
+
+    if not envs_ascend.VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND:
+        return AdapterLatentCache(cfg)
+
+    # The two pools' per-block shapes (the pool tensor is [num_actual_blocks, *shape]).
+    block_shapes = [
+        (cfg.block_size, 1, cfg.kv_lora_rank),     # k_nope
+        (cfg.block_size, 1, cfg.qk_rope_head_dim),  # k_pe
+    ]
+
+    # Per-layer host budget. The pinned pool holds one bundle per logical block; size
+    # it from that need (with headroom) unless the env overrides. Mirrors the adapter's
+    # 32B-aligned bundle layout so the auto value never under-sizes the allocator.
+    def _align32(n: int) -> int:
+        return (n + 31) // 32 * 32
+
+    elt = torch.empty((), dtype=cfg.dtype).element_size()
+    knope_nbytes = _align32(cfg.block_size * cfg.kv_lora_rank * elt)
+    bundle_nbytes = _align32(knope_nbytes + cfg.block_size * cfg.qk_rope_head_dim * elt)
+    pinned_need_bytes = cfg.num_logical_blocks * bundle_nbytes
+
+    cpu_gb = float(envs_ascend.VLLM_ASCEND_DSA_LMCACHE_CPU_GB)
+    if cpu_gb <= 0.0:
+        cpu_gb = max(0.1, pinned_need_bytes * 1.5 / (1024 ** 3))  # 50% headroom
+
+    def _lmcache_factory(layer_name: str) -> BlockStoreBackend:
+        # NPU native path: the pool tensors live on the NPU, so save_slots / load_blocks
+        # auto-dispatch to the native block_bundle kernels (no host index_select round
+        # trip). Passing num_logical_blocks preallocates one pinned host bundle per
+        # logical block up front and reuses them, instead of allocating pinned host on
+        # every eviction. Each layer gets its own lmcache_instance_id (disjoint keys).
+        # Requires the built kv_cache_adapter NPU extension and lmcache(+lmcache_ascend).
+        return LMCacheBackend(
+            block_shape=block_shapes,
+            block_dtype=[cfg.dtype, cfg.dtype],
+            num_logical_blocks=cfg.num_logical_blocks,
+            max_local_cpu_size_gb=cpu_gb,
+            lmcache_instance_id=f"dsa_adapter::{layer_name}",
+        )
+
+    return AdapterLatentCache(cfg, backend_factory=_lmcache_factory)
 
 
 def reserved_bytes_from_vllm(vllm_config) -> int:

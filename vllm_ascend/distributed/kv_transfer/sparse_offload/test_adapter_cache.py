@@ -109,7 +109,7 @@ def seed_prefill(cfg, backends, layer_name, req_slot, num_prefill_tokens):
         ids.append(blk + req_slot * cfg.blocks_per_req)
         knope_blocks.append(kn)
         kpe_blocks.append(kp)
-    backends[layer_name].save_blocks(
+    backends[layer_name].put_blocks(
         torch.tensor(ids, dtype=torch.int64),
         [torch.stack(knope_blocks), torch.stack(kpe_blocks)],
     )
