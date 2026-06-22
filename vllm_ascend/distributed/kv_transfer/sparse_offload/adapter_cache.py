@@ -316,15 +316,17 @@ class AdapterLatentCache:
         b, topk = topk_positions.shape
 
         # ACL graph pads the query/topk dim up to a captured size, so topk_positions can
-        # have MORE rows than there are real requests. The sparse-attn kernel's batch is
-        # the REAL request count (it checks actual_seq_lengths against it). Drop the
-        # padding rows so every output (block_table / sparse_indices / seq_lens) is the
-        # real batch -- same shapes the (working) scratch offload path passes. req_slots
-        # is already the real count (from dsa_req_ids).
+        # have MORE rows (b, padded) than there are real requests (n_real). The kernel
+        # wants MIXED shapes (exactly what native passes): sparse_indices at the padded
+        # query length b (to match the padded query tensor), but actual_seq_lengths_kv
+        # and block_table at the REAL request count. So: pad req_slots to broadcast,
+        # mask the padding query tokens (they select nothing), keep sparse_indices at b,
+        # and slice the per-request outputs (block_table, seq_lens) to n_real at return.
         n_real = req_slots.shape[0]
         if n_real < b:
-            topk_positions = topk_positions[:n_real]
-            b = n_real
+            req_slots = torch.cat([req_slots, req_slots.new_zeros(b - n_real)])
+            topk_positions = topk_positions.clone()
+            topk_positions[n_real:] = INVALID_POSITION
 
         valid = topk_positions >= 0
         local_block = torch.where(valid, topk_positions // bs, torch.zeros_like(topk_positions))
@@ -366,9 +368,10 @@ class AdapterLatentCache:
         return RetrieveResult(
             knope_pool=layer.knope_pool,
             kpe_pool=layer.kpe_pool,
-            block_table=block_table.to(torch.int32),
+            # per-request -> real batch (n_real); per-query-token -> padded length (b).
+            block_table=block_table[:n_real].to(torch.int32),
             sparse_indices=topk_positions.to(torch.int32),
-            seq_lens=valid.sum(dim=1).to(torch.int32),
+            seq_lens=valid.sum(dim=1)[:n_real].to(torch.int32),
             loaded_ids=unique_ids,
         )
 
