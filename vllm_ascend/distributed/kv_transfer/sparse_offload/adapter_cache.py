@@ -315,16 +315,16 @@ class AdapterLatentCache:
         bs = cfg.block_size
         b, topk = topk_positions.shape
 
-        # ACL graph pads the decode batch up to a captured size, so topk_positions can
-        # have MORE rows than there are real requests in req_slots. Pad req_slots to
-        # match and mask the padding rows' positions invalid, so they create no loads /
-        # block_table entries (the runner discards their FA output anyway). The native
-        # path doesn't hit this because vLLM pads attn_metadata.block_table for it.
+        # ACL graph pads the query/topk dim up to a captured size, so topk_positions can
+        # have MORE rows than there are real requests. The sparse-attn kernel's batch is
+        # the REAL request count (it checks actual_seq_lengths against it). Drop the
+        # padding rows so every output (block_table / sparse_indices / seq_lens) is the
+        # real batch -- same shapes the (working) scratch offload path passes. req_slots
+        # is already the real count (from dsa_req_ids).
         n_real = req_slots.shape[0]
         if n_real < b:
-            req_slots = torch.cat([req_slots, req_slots.new_zeros(b - n_real)])
-            topk_positions = topk_positions.clone()
-            topk_positions[n_real:] = INVALID_POSITION
+            topk_positions = topk_positions[:n_real]
+            b = n_real
 
         valid = topk_positions >= 0
         local_block = torch.where(valid, topk_positions // bs, torch.zeros_like(topk_positions))
