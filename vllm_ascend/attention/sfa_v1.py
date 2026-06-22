@@ -1492,11 +1492,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
                 _dbg("begin")
                 with _dsa_prof.section("ad_prep"):
-                    # per-step memo (shared across layers): one .tolist() host sync per
-                    # step instead of one per layer.
-                    _req_slots_a, _cur_pos_a = _ac.step_prep(
-                        layer_name, _req_ids_a, attn_metadata.seq_lens
-                    )
+                    # computed per layer (fresh): a cross-layer memo of these went
+                    # stale on batch changes (wrong size) and bought no TPOT, so it was
+                    # removed -- correctness over a non-win micro-opt.
+                    _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
+                    _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
                     _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
                 _dbg("cur_pos_done")
                 with _dsa_prof.section("ad_insert"):
