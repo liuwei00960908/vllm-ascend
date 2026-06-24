@@ -128,6 +128,7 @@ from vllm_ascend.utils import (
     lmhead_tp_enable,
     set_weight_prefetch_method,
 )
+from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
@@ -149,6 +150,7 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -282,7 +284,9 @@ class NPUModelRunner(GPUModelRunner):
         self.use_sparse = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
             vllm_config.model_config.hf_text_config, "index_topk"
         )
+        self.dsa_index_topk = 0
         if self.use_sparse:
+            self.dsa_index_topk = int(self.model_config.hf_text_config.index_topk)
             self.sparse_head_dim = (
                 self.model_config.hf_text_config.kv_lora_rank,
                 self.model_config.hf_text_config.qk_rope_head_dim,
@@ -311,6 +315,16 @@ class NPUModelRunner(GPUModelRunner):
             logger.info("DSA two-group mode enabled: separate block tables/pools for latent and indexer.")
         elif envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
             logger.warning("VLLM_ASCEND_DSA_TWO_GROUPS requires VLLM_ASCEND_DSA_UNBUNDLE=1; ignoring.")
+        self.dsa_shared_pool = bool(
+            self.dsa_two_groups and envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL
+        )
+        if self.dsa_shared_pool:
+            logger.info("DSA shared bundle pool enabled for latent/indexer KV cache.")
+        elif envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL:
+            logger.warning(
+                "VLLM_ASCEND_DSA_SHARED_POOL requires DSA_UNBUNDLE=1 and "
+                "DSA_TWO_GROUPS=1; ignoring."
+            )
         # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
         self.dsa_shrink_latent = (
             int(envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_two_groups else 0
@@ -2271,11 +2285,17 @@ class NPUModelRunner(GPUModelRunner):
                     # values (decode rows -> plen, prefill/padding rows -> 0 =
                     # no remap) and ships them to device.
                     plens_np = self.input_batch.num_prompt_tokens[:num_reqs]
-                    if not self._dsa_short_prompt_warned and (plens_np > 0).any() and plens_np[plens_np > 0].min() < 2048:
+                    if (
+                        not self._dsa_short_prompt_warned
+                        and (plens_np > 0).any()
+                        and plens_np[plens_np > 0].min() < self.dsa_index_topk
+                    ):
                         logger.warning(
-                            "DSA shrink-latent: request with prompt_len < index_topk (2048) detected; "
+                            "DSA shrink-latent: request with prompt_len < index_topk (%d) detected; "
                             "the compact-scratch path does not support it yet (scratch rows would alias "
-                            "live decode positions). Expect wrong output for such requests.")
+                            "live decode positions). Expect wrong output for such requests.",
+                            self.dsa_index_topk,
+                        )
                         self._dsa_short_prompt_warned = True
                     cm.prompt_lens_cpu = plens_np.copy()
             if self.speculative_config and spec_decode_common_attn_metadata is None:
@@ -2877,6 +2897,25 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(layer_kv_cache_spec[layer_name], AttentionSpec):
                     use_attn = True
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
+            if (
+                self.dsa_shared_pool
+                and self.use_sparse
+                and use_attn
+                and not use_mamba
+                and any("indexer" in ln for ln in kv_cache_tensor.shared_by)
+                and any("indexer" not in ln for ln in kv_cache_tensor.shared_by)
+            ):
+                if self.use_sparse_c8_indexer:
+                    raise RuntimeError("DSA shared pool does not support sparse C8 indexer.")
+                if self.vllm_config.kv_transfer_config is None:
+                    raw_tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
+                else:
+                    cache_size_aligned = kv_cache_tensor.size + alignment
+                    raw_tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
+                    raw_tensor = self._align_memory(raw_tensor, alignment)[: kv_cache_tensor.size]
+                for layer_name_inner in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name_inner] = (raw_tensor,)
+                continue
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 if (
@@ -3055,6 +3094,18 @@ class NPUModelRunner(GPUModelRunner):
                     bs, nh = spec.block_size, spec.num_kv_heads
                     elt = get_dtype_size(spec.dtype)
                     kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
+                    if self.dsa_shared_pool and len(raws) == 1:
+                        kv_caches[layer_name] = reshape_dsa_shared_pool_raw(
+                            raws[0],
+                            spec.dtype,
+                            bs,
+                            nh,
+                            kv_lora_rank,
+                            qk_rope_head_dim,
+                            index_head_dim,
+                            is_indexer="indexer" in layer_name,
+                        )
+                        continue
                     # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
                     if "indexer" in layer_name:  # single vector cache
                         nb = raws[0].numel() // (bs * nh * index_head_dim * elt)
@@ -3307,6 +3358,14 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            if self.dsa_shared_pool and isinstance(kv_cache_group.kv_cache_spec, AttentionSpec):
+                if kv_cache_group.kv_cache_spec.head_size > self.sparse_head_dim[-1]:
+                    blocks_per_bundle = 2
+                else:
+                    blocks_per_bundle = 9
+                max_num_blocks_per_req = cdiv(
+                    max_num_blocks_per_req, blocks_per_bundle
+                ) * blocks_per_bundle
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
