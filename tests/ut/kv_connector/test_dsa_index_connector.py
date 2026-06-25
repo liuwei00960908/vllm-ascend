@@ -1,0 +1,192 @@
+import sys
+import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+fake_mooncake = types.ModuleType("mooncake")
+fake_engine = types.ModuleType("mooncake.engine")
+fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
+fake_mooncake.engine = fake_engine
+sys.modules.setdefault("mooncake", fake_mooncake)
+sys.modules.setdefault("mooncake.engine", fake_engine)
+
+fake_torch_npu = types.ModuleType("torch_npu")
+fake_torch_npu.atb = SimpleNamespace(npu_paged_cache_load=MagicMock())
+sys.modules.setdefault("torch_npu", fake_torch_npu)
+
+from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA  # noqa: E402
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks  # noqa: E402
+
+from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
+    AscendMultiConnector,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (  # noqa: E402
+    MooncakeDSAIndexConnector,
+)
+
+
+class _Block:
+    def __init__(self, block_id: int):
+        self.block_id = block_id
+        self.block_hash = None
+        self.is_null = False
+
+
+def _blocks() -> KVCacheBlocks:
+    return KVCacheBlocks(((_Block(10), _Block(11)), (_Block(20), _Block(21))))
+
+
+def test_dsa_index_connector_supports_hma_and_selects_index_group():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector.connector_scheduler = MagicMock()
+    connector.connector_scheduler.request_finished.return_value = (
+        True,
+        {"remote_block_ids": [20, 21]},
+    )
+
+    request = SimpleNamespace(request_id="req-1")
+    async_save, params = connector.request_finished_all_groups(
+        request,
+        ([10, 11], [20, 21]),
+    )
+
+    assert isinstance(connector, SupportsHMA)
+    assert async_save is True
+    assert params == {"remote_block_ids": [20, 21]}
+    connector.connector_scheduler.request_finished.assert_called_once_with(
+        request,
+        [20, 21],
+    )
+
+
+def test_dsa_index_update_state_uses_index_group_and_preserves_prefill_flag():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector.connector_scheduler = MagicMock()
+
+    def _mutate_prefill_flag(request, _blocks, _tokens):
+        request.kv_transfer_params["do_remote_prefill"] = False
+
+    connector.connector_scheduler.update_state_after_alloc.side_effect = (
+        _mutate_prefill_flag
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params={"do_remote_prefill": True},
+    )
+
+    connector.update_state_after_alloc(request, _blocks(), 32)
+
+    assert request.kv_transfer_params["do_remote_prefill"] is True
+    passed_blocks = (
+        connector.connector_scheduler.update_state_after_alloc.call_args.args[1]
+    )
+    assert passed_blocks.get_unhashed_block_ids() == [20, 21]
+
+
+def test_dsa_index_update_state_skips_without_external_tokens():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector.connector_scheduler = MagicMock()
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params={"do_remote_prefill": True},
+    )
+
+    connector.update_state_after_alloc(request, _blocks(), 0)
+
+    connector.connector_scheduler.update_state_after_alloc.assert_not_called()
+
+
+def test_dsa_index_registers_only_indexer_layers():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector.connector_worker = MagicMock()
+    latent = (object(), object())
+    indexer = (object(),)
+
+    connector.register_kv_caches(
+        {
+            "model.layers.0.self_attn": latent,
+            "model.layers.0.self_attn.indexer": indexer,
+        }
+    )
+
+    connector.connector_worker.register_kv_caches.assert_called_once_with(
+        {"model.layers.0.self_attn.indexer": indexer}
+    )
+
+
+def test_ascend_multi_registers_latent_and_indexer_separately():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.register_kv_caches = MagicMock()
+    multi._connectors = [latent_connector, index_connector]
+
+    latent = (object(), object())
+    indexer = (object(),)
+    kv_caches = {
+        "model.layers.0.self_attn": latent,
+        "model.layers.0.self_attn.indexer": indexer,
+    }
+
+    multi.register_kv_caches(kv_caches)
+
+    latent_connector.register_kv_caches.assert_called_once_with(
+        {"model.layers.0.self_attn": latent}
+    )
+    index_connector.register_kv_caches.assert_called_once_with(kv_caches)
+
+
+def test_ascend_multi_updates_chosen_latent_and_index_connector():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.update_state_after_alloc = MagicMock()
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {"req-1": 0}
+
+    request = SimpleNamespace(request_id="req-1")
+    blocks = _blocks()
+    multi.update_state_after_alloc(request, blocks, 32)
+
+    latent_blocks = latent_connector.update_state_after_alloc.call_args.args[1]
+    index_blocks = index_connector.update_state_after_alloc.call_args.args[1]
+
+    assert latent_blocks.get_unhashed_block_ids() == [10, 11]
+    assert index_blocks is blocks
+    index_connector.update_state_after_alloc.assert_called_once_with(
+        request,
+        blocks,
+        32,
+    )
+
+
+def test_ascend_multi_request_finished_all_groups_merges_params():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    latent_connector.request_finished.return_value = (False, {"first_tok": 7})
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.request_finished_all_groups = MagicMock(
+        return_value=(True, {"do_remote_prefill": True, "remote_block_ids": [20]})
+    )
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10], [20]))
+
+    assert async_save is True
+    assert params == {
+        "first_tok": 7,
+        "do_remote_prefill": True,
+        "remote_block_ids": [20],
+    }
+    latent_connector.request_finished.assert_called_once_with(request, [10])
+    index_connector.request_finished_all_groups.assert_called_once_with(
+        request,
+        ([10], [20]),
+    )

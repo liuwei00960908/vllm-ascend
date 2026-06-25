@@ -1189,7 +1189,8 @@ class MooncakeConnectorWorker:
 
         # TODO(tms): Find a more robust way to detect and handle MLA
         self.use_mla = (
-            first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1) and len(first_kv_cache_tuple) == 2
+            len(first_kv_cache_tuple) == 2
+            and first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1)
         )
         self.use_sparse = len(first_kv_cache_tuple) == 3
 
