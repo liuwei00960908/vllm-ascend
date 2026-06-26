@@ -1095,6 +1095,7 @@ class MooncakeConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self._get_prefill_decode_size(vllm_config)
+        self._validate_local_parallel_config(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
@@ -1180,6 +1181,35 @@ class MooncakeConnectorWorker:
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
         assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
+
+    def _validate_local_parallel_config(self, vllm_config: VllmConfig) -> None:
+        actual_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        actual_pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        kv_role = vllm_config.kv_transfer_config.kv_role
+
+        sides: list[tuple[str, int, int]] = []
+        if kv_role in ("kv_producer", "kv_both"):
+            sides.append(("prefill", self._prefill_tp_size, self._prefill_pp_size))
+        if kv_role in ("kv_consumer", "kv_both"):
+            sides.append(("decode", self._decode_tp_size, self._decode_pp_size))
+
+        for side, configured_tp_size, configured_pp_size in sides:
+            if configured_tp_size != actual_tp_size:
+                raise ValueError(
+                    "MooncakeConnector kv_connector_extra_config."
+                    f"{side}.tp_size ({configured_tp_size}) must match the "
+                    f"actual --tensor-parallel-size ({actual_tp_size}) for "
+                    f"kv_role={kv_role}. Update either --tensor-parallel-size "
+                    f"or kv_connector_extra_config.{side}.tp_size."
+                )
+            if configured_pp_size != actual_pp_size:
+                raise ValueError(
+                    "MooncakeConnector kv_connector_extra_config."
+                    f"{side}.pp_size ({configured_pp_size}) must match the "
+                    f"actual --pipeline-parallel-size ({actual_pp_size}) for "
+                    f"kv_role={kv_role}. Update either --pipeline-parallel-size "
+                    f"or kv_connector_extra_config.{side}.pp_size."
+                )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""

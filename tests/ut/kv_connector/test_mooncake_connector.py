@@ -1191,6 +1191,45 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNone(worker.kv_send_thread)
         self.assertIsNotNone(worker.kv_recv_thread)
 
+    def test_local_parallel_config_validates_consumer_decode_tp(self):
+        self.vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d: {
+            "prefill": {
+                "tp_size": 2,
+                "dp_size": 1,
+                "pp_size": 1
+            },
+            "decode": {
+                "tp_size": 8,
+                "dp_size": 1,
+                "pp_size": 1
+            }
+        }.get(k, d)
+
+        with self.assertRaisesRegex(
+                ValueError,
+                r"decode\.tp_size \(8\).*--tensor-parallel-size \(2\)"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+    def test_local_parallel_config_validates_producer_prefill_tp(self):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d: {
+            "prefill": {
+                "tp_size": 8,
+                "dp_size": 1,
+                "pp_size": 1
+            },
+            "decode": {
+                "tp_size": 2,
+                "dp_size": 1,
+                "pp_size": 1
+            }
+        }.get(k, d)
+
+        with self.assertRaisesRegex(
+                ValueError,
+                r"prefill\.tp_size \(8\).*--tensor-parallel-size \(2\)"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
     def test_register_kv_caches_mla_case(self):
         mla_cache1 = MagicMock()
         mla_cache1.size.return_value = (10, 16, 1, 16)
@@ -1226,6 +1265,8 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                                 "prefill": {"tp_size": prefill_tp_size, "dp_size": 1, "pp_size": prefill_pp_size},
                                 "decode": {"tp_size": decode_tp_size, "dp_size": 1, "pp_size": 1}
                             }.get(k, d)):
+                self.vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+                self.vllm_config.parallel_config.tensor_parallel_size = decode_tp_size
                 self.vllm_config.model_config.hf_text_config.num_key_value_heads = num_kv_heads
                 self.vllm_config.model_config.is_deepseek_mla = is_deepseek_mla
                 worker = MooncakeConnectorWorker(self.vllm_config,
