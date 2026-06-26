@@ -121,9 +121,19 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
         old_do_remote_prefill = (
             params.get("do_remote_prefill") if params is not None else None
         )
+        index_blocks = self._select_index_group_blocks(blocks)
+        logger.info(
+            "MooncakeDSAIndexConnector D alloc: request_id=%s index_group=%d "
+            "external_tokens=%d local_index_blocks=%d do_remote_prefill=%s",
+            request.request_id,
+            self.index_group_id,
+            num_external_tokens,
+            len(index_blocks.blocks[0]),
+            old_do_remote_prefill,
+        )
         self.connector_scheduler.update_state_after_alloc(
             request,
-            self._select_index_group_blocks(blocks),
+            index_blocks,
             num_external_tokens,
         )
         if params is not None and old_do_remote_prefill is not None:
@@ -136,9 +146,9 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         index_block_ids = self._select_index_group_ids(block_ids)
-        logger.debug(
-            "MooncakeDSAIndexConnector request_finished_all_groups: "
-            "request_id=%s index_group=%d blocks=%d",
+        logger.info(
+            "MooncakeDSAIndexConnector P finish: request_id=%s index_group=%d "
+            "remote_index_blocks=%d",
             request.request_id,
             self.index_group_id,
             len(index_block_ids),
