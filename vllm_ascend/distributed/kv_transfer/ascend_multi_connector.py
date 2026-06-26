@@ -240,16 +240,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 wait_for_layer_load(layer_name)
                 layer_only_children.append(connector.__class__.__name__)
 
-        if args or kwargs:
-            logger.info_once(
-                "AscendMultiConnector sparse wait_for_layer_load dispatch: "
+        if args or kwargs or ".layers.0." in layer_name:
+            logger.info(
+                "AscendMultiConnector wait_for_layer_load dispatch: layer=%s "
                 "full_arg_children=%s layer_only_children=%s extra_pos_args=%d "
                 "extra_kwargs=%s",
+                layer_name,
                 ",".join(full_arg_children),
                 ",".join(layer_only_children),
                 len(args),
                 ",".join(sorted(kwargs)),
-                scope="local",
             )
 
     def get_num_new_matched_tokens(

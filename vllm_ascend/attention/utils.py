@@ -7,10 +7,13 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend import envs
 from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+
+logger = init_logger(__name__)
 
 
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -271,12 +274,39 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
+def _debug_tensor_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _should_log_dsa_wait(layer_name: str, selected_tokens: Any) -> bool:
+    return selected_tokens is not None or ".layers.0." in layer_name
+
+
 def wait_for_kv_layer_from_connector(
     layer_name: str,
     selected_tokens=None,
     token_start_index=None,
 ):
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+    has_group = has_kv_transfer_group()
+    is_v1_group = is_v1_kv_transfer_group() if has_group else False
+    if not has_group or not is_v1_group:
+        if _should_log_dsa_wait(layer_name, selected_tokens):
+            logger.info(
+                "DSA wait_for_kv_layer skipped: layer=%s has_group=%s "
+                "is_v1_group=%s selected_shape=%s",
+                layer_name,
+                has_group,
+                is_v1_group,
+                _debug_tensor_shape(selected_tokens),
+            )
         return
 
     connector = get_kv_transfer_group()
@@ -284,6 +314,14 @@ def wait_for_kv_layer_from_connector(
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
+        if _should_log_dsa_wait(layer_name, selected_tokens):
+            logger.info(
+                "DSA wait_for_kv_layer skipped: layer=%s reason=no_attn_metadata "
+                "selected_shape=%s connector=%s",
+                layer_name,
+                _debug_tensor_shape(selected_tokens),
+                connector.__class__.__name__,
+            )
         return
     # TODO: assert ascendMetadata
     # DSA selective load: pass the indexer's top-k positions so LMCache loads only the
@@ -299,10 +337,29 @@ def wait_for_kv_layer_from_connector(
         dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
         if dsa_req_ids is not None:
             request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+        logger.info(
+            "DSA wait_for_kv_layer selected: layer=%s selected_shape=%s "
+            "selected_dtype=%s selected_device=%s token_start_index=%s "
+            "request_ids_len=%s request_ids_preview=%s connector=%s",
+            layer_name,
+            _debug_tensor_shape(selected_tokens),
+            getattr(selected_tokens, "dtype", None),
+            getattr(selected_tokens, "device", None),
+            token_start_index,
+            len(request_ids) if request_ids is not None else None,
+            request_ids[:4] if request_ids is not None else None,
+            connector.__class__.__name__,
+        )
         connector.wait_for_layer_load(
             layer_name, selected_tokens, token_start_index, request_ids
         )
     else:
+        if _should_log_dsa_wait(layer_name, selected_tokens):
+            logger.info(
+                "DSA wait_for_kv_layer dense: layer=%s connector=%s",
+                layer_name,
+                connector.__class__.__name__,
+            )
         connector.wait_for_layer_load(layer_name)
 
 

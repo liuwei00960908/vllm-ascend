@@ -1396,6 +1396,31 @@ class AscendSFAImpl(MLAAttentionImpl):
         # keep their ABSOLUTE positions (>= prompt_len >= k, disjoint from the
         # scratch row space) and are read in place via the same block table.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
+        _has_kv_group = has_kv_transfer_group()
+        _is_v1_kv_group = is_v1_kv_transfer_group() if _has_kv_group else False
+        _dsa_wait_log = bool(self.dsa_shrink_latent) and (
+            ".layers.0." in layer_name or attn_metadata.num_decode_tokens > 0
+        )
+        if _dsa_wait_log:
+            logger.info(
+                "DSA shrink-latent wait gate: layer=%s stage=%s "
+                "prompt_lens_none=%s prompt_lens_shape=%s prompt_lens_device=%s "
+                "num_decode_tokens=%s attn_state=%s has_kv_group=%s "
+                "is_v1_kv_group=%s topk_shape=%s topk_device=%s",
+                layer_name,
+                self.dsa_shrink_latent,
+                attn_metadata.prompt_lens is None,
+                tuple(attn_metadata.prompt_lens.shape)
+                if attn_metadata.prompt_lens is not None else None,
+                attn_metadata.prompt_lens.device
+                if attn_metadata.prompt_lens is not None else None,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.attn_state,
+                _has_kv_group,
+                _is_v1_kv_group,
+                tuple(topk_indices.shape),
+                topk_indices.device,
+            )
         if (
             self.dsa_shrink_latent
             and attn_metadata.prompt_lens is not None
@@ -1409,12 +1434,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             # no-offload runs). Production with an LMCache connector is unchanged.
             _need_packed = (
                 self.dsa_shrink_latent != 3
-                and has_kv_transfer_group()
-                and is_v1_kv_transfer_group()
+                and _has_kv_group
+                and _is_v1_kv_group
             )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices, attn_metadata.prompt_lens, need_packed=_need_packed
+                )
+            if _dsa_wait_log:
+                logger.info(
+                    "DSA shrink-latent remap: layer=%s need_packed=%s "
+                    "selected_none=%s selected_shape=%s selected_dtype=%s "
+                    "selected_device=%s remapped_topk_shape=%s",
+                    layer_name,
+                    _need_packed,
+                    _sel_packed is None,
+                    tuple(_sel_packed.shape) if _sel_packed is not None else None,
+                    _sel_packed.dtype if _sel_packed is not None else None,
+                    _sel_packed.device if _sel_packed is not None else None,
+                    tuple(topk_indices.shape),
                 )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
@@ -1422,11 +1460,29 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 # decode rows come first in the reordered batch; the adapter
                 # iterates exactly the sparse-decode requests in row order.
+                _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
+                if _dsa_wait_log:
+                    logger.info(
+                        "DSA shrink-latent calling connector wait: layer=%s "
+                        "selected_shape=%s selected_dtype=%s selected_device=%s",
+                        layer_name,
+                        tuple(_selected_for_wait.shape),
+                        _selected_for_wait.dtype,
+                        _selected_for_wait.device,
+                    )
                 with _dsa_prof.section("lmc_retrieve"):
                     wait_for_kv_layer_from_connector(
                         layer_name,
-                        selected_tokens=_sel_packed[: attn_metadata.num_decode_tokens],
+                        selected_tokens=_selected_for_wait,
                     )
+            elif _dsa_wait_log:
+                logger.info(
+                    "DSA shrink-latent connector wait skipped after remap: "
+                    "layer=%s stage=%s selected_none=%s",
+                    layer_name,
+                    self.dsa_shrink_latent,
+                    _sel_packed is None,
+                )
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
