@@ -1,3 +1,4 @@
+import inspect
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -33,6 +34,39 @@ def _single_group_blocks(blocks: "KVCacheBlocks", group_idx: int) -> "KVCacheBlo
             f"{len(blocks.blocks)} groups exist."
         )
     return KVCacheBlocks((blocks.blocks[group_idx],))
+
+
+def _callable_accepts_args(
+    func: Any,
+    num_positional_args: int,
+    keyword_names: set[str],
+) -> bool:
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+
+    positional_count = 0
+    accepts_varargs = False
+    accepts_varkw = False
+    accepted_keywords = set()
+    for param in params:
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            accepts_varargs = True
+        elif param.kind == inspect.Parameter.VAR_KEYWORD:
+            accepts_varkw = True
+        elif param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+            accepted_keywords.add(param.name)
+        elif param.kind == inspect.Parameter.KEYWORD_ONLY:
+            accepted_keywords.add(param.name)
+
+    accepts_positional = accepts_varargs or positional_count >= num_positional_args
+    accepts_keywords = accepts_varkw or keyword_names.issubset(accepted_keywords)
+    return accepts_positional and accepts_keywords
 
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
@@ -130,6 +164,23 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 connector.register_kv_caches(kv_caches)
             else:
                 connector.register_kv_caches(latent_only)
+
+    def wait_for_layer_load(
+        self,
+        layer_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        for connector in self._connectors:
+            wait_for_layer_load = connector.wait_for_layer_load
+            if _callable_accepts_args(
+                wait_for_layer_load,
+                1 + len(args),
+                set(kwargs),
+            ):
+                wait_for_layer_load(layer_name, *args, **kwargs)
+            else:
+                wait_for_layer_load(layer_name)
 
     def update_state_after_alloc(
         self,

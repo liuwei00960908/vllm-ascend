@@ -183,6 +183,49 @@ def test_ascend_multi_registers_latent_and_indexer_separately():
     index_connector.register_kv_caches.assert_called_once_with(kv_caches)
 
 
+def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():
+    multi = object.__new__(AscendMultiConnector)
+    calls = []
+
+    class LegacyConnector:
+        def wait_for_layer_load(self, layer_name):
+            calls.append(("legacy", layer_name))
+
+    class SparseLatentConnector:
+        def wait_for_layer_load(
+            self,
+            layer_name,
+            selected_tokens,
+            token_start_index,
+            request_ids,
+        ):
+            calls.append(
+                (
+                    "sparse",
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                )
+            )
+
+    multi._connectors = [LegacyConnector(), SparseLatentConnector()]
+
+    selected_tokens = object()
+    request_ids = ["req-1"]
+    multi.wait_for_layer_load(
+        "model.layers.0.self_attn",
+        selected_tokens,
+        7,
+        request_ids,
+    )
+
+    assert calls == [
+        ("legacy", "model.layers.0.self_attn"),
+        ("sparse", "model.layers.0.self_attn", selected_tokens, 7, request_ids),
+    ]
+
+
 def test_ascend_multi_updates_chosen_latent_and_index_connector():
     multi = object.__new__(AscendMultiConnector)
     latent_connector = MagicMock()
