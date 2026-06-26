@@ -1,7 +1,11 @@
 from typing import TYPE_CHECKING, Any
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    SupportsHMA,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.utils.func_utils import supports_kw
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (
@@ -12,6 +16,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 
@@ -32,6 +39,43 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     # DSA unbundle needs the model runner to pass both latent and indexer KV
     # caches so this connector can route them to different children.
     requires_full_dsa_kv_caches = True
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: "KVConnectorRole",
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
+        KVConnectorBase_V1.__init__(
+            self,
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
+
+        self._connectors: list[KVConnectorBase_V1] = []
+        self._ktc_kv_transfer_config = []
+        for connector_cls, temp_config in self._get_connector_classes_and_configs(
+            vllm_config
+        ):
+            if supports_kw(connector_cls, "kv_cache_config"):
+                connector = connector_cls(
+                    temp_config,
+                    role,
+                    kv_cache_config=kv_cache_config,
+                )
+            else:
+                connector = connector_cls(temp_config, role)
+            self._connectors.append(connector)
+            self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+
+        # A mapping from request id to the index of the connector chosen to
+        # load the request from (if any).
+        self._requests_to_connector: dict[str, int] = {}
+
+        # Tracks additional async saves beyond the first one. This mirrors
+        # MultiConnector while allowing legacy child connector constructors.
+        self._extra_async_saves: dict[str, int] = {}
 
     def _has_dsa_index_connector(self) -> bool:
         return any(isinstance(c, MooncakeDSAIndexConnector) for c in self._connectors)

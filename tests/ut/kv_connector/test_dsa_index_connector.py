@@ -36,6 +36,49 @@ def _blocks() -> KVCacheBlocks:
     return KVCacheBlocks(((_Block(10), _Block(11)), (_Block(20), _Block(21))))
 
 
+def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):
+    calls = []
+
+    class LegacyConnector:
+        def __init__(self, vllm_config, role):
+            calls.append(("legacy", vllm_config, role, None))
+
+    class NewConnector:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            calls.append(("new", vllm_config, role, kv_cache_config))
+
+    top_config = SimpleNamespace(kv_transfer_config=object())
+    legacy_config = SimpleNamespace(kv_transfer_config="legacy-ktc")
+    new_config = SimpleNamespace(kv_transfer_config="new-ktc")
+    role = object()
+    kv_cache_config = object()
+
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: [
+                (LegacyConnector, legacy_config),
+                (NewConnector, new_config),
+            ]
+        ),
+    )
+
+    multi = AscendMultiConnector(top_config, role, kv_cache_config)
+
+    assert [type(connector) for connector in multi._connectors] == [
+        LegacyConnector,
+        NewConnector,
+    ]
+    assert multi._ktc_kv_transfer_config == ["legacy-ktc", "new-ktc"]
+    assert multi._requests_to_connector == {}
+    assert multi._extra_async_saves == {}
+    assert calls == [
+        ("legacy", legacy_config, role, None),
+        ("new", new_config, role, kv_cache_config),
+    ]
+
+
 def test_dsa_index_connector_supports_hma_and_selects_index_group():
     connector = object.__new__(MooncakeDSAIndexConnector)
     connector.index_group_id = 1
