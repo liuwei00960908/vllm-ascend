@@ -43,6 +43,23 @@ def _single_group_blocks(blocks: "KVCacheBlocks", group_idx: int) -> "KVCacheBlo
     return KVCacheBlocks((blocks.blocks[group_idx],))
 
 
+def _has_remote_prefill_blocks(request: "Request") -> bool:
+    params = getattr(request, "kv_transfer_params", None)
+    if not isinstance(params, dict):
+        return False
+    required_keys = (
+        "remote_engine_id",
+        "remote_host",
+        "remote_port",
+        "remote_request_id",
+    )
+    return (
+        bool(params.get("do_remote_prefill"))
+        and bool(params.get("remote_block_ids"))
+        and all(key in params and params[key] is not None for key in required_keys)
+    )
+
+
 def _callable_accepts_args(
     func: Any,
     num_positional_args: int,
@@ -117,6 +134,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         # Tracks additional async saves beyond the first one. This mirrors
         # MultiConnector while allowing legacy child connector constructors.
         self._extra_async_saves: dict[str, int] = {}
+        self._index_load_async_req_ids: set[str] = set()
         self._wait_for_layer_load_sig_cache: dict[
             tuple[type, int, tuple[str, ...]], bool
         ] = {}
@@ -234,6 +252,58 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 scope="local",
             )
 
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        to_return = (0, False)
+        chosen_connector = -1
+        for i, connector in enumerate(self._connectors):
+            tokens, load_async = connector.get_num_new_matched_tokens(
+                request,
+                num_computed_tokens,
+            )
+            if tokens is None:
+                return None, False
+            if to_return[0] == 0 and tokens > 0:
+                self._requests_to_connector[request.request_id] = i
+                chosen_connector = i
+                to_return = (tokens, load_async)
+
+        tokens, load_async = to_return
+        if (
+            tokens > 0
+            and not load_async
+            and self._has_dsa_index_connector()
+            and _has_remote_prefill_blocks(request)
+        ):
+            chosen_connector_name = (
+                self._connectors[chosen_connector].__class__.__name__
+                if 0 <= chosen_connector < len(self._connectors)
+                else "none"
+            )
+            index_load_async_req_ids = getattr(
+                self, "_index_load_async_req_ids", None
+            )
+            if index_load_async_req_ids is None:
+                index_load_async_req_ids = set()
+                self._index_load_async_req_ids = index_load_async_req_ids
+            index_load_async_req_ids.add(request.request_id)
+            params = request.kv_transfer_params
+            logger.info(
+                "AscendMultiConnector scheduling async DSA index load: "
+                "request_id=%s external_tokens=%d chosen_connector=%s "
+                "remote_index_blocks=%d",
+                request.request_id,
+                tokens,
+                chosen_connector_name,
+                len(params["remote_block_ids"]),
+            )
+            return tokens, True
+
+        return to_return
+
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -252,6 +322,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         do_remote_decode = (
             params.get("do_remote_decode") if params is not None else None
+        )
+        index_load_async_req_ids = getattr(self, "_index_load_async_req_ids", set())
+        skip_chosen_zero_update = (
+            num_external_tokens == 0
+            and request.request_id in index_load_async_req_ids
+            and getattr(request, "num_computed_tokens", 0) > 0
+            and chosen_connector >= 0
         )
         if (
             num_external_tokens > 0
@@ -272,6 +349,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
         empty_blocks = blocks.new_empty()
         for i, connector in enumerate(self._connectors):
+            if skip_chosen_zero_update and i == chosen_connector:
+                logger.info(
+                    "AscendMultiConnector preserving latent load state "
+                    "after async DSA index load: request_id=%s "
+                    "skipped_connector=%s",
+                    request.request_id,
+                    connector.__class__.__name__,
+                )
+                continue
             should_update = i == chosen_connector or self._should_receive_alloc_update(
                 connector
             )
@@ -282,6 +368,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 self._blocks_for_connector(connector, target_blocks),
                 target_tokens,
             )
+        if skip_chosen_zero_update:
+            index_load_async_req_ids.discard(request.request_id)
 
     def request_finished_all_groups(
         self,
@@ -318,4 +406,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._extra_async_saves[request.request_id] = async_saves - 1
 
         self._requests_to_connector.pop(request.request_id, None)
+        index_load_async_req_ids = getattr(self, "_index_load_async_req_ids", None)
+        if index_load_async_req_ids is not None:
+            index_load_async_req_ids.discard(request.request_id)
         return async_saves > 0, kv_transfer_params

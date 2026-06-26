@@ -36,6 +36,17 @@ def _blocks() -> KVCacheBlocks:
     return KVCacheBlocks(((_Block(10), _Block(11)), (_Block(20), _Block(21))))
 
 
+def _remote_index_params(remote_block_ids=None):
+    return {
+        "do_remote_prefill": True,
+        "remote_block_ids": [20, 21] if remote_block_ids is None else remote_block_ids,
+        "remote_engine_id": "engine-0",
+        "remote_host": "127.0.0.1",
+        "remote_port": 29000,
+        "remote_request_id": "remote-req-1",
+    }
+
+
 def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):
     calls = []
 
@@ -73,6 +84,7 @@ def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch
     assert multi._ktc_kv_transfer_config == ["legacy-ktc", "new-ktc"]
     assert multi._requests_to_connector == {}
     assert multi._extra_async_saves == {}
+    assert multi._index_load_async_req_ids == set()
     assert calls == [
         ("legacy", legacy_config, role, None),
         ("new", new_config, role, kv_cache_config),
@@ -224,6 +236,87 @@ def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():
         ("legacy", "model.layers.0.self_attn"),
         ("sparse", "model.layers.0.self_attn", selected_tokens, 7, request_ids),
     ]
+
+
+def test_ascend_multi_waits_for_async_index_load_when_latent_hits():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    latent_connector.get_num_new_matched_tokens.return_value = (32, False)
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {}
+
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params=_remote_index_params(),
+    )
+
+    tokens, load_async = multi.get_num_new_matched_tokens(request, 0)
+
+    assert tokens == 32
+    assert load_async is True
+    assert multi._requests_to_connector == {"req-1": 0}
+    assert multi._index_load_async_req_ids == {"req-1"}
+
+
+def test_ascend_multi_keeps_sync_without_remote_index_blocks():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    latent_connector.get_num_new_matched_tokens.return_value = (32, False)
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {}
+
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params=_remote_index_params(remote_block_ids=[]),
+    )
+
+    tokens, load_async = multi.get_num_new_matched_tokens(request, 0)
+
+    assert tokens == 32
+    assert load_async is False
+
+
+def test_ascend_multi_preserves_async_from_chosen_connector():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    latent_connector.get_num_new_matched_tokens.return_value = (32, True)
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {}
+
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params=_remote_index_params(),
+    )
+
+    tokens, load_async = multi.get_num_new_matched_tokens(request, 0)
+
+    assert tokens == 32
+    assert load_async is True
+
+
+def test_ascend_multi_skips_latent_zero_update_after_async_index_wait():
+    multi = object.__new__(AscendMultiConnector)
+    latent_connector = MagicMock()
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.update_state_after_alloc = MagicMock()
+    multi._connectors = [latent_connector, index_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._index_load_async_req_ids = {"req-1"}
+
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_computed_tokens=32,
+        kv_transfer_params=_remote_index_params(),
+    )
+
+    multi.update_state_after_alloc(request, _blocks(), 0)
+
+    latent_connector.update_state_after_alloc.assert_not_called()
+    index_connector.update_state_after_alloc.assert_called_once()
+    assert multi._index_load_async_req_ids == set()
 
 
 def test_ascend_multi_updates_chosen_latent_and_index_connector():
