@@ -167,6 +167,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_DEBUG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0"))
     ),
+    # DSA shrink debug mode:
+    #   fail_only (default): normal path is silent; only explicit validation
+    #     failures/errors are emitted by the relevant component.
+    #   summary/trace/all: emit sampled successful-path diagnostics.
+    "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower(),
     # Max debug records per layer/site to avoid flooding long runs.
     "VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")

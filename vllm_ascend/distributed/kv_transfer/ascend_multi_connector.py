@@ -30,6 +30,13 @@ logger = init_logger(__name__)
 def _should_log_dsa_wait_dispatch(layer_name: str, has_extra_args: bool) -> bool:
     if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
         return False
+    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
+        "summary",
+        "trace",
+        "verbose",
+        "all",
+    ):
+        return False
     if not has_extra_args:
         return False
     layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()

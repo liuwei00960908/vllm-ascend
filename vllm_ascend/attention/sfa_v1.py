@@ -74,6 +74,13 @@ BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 def _dsa_debug_layer_enabled(layer_name: str) -> bool:
     if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
         return False
+    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
+        "summary",
+        "trace",
+        "verbose",
+        "all",
+    ):
+        return False
     layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
     if layer_filter:
         return any(

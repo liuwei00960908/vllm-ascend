@@ -289,6 +289,13 @@ def _debug_tensor_shape(value: Any) -> Any:
 def _should_log_dsa_wait(layer_name: str, selected_tokens: Any = None) -> bool:
     if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
         return False
+    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
+        "summary",
+        "trace",
+        "verbose",
+        "all",
+    ):
+        return False
     layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
     if layer_filter:
         return any(
