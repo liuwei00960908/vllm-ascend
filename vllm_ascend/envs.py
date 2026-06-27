@@ -150,7 +150,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # and indexer layers with one raw tensor laid out as
     # [all k_nope pages][all k_pe pages].
     "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "0"))
+        int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))
     ),
     # DSA Step B staging. Requires TWO_GROUPS=1 + the LMCache connector.
     # 1 (B2): decode reads prefill-selected latent from the compact scratch
