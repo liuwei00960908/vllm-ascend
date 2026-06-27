@@ -10,6 +10,7 @@ from vllm.logger import init_logger, logger as vllm_logger
 from vllm.utils.func_utils import supports_kw
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (
     MooncakeDSAIndexConnector,
 )
@@ -24,6 +25,20 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _should_log_dsa_wait_dispatch(layer_name: str, has_extra_args: bool) -> bool:
+    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+        return False
+    if not has_extra_args:
+        return False
+    layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
+    if layer_filter:
+        return any(
+            part.strip() and part.strip() in layer_name
+            for part in layer_filter.split(",")
+        )
+    return ".layers.0." in layer_name or ".layers.77." in layer_name
 
 
 def _is_single_tensor_kv(kv_cache: Any) -> bool:
@@ -221,9 +236,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             sig_cache = {}
             self._wait_for_layer_load_sig_cache = sig_cache
 
-        log_wait_dispatch = (
-            (args or kwargs or ".layers.0." in layer_name)
-            and (".layers.0." in layer_name or ".layers.77." in layer_name)
+        log_wait_dispatch = _should_log_dsa_wait_dispatch(
+            layer_name, bool(args or kwargs)
         )
         if log_wait_dispatch:
             vllm_logger.warning(

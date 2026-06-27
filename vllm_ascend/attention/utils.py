@@ -287,7 +287,32 @@ def _debug_tensor_shape(value: Any) -> Any:
 
 
 def _should_log_dsa_wait(layer_name: str, selected_tokens: Any = None) -> bool:
+    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+        return False
+    layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
+    if layer_filter:
+        return any(
+            part.strip() and part.strip() in layer_name
+            for part in layer_filter.split(",")
+        )
     return ".layers.0." in layer_name or ".layers.77." in layer_name
+
+
+def _debug_tensor_sample(value: Any, limit: int = 8) -> list:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return []
+    return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+
+
+def _debug_tensor_minmax(value: Any) -> tuple[Any, Any, int] | None:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return None
+    flat = value.detach().reshape(-1)
+    return (
+        flat.min().to(device="cpu").item(),
+        flat.max().to(device="cpu").item(),
+        int(flat.numel()),
+    )
 
 
 def _debug_len(value: Any) -> Any:
@@ -395,30 +420,20 @@ def wait_for_kv_layer_from_connector(
         if trace_wait:
             vllm_logger.warning(
                 "DSA wait dispatch selected: layer=%s selected_shape=%s "
-                "selected_dtype=%s selected_device=%s token_start_index=%s "
+                "selected_dtype=%s selected_device=%s selected_sample=%s "
+                "selected_minmax_count=%s token_start_index=%s "
                 "request_ids_len=%s request_ids_preview=%s connector=%s",
                 layer_name,
                 _debug_tensor_shape(selected_tokens),
                 getattr(selected_tokens, "dtype", None),
                 getattr(selected_tokens, "device", None),
+                _debug_tensor_sample(selected_tokens),
+                _debug_tensor_minmax(selected_tokens),
                 token_start_index,
                 len(request_ids) if request_ids is not None else None,
                 request_ids[:4] if request_ids is not None else None,
                 connector.__class__.__name__,
             )
-        logger.info(
-            "DSA wait_for_kv_layer selected: layer=%s selected_shape=%s "
-            "selected_dtype=%s selected_device=%s token_start_index=%s "
-            "request_ids_len=%s request_ids_preview=%s connector=%s",
-            layer_name,
-            _debug_tensor_shape(selected_tokens),
-            getattr(selected_tokens, "dtype", None),
-            getattr(selected_tokens, "device", None),
-            token_start_index,
-            len(request_ids) if request_ids is not None else None,
-            request_ids[:4] if request_ids is not None else None,
-            connector.__class__.__name__,
-        )
         try:
             connector.wait_for_layer_load(
                 layer_name, selected_tokens, token_start_index, request_ids

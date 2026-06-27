@@ -71,6 +71,59 @@ if TYPE_CHECKING:
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
 
+def _dsa_debug_layer_enabled(layer_name: str) -> bool:
+    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+        return False
+    layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
+    if layer_filter:
+        return any(
+            part.strip() and part.strip() in layer_name
+            for part in layer_filter.split(",")
+        )
+    return ".layers.0." in layer_name or ".layers.77." in layer_name
+
+
+def _dsa_debug_should_log(owner: object, site: str, layer_name: str) -> bool:
+    if not _dsa_debug_layer_enabled(layer_name):
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    key = (site, layer_name)
+    count = counts.get(key, 0)
+    if count >= envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT:
+        return False
+    counts[key] = count + 1
+    return True
+
+
+def _dsa_debug_sample(value, limit: int = 8) -> list:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return []
+    return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+
+
+def _dsa_debug_minmax_count(value) -> tuple[object, object, int] | None:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return None
+    flat = value.detach().reshape(-1)
+    return (
+        flat.min().to(device="cpu").item(),
+        flat.max().to(device="cpu").item(),
+        int(flat.numel()),
+    )
+
+
+def _dsa_debug_preview(value, limit: int = 4):
+    if value is None:
+        return None
+    try:
+        return list(value[:limit])
+    except Exception:
+        return type(value).__name__
+
+
 class AscendSFABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -1407,15 +1460,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         _has_kv_group = has_kv_transfer_group()
         _is_v1_kv_group = is_v1_kv_transfer_group() if _has_kv_group else False
-        _dsa_wait_log = bool(self.dsa_shrink_latent) and (
-            ".layers.0." in layer_name or ".layers.77." in layer_name
+        _dsa_wait_log = bool(self.dsa_shrink_latent) and _dsa_debug_should_log(
+            self, "shrink_wait", layer_name
         )
         if _dsa_wait_log:
+            _fc_dbg = get_forward_context()
             logger.info(
-                "DSA shrink-latent wait gate: layer=%s stage=%s "
+                "[DSA_SHRINK_CHECK] wait_gate layer=%s stage=%s "
                 "prompt_lens_none=%s prompt_lens_shape=%s prompt_lens_device=%s "
+                "prompt_lens_sample=%s prompt_lens_minmax_count=%s "
                 "num_decode_tokens=%s attn_state=%s has_kv_group=%s "
-                "is_v1_kv_group=%s topk_shape=%s topk_device=%s",
+                "is_v1_kv_group=%s topk_shape=%s topk_dtype=%s "
+                "topk_device=%s topk_sample=%s topk_minmax_count=%s "
+                "dsa_req_ids_preview=%s dsa_prompt_lens_preview=%s",
                 layer_name,
                 self.dsa_shrink_latent,
                 attn_metadata.prompt_lens is None,
@@ -1423,12 +1480,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if attn_metadata.prompt_lens is not None else None,
                 attn_metadata.prompt_lens.device
                 if attn_metadata.prompt_lens is not None else None,
+                _dsa_debug_sample(attn_metadata.prompt_lens),
+                _dsa_debug_minmax_count(attn_metadata.prompt_lens),
                 attn_metadata.num_decode_tokens,
                 attn_metadata.attn_state,
                 _has_kv_group,
                 _is_v1_kv_group,
                 tuple(topk_indices.shape),
+                topk_indices.dtype,
                 topk_indices.device,
+                _dsa_debug_sample(topk_indices),
+                _dsa_debug_minmax_count(topk_indices),
+                _dsa_debug_preview(getattr(_fc_dbg, "dsa_req_ids", None)),
+                _dsa_debug_preview(getattr(_fc_dbg, "dsa_prompt_lens", None)),
             )
         if (
             self.dsa_shrink_latent
@@ -1452,16 +1516,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             if _dsa_wait_log:
                 logger.info(
-                    "DSA shrink-latent remap: layer=%s need_packed=%s "
+                    "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
                     "selected_none=%s selected_shape=%s selected_dtype=%s "
-                    "selected_device=%s remapped_topk_shape=%s",
+                    "selected_device=%s selected_sample=%s "
+                    "selected_minmax_count=%s remapped_topk_shape=%s "
+                    "remapped_topk_sample=%s remapped_topk_minmax_count=%s",
                     layer_name,
                     _need_packed,
                     _sel_packed is None,
                     tuple(_sel_packed.shape) if _sel_packed is not None else None,
                     _sel_packed.dtype if _sel_packed is not None else None,
                     _sel_packed.device if _sel_packed is not None else None,
+                    _dsa_debug_sample(_sel_packed),
+                    _dsa_debug_minmax_count(_sel_packed),
                     tuple(topk_indices.shape),
+                    _dsa_debug_sample(topk_indices),
+                    _dsa_debug_minmax_count(topk_indices),
                 )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
@@ -1481,8 +1551,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _wait_fc = get_forward_context()
                     _wait_attn_metadata = getattr(_wait_fc, "attn_metadata", None)
                     logger.warning(
-                        "DSA shrink-latent wait precheck: layer=%s "
+                        "[DSA_SHRINK_CHECK] wait_precheck layer=%s "
                         "selected_shape=%s selected_dtype=%s selected_device=%s "
+                        "selected_sample=%s selected_minmax_count=%s "
                         "has_kv_group=%s is_v1_kv_group=%s forward_context_id=%s "
                         "attn_metadata=%s attn_state=%s num_decode_tokens=%s "
                         "wait_fn_has_trace=%s",
@@ -1490,6 +1561,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         tuple(_selected_for_wait.shape),
                         _selected_for_wait.dtype,
                         _selected_for_wait.device,
+                        _dsa_debug_sample(_selected_for_wait),
+                        _dsa_debug_minmax_count(_selected_for_wait),
                         _has_kv_group,
                         _is_v1_kv_group,
                         id(_wait_fc),
@@ -1500,7 +1573,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _wait_fn_has_trace,
                     )
                     logger.warning(
-                        "DSA shrink-latent connector wait fn: layer=%s "
+                        "[DSA_SHRINK_CHECK] connector_wait_fn layer=%s "
                         "fn_module=%s fn_file=%s fn_firstlineno=%s fn_id=%s",
                         layer_name,
                         getattr(_wait_fn, "__module__", None),
@@ -1509,7 +1582,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         id(_wait_fn),
                     )
                     logger.warning(
-                        "DSA shrink-latent calling connector wait: layer=%s "
+                        "[DSA_SHRINK_CHECK] calling_connector_wait layer=%s "
                         "selected_shape=%s selected_dtype=%s selected_device=%s",
                         layer_name,
                         tuple(_selected_for_wait.shape),
@@ -1524,12 +1597,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 if _dsa_wait_log:
                     logger.warning(
-                        "DSA shrink-latent connector wait returned: layer=%s",
+                        "[DSA_SHRINK_CHECK] connector_wait_returned layer=%s",
                         layer_name,
                     )
             elif _dsa_wait_log:
                 logger.info(
-                    "DSA shrink-latent connector wait skipped after remap: "
+                    "[DSA_SHRINK_CHECK] connector_wait_skipped_after_remap "
                     "layer=%s stage=%s selected_none=%s",
                     layer_name,
                     self.dsa_shrink_latent,

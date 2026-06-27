@@ -162,6 +162,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
     ),
+    # DSA shrink-latent correctness diagnostics. When enabled, logs the
+    # selected-token path from SFA -> KV connector -> LMCache. Default off.
+    "VLLM_ASCEND_DSA_SHRINK_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0"))
+    ),
+    # Max debug records per layer/site to avoid flooding long runs.
+    "VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")
+    ),
+    # Comma-separated layer-name fragments to log. Empty means layer 0 and 77.
+    "VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER", ""
+    ),
     # DSA latent offload micro-profiler. When 1, the decode path brackets each added
     # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
     # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.
