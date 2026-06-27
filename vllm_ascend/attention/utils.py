@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import init_logger
+from vllm.logger import init_logger, logger as vllm_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend import envs
@@ -286,8 +286,26 @@ def _debug_tensor_shape(value: Any) -> Any:
         return type(value).__name__
 
 
-def _should_log_dsa_wait(layer_name: str, selected_tokens: Any) -> bool:
+def _should_log_dsa_wait(layer_name: str, selected_tokens: Any = None) -> bool:
     return ".layers.0." in layer_name or ".layers.77." in layer_name
+
+
+def _debug_len(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _debug_preview(value: Any, limit: int = 4) -> Any:
+    if value is None:
+        return None
+    try:
+        return list(value[:limit])
+    except Exception:
+        return type(value).__name__
 
 
 def wait_for_kv_layer_from_connector(
@@ -295,12 +313,27 @@ def wait_for_kv_layer_from_connector(
     selected_tokens=None,
     token_start_index=None,
 ):
+    trace_wait = _should_log_dsa_wait(layer_name, selected_tokens)
     has_group = has_kv_transfer_group()
     is_v1_group = is_v1_kv_transfer_group() if has_group else False
+    if trace_wait:
+        vllm_logger.warning(
+            "DSA wait trace enter: layer=%s selected_none=%s selected_shape=%s "
+            "selected_dtype=%s selected_device=%s token_start_index=%s "
+            "has_group=%s is_v1_group=%s",
+            layer_name,
+            selected_tokens is None,
+            _debug_tensor_shape(selected_tokens),
+            getattr(selected_tokens, "dtype", None),
+            getattr(selected_tokens, "device", None),
+            token_start_index,
+            has_group,
+            is_v1_group,
+        )
     if not has_group or not is_v1_group:
-        if _should_log_dsa_wait(layer_name, selected_tokens):
-            logger.info(
-                "DSA wait_for_kv_layer skipped: layer=%s has_group=%s "
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait skip: layer=%s reason=no_v1_kv_group has_group=%s "
                 "is_v1_group=%s selected_shape=%s",
                 layer_name,
                 has_group,
@@ -310,13 +343,36 @@ def wait_for_kv_layer_from_connector(
         return
 
     connector = get_kv_transfer_group()
+    if trace_wait:
+        vllm_logger.warning(
+            "DSA wait trace connector: layer=%s connector=%s connector_module=%s "
+            "connector_id=%s",
+            layer_name,
+            connector.__class__.__name__,
+            connector.__class__.__module__,
+            id(connector),
+        )
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
+    dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+    if trace_wait:
+        vllm_logger.warning(
+            "DSA wait trace context: layer=%s forward_context_id=%s "
+            "attn_metadata=%s attn_state=%s num_decode_tokens=%s "
+            "dsa_req_ids_len=%s dsa_req_ids_preview=%s",
+            layer_name,
+            id(forward_context),
+            attn_metadata.__class__.__name__ if attn_metadata is not None else None,
+            getattr(attn_metadata, "attn_state", None),
+            getattr(attn_metadata, "num_decode_tokens", None),
+            _debug_len(dsa_req_ids),
+            _debug_preview(dsa_req_ids),
+        )
     if attn_metadata is None:
-        if _should_log_dsa_wait(layer_name, selected_tokens):
-            logger.info(
-                "DSA wait_for_kv_layer skipped: layer=%s reason=no_attn_metadata "
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait skip: layer=%s reason=no_attn_metadata "
                 "selected_shape=%s connector=%s",
                 layer_name,
                 _debug_tensor_shape(selected_tokens),
@@ -334,9 +390,22 @@ def wait_for_kv_layer_from_connector(
         # position, so a divergence between the connector-metadata order and the
         # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
         request_ids = None
-        dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
         if dsa_req_ids is not None:
             request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait dispatch selected: layer=%s selected_shape=%s "
+                "selected_dtype=%s selected_device=%s token_start_index=%s "
+                "request_ids_len=%s request_ids_preview=%s connector=%s",
+                layer_name,
+                _debug_tensor_shape(selected_tokens),
+                getattr(selected_tokens, "dtype", None),
+                getattr(selected_tokens, "device", None),
+                token_start_index,
+                len(request_ids) if request_ids is not None else None,
+                request_ids[:4] if request_ids is not None else None,
+                connector.__class__.__name__,
+            )
         logger.info(
             "DSA wait_for_kv_layer selected: layer=%s selected_shape=%s "
             "selected_dtype=%s selected_device=%s token_start_index=%s "
@@ -350,17 +419,47 @@ def wait_for_kv_layer_from_connector(
             request_ids[:4] if request_ids is not None else None,
             connector.__class__.__name__,
         )
-        connector.wait_for_layer_load(
-            layer_name, selected_tokens, token_start_index, request_ids
-        )
-    else:
-        if _should_log_dsa_wait(layer_name, selected_tokens):
-            logger.info(
-                "DSA wait_for_kv_layer dense: layer=%s connector=%s",
+        try:
+            connector.wait_for_layer_load(
+                layer_name, selected_tokens, token_start_index, request_ids
+            )
+        except Exception:
+            if trace_wait:
+                vllm_logger.exception(
+                    "DSA wait dispatch selected failed: layer=%s connector=%s",
+                    layer_name,
+                    connector.__class__.__name__,
+                )
+            raise
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait return selected: layer=%s connector=%s",
                 layer_name,
                 connector.__class__.__name__,
             )
-        connector.wait_for_layer_load(layer_name)
+    else:
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait dispatch dense: layer=%s connector=%s",
+                layer_name,
+                connector.__class__.__name__,
+            )
+        try:
+            connector.wait_for_layer_load(layer_name)
+        except Exception:
+            if trace_wait:
+                vllm_logger.exception(
+                    "DSA wait dispatch dense failed: layer=%s connector=%s",
+                    layer_name,
+                    connector.__class__.__name__,
+                )
+            raise
+        if trace_wait:
+            vllm_logger.warning(
+                "DSA wait return dense: layer=%s connector=%s",
+                layer_name,
+                connector.__class__.__name__,
+            )
 
 
 def maybe_save_kv_layer_to_connector(

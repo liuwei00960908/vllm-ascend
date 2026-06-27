@@ -1473,7 +1473,33 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if _dsa_wait_log:
                     _wait_fn = wait_for_kv_layer_from_connector
                     _wait_fn_code = getattr(_wait_fn, "__code__", None)
-                    logger.info(
+                    _wait_fn_consts = getattr(_wait_fn_code, "co_consts", ())
+                    _wait_fn_has_trace = any(
+                        "DSA wait trace enter" in str(_const)
+                        for _const in _wait_fn_consts
+                    )
+                    _wait_fc = get_forward_context()
+                    _wait_attn_metadata = getattr(_wait_fc, "attn_metadata", None)
+                    logger.warning(
+                        "DSA shrink-latent wait precheck: layer=%s "
+                        "selected_shape=%s selected_dtype=%s selected_device=%s "
+                        "has_kv_group=%s is_v1_kv_group=%s forward_context_id=%s "
+                        "attn_metadata=%s attn_state=%s num_decode_tokens=%s "
+                        "wait_fn_has_trace=%s",
+                        layer_name,
+                        tuple(_selected_for_wait.shape),
+                        _selected_for_wait.dtype,
+                        _selected_for_wait.device,
+                        _has_kv_group,
+                        _is_v1_kv_group,
+                        id(_wait_fc),
+                        _wait_attn_metadata.__class__.__name__
+                        if _wait_attn_metadata is not None else None,
+                        getattr(_wait_attn_metadata, "attn_state", None),
+                        getattr(_wait_attn_metadata, "num_decode_tokens", None),
+                        _wait_fn_has_trace,
+                    )
+                    logger.warning(
                         "DSA shrink-latent connector wait fn: layer=%s "
                         "fn_module=%s fn_file=%s fn_firstlineno=%s fn_id=%s",
                         layer_name,
@@ -1482,7 +1508,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         getattr(_wait_fn_code, "co_firstlineno", None),
                         id(_wait_fn),
                     )
-                    logger.info(
+                    logger.warning(
                         "DSA shrink-latent calling connector wait: layer=%s "
                         "selected_shape=%s selected_dtype=%s selected_device=%s",
                         layer_name,
@@ -1497,7 +1523,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         selected_tokens=_selected_for_wait,
                     )
                 if _dsa_wait_log:
-                    logger.info(
+                    logger.warning(
                         "DSA shrink-latent connector wait returned: layer=%s",
                         layer_name,
                     )
