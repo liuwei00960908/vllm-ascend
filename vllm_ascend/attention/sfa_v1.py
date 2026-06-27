@@ -1,6 +1,8 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+import os
+import re
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -129,6 +131,102 @@ def _dsa_debug_preview(value, limit: int = 4):
         return list(value[:limit])
     except Exception:
         return type(value).__name__
+
+
+def _dsa_kv_trace_mode() -> str:
+    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_MODE", "off").strip().lower()
+
+
+def _dsa_kv_trace_enabled() -> bool:
+    return _dsa_kv_trace_mode() in ("record", "compare")
+
+
+def _dsa_kv_trace_dir() -> str:
+    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_DIR", "/tmp/dsa_kv_trace")
+
+
+def _dsa_kv_trace_decode_only() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_DECODE_ONLY", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_kv_trace_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _dsa_kv_trace_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _dsa_kv_trace_layer_enabled(layer_name: str) -> bool:
+    layer_filter = os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_LAYER", "").strip()
+    if not layer_filter:
+        return True
+    return any(
+        part.strip() and part.strip() in layer_name
+        for part in layer_filter.split(",")
+    )
+
+
+def _dsa_kv_trace_rank_tag() -> str:
+    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = str(torch.distributed.get_rank())
+    except Exception:
+        pass
+    device = "na"
+    try:
+        if hasattr(torch, "npu"):
+            device = str(torch.npu.current_device())
+    except Exception:
+        pass
+    return f"rank{rank}_dev{device}"
+
+
+def _dsa_kv_trace_layer_key(layer_name: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]+", "_", layer_name).strip("_")
+
+
+def _dsa_kv_trace_attn_state(attn_metadata: Any) -> str:
+    state = getattr(attn_metadata, "attn_state", None)
+    return getattr(state, "name", str(state))
+
+
+def _dsa_kv_trace_event_path(
+    trace_dir: str,
+    rank_tag: str,
+    layer_key: str,
+    call_idx: int,
+) -> str:
+    return os.path.join(trace_dir, rank_tag, layer_key, f"{call_idx:08d}.pt")
+
+
+def _dsa_kv_trace_error_allowed(owner: object) -> bool:
+    limit = _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_ERRORS", 20)
+    count = getattr(owner, "_dsa_kv_trace_error_count", 0)
+    if limit >= 0 and count >= limit:
+        return False
+    setattr(owner, "_dsa_kv_trace_error_count", count + 1)
+    return True
+
+
+def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
+        return topk_indices[:, 0, :]
+    if topk_indices.dim() == 2:
+        return topk_indices
+    return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
 class AscendSFABackend(AttentionBackend):
@@ -1157,6 +1255,217 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices
 
+    def _maybe_trace_sparse_attention_kv(
+        self,
+        *,
+        layer_name: str | None,
+        trace_label: str,
+        kv: torch.Tensor,
+        key_rope: torch.Tensor,
+        block_table: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata,
+    ) -> None:
+        if not _dsa_kv_trace_enabled():
+            return
+
+        layer_name = layer_name or "unknown_layer"
+        if not _dsa_kv_trace_layer_enabled(layer_name):
+            return
+        if (
+            _dsa_kv_trace_decode_only()
+            and getattr(attn_metadata, "attn_state", None)
+            != AscendAttentionState.DecodeOnly
+        ):
+            return
+
+        layer_key = _dsa_kv_trace_layer_key(layer_name)
+        counts = getattr(self, "_dsa_kv_trace_counts", None)
+        if counts is None:
+            counts = {}
+            setattr(self, "_dsa_kv_trace_counts", counts)
+        call_idx = counts.get(layer_key, 0)
+        counts[layer_key] = call_idx + 1
+
+        max_calls = _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_CALLS", 0)
+        if max_calls > 0 and call_idx >= max_calls:
+            return
+        every_n = max(1, _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_EVERY_N", 1))
+        if call_idx % every_n != 0:
+            return
+
+        try:
+            if os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_SYNC", "1").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ) and hasattr(torch, "npu"):
+                torch.npu.synchronize()
+
+            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices).to(torch.long)
+            if topk_2d.numel() == 0:
+                return
+            num_rows = min(int(topk_2d.shape[0]), int(block_table.shape[0]))
+            max_rows = _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_ROWS", 0)
+            if max_rows > 0:
+                num_rows = min(num_rows, max_rows)
+            if num_rows <= 0:
+                return
+
+            topk_2d = topk_2d[:num_rows]
+            block_table_rows = block_table[:num_rows].to(torch.long)
+            block_size = int(kv.shape[1])
+            num_logical_blocks = int(block_table_rows.shape[1])
+            kv_flat = kv.reshape(-1, *kv.shape[2:])
+            key_rope_flat = key_rope.reshape(-1, *key_rope.shape[2:])
+
+            safe_indices = torch.clamp(topk_2d, min=0)
+            logical_blocks = safe_indices // block_size
+            block_offsets = safe_indices % block_size
+            valid = (topk_2d >= 0) & (logical_blocks < num_logical_blocks)
+            safe_logical_blocks = torch.clamp(
+                logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
+            )
+            physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+            slots = physical_blocks * block_size + block_offsets
+            valid = valid & (physical_blocks >= 0) & (slots < kv_flat.shape[0])
+            safe_slots = torch.clamp(slots, min=0, max=max(kv_flat.shape[0] - 1, 0))
+
+            flat_slots = safe_slots.reshape(-1)
+            kv_selected = kv_flat.index_select(0, flat_slots).reshape(
+                *safe_slots.shape, *kv_flat.shape[1:]
+            )
+            key_rope_selected = key_rope_flat.index_select(0, flat_slots).reshape(
+                *safe_slots.shape, *key_rope_flat.shape[1:]
+            )
+
+            if not torch.all(valid):
+                kv_selected = torch.where(
+                    valid.reshape(*valid.shape, *([1] * (kv_selected.dim() - 2))),
+                    kv_selected,
+                    torch.zeros_like(kv_selected),
+                )
+                key_rope_selected = torch.where(
+                    valid.reshape(
+                        *valid.shape, *([1] * (key_rope_selected.dim() - 2))
+                    ),
+                    key_rope_selected,
+                    torch.zeros_like(key_rope_selected),
+                )
+
+            rank_tag = _dsa_kv_trace_rank_tag()
+            trace_dir = _dsa_kv_trace_dir()
+            event_path = _dsa_kv_trace_event_path(
+                trace_dir, rank_tag, layer_key, call_idx
+            )
+            payload = {
+                "meta": {
+                    "layer_name": layer_name,
+                    "layer_key": layer_key,
+                    "trace_label": trace_label,
+                    "rank_tag": rank_tag,
+                    "call_idx": call_idx,
+                    "attn_state": _dsa_kv_trace_attn_state(attn_metadata),
+                    "kv_shape": tuple(kv.shape),
+                    "key_rope_shape": tuple(key_rope.shape),
+                    "block_table_shape": tuple(block_table.shape),
+                    "topk_shape": tuple(topk_indices.shape),
+                    "block_size": block_size,
+                    "num_rows": num_rows,
+                    "num_valid": int(valid.sum().detach().to(device="cpu").item()),
+                },
+                "topk_indices": topk_2d.detach().to(device="cpu"),
+                "valid": valid.detach().to(device="cpu"),
+                "physical_blocks": physical_blocks.detach().to(device="cpu"),
+                "slots": slots.detach().to(device="cpu"),
+                "block_table_rows": block_table_rows.detach().to(device="cpu"),
+                "kv": kv_selected.detach().to(device="cpu"),
+                "key_rope": key_rope_selected.detach().to(device="cpu"),
+            }
+
+            mode = _dsa_kv_trace_mode()
+            if mode == "record":
+                os.makedirs(os.path.dirname(event_path), exist_ok=True)
+                torch.save(payload, event_path)
+                return
+
+            if mode != "compare":
+                return
+            if not os.path.exists(event_path):
+                if _dsa_kv_trace_error_allowed(self):
+                    logger.error(
+                        "[DSA_KV_TRACE_MISSING] layer=%s call=%s label=%s path=%s",
+                        layer_name,
+                        call_idx,
+                        trace_label,
+                        event_path,
+                    )
+                return
+
+            ref = torch.load(event_path, map_location="cpu")
+            atol = _dsa_kv_trace_float_env("VLLM_ASCEND_DSA_KV_TRACE_ATOL", 0.0)
+            mismatch: list[str] = []
+
+            def _compare_tensor(name: str) -> None:
+                cur = payload[name]
+                old = ref[name]
+                if tuple(cur.shape) != tuple(old.shape):
+                    mismatch.append(
+                        f"{name}:shape current={tuple(cur.shape)} ref={tuple(old.shape)}"
+                    )
+                    return
+                if cur.dtype == torch.bool:
+                    ok = torch.equal(cur, old)
+                    max_diff = 0.0 if ok else 1.0
+                else:
+                    diff = (cur.float() - old.float()).abs()
+                    max_diff = float(diff.max().item()) if diff.numel() > 0 else 0.0
+                    ok = max_diff <= atol
+                if not ok:
+                    mismatch.append(f"{name}:max_abs_diff={max_diff}")
+
+            _compare_tensor("valid")
+            _compare_tensor("kv")
+            _compare_tensor("key_rope")
+
+            if os.environ.get(
+                "VLLM_ASCEND_DSA_KV_TRACE_COMPARE_INDICES", "0"
+            ).lower() in ("1", "true", "yes", "on"):
+                _compare_tensor("topk_indices")
+                _compare_tensor("slots")
+
+            if mismatch and _dsa_kv_trace_error_allowed(self):
+                mismatch_dir = os.path.join(trace_dir, "mismatch", rank_tag, layer_key)
+                os.makedirs(mismatch_dir, exist_ok=True)
+                cur_path = os.path.join(mismatch_dir, f"{call_idx:08d}_current.pt")
+                torch.save(payload, cur_path)
+                logger.error(
+                    "[DSA_KV_TRACE_MISMATCH] layer=%s call=%s label=%s "
+                    "mismatch=%s ref_label=%s ref_path=%s current_path=%s "
+                    "topk_sample=%s ref_topk_sample=%s slots_sample=%s "
+                    "ref_slots_sample=%s",
+                    layer_name,
+                    call_idx,
+                    trace_label,
+                    "; ".join(mismatch),
+                    ref.get("meta", {}).get("trace_label"),
+                    event_path,
+                    cur_path,
+                    payload["topk_indices"].reshape(-1)[:8].tolist(),
+                    ref["topk_indices"].reshape(-1)[:8].tolist(),
+                    payload["slots"].reshape(-1)[:8].tolist(),
+                    ref["slots"].reshape(-1)[:8].tolist(),
+                )
+        except Exception:
+            if _dsa_kv_trace_error_allowed(self):
+                logger.exception(
+                    "[DSA_KV_TRACE_ERROR] layer=%s call=%s label=%s",
+                    layer_name,
+                    call_idx if "call_idx" in locals() else None,
+                    trace_label,
+                )
+
     def _execute_sparse_flash_attention_process(
         self,
         ql_nope,
@@ -1169,6 +1478,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_override=None,
         key_rope_override=None,
         block_table_override=None,
+        layer_name: str | None = None,
+        trace_label: str = "native",
     ):
         # DSA latent offload: when overrides are given, read latent from the A1 scratch
         # (kv_override/key_rope_override) via the scratch block_table instead of the
@@ -1181,6 +1492,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table = attn_metadata.block_table
             kv = kv_cache[0]
             key_rope = kv_cache[1]
+
+        self._maybe_trace_sparse_attention_kv(
+            layer_name=layer_name,
+            trace_label=trace_label,
+            kv=kv,
+            key_rope=key_rope,
+            block_table=block_table,
+            topk_indices=topk_indices,
+            attn_metadata=attn_metadata,
+        )
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
@@ -1721,6 +2042,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         kv_override=_res_a.knope_pool,
                         key_rope_override=_res_a.kpe_pool,
                         block_table_override=_res_a.block_table,
+                        layer_name=layer_name,
+                        trace_label="adapter",
                     )
                 _dbg("fa_done")
                 with _dsa_prof.section("ad_release"):
@@ -1731,6 +2054,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                         actual_seq_lengths_query, actual_seq_lengths_key,
+                        layer_name=layer_name,
+                        trace_label="adapter_parity_native",
                     )
                     diff = (native_out.float() - adapter_out.float()).abs().max()
                     logger.info("[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -1786,12 +2111,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         kv_override=s_knope,
                         key_rope_override=s_kpe,
                         block_table_override=s_bt,
+                        layer_name=layer_name,
+                        trace_label="lmcache_scratch",
                     )
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                         actual_seq_lengths_query, actual_seq_lengths_key,
+                        layer_name=layer_name,
+                        trace_label="lmcache_parity_native",
                     )
                     diff = (native_out.float() - scratch_out.float()).abs().max()
                     logger.info("[DSA-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -1820,11 +2149,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                     actual_seq_lengths_query, actual_seq_lengths_key,
                     kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
+                    layer_name=layer_name,
+                    trace_label="pool_prefill",
                 )
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
                         ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                         actual_seq_lengths_query, actual_seq_lengths_key,
+                        layer_name=layer_name,
+                        trace_label="pool_prefill_parity_native",
                     )
                     diff = (native_out.float() - pool_out.float()).abs().max()
                     logger.info("[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -1837,6 +2170,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
                     actual_seq_lengths_query, actual_seq_lengths_key,
+                    layer_name=layer_name,
+                    trace_label="native",
                 )
             # one step per layer-call on the native (user) path so the profiler
             # logs mean ms/layer-call periodically (mirrors the manager path).
