@@ -221,6 +221,20 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             sig_cache = {}
             self._wait_for_layer_load_sig_cache = sig_cache
 
+        log_wait_dispatch = (
+            (args or kwargs or ".layers.0." in layer_name)
+            and (".layers.0." in layer_name or ".layers.77." in layer_name)
+        )
+        if log_wait_dispatch:
+            logger.info(
+                "AscendMultiConnector wait_for_layer_load begin: layer=%s "
+                "child_count=%d extra_pos_args=%d extra_kwargs=%s",
+                layer_name,
+                len(self._connectors),
+                len(args),
+                ",".join(sorted(kwargs)),
+            )
+
         for connector in self._connectors:
             wait_for_layer_load = connector.wait_for_layer_load
             cache_key = (connector.__class__, 1 + len(args), tuple(sorted(kwargs)))
@@ -240,9 +254,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 wait_for_layer_load(layer_name)
                 layer_only_children.append(connector.__class__.__name__)
 
-        if args or kwargs or ".layers.0." in layer_name:
+        if log_wait_dispatch:
             logger.info(
-                "AscendMultiConnector wait_for_layer_load dispatch: layer=%s "
+                "AscendMultiConnector wait_for_layer_load end: layer=%s "
                 "full_arg_children=%s layer_only_children=%s extra_pos_args=%d "
                 "extra_kwargs=%s",
                 layer_name,

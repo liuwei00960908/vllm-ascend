@@ -1399,7 +1399,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         _has_kv_group = has_kv_transfer_group()
         _is_v1_kv_group = is_v1_kv_transfer_group() if _has_kv_group else False
         _dsa_wait_log = bool(self.dsa_shrink_latent) and (
-            ".layers.0." in layer_name or attn_metadata.num_decode_tokens > 0
+            ".layers.0." in layer_name or ".layers.77." in layer_name
         )
         if _dsa_wait_log:
             logger.info(
@@ -1462,6 +1462,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # iterates exactly the sparse-decode requests in row order.
                 _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
                 if _dsa_wait_log:
+                    _wait_fn = wait_for_kv_layer_from_connector
+                    _wait_fn_code = getattr(_wait_fn, "__code__", None)
+                    logger.info(
+                        "DSA shrink-latent connector wait fn: layer=%s "
+                        "fn_module=%s fn_file=%s fn_firstlineno=%s fn_id=%s",
+                        layer_name,
+                        getattr(_wait_fn, "__module__", None),
+                        getattr(_wait_fn_code, "co_filename", None),
+                        getattr(_wait_fn_code, "co_firstlineno", None),
+                        id(_wait_fn),
+                    )
                     logger.info(
                         "DSA shrink-latent calling connector wait: layer=%s "
                         "selected_shape=%s selected_dtype=%s selected_device=%s",
@@ -1470,10 +1481,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _selected_for_wait.dtype,
                         _selected_for_wait.device,
                     )
+                _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
-                    wait_for_kv_layer_from_connector(
+                    _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
+                    )
+                if _dsa_wait_log:
+                    logger.info(
+                        "DSA shrink-latent connector wait returned: layer=%s",
+                        layer_name,
                     )
             elif _dsa_wait_log:
                 logger.info(

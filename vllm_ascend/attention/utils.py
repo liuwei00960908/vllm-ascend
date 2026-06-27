@@ -287,7 +287,7 @@ def _debug_tensor_shape(value: Any) -> Any:
 
 
 def _should_log_dsa_wait(layer_name: str, selected_tokens: Any) -> bool:
-    return selected_tokens is not None or ".layers.0." in layer_name
+    return ".layers.0." in layer_name or ".layers.77." in layer_name
 
 
 def wait_for_kv_layer_from_connector(
