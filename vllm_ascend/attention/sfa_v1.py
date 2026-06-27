@@ -480,6 +480,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         # indexer param
         self.n_head: int = self.indexer.n_head  # 64
         self.head_dim: int = self.indexer.head_dim  # 128
+        hf_config = self.vllm_config.model_config.hf_config
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        self.index_topk = int(
+            getattr(
+                self.indexer,
+                "topk_tokens",
+                getattr(hf_text_config or hf_config, "index_topk", 2048),
+            )
+        )
         self.wq_b = self.indexer.wq_b
         self.wk = self.indexer.wk
         self.weights_proj = self.indexer.weights_proj
@@ -1057,7 +1066,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 key_quant_mode=0,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.index_topk,
                 sparse_mode=3,
             )
         elif self.use_torch_npu_lightning_indexer:
@@ -1070,7 +1079,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=indexer_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.index_topk,
                 sparse_mode=3,
             )
         else:
@@ -1083,7 +1092,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=indexer_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.index_topk,
                 sparse_mode=3,
             )
         return topk_indices
