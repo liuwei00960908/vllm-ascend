@@ -615,8 +615,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             (decoded_counts - 1) // window_tokens
                         ) * window_tokens
                         decode_window_flush = decode_window_flush or bool(
-                            (decoded_counts > 0).any()
-                            and (decoded_counts % window_tokens == 0).any()
+                            (
+                                (decoded_counts > 0)
+                                & (decoded_counts % window_tokens == 0)
+                            ).any()
                         )
                     else:
                         lmcache_lens[first_decode:e] = plen

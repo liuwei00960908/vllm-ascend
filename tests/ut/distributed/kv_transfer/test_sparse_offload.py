@@ -374,3 +374,21 @@ class TestScratchRemap:
         assert new_idx.tolist() == [[[0, 100, 1]],
                                     [[5, 100, 7]]]      # prefill row unchanged
         assert packed.tolist()[0] == [5, 7, 0]
+
+    def test_remap_decode_window_uses_lmcache_boundary_and_ring(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[[2, 11, 14, 16, 17, -1]]], dtype=torch.int32)
+        plen = torch.tensor([10])
+        lmcache_lens = torch.tensor([14])
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            lmcache_lens=lmcache_lens,
+            decode_window_tokens=4,
+        )
+
+        # 2 and 11 are already in LMCache and go to compact scratch.
+        # 14, 16, 17 are live decode positions and map into [10, 14).
+        assert new_idx.tolist() == [[[0, 1, 10, 12, 13, -1]]]
+        assert packed.tolist() == [[2, 11, 0, 0, 0, 0]]
