@@ -344,6 +344,8 @@ def wait_for_kv_layer_from_connector(
     layer_name: str,
     selected_tokens=None,
     token_start_index=None,
+    request_ids=None,
+    target_slot_mapping=None,
 ):
     trace_wait = _should_log_dsa_wait(layer_name, selected_tokens)
     has_group = has_kv_transfer_group()
@@ -352,13 +354,14 @@ def wait_for_kv_layer_from_connector(
         vllm_logger.warning(
             "DSA wait trace enter: layer=%s selected_none=%s selected_shape=%s "
             "selected_dtype=%s selected_device=%s token_start_index=%s "
-            "has_group=%s is_v1_group=%s",
+            "target_slot_shape=%s has_group=%s is_v1_group=%s",
             layer_name,
             selected_tokens is None,
             _debug_tensor_shape(selected_tokens),
             getattr(selected_tokens, "dtype", None),
             getattr(selected_tokens, "device", None),
             token_start_index,
+            _debug_tensor_shape(target_slot_mapping),
             has_group,
             is_v1_group,
         )
@@ -421,14 +424,15 @@ def wait_for_kv_layer_from_connector(
         # decode request to its own selected-token row by req_id instead of by loop
         # position, so a divergence between the connector-metadata order and the
         # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
-        request_ids = None
-        if dsa_req_ids is not None:
+        if request_ids is None and dsa_req_ids is not None:
             request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
         if trace_wait:
             vllm_logger.warning(
                 "DSA wait dispatch selected: layer=%s selected_shape=%s "
                 "selected_dtype=%s selected_device=%s selected_sample=%s "
                 "selected_minmax_count=%s token_start_index=%s "
+                "target_slot_shape=%s target_slot_sample=%s "
+                "target_slot_minmax_count=%s "
                 "request_ids_len=%s request_ids_preview=%s connector=%s",
                 layer_name,
                 _debug_tensor_shape(selected_tokens),
@@ -437,13 +441,20 @@ def wait_for_kv_layer_from_connector(
                 _debug_tensor_sample(selected_tokens),
                 _debug_tensor_minmax(selected_tokens),
                 token_start_index,
+                _debug_tensor_shape(target_slot_mapping),
+                _debug_tensor_sample(target_slot_mapping),
+                _debug_tensor_minmax(target_slot_mapping),
                 len(request_ids) if request_ids is not None else None,
                 request_ids[:4] if request_ids is not None else None,
                 connector.__class__.__name__,
             )
         try:
             connector.wait_for_layer_load(
-                layer_name, selected_tokens, token_start_index, request_ids
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                target_slot_mapping=target_slot_mapping,
             )
         except Exception:
             if trace_wait:
