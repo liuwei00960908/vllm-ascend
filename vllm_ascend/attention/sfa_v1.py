@@ -1436,47 +1436,44 @@ class AscendSFAImpl(MLAAttentionImpl):
             return
 
         try:
-            shadow = getattr(self, "_dsa_prefill_shadow_kv", None)
-            if (
-                shadow is None
-                or tuple(shadow[0].shape) != tuple(kv_cache[0].shape)
-                or tuple(shadow[1].shape) != tuple(kv_cache[1].shape)
-                or shadow[0].dtype != kv_cache[0].dtype
-                or shadow[1].dtype != kv_cache[1].dtype
-                or shadow[0].device != kv_cache[0].device
-                or shadow[1].device != kv_cache[1].device
-            ):
-                shadow = (torch.empty_like(kv_cache[0]), torch.empty_like(kv_cache[1]))
-                self._dsa_prefill_shadow_kv = shadow
-                self._dsa_prefill_shadow_block_tables = {}
-                self._dsa_prefill_shadow_prompt_lens = {}
-
-            shadow[0].copy_(kv_cache[0])
-            shadow[1].copy_(kv_cache[1])
-
             fc = get_forward_context()
             req_ids = getattr(fc, "dsa_req_ids", None)
             prompt_lens = getattr(fc, "dsa_prompt_lens", None)
             block_tables = getattr(attn_metadata, "block_table", None)
-            if req_ids is not None and block_tables is not None:
-                saved_tables = getattr(self, "_dsa_prefill_shadow_block_tables", None)
-                if saved_tables is None:
-                    saved_tables = {}
-                    self._dsa_prefill_shadow_block_tables = saved_tables
-                saved_plens = getattr(self, "_dsa_prefill_shadow_prompt_lens", None)
-                if saved_plens is None:
-                    saved_plens = {}
-                    self._dsa_prefill_shadow_prompt_lens = saved_plens
+            if req_ids is None or block_tables is None:
+                return
 
-                nrows = min(len(req_ids), int(block_tables.shape[0]))
-                for row in range(nrows):
-                    key = _dsa_req_id_key(req_ids[row])
-                    saved_tables[key] = block_tables[row].detach().clone()
-                    if prompt_lens is not None and row < len(prompt_lens):
-                        try:
-                            saved_plens[key] = int(prompt_lens[row])
-                        except Exception:
-                            saved_plens[key] = prompt_lens[row]
+            # Keep the full prefill snapshot on CPU. A full NPU shadow doubles
+            # latent KV memory and can prevent the server from starting.
+            self._dsa_prefill_shadow_kv = (
+                kv_cache[0].detach().to(device="cpu", copy=True),
+                kv_cache[1].detach().to(device="cpu", copy=True),
+            )
+            if not hasattr(self, "_dsa_prefill_shadow_block_tables"):
+                self._dsa_prefill_shadow_block_tables = {}
+            if not hasattr(self, "_dsa_prefill_shadow_prompt_lens"):
+                self._dsa_prefill_shadow_prompt_lens = {}
+
+            saved_tables = getattr(self, "_dsa_prefill_shadow_block_tables", None)
+            if saved_tables is None:
+                saved_tables = {}
+                self._dsa_prefill_shadow_block_tables = saved_tables
+            saved_plens = getattr(self, "_dsa_prefill_shadow_prompt_lens", None)
+            if saved_plens is None:
+                saved_plens = {}
+                self._dsa_prefill_shadow_prompt_lens = saved_plens
+
+            nrows = min(len(req_ids), int(block_tables.shape[0]))
+            for row in range(nrows):
+                key = _dsa_req_id_key(req_ids[row])
+                saved_tables[key] = block_tables[row].detach().to(
+                    device="cpu", dtype=torch.long, copy=True
+                )
+                if prompt_lens is not None and row < len(prompt_lens):
+                    try:
+                        saved_plens[key] = int(prompt_lens[row])
+                    except Exception:
+                        saved_plens[key] = prompt_lens[row]
 
             self._dsa_prefill_shadow_ready = True
         except Exception:
@@ -1542,16 +1539,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                 int(current_valid.shape[0]),
                 int(current_kv.shape[0]),
             )
+            topk_cpu = topk_2d[:num_rows].detach().to(device="cpu", dtype=torch.long)
+            current_valid_cpu = current_valid[:num_rows].detach().to(device="cpu")
+            current_slots_cpu = current_slots[:num_rows].detach().to(
+                device="cpu", dtype=torch.long
+            )
+            current_physical_blocks_cpu = current_physical_blocks[
+                :num_rows
+            ].detach().to(device="cpu", dtype=torch.long)
+            current_block_table_rows_cpu = current_block_table_rows[
+                :num_rows
+            ].detach().to(device="cpu", dtype=torch.long)
             original_2d = _dsa_kv_trace_to_2d_indices(original_topk)[
                 :num_rows
-            ].to(device=topk_2d.device, dtype=torch.long)
-            prompt = prompt_lens.reshape(-1)[:num_rows].to(
-                device=topk_2d.device, dtype=torch.long
+            ].detach().to(device="cpu", dtype=torch.long)
+            prompt = prompt_lens.reshape(-1)[:num_rows].detach().to(
+                device="cpu", dtype=torch.long
             )
             if prompt.shape[0] < num_rows:
                 pad = torch.zeros(
                     num_rows - prompt.shape[0],
-                    device=topk_2d.device,
+                    device="cpu",
                     dtype=torch.long,
                 )
                 prompt = torch.cat([prompt, pad])
@@ -1565,12 +1573,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             remap_check_mask = original_2d >= 0
             remapped_ok = bool(
                 (
-                    topk_2d[:num_rows][remap_check_mask]
+                    topk_cpu[remap_check_mask]
                     == expected_remapped_topk[remap_check_mask]
                 )
                 .all()
-                .detach()
-                .to(device="cpu")
                 .item()
             ) if remap_check_mask.numel() else True
 
@@ -1593,7 +1599,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if table is None:
                     missing_req_ids.append(key)
                     table = torch.zeros_like(next(iter(saved_tables.values())))
-                rows.append(table.to(device=topk_2d.device, dtype=torch.long))
+                rows.append(table.to(device="cpu", dtype=torch.long))
             if missing_req_ids:
                 if _dsa_kv_debug_error_allowed(self):
                     logger.error(
@@ -1623,7 +1629,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 & (physical_blocks >= 0)
                 & (slots >= 0)
                 & (slots < shadow_flat_kv.shape[0])
-                & current_valid[:num_rows]
+                & current_valid_cpu
             )
             if not bool(shadow_valid.any().detach().to(device="cpu").item()):
                 if _dsa_kv_debug_error_allowed(self):
@@ -1637,9 +1643,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         trace_label,
                         remapped_ok,
                         _dsa_debug_sample(original_2d),
-                        _dsa_debug_sample(topk_2d),
+                        _dsa_debug_sample(topk_cpu),
                         _dsa_debug_sample(expected_remapped_topk),
-                        _dsa_debug_sample(current_valid),
+                        _dsa_debug_sample(current_valid_cpu),
                         _dsa_debug_sample(prefill_mask),
                     )
                 return
@@ -1654,9 +1660,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 0, safe_slots.reshape(-1)
             ).reshape(*safe_slots.shape, *shadow_flat_key_rope.shape[1:])
 
-            current_kv_cmp = current_kv[:num_rows][shadow_valid]
+            current_kv_cpu = current_kv[:num_rows].detach().to(device="cpu")
+            current_key_rope_cpu = current_key_rope[:num_rows].detach().to(
+                device="cpu"
+            )
+            current_kv_cmp = current_kv_cpu[shadow_valid]
             expected_kv_cmp = expected_kv[shadow_valid]
-            current_key_rope_cmp = current_key_rope[:num_rows][shadow_valid]
+            current_key_rope_cmp = current_key_rope_cpu[shadow_valid]
             expected_key_rope_cmp = expected_key_rope[shadow_valid]
 
             atol = 0.0
@@ -1706,22 +1716,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                             "selected_matches_raw": selected_matches_raw,
                             "remapped_topk_matches_expected": remapped_ok,
                         },
-                        "topk_indices": topk_2d.detach().to(device="cpu"),
+                        "topk_indices": topk_cpu,
                         "expected_remapped_topk": expected_remapped_topk.detach().to(
                             device="cpu"
                         ),
                         "original_topk": original_2d.detach().to(device="cpu"),
                         "prefill_mask": prefill_mask.detach().to(device="cpu"),
                         "compare_mask": shadow_valid.detach().to(device="cpu"),
-                        "current_slots": current_slots[:num_rows].detach().to(
-                            device="cpu"
-                        ),
-                        "current_physical_blocks": current_physical_blocks[
-                            :num_rows
-                        ].detach().to(device="cpu"),
-                        "current_block_table_rows": current_block_table_rows[
-                            :num_rows
-                        ].detach().to(device="cpu"),
+                        "current_slots": current_slots_cpu,
+                        "current_physical_blocks": current_physical_blocks_cpu,
+                        "current_block_table_rows": current_block_table_rows_cpu,
                         "shadow_slots": slots.detach().to(device="cpu"),
                         "current_kv": current_kv_cmp.detach().to(device="cpu"),
                         "expected_kv": expected_kv_cmp.detach().to(device="cpu"),
@@ -1751,10 +1755,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     selected_matches_expected,
                     selected_matches_raw,
                     remapped_ok,
-                    _dsa_debug_sample(topk_2d),
+                    _dsa_debug_sample(topk_cpu),
                     _dsa_debug_sample(expected_remapped_topk),
                     _dsa_debug_sample(original_2d),
-                    _dsa_debug_sample(current_slots[:num_rows]),
+                    _dsa_debug_sample(current_slots_cpu),
                     _dsa_debug_sample(slots),
                     _dsa_debug_sample(prompt),
                     dump_path,
