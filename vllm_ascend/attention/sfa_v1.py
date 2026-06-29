@@ -1416,6 +1416,102 @@ class AscendSFAImpl(MLAAttentionImpl):
                     layer_name,
                 )
 
+    def _maybe_capture_pre_lmcache_scratch_kv(
+        self,
+        *,
+        layer_name: str,
+        kv_cache,
+        block_table: torch.Tensor,
+        remapped_topk: torch.Tensor,
+        attn_metadata,
+    ) -> None:
+        if not _dsa_prefill_shadow_enabled():
+            return
+        if not _dsa_prefill_shadow_layer_enabled(layer_name):
+            return
+        if (
+            getattr(attn_metadata, "attn_state", None)
+            != AscendAttentionState.DecodeOnly
+        ):
+            return
+        if kv_cache is None or len(kv_cache) < 2 or block_table is None:
+            return
+        if getattr(attn_metadata, "num_decode_tokens", 0) <= 0:
+            return
+
+        try:
+            if hasattr(torch, "npu"):
+                torch.npu.synchronize()
+
+            topk_2d = _dsa_kv_trace_to_2d_indices(remapped_topk).to(torch.long)
+            if topk_2d.numel() == 0:
+                return
+            num_rows = min(
+                int(getattr(attn_metadata, "num_decode_tokens", 0)),
+                int(topk_2d.shape[0]),
+                int(block_table.shape[0]),
+            )
+            if num_rows <= 0:
+                return
+
+            topk_2d = topk_2d[:num_rows]
+            block_table_rows = block_table[:num_rows].to(torch.long)
+            kv = kv_cache[0]
+            key_rope = kv_cache[1]
+            block_size = int(kv.shape[1])
+            num_logical_blocks = int(block_table_rows.shape[1])
+            kv_flat = kv.reshape(-1, *kv.shape[2:])
+            key_rope_flat = key_rope.reshape(-1, *key_rope.shape[2:])
+
+            safe_indices = torch.clamp(topk_2d, min=0)
+            logical_blocks = safe_indices // block_size
+            block_offsets = safe_indices % block_size
+            valid = (topk_2d >= 0) & (logical_blocks < num_logical_blocks)
+            safe_logical_blocks = torch.clamp(
+                logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
+            )
+            physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+            slots = physical_blocks * block_size + block_offsets
+            valid = valid & (physical_blocks >= 0) & (slots < kv_flat.shape[0])
+            safe_slots = torch.clamp(slots, min=0, max=max(kv_flat.shape[0] - 1, 0))
+            flat_slots = safe_slots.reshape(-1)
+
+            kv_selected = kv_flat.index_select(0, flat_slots).reshape(
+                *safe_slots.shape, *kv_flat.shape[1:]
+            )
+            key_rope_selected = key_rope_flat.index_select(
+                0, flat_slots
+            ).reshape(*safe_slots.shape, *key_rope_flat.shape[1:])
+            if not torch.all(valid):
+                kv_selected = torch.where(
+                    valid.reshape(*valid.shape, *([1] * (kv_selected.dim() - 2))),
+                    kv_selected,
+                    torch.zeros_like(kv_selected),
+                )
+                key_rope_selected = torch.where(
+                    valid.reshape(
+                        *valid.shape, *([1] * (key_rope_selected.dim() - 2))
+                    ),
+                    key_rope_selected,
+                    torch.zeros_like(key_rope_selected),
+                )
+
+            self._dsa_pre_lmcache_scratch_kv = {
+                "layer_name": layer_name,
+                "topk": topk_2d.detach().to(device="cpu", dtype=torch.long),
+                "valid": valid.detach().to(device="cpu"),
+                "slots": slots.detach().to(device="cpu", dtype=torch.long),
+                "kv": kv_selected.detach().to(device="cpu"),
+                "key_rope": key_rope_selected.detach().to(device="cpu"),
+            }
+        except Exception:
+            if _dsa_kv_debug_error_allowed(self):
+                logger.exception(
+                    "[DSA_KV_DEBUG] cause=pre_lmcache_scratch_capture_error "
+                    "layer=%s",
+                    layer_name,
+                )
+
     def _maybe_capture_prefill_shadow_kv(
         self,
         *,
@@ -1682,6 +1778,52 @@ class AscendSFAImpl(MLAAttentionImpl):
                 return
 
             if _dsa_kv_debug_error_allowed(self):
+                pre_scratch = getattr(self, "_dsa_pre_lmcache_scratch_kv", None)
+                scratch_changed = None
+                scratch_slots_match = None
+                scratch_kv_delta_max = None
+                scratch_key_rope_delta_max = None
+                pre_kv_cmp = None
+                pre_key_rope_cmp = None
+                if (
+                    isinstance(pre_scratch, dict)
+                    and pre_scratch.get("layer_name") == layer_name
+                ):
+                    pre_valid = pre_scratch["valid"][:num_rows].to(torch.bool)
+                    pre_slots = pre_scratch["slots"][:num_rows].to(torch.long)
+                    scratch_slots_match = (
+                        tuple(pre_slots.shape) == tuple(current_slots_cpu.shape)
+                        and torch.equal(pre_slots, current_slots_cpu)
+                    )
+                    if (
+                        tuple(pre_valid.shape) == tuple(shadow_valid.shape)
+                        and scratch_slots_match
+                    ):
+                        pre_kv_cpu = pre_scratch["kv"][:num_rows]
+                        pre_key_rope_cpu = pre_scratch["key_rope"][:num_rows]
+                        pre_kv_cmp = pre_kv_cpu[shadow_valid]
+                        pre_key_rope_cmp = pre_key_rope_cpu[shadow_valid]
+                        scratch_kv_delta = (
+                            current_kv_cmp.float() - pre_kv_cmp.float()
+                        ).abs()
+                        scratch_key_rope_delta = (
+                            current_key_rope_cmp.float()
+                            - pre_key_rope_cmp.float()
+                        ).abs()
+                        scratch_kv_delta_max = (
+                            float(scratch_kv_delta.max().item())
+                            if scratch_kv_delta.numel()
+                            else 0.0
+                        )
+                        scratch_key_rope_delta_max = (
+                            float(scratch_key_rope_delta.max().item())
+                            if scratch_key_rope_delta.numel()
+                            else 0.0
+                        )
+                        scratch_changed = (
+                            scratch_kv_delta_max > 0.0
+                            or scratch_key_rope_delta_max > 0.0
+                        )
                 selected_matches_expected = getattr(
                     self, "_dsa_last_lmc_selected_matches_expected", None
                 )
@@ -1692,6 +1834,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     cause = "selected_for_lmcache_mismatch_before_retrieve"
                 elif not remapped_ok:
                     cause = "scratch_remap_topk_mismatch_before_attention"
+                elif scratch_changed is False:
+                    cause = "lmcache_retrieve_did_not_write_scratch"
+                elif scratch_changed is True:
+                    cause = "lmcache_retrieve_wrote_wrong_scratch_data"
                 else:
                     cause = "lmcache_retrieve_or_scratch_mapping_mismatch"
 
@@ -1715,6 +1861,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                             "selected_matches_expected": selected_matches_expected,
                             "selected_matches_raw": selected_matches_raw,
                             "remapped_topk_matches_expected": remapped_ok,
+                            "scratch_changed": scratch_changed,
+                            "scratch_slots_match": scratch_slots_match,
+                            "scratch_kv_delta_max_abs": scratch_kv_delta_max,
+                            "scratch_key_rope_delta_max_abs": (
+                                scratch_key_rope_delta_max
+                            ),
                         },
                         "topk_indices": topk_cpu,
                         "expected_remapped_topk": expected_remapped_topk.detach().to(
@@ -1735,6 +1887,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         "expected_key_rope": expected_key_rope_cmp.detach().to(
                             device="cpu"
                         ),
+                        "pre_wait_kv": (
+                            None
+                            if pre_kv_cmp is None
+                            else pre_kv_cmp.detach().to(device="cpu")
+                        ),
+                        "pre_wait_key_rope": (
+                            None
+                            if pre_key_rope_cmp is None
+                            else pre_key_rope_cmp.detach().to(device="cpu")
+                        ),
                     },
                     dump_path,
                 )
@@ -1743,6 +1905,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "kv_max_abs_diff=%s key_rope_max_abs_diff=%s "
                     "compared_tokens=%s selected_matches_expected=%s "
                     "selected_matches_raw=%s remapped_topk_matches_expected=%s "
+                    "scratch_changed=%s scratch_slots_match=%s "
+                    "scratch_kv_delta_max_abs=%s "
+                    "scratch_key_rope_delta_max_abs=%s "
                     "topk_sample=%s expected_remapped_topk_sample=%s "
                     "original_topk_sample=%s current_slots_sample=%s "
                     "shadow_slots_sample=%s prompt_lens_sample=%s dump_path=%s",
@@ -1755,6 +1920,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     selected_matches_expected,
                     selected_matches_raw,
                     remapped_ok,
+                    scratch_changed,
+                    scratch_slots_match,
+                    scratch_kv_delta_max,
+                    scratch_key_rope_delta_max,
                     _dsa_debug_sample(topk_cpu),
                     _dsa_debug_sample(expected_remapped_topk),
                     _dsa_debug_sample(original_2d),
@@ -2438,6 +2607,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     selected_for_lmcache=_selected_for_wait,
                     prompt_lens=attn_metadata.prompt_lens,
                     num_decode_tokens=attn_metadata.num_decode_tokens,
+                )
+                self._maybe_capture_pre_lmcache_scratch_kv(
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    remapped_topk=topk_indices,
+                    attn_metadata=attn_metadata,
                 )
                 if _dsa_wait_log:
                     _wait_fn = wait_for_kv_layer_from_connector
