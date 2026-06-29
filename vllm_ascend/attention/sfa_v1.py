@@ -229,6 +229,56 @@ def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
+def _dsa_build_decode_window_slot_mapping(
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    row_req_indices: torch.Tensor | None,
+    prompt_lens: torch.Tensor | None,
+    decode_positions: torch.Tensor | None,
+    decode_window_tokens: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Map decode writes back into the fixed live decode window."""
+    if (
+        decode_window_tokens <= 0
+        or row_req_indices is None
+        or prompt_lens is None
+        or decode_positions is None
+        or slot_mapping.numel() == 0
+    ):
+        return slot_mapping
+
+    n = min(
+        int(slot_mapping.shape[0]),
+        int(row_req_indices.shape[0]),
+        int(prompt_lens.shape[0]),
+        int(decode_positions.shape[0]),
+    )
+    if n <= 0:
+        return slot_mapping
+
+    req_idx = row_req_indices[:n].to(device=block_table.device, dtype=torch.long)
+    plen = prompt_lens[:n].to(device=block_table.device, dtype=torch.long)
+    pos = decode_positions[:n].to(device=block_table.device, dtype=torch.long)
+    mask = (req_idx >= 0) & (plen > 0) & (pos >= plen)
+    safe_req_idx = torch.clamp(req_idx, min=0)
+    logical_pos = plen + torch.remainder(pos - plen, decode_window_tokens)
+
+    block_table_rows = block_table.index_select(0, safe_req_idx).to(torch.long)
+    logical_blocks = logical_pos // block_size
+    offsets = logical_pos % block_size
+    max_logical_block = max(int(block_table_rows.shape[1]) - 1, 0)
+    safe_logical_blocks = torch.clamp(logical_blocks, min=0, max=max_logical_block)
+    physical_blocks = block_table_rows.gather(
+        1, safe_logical_blocks.reshape(-1, 1)
+    ).reshape(-1)
+    target_slots = physical_blocks * block_size + offsets
+
+    remapped = slot_mapping.clone()
+    remapped[:n] = torch.where(mask, target_slots, remapped[:n].to(torch.long))
+    return remapped
+
+
 def _dsa_env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -267,20 +317,22 @@ def _dsa_req_id_key(req_id: object) -> str:
 def _dsa_expected_lmcache_selected(
     original_topk: torch.Tensor,
     prompt_lens: torch.Tensor,
+    lmcache_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     original_2d = _dsa_kv_trace_to_2d_indices(original_topk)
     sel = original_2d.to(torch.long)
-    prompt = prompt_lens.reshape(-1)[: sel.shape[0]].to(
+    source_lens = prompt_lens if lmcache_lens is None else lmcache_lens
+    source = source_lens.reshape(-1)[: sel.shape[0]].to(
         device=sel.device, dtype=sel.dtype
     )
-    if prompt.shape[0] < sel.shape[0]:
+    if source.shape[0] < sel.shape[0]:
         pad = torch.zeros(
-            sel.shape[0] - prompt.shape[0],
+            sel.shape[0] - source.shape[0],
             device=sel.device,
             dtype=sel.dtype,
         )
-        prompt = torch.cat([prompt, pad])
-    is_prefill = (sel >= 0) & (sel < prompt.reshape(-1, 1))
+        source = torch.cat([source, pad])
+    is_prefill = (sel >= 0) & (sel < source.reshape(-1, 1))
     if sel.numel() == 0:
         return sel.to(torch.int32), is_prefill
     width = int(sel.shape[1])
@@ -396,6 +448,10 @@ class AscendSFAMetadata:
     # in (see sparse_offload/INTEGRATION.md section B).
     req_ids: list[str] | None = None
     prompt_lens: torch.Tensor | None = None
+    decode_req_indices: torch.Tensor | None = None
+    decode_positions: torch.Tensor | None = None
+    lmcache_lens: torch.Tensor | None = None
+    decode_window_flush: bool = False
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -492,24 +548,52 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # prefill and padding rows get 0 (= left untouched by the remap). Works
         # for both pure-decode and mixed chunked-prefill+decode steps.
         prompt_lens_rows = None
+        decode_req_indices_rows = None
+        decode_positions_rows = None
+        lmcache_lens_rows = None
+        decode_window_flush = False
         num_decode_rows = 0
         plens_cpu = common_attn_metadata.prompt_lens_cpu
         if plens_cpu is not None:
             rows = np.zeros(num_input_tokens, dtype=np.int32)
+            req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
+            decode_positions = np.zeros(num_input_tokens, dtype=np.int32)
+            lmcache_lens = np.zeros(num_input_tokens, dtype=np.int32)
             n_real = min(len(plens_cpu), num_reqs)
-            if common_attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                rows[:n_real] = plens_cpu[:n_real]
-            else:
-                qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
-                computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-                for r in range(n_real):
-                    s, e = int(qsl[r]), int(qsl[r + 1])
-                    plen = int(plens_cpu[r])
-                    first_decode = max(s, s + plen - int(computed[r]))
-                    if first_decode < e:
-                        rows[first_decode:e] = plen
+            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
+            computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
+            window_tokens = int(envs.VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS)
+            for r in range(n_real):
+                s, e = int(qsl[r]), int(qsl[r + 1])
+                plen = int(plens_cpu[r])
+                first_decode = max(s, s + plen - int(computed[r]))
+                if first_decode < e:
+                    abs_pos = int(computed[r]) + (
+                        np.arange(first_decode - s, e - s, dtype=np.int32)
+                    )
+                    rows[first_decode:e] = plen
+                    req_rows[first_decode:e] = r
+                    decode_positions[first_decode:e] = abs_pos
+                    if window_tokens > 0:
+                        decoded_counts = abs_pos + 1 - plen
+                        lmcache_lens[first_decode:e] = plen + (
+                            (decoded_counts - 1) // window_tokens
+                        ) * window_tokens
+                        decode_window_flush = decode_window_flush or bool(
+                            (
+                                (decoded_counts > 0)
+                                & (decoded_counts % window_tokens == 0)
+                            ).any()
+                        )
+                    else:
+                        lmcache_lens[first_decode:e] = plen
             num_decode_rows = int((rows > 0).sum())
             prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
+            decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
+            decode_positions_rows = torch.from_numpy(decode_positions).to(
+                block_table.device
+            )
+            lmcache_lens_rows = torch.from_numpy(lmcache_lens).to(block_table.device)
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -616,6 +700,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
             prompt_lens=prompt_lens_rows,
+            decode_req_indices=decode_req_indices_rows,
+            decode_positions=decode_positions_rows,
+            lmcache_lens=lmcache_lens_rows,
+            decode_window_flush=decode_window_flush,
             num_decode_tokens=num_decode_rows,
         )
 
@@ -1333,6 +1421,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         remapped_topk: torch.Tensor,
         selected_for_lmcache: torch.Tensor,
         prompt_lens: torch.Tensor,
+        lmcache_lens: torch.Tensor | None,
         num_decode_tokens: int,
     ) -> None:
         if not _dsa_lmc_selected_check_enabled():
@@ -1344,7 +1433,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         try:
             expected, prefill_mask = _dsa_expected_lmcache_selected(
-                original_topk, prompt_lens
+                original_topk, prompt_lens, lmcache_lens
             )
             decode_rows = min(
                 int(num_decode_tokens),
@@ -1382,6 +1471,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             self._dsa_last_original_topk = original_topk.detach()
             self._dsa_last_prompt_lens = prompt_lens.detach()
+            if lmcache_lens is not None:
+                self._dsa_last_lmcache_lens = lmcache_lens.detach()
             self._dsa_last_selected_for_lmcache = selected_for_lmcache.detach()
             self._dsa_last_lmc_selected_matches_expected = matches_expected
             self._dsa_last_lmc_selected_matches_raw = matches_raw_original
@@ -1396,7 +1487,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "matches_raw_original=%s all_original_topk_prefill=%s "
                     "original_topk_sample=%s expected_selected_sample=%s "
                     "selected_for_lmcache_sample=%s remapped_topk_sample=%s "
-                    "prompt_lens_sample=%s prefill_mask_sample=%s",
+                    "prompt_lens_sample=%s lmcache_lens_sample=%s "
+                    "prefill_mask_sample=%s",
                     layer_name,
                     decode_rows,
                     matches_raw_original,
@@ -1406,6 +1498,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _dsa_debug_sample(selected),
                     _dsa_debug_sample(remapped_2d),
                     _dsa_debug_sample(prompt_lens[:decode_rows]),
+                    _dsa_debug_sample(
+                        lmcache_lens[:decode_rows]
+                        if lmcache_lens is not None else None
+                    ),
                     _dsa_debug_sample(prefill_mask),
                 )
         except Exception:
@@ -2284,6 +2380,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
+        _dsa_decode_window_tokens = int(envs.VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS)
+        if (
+            kv_cache is not None
+            and self.dsa_shrink_latent
+            and _dsa_decode_window_tokens > 0
+            and attn_metadata.num_decode_tokens > 0
+            and not self.enable_dsa_cp
+        ):
+            slot_mapping = _dsa_build_decode_window_slot_mapping(
+                attn_metadata.block_table,
+                slot_mapping,
+                attn_metadata.decode_req_indices,
+                attn_metadata.prompt_lens,
+                attn_metadata.decode_positions,
+                _dsa_decode_window_tokens,
+                int(kv_cache[0].shape[1]),
+            )
         # DSA two-group mode: the indexer cache write must use the indexer
         # group's own slots; falls back to the shared slots in single-group mode.
         idx_slot_mapping = (
@@ -2572,7 +2685,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             _topk_before_remap = topk_indices
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
-                    topk_indices, attn_metadata.prompt_lens, need_packed=_need_packed
+                    topk_indices,
+                    attn_metadata.prompt_lens,
+                    need_packed=_need_packed,
+                    lmcache_lens=attn_metadata.lmcache_lens,
+                    decode_window_tokens=_dsa_decode_window_tokens,
                 )
             if _dsa_wait_log:
                 logger.info(
@@ -2606,6 +2723,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     remapped_topk=topk_indices,
                     selected_for_lmcache=_selected_for_wait,
                     prompt_lens=attn_metadata.prompt_lens,
+                    lmcache_lens=attn_metadata.lmcache_lens,
                     num_decode_tokens=attn_metadata.num_decode_tokens,
                 )
                 self._maybe_capture_pre_lmcache_scratch_kv(
@@ -2976,7 +3094,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
-        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode
+        _skip_decode_save = (
+            bool(self.dsa_shrink_latent)
+            and _is_pure_decode
+            and not bool(attn_metadata.decode_window_flush)
+        )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
