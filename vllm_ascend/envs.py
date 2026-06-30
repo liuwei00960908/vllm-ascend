@@ -162,13 +162,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
     ),
-    # DSA shrink-latent decode resident window, in tokens. During decode, the
-    # latent group allocates NPU pages only until this many generated tokens are
-    # resident; each full window is saved to LMCache and subsequent decode writes
-    # reuse the same NPU slots. Set 0 to keep the old unbounded decode tail.
-    "VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024")
-    ),
     # DSA shrink-latent correctness diagnostics. When enabled, logs the
     # selected-token path from SFA -> KV connector -> LMCache. Default off.
     "VLLM_ASCEND_DSA_SHRINK_DEBUG": lambda: bool(
