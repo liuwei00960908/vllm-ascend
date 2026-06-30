@@ -519,11 +519,18 @@ def maybe_save_kv_layer_to_connector(
     if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
         vllm_logger.warning(
             "[DSA_SAVE_DBG] maybe_save_dispatch layer=%s connector=%s "
-            "attn_metadata=%s attn_state=%s decode_window_flush=%s "
-            "num_decode_tokens=%s",
+            "connector_id=%s connector_metadata_id=%s forward_context_id=%s "
+            "attn_metadata=%s attn_metadata_id=%s attn_state=%s "
+            "decode_window_flush=%s num_decode_tokens=%s",
             layer_name,
             connector.__class__.__name__,
+            id(connector),
+            id(getattr(connector, "_connector_metadata", None))
+            if getattr(connector, "_connector_metadata", None) is not None
+            else None,
+            id(forward_context),
             attn_metadata.__class__.__name__,
+            id(attn_metadata),
             getattr(attn_metadata, "attn_state", None),
             getattr(attn_metadata, "decode_window_flush", None),
             getattr(attn_metadata, "num_decode_tokens", None),
