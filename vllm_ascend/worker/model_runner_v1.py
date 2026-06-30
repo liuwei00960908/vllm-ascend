@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -161,6 +162,15 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 @dataclass
@@ -1450,9 +1460,46 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if _dsa_debug_enabled():
+                _fc_dbg = get_forward_context()
+                logger.warning(
+                    "[DSA_LOAD_DBG] ascend_model_forward_enter "
+                    "forward_context_id=%s total_scheduled_tokens=%s "
+                    "num_tokens_padded=%s batch_desc=%s kv_output_id=%s",
+                    id(_fc_dbg),
+                    scheduler_output.total_num_scheduled_tokens,
+                    num_tokens_padded,
+                    batch_desc,
+                    id(kv_connector_output),
+                )
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+            except Exception:
+                if _dsa_debug_enabled():
+                    _fc_dbg = get_forward_context()
+                    logger.exception(
+                        "[DSA_LOAD_DBG] ascend_model_forward_exception "
+                        "forward_context_id=%s total_scheduled_tokens=%s "
+                        "num_tokens_padded=%s batch_desc=%s",
+                        id(_fc_dbg),
+                        scheduler_output.total_num_scheduled_tokens,
+                        num_tokens_padded,
+                        batch_desc,
+                    )
+                raise
+            if _dsa_debug_enabled():
+                _fc_dbg = get_forward_context()
+                logger.warning(
+                    "[DSA_LOAD_DBG] ascend_model_forward_return "
+                    "forward_context_id=%s hidden_type=%s total_scheduled_tokens=%s "
+                    "num_tokens_padded=%s",
+                    id(_fc_dbg),
+                    hidden_states.__class__.__name__,
+                    scheduler_output.total_num_scheduled_tokens,
+                    num_tokens_padded,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
