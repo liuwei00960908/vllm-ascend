@@ -2719,9 +2719,11 @@ class NPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
             kv_caches_to_register = kv_caches
-            if self.dsa_unbundle and not getattr(
-                kv_transfer_group, "requires_full_dsa_kv_caches", False
-            ):
+            requires_full_dsa_kv_caches = bool(
+                getattr(kv_transfer_group, "requires_full_dsa_kv_caches", False)
+                or getattr(kv_transfer_group, "supports_dsa_index_lmcache", False)
+            )
+            if self.dsa_unbundle and not requires_full_dsa_kv_caches:
                 # Un-bundled: the indexer layer registers a 1-tuple (key only, no
                 # value). The KV connector only offloads the latent, and LMCache's
                 # permute requires >=2 tensors per entry, so register latent layers

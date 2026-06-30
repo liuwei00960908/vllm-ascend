@@ -11,7 +11,11 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
-from vllm.distributed.kv_transfer import has_kv_transfer_group, is_v1_kv_transfer_group
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    is_v1_kv_transfer_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
@@ -275,6 +279,17 @@ def _dsa_kv_debug_error_allowed(owner: object) -> bool:
         return False
     setattr(owner, "_dsa_kv_debug_error_count", count + 1)
     return True
+
+
+def _dsa_indexer_layer_name(layer_name: str) -> str:
+    return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+
+
+def _dsa_index_lmcache_enabled() -> bool:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    connector = get_kv_transfer_group()
+    return bool(getattr(connector, "supports_dsa_index_lmcache", False))
 
 
 def _dsa_lmc_selected_check_enabled() -> bool:
@@ -2304,18 +2319,30 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
         )
         _sfa_t = _dsa_prof.begin("sfa_fwd")
+        _is_pure_decode = attn_metadata.attn_state in (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        )
+        index_layer_name = (
+            _dsa_indexer_layer_name(layer_name)
+            if self.dsa_offload_unbundle
+            else None
+        )
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
             # layer_name is the inner MLAAttention name (...self_attn.attn); the indexer
             # cache is the sibling ...self_attn.indexer.k_cache. Re-assemble a 3-tuple so
             # the indexer read/write (kv_cache[2]) work unchanged — both groups share the
             # request's block ids, so attn_metadata.block_table/slot_mapping address both.
+            # NOTE: in two-group mode the indexer group has its own block table and
+            # slot mapping; the shared-block assumption only applies to legacy layouts.
             # The indexer KV tensor is allocated once at startup; cache the ref to avoid a
             # per-layer no_compile_layers dict lookup + tuple rebuild on the decode path.
             _idx_t = getattr(self, "_dsa_idx_cache_t", None)
             if _idx_t is None:
                 _fc_ub = get_forward_context()
-                _idx_name = layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                assert index_layer_name is not None
+                _idx_name = index_layer_name
                 _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
                 _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
                 self._dsa_idx_cache_t = _idx_t
@@ -2500,6 +2527,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = self._get_full_kv(k_li, attn_metadata)
 
         if kv_cache is not None:
+            if (
+                self.dsa_offload_unbundle
+                and index_layer_name is not None
+                and not _is_pure_decode
+                and _dsa_index_lmcache_enabled()
+            ):
+                with _dsa_prof.section("lmc_index_retrieve"):
+                    wait_for_kv_layer_from_connector(index_layer_name)
+
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
             torch_npu.npu_scatter_nd_update_(
@@ -3045,22 +3081,19 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        # Offload to LMCache. Un-bundled: save ONLY the latent (k_nope, k_pe) — the
-        # indexer key (kv_cache[2]) stays resident on NPU (it scores every step), so it
-        # must not be offloaded. Bundled path saves the whole tuple as before.
+        # Offload to LMCache. Legacy un-bundled connectors save only the latent
+        # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
+        # save the sibling indexer layer in prefill; pure decode still skips
+        # indexer save. Bundled path saves the whole tuple as before.
         # Shrink-latent: a pure-decode step's latent lives in the resident tail and is
         # never reloaded from LMCache, so saving it every decode layer is redundant
         # connector work (scales with batch). Skip save on steps with no prefill tokens
-        # — gated per STEP (num_prefills is shared by all layers), so the layerwise save
+        # gated per step (num_prefills is shared by all layers), so the layerwise save
         # generator is never created that step and wait_for_save tolerates its absence.
         # NOTE: the SFA builder never populates attn_metadata.num_prefills (stays at
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
-        _is_pure_decode = attn_metadata.attn_state in (
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        )
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
             and _is_pure_decode
@@ -3068,6 +3101,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+                if (
+                    len(kv_cache) >= 3
+                    and index_layer_name is not None
+                    and not _is_pure_decode
+                    and _dsa_index_lmcache_enabled()
+                ):
+                    maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
             else:
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
