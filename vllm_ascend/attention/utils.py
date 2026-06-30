@@ -488,7 +488,18 @@ def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
 ):
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+    has_group = has_kv_transfer_group()
+    is_v1_group = is_v1_kv_transfer_group() if has_group else False
+    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+        vllm_logger.warning(
+            "[DSA_SAVE_DBG] maybe_save_enter layer=%s has_group=%s "
+            "is_v1_group=%s kv_cache_layer_len=%s",
+            layer_name,
+            has_group,
+            is_v1_group,
+            len(kv_cache_layer),
+        )
+    if not has_group or not is_v1_group:
         return
 
     connector = get_kv_transfer_group()
@@ -496,8 +507,27 @@ def maybe_save_kv_layer_to_connector(
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
+        if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+            vllm_logger.warning(
+                "[DSA_SAVE_DBG] maybe_save_skip layer=%s reason=no_attn_metadata "
+                "connector=%s",
+                layer_name,
+                connector.__class__.__name__,
+            )
         return
     # TODO: assert ascendMetadata
+    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+        vllm_logger.warning(
+            "[DSA_SAVE_DBG] maybe_save_dispatch layer=%s connector=%s "
+            "attn_metadata=%s attn_state=%s decode_window_flush=%s "
+            "num_decode_tokens=%s",
+            layer_name,
+            connector.__class__.__name__,
+            attn_metadata.__class__.__name__,
+            getattr(attn_metadata, "attn_state", None),
+            getattr(attn_metadata, "decode_window_flush", None),
+            getattr(attn_metadata, "num_decode_tokens", None),
+        )
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 

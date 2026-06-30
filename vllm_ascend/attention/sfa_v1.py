@@ -588,6 +588,30 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     else:
                         lmcache_lens[first_decode:e] = plen
             num_decode_rows = int((rows > 0).sum())
+            if (
+                envs.VLLM_ASCEND_DSA_SHRINK_DEBUG
+                and window_tokens > 0
+                and n_real > 0
+                and num_decode_rows > 0
+            ):
+                _dbg_plen = int(plens_cpu[0])
+                _dbg_computed = int(computed[0])
+                _dbg_decoded_count = _dbg_computed + 1 - _dbg_plen
+                logger.warning(
+                    "[DSA_SAVE_DBG] sfa_builder_decode_window r0_plen=%s "
+                    "r0_computed=%s r0_decoded_count=%s window_tokens=%s "
+                    "decode_window_flush=%s num_decode_rows=%s "
+                    "attn_state=%s num_input_tokens=%s num_actual_tokens=%s",
+                    _dbg_plen,
+                    _dbg_computed,
+                    _dbg_decoded_count,
+                    window_tokens,
+                    decode_window_flush,
+                    num_decode_rows,
+                    common_attn_metadata.attn_state,
+                    num_input_tokens,
+                    num_actual_tokens,
+                )
             prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
             decode_positions_rows = torch.from_numpy(decode_positions).to(
@@ -3099,6 +3123,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             and _is_pure_decode
             and not bool(attn_metadata.decode_window_flush)
         )
+        if _dsa_debug_should_log(self, "save_gate", layer_name):
+            logger.warning(
+                "[DSA_SAVE_DBG] sfa_save_gate layer=%s is_pure_decode=%s "
+                "dsa_shrink_latent=%s decode_window_flush=%s "
+                "skip_decode_save=%s num_decode_tokens=%s attn_state=%s "
+                "kv_cache_len=%s dsa_offload_unbundle=%s",
+                layer_name,
+                _is_pure_decode,
+                self.dsa_shrink_latent,
+                bool(attn_metadata.decode_window_flush),
+                _skip_decode_save,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.attn_state,
+                len(kv_cache) if kv_cache is not None else None,
+                self.dsa_offload_unbundle,
+            )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
