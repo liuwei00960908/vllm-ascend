@@ -393,6 +393,86 @@ def _dsa_build_target_slot_mapping(
     return physical_blocks * block_size + offsets
 
 
+def _dsa_target_slot_sync_checkpoint(
+    *,
+    stage: str,
+    layer_name: str | None,
+    selected_tokens: torch.Tensor | None,
+    target_slot_mapping: torch.Tensor | None,
+) -> None:
+    if not hasattr(torch, "npu"):
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception as exc:
+        raise RuntimeError(
+            "DSA target_slot_mapping sync checkpoint failed: "
+            f"stage={stage} layer={layer_name} "
+            f"selected_shape="
+            f"{tuple(selected_tokens.shape) if selected_tokens is not None else None} "
+            f"target_slot_shape="
+            f"{tuple(target_slot_mapping.shape) if target_slot_mapping is not None else None}"
+        ) from exc
+
+
+def _dsa_validate_target_slot_mapping(
+    *,
+    layer_name: str | None,
+    selected_tokens: torch.Tensor,
+    target_slot_mapping: torch.Tensor,
+    kv_cache_layer: torch.Tensor,
+    row_req_indices: torch.Tensor | None,
+    row_scratch_base: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+) -> None:
+    if target_slot_mapping.numel() == 0:
+        return
+    if kv_cache_layer.dim() < 2:
+        raise RuntimeError(
+            "DSA target_slot_mapping guard requires paged KV cache: "
+            f"layer={layer_name} kv_shape={tuple(kv_cache_layer.shape)}"
+        )
+    if selected_tokens.shape != target_slot_mapping.shape:
+        raise RuntimeError(
+            "DSA target_slot_mapping shape mismatch: "
+            f"layer={layer_name} selected_shape={tuple(selected_tokens.shape)} "
+            f"target_slot_shape={tuple(target_slot_mapping.shape)}"
+        )
+
+    block_size = int(kv_cache_layer.shape[1])
+    max_slots = int(kv_cache_layer.shape[0]) * block_size
+    target_slots = target_slot_mapping.to(device=kv_cache_layer.device, dtype=torch.long)
+    min_slot = int(target_slots.min().to(device="cpu").item())
+    max_slot = int(target_slots.max().to(device="cpu").item())
+    physical_blocks = target_slots // block_size
+    bad_slots = (target_slots < 0) | (target_slots >= max_slots) | (physical_blocks == 0)
+    if not bool(bad_slots.any().to(device="cpu").item()):
+        return
+
+    width = int(target_slots.reshape(target_slots.shape[0], -1).shape[1])
+    flat_idx = int(bad_slots.reshape(-1).nonzero(as_tuple=False)[0].item())
+    row = flat_idx // width
+    col = flat_idx % width
+    first_slot = int(target_slots.reshape(target_slots.shape[0], -1)[row, col]
+                     .to(device="cpu").item())
+    first_physical_block = first_slot // block_size
+    raise RuntimeError(
+        "DSA target_slot_mapping contains invalid write slot: "
+        f"layer={layer_name} selected_shape={tuple(selected_tokens.shape)} "
+        f"target_slot_shape={tuple(target_slot_mapping.shape)} "
+        f"kv_shape={tuple(kv_cache_layer.shape)} block_size={block_size} "
+        f"max_slots={max_slots} min_slot={min_slot} max_slot={max_slot} "
+        f"first_bad_row={row} first_bad_col={col} "
+        f"first_bad_slot={first_slot} "
+        f"first_bad_physical_block={first_physical_block} "
+        f"selected_sample={_dsa_debug_sample(selected_tokens)} "
+        f"target_slot_sample={_dsa_debug_sample(target_slot_mapping)} "
+        f"row_req_indices_sample={_dsa_debug_sample(row_req_indices)} "
+        f"row_scratch_base_sample={_dsa_debug_sample(row_scratch_base)} "
+        f"block_table_shape={tuple(block_table.shape) if block_table is not None else None}"
+    )
+
+
 def _dsa_env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -2924,6 +3004,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
+                _row_req_indices_for_wait = None
+                _row_scratch_base_for_wait = None
                 if _disable_target_slot_mapping:
                     # Debug fallback: keep the pre-MTP selected-token retrieve path
                     # so we can isolate explicit target_slot_mapping issues.
@@ -2938,6 +3020,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _row_scratch_base = _scratch_base[: _sel_packed.shape[0]][
                         _decode_row_mask
                     ]
+                    _row_req_indices_for_wait = _row_req_indices
+                    _row_scratch_base_for_wait = _row_scratch_base
                     _target_slot_mapping_for_wait = _dsa_build_target_slot_mapping(
                         attn_metadata.block_table,
                         _row_req_indices,
@@ -2955,6 +3039,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Compatibility fallback for metadata built before row-level DSA
                     # fields existed. Standard MTP should not take this path.
                     _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
+                if (
+                    _target_slot_mapping_for_wait is not None
+                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
+                ):
+                    _dsa_target_slot_sync_checkpoint(
+                        stage="before_target_slot_validate",
+                        layer_name=layer_name,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
+                    )
+                    _dsa_validate_target_slot_mapping(
+                        layer_name=layer_name,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
+                        kv_cache_layer=kv_cache[0],
+                        row_req_indices=_row_req_indices_for_wait,
+                        row_scratch_base=_row_scratch_base_for_wait,
+                        block_table=attn_metadata.block_table,
+                    )
                 self._maybe_check_lmcache_selected_tokens(
                     layer_name=layer_name,
                     original_topk=_topk_before_remap,
@@ -3025,12 +3128,32 @@ class AscendSFAImpl(MLAAttentionImpl):
                         if _request_ids_for_wait is not None else None,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
+                if (
+                    _target_slot_mapping_for_wait is not None
+                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
+                ):
+                    _dsa_target_slot_sync_checkpoint(
+                        stage="before_connector_wait",
+                        layer_name=layer_name,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
+                    )
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
+                    )
+                if (
+                    _target_slot_mapping_for_wait is not None
+                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
+                ):
+                    _dsa_target_slot_sync_checkpoint(
+                        stage="after_connector_wait",
+                        layer_name=layer_name,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
                     )
                 if _dsa_wait_log:
                     logger.warning(
