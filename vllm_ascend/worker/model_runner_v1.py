@@ -2719,6 +2719,9 @@ class NPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
             kv_caches_to_register = kv_caches
+            disable_dsa_index_lmcache = bool(
+                envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
+            )
             requires_full_dsa_kv_caches = bool(
                 getattr(kv_transfer_group, "requires_full_dsa_kv_caches", False)
             )
@@ -2726,7 +2729,8 @@ class NPUModelRunner(GPUModelRunner):
                 getattr(kv_transfer_group, "supports_dsa_index_lmcache", False)
             )
             register_full_dsa_kv_caches = (
-                requires_full_dsa_kv_caches or supports_dsa_index_lmcache
+                not disable_dsa_index_lmcache
+                and (requires_full_dsa_kv_caches or supports_dsa_index_lmcache)
             )
             if self.dsa_unbundle and not register_full_dsa_kv_caches:
                 # Un-bundled: the indexer layer registers a 1-tuple (key only, no
@@ -2742,21 +2746,25 @@ class NPUModelRunner(GPUModelRunner):
                     "DSA un-bundle: registering %d/%d KV layers with the connector "
                     "(latent only; indexer kept resident; "
                     "requires_full_dsa_kv_caches=%s "
-                    "supports_dsa_index_lmcache=%s).",
+                    "supports_dsa_index_lmcache=%s "
+                    "disable_dsa_index_lmcache=%s).",
                     len(kv_caches_to_register),
                     len(kv_caches),
                     requires_full_dsa_kv_caches,
                     supports_dsa_index_lmcache,
+                    disable_dsa_index_lmcache,
                 )
             elif self.dsa_unbundle:
                 logger.info(
                     "DSA un-bundle: registering all %d KV layers with the "
                     "group-aware connector for latent/indexer sub-dispatch "
                     "(requires_full_dsa_kv_caches=%s "
-                    "supports_dsa_index_lmcache=%s).",
+                    "supports_dsa_index_lmcache=%s "
+                    "disable_dsa_index_lmcache=%s).",
                     len(kv_caches_to_register),
                     requires_full_dsa_kv_caches,
                     supports_dsa_index_lmcache,
+                    disable_dsa_index_lmcache,
                 )
             kv_transfer_group.register_kv_caches(kv_caches_to_register)
 

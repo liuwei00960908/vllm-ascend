@@ -152,6 +152,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))
     ),
+    # Debug/compat switch: disable DSA indexer LMCache/index-offload hooks.
+    # When enabled, unbundled indexer 1-tuple caches stay resident and are not
+    # registered with LMCache connectors that cannot permute 1-tuple KV entries.
+    "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0"))
+    ),
     # DSA Step B staging. Requires TWO_GROUPS=1 + the LMCache connector.
     # 1 (B2): decode reads prefill-selected latent from the compact scratch
     #   (request's first ceil(k/block_size) latent blocks, filled by LMCache);

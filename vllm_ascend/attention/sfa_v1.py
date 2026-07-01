@@ -286,6 +286,8 @@ def _dsa_indexer_layer_name(layer_name: str) -> str:
 
 
 def _dsa_index_lmcache_enabled() -> bool:
+    if envs.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE:
+        return False
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return False
     connector = get_kv_transfer_group()
