@@ -233,33 +233,40 @@ def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
-def _dsa_expand_block_table_for_sparse_rows(
-    block_table: torch.Tensor,
+def _dsa_mask_padding_sparse_rows(
+    topk_indices: torch.Tensor,
     row_req_indices: torch.Tensor | None,
-    num_rows: int,
-) -> torch.Tensor:
-    """Expand request-level block table to sparse FA row-level layout."""
-    block_table_rows = int(block_table.shape[0])
-    if (
-        num_rows <= block_table_rows
-        or row_req_indices is None
-        or block_table_rows <= 0
-    ):
-        return block_table
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep graph padding rows from referencing freed DSA logical blocks."""
+    topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+    num_rows = int(topk_2d.shape[0])
+    if row_req_indices is None:
+        return topk_indices, topk_2d
 
     row_req_indices = row_req_indices[:num_rows].to(
-        device=block_table.device, dtype=torch.long
+        device=topk_indices.device, dtype=torch.long
     )
     if int(row_req_indices.numel()) < num_rows:
         pad = torch.full(
             (num_rows - int(row_req_indices.numel()),),
             -1,
             dtype=torch.long,
-            device=block_table.device,
+            device=topk_indices.device,
         )
         row_req_indices = torch.cat((row_req_indices, pad), dim=0)
-    safe_req_indices = torch.clamp(row_req_indices, min=0, max=block_table_rows - 1)
-    return block_table.index_select(0, safe_req_indices)
+    padding_mask = row_req_indices < 0
+    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
+        topk_indices = topk_indices.masked_fill(
+            padding_mask.reshape(-1, 1, 1), 0
+        )
+    elif topk_indices.dim() == 2:
+        topk_indices = topk_indices.masked_fill(padding_mask.reshape(-1, 1), 0)
+    else:
+        topk_indices = topk_indices.clone()
+        topk_indices.reshape(num_rows, -1).masked_fill_(
+            padding_mask.reshape(-1, 1), 0
+        )
+    return topk_indices, _dsa_kv_trace_to_2d_indices(topk_indices)
 
 
 def _dsa_build_target_slot_mapping(
@@ -2323,11 +2330,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         topk_2d = None
         if _dsa_decode_sparse_fa:
-            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
-            block_table = _dsa_expand_block_table_for_sparse_rows(
-                block_table,
+            topk_indices, topk_2d = _dsa_mask_padding_sparse_rows(
+                topk_indices,
                 getattr(attn_metadata, "decode_req_indices", None),
-                int(topk_2d.shape[0]),
             )
 
         self._maybe_trace_sparse_attention_kv(
@@ -2348,7 +2353,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
             topk_rows = int(topk_2d.shape[0])
             block_table_rows = int(block_table.shape[0])
-            if topk_rows > block_table_rows:
+            batch_size = int(actual_seq_lengths_query.numel())
+            if block_table_rows != batch_size:
                 decode_req_indices = getattr(attn_metadata, "decode_req_indices", None)
                 decode_req_indices_sample = None
                 if decode_req_indices is not None:
@@ -2359,14 +2365,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         .tolist()
                     )
                 raise RuntimeError(
-                    "DSA sparse FA block_table is not row-expanded for sparse "
-                    "MTP rows: "
+                    "DSA sparse FA block_table batch dimension mismatch: "
                     f"layer={layer_name} trace_label={trace_label} "
                     f"attn_state={attn_metadata.attn_state} "
                     f"topk_shape={tuple(topk_indices.shape)} "
                     f"topk_rows={topk_rows} "
                     f"block_table_shape={tuple(block_table.shape)} "
                     f"block_table_rows={block_table_rows} "
+                    f"batch_size={batch_size} "
                     f"num_decode_tokens={attn_metadata.num_decode_tokens} "
                     f"decode_req_indices_shape="
                     f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
