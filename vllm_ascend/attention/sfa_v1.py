@@ -2293,6 +2293,39 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata=attn_metadata,
         )
 
+        if (
+            self.dsa_shrink_latent
+            and _dsa_env_flag("VLLM_ASCEND_DSA_SPARSE_FA_GUARD", True)
+            and block_table is not None
+        ):
+            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+            topk_rows = int(topk_2d.shape[0])
+            block_table_rows = int(block_table.shape[0])
+            if topk_rows > block_table_rows:
+                decode_req_indices = getattr(attn_metadata, "decode_req_indices", None)
+                decode_req_indices_sample = None
+                if decode_req_indices is not None:
+                    decode_req_indices_sample = (
+                        decode_req_indices[: min(topk_rows, 8)]
+                        .detach()
+                        .to(device="cpu")
+                        .tolist()
+                    )
+                raise RuntimeError(
+                    "DSA sparse FA block_table is not row-expanded for sparse "
+                    "MTP rows: "
+                    f"layer={layer_name} trace_label={trace_label} "
+                    f"attn_state={attn_metadata.attn_state} "
+                    f"topk_shape={tuple(topk_indices.shape)} "
+                    f"topk_rows={topk_rows} "
+                    f"block_table_shape={tuple(block_table.shape)} "
+                    f"block_table_rows={block_table_rows} "
+                    f"num_decode_tokens={attn_metadata.num_decode_tokens} "
+                    f"decode_req_indices_shape="
+                    f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
+                    f"decode_req_indices_sample={decode_req_indices_sample}"
+                )
+
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
