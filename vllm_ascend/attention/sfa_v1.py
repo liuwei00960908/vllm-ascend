@@ -233,6 +233,35 @@ def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
+def _dsa_expand_block_table_for_sparse_rows(
+    block_table: torch.Tensor,
+    row_req_indices: torch.Tensor | None,
+    num_rows: int,
+) -> torch.Tensor:
+    """Expand request-level block table to sparse FA row-level layout."""
+    block_table_rows = int(block_table.shape[0])
+    if (
+        num_rows <= block_table_rows
+        or row_req_indices is None
+        or block_table_rows <= 0
+    ):
+        return block_table
+
+    row_req_indices = row_req_indices[:num_rows].to(
+        device=block_table.device, dtype=torch.long
+    )
+    if int(row_req_indices.numel()) < num_rows:
+        pad = torch.full(
+            (num_rows - int(row_req_indices.numel()),),
+            -1,
+            dtype=torch.long,
+            device=block_table.device,
+        )
+        row_req_indices = torch.cat((row_req_indices, pad), dim=0)
+    safe_req_indices = torch.clamp(row_req_indices, min=0, max=block_table_rows - 1)
+    return block_table.index_select(0, safe_req_indices)
+
+
 def _dsa_build_target_slot_mapping(
     block_table: torch.Tensor,
     row_req_indices: torch.Tensor,
@@ -2283,6 +2312,24 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv = kv_cache[0]
             key_rope = kv_cache[1]
 
+        _dsa_decode_sparse_fa = (
+            self.dsa_shrink_latent
+            and block_table is not None
+            and attn_metadata.num_decode_tokens > 0
+            and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            )
+        )
+        topk_2d = None
+        if _dsa_decode_sparse_fa:
+            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+            block_table = _dsa_expand_block_table_for_sparse_rows(
+                block_table,
+                getattr(attn_metadata, "decode_req_indices", None),
+                int(topk_2d.shape[0]),
+            )
+
         self._maybe_trace_sparse_attention_kv(
             layer_name=layer_name,
             trace_label=trace_label,
@@ -2294,16 +2341,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if (
-            self.dsa_shrink_latent
+            _dsa_decode_sparse_fa
             and _dsa_env_flag("VLLM_ASCEND_DSA_SPARSE_FA_GUARD", True)
-            and block_table is not None
-            and attn_metadata.num_decode_tokens > 0
-            and attn_metadata.attn_state in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            )
         ):
-            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+            if topk_2d is None:
+                topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
             topk_rows = int(topk_2d.shape[0])
             block_table_rows = int(block_table.shape[0])
             if topk_rows > block_table_rows:
