@@ -2328,6 +2328,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_offload_unbundle
             else None
         )
+        index_lmcache_enabled = (
+            self.dsa_offload_unbundle
+            and index_layer_name is not None
+            and _dsa_index_lmcache_enabled()
+        )
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
             # layer_name is the inner MLAAttention name (...self_attn.attn); the indexer
@@ -2528,11 +2533,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None:
             if (
-                self.dsa_offload_unbundle
-                and index_layer_name is not None
+                index_lmcache_enabled
                 and not _is_pure_decode
-                and _dsa_index_lmcache_enabled()
             ):
+                logger.info(
+                    "[DSA_INDEX_LMCACHE] load_call layer=%s index_layer=%s "
+                    "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+                    "kv_shape=%s",
+                    layer_name,
+                    index_layer_name,
+                    attn_metadata.attn_state,
+                    attn_metadata.num_actual_tokens,
+                    attn_metadata.num_decode_tokens,
+                    tuple(kv_cache[2].shape) if len(kv_cache) >= 3 else None,
+                )
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
 
@@ -3114,9 +3128,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if (
                     len(kv_cache) >= 3
                     and index_layer_name is not None
+                    and index_lmcache_enabled
                     and not _is_pure_decode
-                    and _dsa_index_lmcache_enabled()
                 ):
+                    logger.info(
+                        "[DSA_INDEX_LMCACHE] save_call layer=%s index_layer=%s "
+                        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+                        "kv_shape=%s",
+                        layer_name,
+                        index_layer_name,
+                        attn_metadata.attn_state,
+                        attn_metadata.num_actual_tokens,
+                        attn_metadata.num_decode_tokens,
+                        tuple(kv_cache[2].shape),
+                    )
                     maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
             else:
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
