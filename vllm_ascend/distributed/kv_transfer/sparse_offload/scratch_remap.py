@@ -52,6 +52,7 @@ def scratch_remap(
     sel = topk_indices.reshape(orig_shape[0], -1)
     k = sel.shape[1]
     plen = prompt_lens.reshape(-1, 1).to(device=sel.device, dtype=sel.dtype)
+    has_lmcache_lens = lmcache_lens is not None
     if lmcache_lens is None:
         lmc_len = plen
     else:
@@ -66,11 +67,27 @@ def scratch_remap(
     rank = torch.cumsum(is_lmcache, dim=1, dtype=sel.dtype) - 1
     new_indices = torch.where(is_lmcache, rank, sel)
     if decode_window_tokens > 0:
-        window = torch.tensor(
-            decode_window_tokens, dtype=sel.dtype, device=sel.device
-        )
-        is_live_decode = (sel >= lmc_len) & (sel >= plen)
-        window_pos = plen + torch.remainder(sel - plen, window)
+        if has_lmcache_lens:
+            # lmc_len is window-aligned by the SFA metadata builder
+            # (plen + k * decode_window_tokens). For live decode tokens,
+            # (sel - plen) % window == sel - lmc_len, avoiding a per-token
+            # remainder in the hot path. The upper bound keeps unexpected
+            # out-of-window selections from producing invalid window indices.
+            live_rel = sel - lmc_len
+            is_live_decode = (
+                (sel >= lmc_len)
+                & (sel >= plen)
+                & (live_rel < decode_window_tokens)
+            )
+            window_pos = plen + live_rel
+        else:
+            # Compatibility fallback: without a window-aligned LMCache boundary,
+            # only the modulo form is correct once decode crosses one window.
+            window = torch.tensor(
+                decode_window_tokens, dtype=sel.dtype, device=sel.device
+            )
+            is_live_decode = (sel >= lmc_len) & (sel >= plen)
+            window_pos = plen + torch.remainder(sel - plen, window)
         new_indices = torch.where(is_live_decode, window_pos, new_indices)
 
     if not need_packed:

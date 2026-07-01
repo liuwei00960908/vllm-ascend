@@ -392,3 +392,54 @@ class TestScratchRemap:
         # 14, 16, 17 are live decode positions and map into [10, 14).
         assert new_idx.tolist() == [[[0, 1, 10, 12, 13, -1]]]
         assert packed.tolist() == [[2, 11, 0, 0, 0, 0]]
+
+    def test_remap_decode_window_subtracts_lmcache_boundary(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[[2, 17, 18, 20, 21]]], dtype=torch.int32)
+        plen = torch.tensor([10])
+        lmcache_lens = torch.tensor([18])
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            lmcache_lens=lmcache_lens,
+            decode_window_tokens=4,
+        )
+
+        # lmc_len=18 is plen + 2*window. Live decode positions subtract
+        # lmc_len instead of taking a per-token modulo against plen.
+        assert new_idx.tolist() == [[[0, 1, 10, 12, 13]]]
+        assert packed.tolist() == [[2, 17, 0, 0, 0]]
+
+    def test_remap_decode_window_leaves_out_of_window_selected_unchanged(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[[18, 22]]], dtype=torch.int32)
+        plen = torch.tensor([10])
+        lmcache_lens = torch.tensor([18])
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            lmcache_lens=lmcache_lens,
+            decode_window_tokens=4,
+        )
+
+        # 22 is one past the [18, 22) live window. The subtraction path must not
+        # remap it to plen + 4, which would be outside the resident window.
+        assert new_idx.tolist() == [[[10, 22]]]
+        assert packed.tolist() == [[0, 0]]
+
+    def test_remap_decode_window_without_lmcache_boundary_uses_modulo_fallback(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+
+        topk = torch.tensor([[[14, 16, 17]]], dtype=torch.int32)
+        plen = torch.tensor([10])
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            lmcache_lens=None,
+            decode_window_tokens=4,
+        )
+
+        assert new_idx.tolist() == [[[10, 12, 13]]]
+        assert packed.tolist() == [[0, 0, 0]]
