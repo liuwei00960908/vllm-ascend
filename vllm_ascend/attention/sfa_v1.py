@@ -107,10 +107,93 @@ def _dsa_debug_should_log(owner: object, site: str, layer_name: str) -> bool:
     return True
 
 
+def _dsa_retrieve_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_RETRIEVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_retrieve_debug_limit() -> int:
+    try:
+        return max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_DSA_RETRIEVE_DEBUG_LIMIT",
+                    str(envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT),
+                )
+            ),
+        )
+    except ValueError:
+        return envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT
+
+
+def _dsa_retrieve_debug_layer_enabled(layer_name: str) -> bool:
+    if not _dsa_retrieve_debug_enabled():
+        return False
+    layer_filter = os.environ.get(
+        "VLLM_ASCEND_DSA_RETRIEVE_DEBUG_LAYER",
+        envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER,
+    ).strip()
+    if layer_filter:
+        return any(
+            part.strip() and part.strip() in layer_name
+            for part in layer_filter.split(",")
+        )
+    return ".layers.0." in layer_name or ".layers.77." in layer_name
+
+
+def _dsa_retrieve_debug_should_log(
+    owner: object,
+    site: str,
+    layer_name: str,
+) -> bool:
+    if not _dsa_retrieve_debug_layer_enabled(layer_name):
+        return False
+    counts = getattr(owner, "_dsa_retrieve_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_retrieve_debug_counts", counts)
+    key = (site, layer_name)
+    count = counts.get(key, 0)
+    if count >= _dsa_retrieve_debug_limit():
+        return False
+    counts[key] = count + 1
+    return True
+
+
 def _dsa_debug_sample(value, limit: int = 8) -> list:
     if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
         return []
     return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+
+
+def _dsa_debug_tail_sample(value, limit: int = 8) -> list:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return []
+    return value.detach().reshape(-1)[-limit:].to(device="cpu").tolist()
+
+
+def _dsa_debug_value_count(value, target: int) -> int | None:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return None
+    flat = value.detach().reshape(-1)
+    return int((flat == target).sum().to(device="cpu").item())
+
+
+def _dsa_debug_trailing_value_count(value, target: int) -> int | None:
+    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return None
+    seq = value.detach().reshape(-1).to(device="cpu").tolist()
+    count = 0
+    for item in reversed(seq):
+        if item != target:
+            break
+        count += 1
+    return count
 
 
 def _dsa_debug_minmax_count(value) -> tuple[object, object, int] | None:
@@ -2738,6 +2821,39 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _dsa_debug_sample(topk_indices),
                     _dsa_debug_minmax_count(topk_indices),
                 )
+            if _dsa_retrieve_debug_should_log(self, "sfa_remap", layer_name):
+                logger.warning(
+                    "[DSA_RETRIEVE_DEBUG] sfa_remap layer=%s need_packed=%s "
+                    "selected_none=%s selected_shape=%s selected_dtype=%s "
+                    "selected_device=%s selected_sample=%s selected_tail=%s "
+                    "selected_zero_count=%s selected_trailing_zeros=%s "
+                    "selected_minmax_count=%s remapped_topk_shape=%s "
+                    "remapped_topk_sample=%s remapped_topk_tail=%s "
+                    "remapped_topk_zero_count=%s "
+                    "remapped_topk_minmax_count=%s prompt_lens_sample=%s "
+                    "prompt_lens_minmax_count=%s lmcache_lens_sample=%s "
+                    "lmcache_lens_minmax_count=%s",
+                    layer_name,
+                    _need_packed,
+                    _sel_packed is None,
+                    tuple(_sel_packed.shape) if _sel_packed is not None else None,
+                    _sel_packed.dtype if _sel_packed is not None else None,
+                    _sel_packed.device if _sel_packed is not None else None,
+                    _dsa_debug_sample(_sel_packed),
+                    _dsa_debug_tail_sample(_sel_packed),
+                    _dsa_debug_value_count(_sel_packed, 0),
+                    _dsa_debug_trailing_value_count(_sel_packed, 0),
+                    _dsa_debug_minmax_count(_sel_packed),
+                    tuple(topk_indices.shape),
+                    _dsa_debug_sample(topk_indices),
+                    _dsa_debug_tail_sample(topk_indices),
+                    _dsa_debug_value_count(topk_indices, 0),
+                    _dsa_debug_minmax_count(topk_indices),
+                    _dsa_debug_sample(attn_metadata.prompt_lens),
+                    _dsa_debug_minmax_count(attn_metadata.prompt_lens),
+                    _dsa_debug_sample(attn_metadata.lmcache_lens),
+                    _dsa_debug_minmax_count(attn_metadata.lmcache_lens),
+                )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
@@ -2809,6 +2925,28 @@ class AscendSFAImpl(MLAAttentionImpl):
                         tuple(_selected_for_wait.shape),
                         _selected_for_wait.dtype,
                         _selected_for_wait.device,
+                    )
+                if _dsa_retrieve_debug_should_log(
+                    self, "sfa_wait_precheck", layer_name
+                ):
+                    logger.warning(
+                        "[DSA_RETRIEVE_DEBUG] sfa_wait_precheck layer=%s "
+                        "selected_shape=%s selected_dtype=%s "
+                        "selected_device=%s selected_sample=%s "
+                        "selected_tail=%s selected_zero_count=%s "
+                        "selected_trailing_zeros=%s selected_minmax_count=%s "
+                        "prompt_lens_sample=%s lmcache_lens_sample=%s",
+                        layer_name,
+                        tuple(_selected_for_wait.shape),
+                        _selected_for_wait.dtype,
+                        _selected_for_wait.device,
+                        _dsa_debug_sample(_selected_for_wait),
+                        _dsa_debug_tail_sample(_selected_for_wait),
+                        _dsa_debug_value_count(_selected_for_wait, 0),
+                        _dsa_debug_trailing_value_count(_selected_for_wait, 0),
+                        _dsa_debug_minmax_count(_selected_for_wait),
+                        _dsa_debug_sample(attn_metadata.prompt_lens),
+                        _dsa_debug_sample(attn_metadata.lmcache_lens),
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
