@@ -2648,8 +2648,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             _topk_before_remap = topk_indices
             _topk_2d_before_remap = _dsa_kv_trace_to_2d_indices(topk_indices)
             _topk_width = int(_topk_2d_before_remap.shape[1])
+            _disable_target_slot_mapping = _dsa_env_flag(
+                "VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING"
+            )
             _scratch_base = None
-            if attn_metadata.decode_row_offsets is not None:
+            if (
+                attn_metadata.decode_row_offsets is not None
+                and not _disable_target_slot_mapping
+            ):
                 _scratch_base = (
                     attn_metadata.decode_row_offsets[: _topk_2d_before_remap.shape[0]]
                     .to(device=topk_indices.device)
@@ -2687,7 +2693,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
-                if attn_metadata.decode_req_indices is not None and _scratch_base is not None:
+                if _disable_target_slot_mapping:
+                    # Debug fallback: keep the pre-MTP selected-token retrieve path
+                    # so we can isolate explicit target_slot_mapping issues.
+                    _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
+                elif attn_metadata.decode_req_indices is not None and _scratch_base is not None:
                     _decode_req_indices = attn_metadata.decode_req_indices[
                         : _sel_packed.shape[0]
                     ]
