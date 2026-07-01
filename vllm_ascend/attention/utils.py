@@ -449,13 +449,18 @@ def wait_for_kv_layer_from_connector(
                 connector.__class__.__name__,
             )
         try:
-            connector.wait_for_layer_load(
-                layer_name,
-                selected_tokens,
-                token_start_index,
-                request_ids,
-                target_slot_mapping=target_slot_mapping,
-            )
+            if target_slot_mapping is None:
+                connector.wait_for_layer_load(
+                    layer_name, selected_tokens, token_start_index, request_ids
+                )
+            else:
+                connector.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    target_slot_mapping=target_slot_mapping,
+                )
         except Exception:
             if trace_wait:
                 vllm_logger.exception(
