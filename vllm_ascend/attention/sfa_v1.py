@@ -2822,16 +2822,36 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _dsa_debug_minmax_count(topk_indices),
                 )
             if _dsa_retrieve_debug_should_log(self, "sfa_remap", layer_name):
+                _sel_zero_count = _dsa_debug_value_count(_sel_packed, 0)
+                _sel_trailing_zeros = _dsa_debug_trailing_value_count(
+                    _sel_packed, 0
+                )
+                _topk_zero_count = _dsa_debug_value_count(topk_indices, 0)
+                _topk_trailing_zeros = _dsa_debug_trailing_value_count(
+                    topk_indices, 0
+                )
+                try:
+                    _remap_changed_count = (
+                        int(
+                            (_topk_before_remap != topk_indices)
+                            .sum()
+                            .to(device="cpu")
+                            .item()
+                        )
+                        if _topk_before_remap.shape == topk_indices.shape
+                        else "shape_mismatch"
+                    )
+                except Exception as exc:
+                    _remap_changed_count = f"{type(exc).__name__}:{exc}"
                 logger.warning(
                     "[DSA_RETRIEVE_DEBUG] sfa_remap layer=%s need_packed=%s "
                     "selected_none=%s selected_shape=%s selected_dtype=%s "
-                    "selected_device=%s selected_sample=%s selected_tail=%s "
-                    "selected_zero_count=%s selected_trailing_zeros=%s "
+                    "selected_device=%s selected_zero_count=%s "
+                    "selected_trailing_zeros=%s selected_padding_suspect=%s "
                     "selected_minmax_count=%s remapped_topk_shape=%s "
-                    "remapped_topk_sample=%s remapped_topk_tail=%s "
-                    "remapped_topk_zero_count=%s "
-                    "remapped_topk_minmax_count=%s prompt_lens_sample=%s "
-                    "prompt_lens_minmax_count=%s lmcache_lens_sample=%s "
+                    "remapped_topk_zero_count=%s remapped_topk_trailing_zeros=%s "
+                    "remapped_topk_minmax_count=%s remap_changed_count=%s "
+                    "prompt_lens_minmax_count=%s "
                     "lmcache_lens_minmax_count=%s",
                     layer_name,
                     _need_packed,
@@ -2839,19 +2859,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                     tuple(_sel_packed.shape) if _sel_packed is not None else None,
                     _sel_packed.dtype if _sel_packed is not None else None,
                     _sel_packed.device if _sel_packed is not None else None,
-                    _dsa_debug_sample(_sel_packed),
-                    _dsa_debug_tail_sample(_sel_packed),
-                    _dsa_debug_value_count(_sel_packed, 0),
-                    _dsa_debug_trailing_value_count(_sel_packed, 0),
+                    _sel_zero_count,
+                    _sel_trailing_zeros,
+                    isinstance(_sel_trailing_zeros, int)
+                    and _sel_trailing_zeros > 0,
                     _dsa_debug_minmax_count(_sel_packed),
                     tuple(topk_indices.shape),
-                    _dsa_debug_sample(topk_indices),
-                    _dsa_debug_tail_sample(topk_indices),
-                    _dsa_debug_value_count(topk_indices, 0),
+                    _topk_zero_count,
+                    _topk_trailing_zeros,
                     _dsa_debug_minmax_count(topk_indices),
-                    _dsa_debug_sample(attn_metadata.prompt_lens),
+                    _remap_changed_count,
                     _dsa_debug_minmax_count(attn_metadata.prompt_lens),
-                    _dsa_debug_sample(attn_metadata.lmcache_lens),
                     _dsa_debug_minmax_count(attn_metadata.lmcache_lens),
                 )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
@@ -2929,24 +2947,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if _dsa_retrieve_debug_should_log(
                     self, "sfa_wait_precheck", layer_name
                 ):
+                    _wait_zero_count = _dsa_debug_value_count(
+                        _selected_for_wait, 0
+                    )
+                    _wait_trailing_zeros = _dsa_debug_trailing_value_count(
+                        _selected_for_wait, 0
+                    )
                     logger.warning(
                         "[DSA_RETRIEVE_DEBUG] sfa_wait_precheck layer=%s "
                         "selected_shape=%s selected_dtype=%s "
-                        "selected_device=%s selected_sample=%s "
-                        "selected_tail=%s selected_zero_count=%s "
-                        "selected_trailing_zeros=%s selected_minmax_count=%s "
-                        "prompt_lens_sample=%s lmcache_lens_sample=%s",
+                        "selected_device=%s selected_zero_count=%s "
+                        "selected_trailing_zeros=%s selected_padding_suspect=%s "
+                        "selected_minmax_count=%s prompt_lens_minmax_count=%s "
+                        "lmcache_lens_minmax_count=%s will_call_lmcache=%s",
                         layer_name,
                         tuple(_selected_for_wait.shape),
                         _selected_for_wait.dtype,
                         _selected_for_wait.device,
-                        _dsa_debug_sample(_selected_for_wait),
-                        _dsa_debug_tail_sample(_selected_for_wait),
-                        _dsa_debug_value_count(_selected_for_wait, 0),
-                        _dsa_debug_trailing_value_count(_selected_for_wait, 0),
+                        _wait_zero_count,
+                        _wait_trailing_zeros,
+                        isinstance(_wait_trailing_zeros, int)
+                        and _wait_trailing_zeros > 0,
                         _dsa_debug_minmax_count(_selected_for_wait),
-                        _dsa_debug_sample(attn_metadata.prompt_lens),
-                        _dsa_debug_sample(attn_metadata.lmcache_lens),
+                        _dsa_debug_minmax_count(attn_metadata.prompt_lens),
+                        _dsa_debug_minmax_count(attn_metadata.lmcache_lens),
+                        True,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
