@@ -269,6 +269,101 @@ def _dsa_mask_padding_sparse_rows(
     return topk_indices, _dsa_kv_trace_to_2d_indices(topk_indices)
 
 
+def _dsa_sparse_fa_bad_block_hit(
+    topk_2d: torch.Tensor,
+    block_table: torch.Tensor,
+    row_req_indices: torch.Tensor | None,
+    block_size: int,
+) -> dict[str, object] | None:
+    if row_req_indices is None or topk_2d.numel() == 0 or block_table.numel() == 0:
+        return None
+    num_rows = int(topk_2d.shape[0])
+    width = int(topk_2d.reshape(num_rows, -1).shape[1])
+    if num_rows <= 0 or width <= 0 or block_size <= 0:
+        return None
+
+    topk_2d = topk_2d.reshape(num_rows, width).to(
+        device=block_table.device, dtype=torch.long
+    )
+    row_req_indices = row_req_indices[:num_rows].to(
+        device=block_table.device, dtype=torch.long
+    )
+    if int(row_req_indices.numel()) < num_rows:
+        pad = torch.full(
+            (num_rows - int(row_req_indices.numel()),),
+            -1,
+            dtype=torch.long,
+            device=block_table.device,
+        )
+        row_req_indices = torch.cat((row_req_indices, pad), dim=0)
+
+    real_row_mask = row_req_indices >= 0
+    if not bool(real_row_mask.any().to(device="cpu").item()):
+        return None
+
+    real_rows = real_row_mask.nonzero(as_tuple=False).flatten()
+    real_req_indices = row_req_indices.index_select(0, real_rows)
+    req_in_range = real_req_indices < int(block_table.shape[0])
+    if not bool(req_in_range.all().to(device="cpu").item()):
+        bad_idx = int((~req_in_range).nonzero(as_tuple=False)[0].item())
+        sparse_row = int(real_rows[bad_idx].to(device="cpu").item())
+        req_idx = int(real_req_indices[bad_idx].to(device="cpu").item())
+        return {
+            "reason": "req_index_out_of_range",
+            "sparse_row": sparse_row,
+            "req_idx": req_idx,
+            "batch_size": int(block_table.shape[0]),
+        }
+
+    real_topk = topk_2d.index_select(0, real_rows)
+    block_table_rows = block_table.index_select(0, real_req_indices).to(torch.long)
+    num_logical_blocks = int(block_table_rows.shape[1])
+    if num_logical_blocks <= 0:
+        return {
+            "reason": "empty_block_table",
+            "batch_size": int(block_table.shape[0]),
+        }
+
+    safe_indices = torch.clamp(real_topk, min=0)
+    logical_blocks = safe_indices // block_size
+    logical_oob = (real_topk >= 0) & (logical_blocks >= num_logical_blocks)
+    safe_logical_blocks = torch.clamp(
+        logical_blocks, min=0, max=num_logical_blocks - 1
+    )
+    physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+    bad_hits = (real_topk >= 0) & ((physical_blocks == 0) | logical_oob)
+    if not bool(bad_hits.any().to(device="cpu").item()):
+        return None
+
+    flat_idx = int(bad_hits.reshape(-1).nonzero(as_tuple=False)[0].item())
+    row_in_real = flat_idx // width
+    col = flat_idx % width
+    sparse_row = int(real_rows[row_in_real].to(device="cpu").item())
+    req_idx = int(real_req_indices[row_in_real].to(device="cpu").item())
+    first_topk = int(real_topk[row_in_real, col].to(device="cpu").item())
+    first_logical_block = int(
+        logical_blocks[row_in_real, col].to(device="cpu").item()
+    )
+    first_physical_block = int(
+        physical_blocks[row_in_real, col].to(device="cpu").item()
+    )
+    return {
+        "reason": "null_or_oob_block",
+        "sparse_row": sparse_row,
+        "req_idx": req_idx,
+        "col": col,
+        "topk": first_topk,
+        "logical_block": first_logical_block,
+        "physical_block": first_physical_block,
+        "num_logical_blocks": num_logical_blocks,
+        "row_req_indices_sample": _dsa_debug_sample(row_req_indices),
+        "topk_row_sample": _dsa_debug_sample(real_topk[row_in_real]),
+        "logical_blocks_sample": _dsa_debug_sample(logical_blocks[row_in_real]),
+        "physical_blocks_sample": _dsa_debug_sample(physical_blocks[row_in_real]),
+        "block_table_row_sample": _dsa_debug_sample(block_table_rows[row_in_real]),
+    }
+
+
 def _dsa_build_target_slot_mapping(
     block_table: torch.Tensor,
     row_req_indices: torch.Tensor,
@@ -2377,6 +2472,28 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"decode_req_indices_shape="
                     f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
                     f"decode_req_indices_sample={decode_req_indices_sample}"
+                )
+            bad_block_hit = _dsa_sparse_fa_bad_block_hit(
+                topk_2d=topk_2d,
+                block_table=block_table,
+                row_req_indices=getattr(attn_metadata, "decode_req_indices", None),
+                block_size=int(kv.shape[1]),
+            )
+            if bad_block_hit is not None:
+                raise RuntimeError(
+                    "DSA sparse FA topk resolves to a null/freed block: "
+                    f"layer={layer_name} trace_label={trace_label} "
+                    f"attn_state={attn_metadata.attn_state} "
+                    f"topk_shape={tuple(topk_indices.shape)} "
+                    f"block_table_shape={tuple(block_table.shape)} "
+                    f"block_size={int(kv.shape[1])} "
+                    f"num_decode_tokens={attn_metadata.num_decode_tokens} "
+                    f"actual_seq_lengths_query_sample="
+                    f"{_dsa_debug_sample(actual_seq_lengths_query)} "
+                    f"actual_seq_lengths_key_sample="
+                    f"{_dsa_debug_sample(actual_seq_lengths_key)} "
+                    f"topk_minmax_count={_dsa_debug_minmax_count(topk_indices)} "
+                    f"bad_hit={bad_block_hit}"
                 )
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
