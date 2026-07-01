@@ -549,18 +549,30 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
             row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
             n_real = min(len(plens_cpu), num_reqs)
-            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
-            computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            for r in range(n_real):
-                s, e = int(qsl[r]), int(qsl[r + 1])
-                plen = int(plens_cpu[r])
-                first_decode = max(s, s + plen - int(computed[r]))
-                if first_decode < e:
-                    count = e - first_decode
-                    offsets = np.arange(count, dtype=np.int32)
-                    rows[first_decode:e] = plen
-                    req_rows[first_decode:e] = r
-                    row_offsets[first_decode:e] = offsets
+            legacy_decode_rows = (
+                _dsa_env_flag("VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING")
+                and common_attn_metadata.attn_state
+                in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
+            )
+            if legacy_decode_rows:
+                # Full legacy fallback for non-MTP bisecting: match the old
+                # compact-scratch row semantics used by sparse_lmy.
+                rows[:n_real] = plens_cpu[:n_real]
+                req_rows[:n_real] = np.arange(n_real, dtype=np.int32)
+                row_offsets[:n_real] = 0
+            else:
+                qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
+                computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_cpu[r])
+                    first_decode = max(s, s + plen - int(computed[r]))
+                    if first_decode < e:
+                        count = e - first_decode
+                        offsets = np.arange(count, dtype=np.int32)
+                        rows[first_decode:e] = plen
+                        req_rows[first_decode:e] = r
+                        row_offsets[first_decode:e] = offsets
             num_decode_rows = int((rows > 0).sum())
             prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
