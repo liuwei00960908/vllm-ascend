@@ -30,6 +30,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import vllm_ascend.envs as envs_ascend
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
