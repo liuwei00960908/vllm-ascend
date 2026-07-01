@@ -2297,6 +2297,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.dsa_shrink_latent
             and _dsa_env_flag("VLLM_ASCEND_DSA_SPARSE_FA_GUARD", True)
             and block_table is not None
+            and attn_metadata.num_decode_tokens > 0
+            and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            )
         ):
             topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
             topk_rows = int(topk_2d.shape[0])
