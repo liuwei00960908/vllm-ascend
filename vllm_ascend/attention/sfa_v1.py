@@ -658,10 +658,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     req_rows[first_decode:e] = r
                     decode_positions[first_decode:e] = abs_pos
                     if window_tokens > 0:
-                        decoded_counts = abs_pos + 1 - plen
-                        lmcache_lens[first_decode:e] = plen + (
-                            (decoded_counts - 1) // window_tokens
-                        ) * window_tokens
+                        visible_decoded_count = max(0, int(computed[r]) - plen)
+                        if visible_decoded_count > 0:
+                            visible_decode_tokens = (
+                                (visible_decoded_count - 1) // window_tokens
+                            ) * window_tokens
+                        else:
+                            visible_decode_tokens = 0
+                        lmcache_lens[first_decode:e] = plen + visible_decode_tokens
                         flush_decoded_counts = abs_pos - plen
                         decode_window_flush = decode_window_flush or bool(
                             (
@@ -680,7 +684,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             ):
                 _dbg_plen = int(plens_cpu[0])
                 _dbg_computed = int(computed[0])
-                _dbg_retrieve_decoded_count = _dbg_computed + 1 - _dbg_plen
+                _dbg_retrieve_decoded_count = max(0, _dbg_computed - _dbg_plen)
                 _dbg_flush_decoded_count = _dbg_computed - _dbg_plen
                 logger.warning(
                     "[DSA_SAVE_DBG] sfa_builder_decode_window r0_plen=%s "
