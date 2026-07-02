@@ -484,6 +484,45 @@ def wait_for_kv_layer_from_connector(
             )
 
 
+def verify_decode_window_layer_from_connector(
+    layer_name: str,
+    *,
+    selected_tokens,
+    selected_counts,
+    slot_mapping,
+    kvcaches,
+) -> bool:
+    """Ask the KV connector to shadow-load decode-window topk rows.
+
+    This validation path must not consume the normal layerwise retriever used by
+    wait_for_kv_layer_from_connector().
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    verify_load = getattr(connector, "verify_decode_window_layer_load", None)
+    if verify_load is None:
+        return False
+
+    forward_context: ForwardContext = get_forward_context()
+    dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+    request_ids = None
+    if dsa_req_ids is not None:
+        request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+
+    return bool(
+        verify_load(
+            layer_name,
+            selected_tokens=selected_tokens,
+            selected_counts=selected_counts,
+            slot_mapping=slot_mapping,
+            request_ids=request_ids,
+            kvcaches=kvcaches,
+        )
+    )
+
+
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],

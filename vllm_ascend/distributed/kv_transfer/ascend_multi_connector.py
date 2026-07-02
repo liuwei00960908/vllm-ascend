@@ -322,6 +322,22 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 ",".join(sorted(kwargs)),
             )
 
+    def verify_decode_window_layer_load(
+        self,
+        layer_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        handled = False
+        for connector in self._connectors:
+            verify_load = getattr(
+                connector, "verify_decode_window_layer_load", None
+            )
+            if verify_load is None:
+                continue
+            handled = bool(verify_load(layer_name, *args, **kwargs)) or handled
+        return handled
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

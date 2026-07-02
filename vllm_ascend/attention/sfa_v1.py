@@ -40,6 +40,7 @@ from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
+    verify_decode_window_layer_from_connector,
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.device.device_op import DeviceOperator
@@ -234,6 +235,18 @@ def _dsa_env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _decode_window_save_window_size() -> int:
+    value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
+
+
+def _decode_window_save_debug_enabled() -> bool:
+    return _dsa_env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
 
 
 def _dsa_kv_debug_enabled() -> bool:
@@ -1415,6 +1428,289 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "layer=%s",
                     layer_name,
                 )
+
+    def _gather_sparse_kv_rows(
+        self,
+        *,
+        kv: torch.Tensor,
+        key_rope: torch.Tensor,
+        block_table: torch.Tensor,
+        topk_2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        topk_2d = topk_2d.to(torch.long)
+        block_table_rows = block_table[: topk_2d.shape[0]].to(torch.long)
+        block_size = int(kv.shape[1])
+        num_logical_blocks = int(block_table_rows.shape[1])
+        kv_flat = kv.reshape(-1, *kv.shape[2:])
+        key_rope_flat = key_rope.reshape(-1, *key_rope.shape[2:])
+
+        safe_indices = torch.clamp(topk_2d, min=0)
+        logical_blocks = safe_indices // block_size
+        block_offsets = safe_indices % block_size
+        valid = (topk_2d >= 0) & (logical_blocks < num_logical_blocks)
+        safe_logical_blocks = torch.clamp(
+            logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
+        )
+        physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+        slots = physical_blocks * block_size + block_offsets
+        valid = valid & (physical_blocks >= 0) & (slots < kv_flat.shape[0])
+        safe_slots = torch.clamp(slots, min=0, max=max(kv_flat.shape[0] - 1, 0))
+
+        flat_slots = safe_slots.reshape(-1)
+        kv_selected = kv_flat.index_select(0, flat_slots).reshape(
+            *safe_slots.shape, *kv_flat.shape[1:]
+        )
+        key_rope_selected = key_rope_flat.index_select(0, flat_slots).reshape(
+            *safe_slots.shape, *key_rope_flat.shape[1:]
+        )
+        if not torch.all(valid):
+            valid_shape = valid.reshape(
+                *valid.shape, *([1] * (kv_selected.dim() - 2))
+            )
+            kv_selected = torch.where(
+                valid_shape, kv_selected, torch.zeros_like(kv_selected)
+            )
+            key_rope_selected = torch.where(
+                valid_shape, key_rope_selected, torch.zeros_like(key_rope_selected)
+            )
+
+        return kv_selected, key_rope_selected, valid
+
+    def _decode_window_verify_buffers(
+        self,
+        *,
+        kv_cache,
+        num_rows: int,
+        topk: int,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        kv = kv_cache[0]
+        key_rope = kv_cache[1]
+        block_size = int(kv.shape[1])
+        blocks_per_row = (topk + block_size - 1) // block_size
+        num_blocks = max(1, num_rows * blocks_per_row)
+        shadow_kv = kv.new_zeros((num_blocks, block_size, *kv.shape[2:]))
+        shadow_key_rope = key_rope.new_zeros(
+            (num_blocks, block_size, *key_rope.shape[2:])
+        )
+
+        row_base = (
+            torch.arange(num_rows, device=kv.device, dtype=torch.long)
+            * blocks_per_row
+            * block_size
+        )
+        slot_cols = torch.arange(topk, device=kv.device, dtype=torch.long)
+        slot_matrix = row_base.unsqueeze(1) + slot_cols.unsqueeze(0)
+        block_table = torch.arange(
+            num_blocks, device=kv.device, dtype=torch.int32
+        ).reshape(num_rows, blocks_per_row)
+        return (shadow_kv, shadow_key_rope), slot_matrix, block_table
+
+    def _maybe_verify_decode_window_topk(
+        self,
+        *,
+        layer_name: str,
+        original_topk: torch.Tensor,
+        remapped_topk: torch.Tensor,
+        kv_cache,
+        attn_metadata,
+    ) -> None:
+        window_size = _decode_window_save_window_size()
+        if window_size <= 0:
+            return
+        if kv_cache is None or len(kv_cache) < 2:
+            return
+        if getattr(attn_metadata, "block_table", None) is None:
+            return
+        if (
+            getattr(attn_metadata, "attn_state", None)
+            != AscendAttentionState.DecodeOnly
+        ):
+            return
+        num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0) or 0)
+        if num_decode_tokens <= 0:
+            return
+
+        try:
+            original_2d = _dsa_kv_trace_to_2d_indices(original_topk).to(torch.long)
+            remapped_2d = _dsa_kv_trace_to_2d_indices(remapped_topk).to(torch.long)
+            num_rows = min(
+                num_decode_tokens,
+                int(original_2d.shape[0]),
+                int(remapped_2d.shape[0]),
+                int(attn_metadata.block_table.shape[0]),
+                int(attn_metadata.seq_lens.shape[0]),
+            )
+            if num_rows <= 0:
+                return
+
+            original_2d = original_2d[:num_rows]
+            remapped_2d = remapped_2d[:num_rows]
+            topk = int(original_2d.shape[1])
+            if topk <= 0:
+                return
+
+            seq_lens = attn_metadata.seq_lens[:num_rows].to(
+                device=original_2d.device, dtype=torch.long
+            )
+            cur_pos = seq_lens - 1
+            current_window_start = (cur_pos // window_size) * window_size
+            valid_topk = original_2d >= 0
+            old_mask = valid_topk & (
+                original_2d < current_window_start.reshape(-1, 1)
+            )
+            old_counts = old_mask.sum(dim=1).to(torch.int32)
+            old_total = int(old_counts.sum().detach().to(device="cpu").item())
+            if old_total <= 0:
+                return
+
+            verify_kvcaches, slot_matrix, _ = self._decode_window_verify_buffers(
+                kv_cache=kv_cache,
+                num_rows=num_rows,
+                topk=topk,
+            )
+
+            rank = torch.cumsum(old_mask.to(torch.long), dim=1) - 1
+            overflow_col = torch.full_like(rank, topk)
+            dst = torch.where(old_mask, rank, overflow_col)
+
+            selected_tmp = torch.zeros(
+                (num_rows, topk + 1),
+                device=original_2d.device,
+                dtype=torch.long,
+            )
+            selected_tmp.scatter_(1, dst, torch.where(old_mask, original_2d, 0))
+            selected_packed = selected_tmp[:, :topk].to(torch.int32)
+
+            slot_tmp = torch.zeros(
+                (num_rows, topk + 1),
+                device=slot_matrix.device,
+                dtype=torch.long,
+            )
+            slot_tmp.scatter_(1, dst.to(slot_matrix.device), slot_matrix)
+            slot_packed = slot_tmp[:, :topk]
+
+            loaded = verify_decode_window_layer_from_connector(
+                layer_name,
+                selected_tokens=selected_packed,
+                selected_counts=old_counts,
+                slot_mapping=slot_packed,
+                kvcaches=verify_kvcaches,
+            )
+            if not loaded:
+                return
+
+            current_kv, current_key_rope, current_valid = self._gather_sparse_kv_rows(
+                kv=kv_cache[0],
+                key_rope=kv_cache[1],
+                block_table=attn_metadata.block_table[:num_rows],
+                topk_2d=remapped_2d,
+            )
+            compare_mask = valid_topk & current_valid
+            current_window_mask = compare_mask & ~old_mask
+
+            shadow_kv_flat = verify_kvcaches[0].reshape(
+                -1, *verify_kvcaches[0].shape[2:]
+            )
+            shadow_key_rope_flat = verify_kvcaches[1].reshape(
+                -1, *verify_kvcaches[1].shape[2:]
+            )
+            if bool(current_window_mask.any().detach().to(device="cpu").item()):
+                current_slots = slot_matrix[current_window_mask].to(
+                    device=shadow_kv_flat.device, dtype=torch.long
+                )
+                shadow_kv_flat.index_copy_(
+                    0,
+                    current_slots,
+                    current_kv[current_window_mask].to(verify_kvcaches[0].dtype),
+                )
+                shadow_key_rope_flat.index_copy_(
+                    0,
+                    current_slots,
+                    current_key_rope[current_window_mask].to(verify_kvcaches[1].dtype),
+                )
+
+            flat_slots = slot_matrix.reshape(-1).to(
+                device=shadow_kv_flat.device, dtype=torch.long
+            )
+            shadow_kv = shadow_kv_flat.index_select(0, flat_slots).reshape(
+                num_rows, topk, *shadow_kv_flat.shape[1:]
+            )
+            shadow_key_rope = shadow_key_rope_flat.index_select(
+                0, flat_slots
+            ).reshape(num_rows, topk, *shadow_key_rope_flat.shape[1:])
+
+            if not bool(compare_mask.any().detach().to(device="cpu").item()):
+                return
+
+            lhs_kv = shadow_kv[compare_mask]
+            rhs_kv = current_kv[compare_mask]
+            lhs_key_rope = shadow_key_rope[compare_mask]
+            rhs_key_rope = current_key_rope[compare_mask]
+            kv_equal = torch.equal(lhs_kv, rhs_kv)
+            key_rope_equal = torch.equal(lhs_key_rope, rhs_key_rope)
+            if kv_equal and key_rope_equal:
+                if _decode_window_save_debug_enabled():
+                    logger.warning(
+                        "[DECODE_WINDOW_VERIFY] match layer=%s rows=%d "
+                        "topk=%d window_size=%d old_tokens=%d "
+                        "current_tokens=%d window_start_sample=%s",
+                        layer_name,
+                        num_rows,
+                        topk,
+                        window_size,
+                        old_total,
+                        int(
+                            current_window_mask.sum()
+                            .detach()
+                            .to(device="cpu")
+                            .item()
+                        ),
+                        _dsa_debug_sample(current_window_start),
+                    )
+                return
+
+            kv_diff = (lhs_kv.float() - rhs_kv.float()).abs()
+            key_rope_diff = (lhs_key_rope.float() - rhs_key_rope.float()).abs()
+            kv_max = (
+                float(kv_diff.max().detach().to(device="cpu").item())
+                if kv_diff.numel()
+                else 0.0
+            )
+            key_rope_max = (
+                float(key_rope_diff.max().detach().to(device="cpu").item())
+                if key_rope_diff.numel()
+                else 0.0
+            )
+            logger.error(
+                "[DECODE_WINDOW_VERIFY] mismatch layer=%s rows=%d topk=%d "
+                "window_size=%d old_tokens=%d current_tokens=%d "
+                "kv_equal=%s key_rope_equal=%s kv_max_abs_diff=%s "
+                "key_rope_max_abs_diff=%s original_topk_sample=%s "
+                "remapped_topk_sample=%s old_counts_sample=%s "
+                "window_start_sample=%s",
+                layer_name,
+                num_rows,
+                topk,
+                window_size,
+                old_total,
+                int(
+                    current_window_mask.sum().detach().to(device="cpu").item()
+                ),
+                kv_equal,
+                key_rope_equal,
+                kv_max,
+                key_rope_max,
+                _dsa_debug_sample(original_2d),
+                _dsa_debug_sample(remapped_2d),
+                _dsa_debug_sample(old_counts),
+                _dsa_debug_sample(current_window_start),
+            )
+        except Exception:
+            logger.exception(
+                "[DECODE_WINDOW_VERIFY] error layer=%s window_size=%s",
+                layer_name,
+                window_size,
+            )
 
     def _maybe_capture_pre_lmcache_scratch_kv(
         self,
@@ -2670,6 +2966,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                         layer_name,
                         selected_tokens=_selected_for_wait,
                     )
+                self._maybe_verify_decode_window_topk(
+                    layer_name=layer_name,
+                    original_topk=_topk_before_remap,
+                    remapped_topk=topk_indices,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                )
                 if _dsa_wait_log:
                     logger.warning(
                         "[DSA_SHRINK_CHECK] connector_wait_returned layer=%s",
