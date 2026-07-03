@@ -16,6 +16,44 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_de
 logger = init_logger(__name__)
 
 
+def _dsa_lmcache_log_layer(layer_name: str) -> bool:
+    return "layers.0." in layer_name
+
+
+def _tensor_like_debug(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        flat = value.flatten()
+        try:
+            head = flat[:4].tolist() if flat.numel() else None
+            tail = flat[-4:].tolist() if flat.numel() > 4 else head
+        except Exception as exc:
+            head = None
+            tail = None
+            value_error = f"{type(exc).__name__}: {exc}"
+        else:
+            value_error = None
+        return {
+            "type": "Tensor",
+            "shape": list(value.shape),
+            "numel": int(value.numel()),
+            "device": str(value.device),
+            "dtype": str(value.dtype),
+            "head": head,
+            "tail": tail,
+            "value_error": value_error,
+        }
+    if isinstance(value, (list, tuple)):
+        first = value[0] if value else None
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "first": _tensor_like_debug(first),
+        }
+    return {"type": type(value).__name__}
+
+
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
@@ -290,32 +328,71 @@ def wait_for_kv_layer_from_connector(
     if attn_metadata is None:
         return
 
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_wait_enter layer=%s "
+            "connector=%s selected=%s token_start_index=%s request_ids=%s "
+            "target_slot_mapping=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(selected_tokens),
+            _tensor_like_debug(token_start_index),
+            request_ids,
+            _tensor_like_debug(target_slot_mapping),
+            type(attn_metadata).__name__,
+        )
+
     # DSA selective load: pass the indexer's top-k positions so LMCache loads only the
     # selected prefill latent for this decode step. Falls back to a whole-layer load when
     # not provided (prefill / non-sparse).
-    if selected_tokens is not None:
-        # Per-row request identity, in the SAME order as `selected_tokens` (both are
-        # sliced from input_batch-row-ordered data). LMCache uses this to pair each
-        # decode request to its own selected-token row by req_id instead of by loop
-        # position, so a divergence between the connector-metadata order and the
-        # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
-        dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
-        if request_ids is None and dsa_req_ids is not None:
-            request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
-        if target_slot_mapping is None:
-            connector.wait_for_layer_load(
-                layer_name, selected_tokens, token_start_index, request_ids
-            )
+    try:
+        if selected_tokens is not None:
+            # Per-row request identity, in the SAME order as `selected_tokens` (both are
+            # sliced from input_batch-row-ordered data). LMCache uses this to pair each
+            # decode request to its own selected-token row by req_id instead of by loop
+            # position, so a divergence between the connector-metadata order and the
+            # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
+            dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+            if request_ids is None and dsa_req_ids is not None:
+                request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+            if target_slot_mapping is None:
+                connector.wait_for_layer_load(
+                    layer_name, selected_tokens, token_start_index, request_ids
+                )
+            else:
+                connector.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    target_slot_mapping=target_slot_mapping,
+                )
         else:
-            connector.wait_for_layer_load(
-                layer_name,
-                selected_tokens,
-                token_start_index,
-                request_ids,
-                target_slot_mapping=target_slot_mapping,
-            )
-    else:
-        connector.wait_for_layer_load(layer_name)
+            connector.wait_for_layer_load(layer_name)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_wait_error layer=%s "
+            "connector=%s selected=%s token_start_index=%s request_ids=%s "
+            "target_slot_mapping=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(selected_tokens),
+            _tensor_like_debug(token_start_index),
+            request_ids,
+            _tensor_like_debug(target_slot_mapping),
+            type(attn_metadata).__name__,
+        )
+        raise
+
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_wait_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
+
+
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
@@ -330,7 +407,34 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s "
+            "connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+    try:
+        connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s "
+            "connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+        raise
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
 
 
 def round_up(val: int, align: int) -> int:
