@@ -6,11 +6,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
-from vllm.logger import init_logger, logger as vllm_logger
+from vllm.logger import init_logger
 from vllm.utils.func_utils import supports_kw
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
-from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (
     MooncakeDSAIndexConnector,
 )
@@ -25,27 +24,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-
-def _should_log_dsa_wait_dispatch(layer_name: str, has_extra_args: bool) -> bool:
-    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
-        return False
-    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
-        "summary",
-        "trace",
-        "verbose",
-        "all",
-    ):
-        return False
-    if not has_extra_args:
-        return False
-    layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
-    if layer_filter:
-        return any(
-            part.strip() and part.strip() in layer_name
-            for part in layer_filter.split(",")
-        )
-    return ".layers.0." in layer_name or ".layers.77." in layer_name
 
 
 def _is_single_tensor_kv(kv_cache: Any) -> bool:
@@ -236,25 +214,10 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        full_arg_children: list[str] = []
-        layer_only_children: list[str] = []
         sig_cache = getattr(self, "_wait_for_layer_load_sig_cache", None)
         if sig_cache is None:
             sig_cache = {}
             self._wait_for_layer_load_sig_cache = sig_cache
-
-        log_wait_dispatch = _should_log_dsa_wait_dispatch(
-            layer_name, bool(args or kwargs)
-        )
-        if log_wait_dispatch:
-            vllm_logger.warning(
-                "AscendMultiConnector wait_for_layer_load begin: layer=%s "
-                "child_count=%d extra_pos_args=%d extra_kwargs=%s",
-                layer_name,
-                len(self._connectors),
-                len(args),
-                ",".join(sorted(kwargs)),
-            )
 
         for connector in self._connectors:
             wait_for_layer_load = connector.wait_for_layer_load
@@ -268,60 +231,10 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 )
                 sig_cache[cache_key] = accepts_args
 
-            if log_wait_dispatch:
-                vllm_logger.warning(
-                    "AscendMultiConnector wait_for_layer_load child: layer=%s "
-                    "child=%s child_module=%s accepts_extra_args=%s "
-                    "extra_pos_args=%d extra_kwargs=%s",
-                    layer_name,
-                    connector.__class__.__name__,
-                    connector.__class__.__module__,
-                    accepts_args,
-                    len(args),
-                    ",".join(sorted(kwargs)),
-                )
-
             if accepts_args:
-                try:
-                    wait_for_layer_load(layer_name, *args, **kwargs)
-                except Exception:
-                    if log_wait_dispatch:
-                        vllm_logger.exception(
-                            "AscendMultiConnector wait_for_layer_load child "
-                            "failed: layer=%s child=%s accepts_extra_args=%s",
-                            layer_name,
-                            connector.__class__.__name__,
-                            accepts_args,
-                        )
-                    raise
-                full_arg_children.append(connector.__class__.__name__)
+                wait_for_layer_load(layer_name, *args, **kwargs)
             else:
-                try:
-                    wait_for_layer_load(layer_name)
-                except Exception:
-                    if log_wait_dispatch:
-                        vllm_logger.exception(
-                            "AscendMultiConnector wait_for_layer_load child "
-                            "failed: layer=%s child=%s accepts_extra_args=%s",
-                            layer_name,
-                            connector.__class__.__name__,
-                            accepts_args,
-                        )
-                    raise
-                layer_only_children.append(connector.__class__.__name__)
-
-        if log_wait_dispatch:
-            vllm_logger.warning(
-                "AscendMultiConnector wait_for_layer_load end: layer=%s "
-                "full_arg_children=%s layer_only_children=%s extra_pos_args=%d "
-                "extra_kwargs=%s",
-                layer_name,
-                ",".join(full_arg_children),
-                ",".join(layer_only_children),
-                len(args),
-                ",".join(sorted(kwargs)),
-            )
-
+                wait_for_layer_load(layer_name)
     def get_num_new_matched_tokens(
         self,
         request: "Request",

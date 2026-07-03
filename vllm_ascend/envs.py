@@ -168,43 +168,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
     ),
-    # DSA shrink-latent correctness diagnostics. When enabled, logs the
-    # selected-token path from SFA -> KV connector -> LMCache. Default off.
-    "VLLM_ASCEND_DSA_SHRINK_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0"))
-    ),
-    # DSA shrink debug mode:
-    #   fail_only (default): normal path is silent; only explicit validation
-    #     failures/errors are emitted by the relevant component.
-    #   summary/trace/all: emit sampled successful-path diagnostics.
-    "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
-    ).lower(),
-    # Max debug records per layer/site to avoid flooding long runs.
-    "VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")
-    ),
-    # Comma-separated layer-name fragments to log. Empty means layer 0 and 77.
-    "VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER": lambda: os.getenv(
-        "VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER", ""
-    ),
-    # DSA latent offload micro-profiler. When 1, the decode path brackets each added
-    # section (exec_kv->pool, gather sub-steps, kernel) with npu.synchronize() and logs
-    # mean ms/layer-call periodically. Diagnostic only; adds syncs. Default 0.
-    "VLLM_ASCEND_DSA_OFFLOAD_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_PROFILE", "0"))
-    ),
-    # DSA latent offload introspection (bring-up Round 1). When 1, read-only probes in
-    # the SFA forward / model runner dump the ground-truth facts we need to finalize
-    # the integration (metadata fields, kv_cache layout, topk_indices shape/sentinel,
-    # MLA layer count, input_batch fields). Safe / no behavior change. Default 0.
-    "VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT", "0"))
-    ),
-    # File the introspection probes append their report to.
-    "VLLM_ASCEND_DSA_INTROSPECT_FILE": lambda: os.getenv(
-        "VLLM_ASCEND_DSA_INTROSPECT_FILE", "dsa_introspect.log"
-    ),
     # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
     # default from max_num_seqs. The pool holds prefill latent during prefill (freed
     # after) + decode latent, sized far below full-context. Tune up for long prompts.
@@ -232,18 +195,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Concurrency the adapter pool is sized for without thrash (0 -> max_num_seqs).
     "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")
-    ),
-    # Debug: sync + log each phase of the adapter decode path so a device-side stall
-    # localizes to the last printed phase. Floods the log; bring-up diagnosis only.
-    "VLLM_ASCEND_DSA_ADAPTER_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_DEBUG", "0"))
-    ),
-    # Localization knob: comma-separated decode phases to device-sync after (no log),
-    # to pin down the minimal sync that avoids the no-sync freeze. Phases:
-    # begin,cur_pos_done,insert_done,retrieve_done,fa_done,release_done.
-    # e.g. VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES=insert_done
-    "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES": lambda: os.getenv(
-        "VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES", ""
     ),
     # Back the adapter latent pool with LMCache (host KV store) instead of the
     # in-memory reference backend. Default OFF: the in-memory backend keeps the CPU

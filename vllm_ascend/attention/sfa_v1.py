@@ -1,8 +1,5 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
-
-import os
-import re
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -77,40 +74,6 @@ if TYPE_CHECKING:
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
 
-def _dsa_debug_layer_enabled(layer_name: str) -> bool:
-    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
-        return False
-    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
-        "summary",
-        "trace",
-        "verbose",
-        "all",
-    ):
-        return False
-    layer_filter = envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LAYER.strip()
-    if layer_filter:
-        return any(
-            part.strip() and part.strip() in layer_name
-            for part in layer_filter.split(",")
-        )
-    return ".layers.0." in layer_name or ".layers.77." in layer_name
-
-
-def _dsa_debug_should_log(owner: object, site: str, layer_name: str) -> bool:
-    if not _dsa_debug_layer_enabled(layer_name):
-        return False
-    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
-    if counts is None:
-        counts = {}
-        setattr(owner, "_dsa_shrink_debug_counts", counts)
-    key = (site, layer_name)
-    count = counts.get(key, 0)
-    if count >= envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT:
-        return False
-    counts[key] = count + 1
-    return True
-
-
 def _dsa_debug_sample(value, limit: int = 8) -> list:
     if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
         return []
@@ -128,104 +91,7 @@ def _dsa_debug_minmax_count(value) -> tuple[object, object, int] | None:
     )
 
 
-def _dsa_debug_preview(value, limit: int = 4):
-    if value is None:
-        return None
-    try:
-        return list(value[:limit])
-    except Exception:
-        return type(value).__name__
-
-
-def _dsa_kv_trace_mode() -> str:
-    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_MODE", "off").strip().lower()
-
-
-def _dsa_kv_trace_enabled() -> bool:
-    return _dsa_kv_trace_mode() in ("record", "compare")
-
-
-def _dsa_kv_trace_dir() -> str:
-    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_DIR", "/tmp/dsa_kv_trace")
-
-
-def _dsa_kv_trace_decode_only() -> bool:
-    return os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_DECODE_ONLY", "1").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _dsa_kv_trace_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
-
-
-def _dsa_kv_trace_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
-
-
-def _dsa_kv_trace_layer_enabled(layer_name: str) -> bool:
-    layer_filter = os.environ.get("VLLM_ASCEND_DSA_KV_TRACE_LAYER", "").strip()
-    if not layer_filter:
-        return True
-    return any(
-        part.strip() and part.strip() in layer_name
-        for part in layer_filter.split(",")
-    )
-
-
-def _dsa_kv_trace_rank_tag() -> str:
-    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
-    try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = str(torch.distributed.get_rank())
-    except Exception:
-        pass
-    device = "na"
-    try:
-        if hasattr(torch, "npu"):
-            device = str(torch.npu.current_device())
-    except Exception:
-        pass
-    return f"rank{rank}_dev{device}"
-
-
-def _dsa_kv_trace_layer_key(layer_name: str) -> str:
-    return re.sub(r"[^0-9A-Za-z_.-]+", "_", layer_name).strip("_")
-
-
-def _dsa_kv_trace_attn_state(attn_metadata: Any) -> str:
-    state = getattr(attn_metadata, "attn_state", None)
-    return getattr(state, "name", str(state))
-
-
-def _dsa_kv_trace_event_path(
-    trace_dir: str,
-    rank_tag: str,
-    layer_key: str,
-    call_idx: int,
-) -> str:
-    return os.path.join(trace_dir, rank_tag, layer_key, f"{call_idx:08d}.pt")
-
-
-def _dsa_kv_trace_error_allowed(owner: object) -> bool:
-    limit = _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_ERRORS", 20)
-    count = getattr(owner, "_dsa_kv_trace_error_count", 0)
-    if limit >= 0 and count >= limit:
-        return False
-    setattr(owner, "_dsa_kv_trace_error_count", count + 1)
-    return True
-
-
-def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
         return topk_indices[:, 0, :]
     if topk_indices.dim() == 2:
@@ -238,7 +104,7 @@ def _dsa_mask_padding_sparse_rows(
     row_req_indices: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep graph padding rows from referencing freed DSA logical blocks."""
-    topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+    topk_2d = _dsa_topk_to_2d_indices(topk_indices)
     num_rows = int(topk_2d.shape[0])
     if row_req_indices is None:
         return topk_indices, topk_2d
@@ -266,7 +132,7 @@ def _dsa_mask_padding_sparse_rows(
         topk_indices.reshape(num_rows, -1).masked_fill_(
             padding_mask.reshape(-1, 1), 0
         )
-    return topk_indices, _dsa_kv_trace_to_2d_indices(topk_indices)
+    return topk_indices, _dsa_topk_to_2d_indices(topk_indices)
 
 
 def _dsa_sparse_fa_bad_block_hit(
@@ -393,28 +259,6 @@ def _dsa_build_target_slot_mapping(
     return physical_blocks * block_size + offsets
 
 
-def _dsa_target_slot_sync_checkpoint(
-    *,
-    stage: str,
-    layer_name: str | None,
-    selected_tokens: torch.Tensor | None,
-    target_slot_mapping: torch.Tensor | None,
-) -> None:
-    if not hasattr(torch, "npu"):
-        return
-    try:
-        torch.npu.synchronize()
-    except Exception as exc:
-        raise RuntimeError(
-            "DSA target_slot_mapping sync checkpoint failed: "
-            f"stage={stage} layer={layer_name} "
-            f"selected_shape="
-            f"{tuple(selected_tokens.shape) if selected_tokens is not None else None} "
-            f"target_slot_shape="
-            f"{tuple(target_slot_mapping.shape) if target_slot_mapping is not None else None}"
-        ) from exc
-
-
 def _dsa_validate_target_slot_mapping(
     *,
     layer_name: str | None,
@@ -473,25 +317,6 @@ def _dsa_validate_target_slot_mapping(
     )
 
 
-def _dsa_env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _dsa_kv_debug_enabled() -> bool:
-    return _dsa_env_flag("VLLM_ASCEND_DSA_KV_DEBUG")
-
-
-def _dsa_kv_debug_error_allowed(owner: object) -> bool:
-    count = getattr(owner, "_dsa_kv_debug_error_count", 0)
-    if count >= 8:
-        return False
-    setattr(owner, "_dsa_kv_debug_error_count", count + 1)
-    return True
-
-
 def _dsa_indexer_layer_name(layer_name: str) -> str:
     return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
 
@@ -503,57 +328,6 @@ def _dsa_index_lmcache_enabled() -> bool:
         return False
     connector = get_kv_transfer_group()
     return bool(getattr(connector, "supports_dsa_index_lmcache", False))
-
-
-def _dsa_lmc_selected_check_enabled() -> bool:
-    return _dsa_kv_debug_enabled()
-
-
-def _dsa_prefill_shadow_enabled() -> bool:
-    return _dsa_kv_debug_enabled()
-
-
-def _dsa_prefill_shadow_layer_enabled(layer_name: str) -> bool:
-    return True
-
-
-def _dsa_req_id_key(req_id: object) -> str:
-    return str(req_id)
-
-
-def _dsa_expected_lmcache_selected(
-    original_topk: torch.Tensor,
-    prompt_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    original_2d = _dsa_kv_trace_to_2d_indices(original_topk)
-    sel = original_2d.to(torch.long)
-    source = prompt_lens.reshape(-1)[: sel.shape[0]].to(
-        device=sel.device, dtype=sel.dtype
-    )
-    if source.shape[0] < sel.shape[0]:
-        pad = torch.zeros(
-            sel.shape[0] - source.shape[0],
-            device=sel.device,
-            dtype=sel.dtype,
-        )
-        source = torch.cat([source, pad])
-    is_prefill = (sel >= 0) & (sel < source.reshape(-1, 1))
-    if sel.numel() == 0:
-        return sel.to(torch.int32), is_prefill
-    width = int(sel.shape[1])
-    rank = torch.cumsum(is_prefill.to(torch.int64), dim=1) - 1
-    dst = torch.where(
-        is_prefill,
-        rank,
-        torch.full_like(rank, width),
-    )
-    expected = torch.zeros(
-        (sel.shape[0], width + 1),
-        device=sel.device,
-        dtype=sel.dtype,
-    )
-    expected.scatter_(1, dst, sel)
-    return expected[:, :width].to(torch.int32), is_prefill
 
 
 class AscendSFABackend(AttentionBackend):
@@ -760,30 +534,18 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
             row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
             n_real = min(len(plens_cpu), num_reqs)
-            legacy_decode_rows = (
-                _dsa_env_flag("VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING")
-                and common_attn_metadata.attn_state
-                in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
-            )
-            if legacy_decode_rows:
-                # Full legacy fallback for non-MTP bisecting: match the old
-                # compact-scratch row semantics used by sparse_lmy.
-                rows[:n_real] = plens_cpu[:n_real]
-                req_rows[:n_real] = np.arange(n_real, dtype=np.int32)
-                row_offsets[:n_real] = 0
-            else:
-                qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
-                computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-                for r in range(n_real):
-                    s, e = int(qsl[r]), int(qsl[r + 1])
-                    plen = int(plens_cpu[r])
-                    first_decode = max(s, s + plen - int(computed[r]))
-                    if first_decode < e:
-                        count = e - first_decode
-                        offsets = np.arange(count, dtype=np.int32)
-                        rows[first_decode:e] = plen
-                        req_rows[first_decode:e] = r
-                        row_offsets[first_decode:e] = offsets
+            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
+            computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
+            for r in range(n_real):
+                s, e = int(qsl[r]), int(qsl[r + 1])
+                plen = int(plens_cpu[r])
+                first_decode = max(s, s + plen - int(computed[r]))
+                if first_decode < e:
+                    count = e - first_decode
+                    offsets = np.arange(count, dtype=np.int32)
+                    rows[first_decode:e] = plen
+                    req_rows[first_decode:e] = r
+                    row_offsets[first_decode:e] = offsets
             num_decode_rows = int((rows > 0).sum())
             prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
@@ -1605,868 +1367,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices
 
-    def _maybe_check_lmcache_selected_tokens(
-        self,
-        *,
-        layer_name: str,
-        original_topk: torch.Tensor,
-        remapped_topk: torch.Tensor,
-        selected_for_lmcache: torch.Tensor,
-        prompt_lens: torch.Tensor,
-        num_decode_tokens: int,
-    ) -> None:
-        if not _dsa_lmc_selected_check_enabled():
-            return
-        if num_decode_tokens <= 0:
-            return
-        if not _dsa_kv_trace_layer_enabled(layer_name):
-            return
-
-        try:
-            expected, prefill_mask = _dsa_expected_lmcache_selected(
-                original_topk, prompt_lens
-            )
-            decode_rows = min(
-                int(num_decode_tokens),
-                int(expected.shape[0]),
-                int(selected_for_lmcache.shape[0]),
-            )
-            if decode_rows <= 0:
-                return
-
-            selected = selected_for_lmcache[:decode_rows]
-            expected = expected[:decode_rows].to(
-                device=selected.device, dtype=selected.dtype
-            )
-            original_2d = _dsa_kv_trace_to_2d_indices(original_topk)[
-                :decode_rows
-            ].to(device=selected.device, dtype=selected.dtype)
-            remapped_2d = _dsa_kv_trace_to_2d_indices(remapped_topk)[
-                :decode_rows
-            ].to(device=selected.device, dtype=selected.dtype)
-            prefill_mask = prefill_mask[:decode_rows]
-
-            matches_expected = (
-                tuple(selected.shape) == tuple(expected.shape)
-                and torch.equal(selected, expected)
-            )
-            matches_raw_original = (
-                tuple(selected.shape) == tuple(original_2d.shape)
-                and torch.equal(selected, original_2d)
-            )
-            all_original_topk_prefill = (
-                bool(prefill_mask.all().detach().to(device="cpu").item())
-                if prefill_mask.numel()
-                else False
-            )
-
-            self._dsa_last_original_topk = original_topk.detach()
-            self._dsa_last_prompt_lens = prompt_lens.detach()
-            self._dsa_last_selected_for_lmcache = selected_for_lmcache.detach()
-            self._dsa_last_lmc_selected_matches_expected = matches_expected
-            self._dsa_last_lmc_selected_matches_raw = matches_raw_original
-
-            if matches_expected:
-                return
-
-            if _dsa_kv_debug_error_allowed(self):
-                logger.error(
-                    "[DSA_KV_DEBUG] cause=selected_for_lmcache_mismatch "
-                    "layer=%s rows=%s "
-                    "matches_raw_original=%s all_original_topk_prefill=%s "
-                    "original_topk_sample=%s expected_selected_sample=%s "
-                    "selected_for_lmcache_sample=%s remapped_topk_sample=%s "
-                    "prompt_lens_sample=%s prefill_mask_sample=%s",
-                    layer_name,
-                    decode_rows,
-                    matches_raw_original,
-                    all_original_topk_prefill,
-                    _dsa_debug_sample(original_2d),
-                    _dsa_debug_sample(expected),
-                    _dsa_debug_sample(selected),
-                    _dsa_debug_sample(remapped_2d),
-                    _dsa_debug_sample(prompt_lens[:decode_rows]),
-                    _dsa_debug_sample(prefill_mask),
-                )
-        except Exception:
-            if _dsa_kv_debug_error_allowed(self):
-                logger.exception(
-                    "[DSA_KV_DEBUG] cause=selected_for_lmcache_check_error "
-                    "layer=%s",
-                    layer_name,
-                )
-
-    def _maybe_capture_pre_lmcache_scratch_kv(
-        self,
-        *,
-        layer_name: str,
-        kv_cache,
-        block_table: torch.Tensor,
-        remapped_topk: torch.Tensor,
-        attn_metadata,
-    ) -> None:
-        if not _dsa_prefill_shadow_enabled():
-            return
-        if not _dsa_prefill_shadow_layer_enabled(layer_name):
-            return
-        if (
-            getattr(attn_metadata, "attn_state", None)
-            != AscendAttentionState.DecodeOnly
-        ):
-            return
-        if kv_cache is None or len(kv_cache) < 2 or block_table is None:
-            return
-        if getattr(attn_metadata, "num_decode_tokens", 0) <= 0:
-            return
-
-        try:
-            if hasattr(torch, "npu"):
-                torch.npu.synchronize()
-
-            topk_2d = _dsa_kv_trace_to_2d_indices(remapped_topk).to(torch.long)
-            if topk_2d.numel() == 0:
-                return
-            num_rows = min(
-                int(getattr(attn_metadata, "num_decode_tokens", 0)),
-                int(topk_2d.shape[0]),
-                int(block_table.shape[0]),
-            )
-            if num_rows <= 0:
-                return
-
-            topk_2d = topk_2d[:num_rows]
-            block_table_rows = block_table[:num_rows].to(torch.long)
-            kv = kv_cache[0]
-            key_rope = kv_cache[1]
-            block_size = int(kv.shape[1])
-            num_logical_blocks = int(block_table_rows.shape[1])
-            kv_flat = kv.reshape(-1, *kv.shape[2:])
-            key_rope_flat = key_rope.reshape(-1, *key_rope.shape[2:])
-
-            safe_indices = torch.clamp(topk_2d, min=0)
-            logical_blocks = safe_indices // block_size
-            block_offsets = safe_indices % block_size
-            valid = (topk_2d >= 0) & (logical_blocks < num_logical_blocks)
-            safe_logical_blocks = torch.clamp(
-                logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
-            )
-            physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
-            slots = physical_blocks * block_size + block_offsets
-            valid = valid & (physical_blocks >= 0) & (slots < kv_flat.shape[0])
-            safe_slots = torch.clamp(slots, min=0, max=max(kv_flat.shape[0] - 1, 0))
-            flat_slots = safe_slots.reshape(-1)
-
-            kv_selected = kv_flat.index_select(0, flat_slots).reshape(
-                *safe_slots.shape, *kv_flat.shape[1:]
-            )
-            key_rope_selected = key_rope_flat.index_select(
-                0, flat_slots
-            ).reshape(*safe_slots.shape, *key_rope_flat.shape[1:])
-            if not torch.all(valid):
-                kv_selected = torch.where(
-                    valid.reshape(*valid.shape, *([1] * (kv_selected.dim() - 2))),
-                    kv_selected,
-                    torch.zeros_like(kv_selected),
-                )
-                key_rope_selected = torch.where(
-                    valid.reshape(
-                        *valid.shape, *([1] * (key_rope_selected.dim() - 2))
-                    ),
-                    key_rope_selected,
-                    torch.zeros_like(key_rope_selected),
-                )
-
-            self._dsa_pre_lmcache_scratch_kv = {
-                "layer_name": layer_name,
-                "topk": topk_2d.detach().to(device="cpu", dtype=torch.long),
-                "valid": valid.detach().to(device="cpu"),
-                "slots": slots.detach().to(device="cpu", dtype=torch.long),
-                "kv": kv_selected.detach().to(device="cpu"),
-                "key_rope": key_rope_selected.detach().to(device="cpu"),
-            }
-        except Exception:
-            if _dsa_kv_debug_error_allowed(self):
-                logger.exception(
-                    "[DSA_KV_DEBUG] cause=pre_lmcache_scratch_capture_error "
-                    "layer=%s",
-                    layer_name,
-                )
-
-    def _maybe_capture_prefill_shadow_kv(
-        self,
-        *,
-        layer_name: str,
-        kv_cache,
-        attn_metadata,
-    ) -> None:
-        if not _dsa_prefill_shadow_enabled():
-            return
-        if kv_cache is None or len(kv_cache) < 2:
-            return
-        if attn_metadata.attn_state in (
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        ):
-            return
-        if not _dsa_prefill_shadow_layer_enabled(layer_name):
-            return
-
-        try:
-            fc = get_forward_context()
-            req_ids = getattr(fc, "dsa_req_ids", None)
-            prompt_lens = getattr(fc, "dsa_prompt_lens", None)
-            block_tables = getattr(attn_metadata, "block_table", None)
-            if req_ids is None or block_tables is None:
-                return
-
-            # Keep the full prefill snapshot on CPU. A full NPU shadow doubles
-            # latent KV memory and can prevent the server from starting.
-            self._dsa_prefill_shadow_kv = (
-                kv_cache[0].detach().to(device="cpu", copy=True),
-                kv_cache[1].detach().to(device="cpu", copy=True),
-            )
-            if not hasattr(self, "_dsa_prefill_shadow_block_tables"):
-                self._dsa_prefill_shadow_block_tables = {}
-            if not hasattr(self, "_dsa_prefill_shadow_prompt_lens"):
-                self._dsa_prefill_shadow_prompt_lens = {}
-
-            saved_tables = getattr(self, "_dsa_prefill_shadow_block_tables", None)
-            if saved_tables is None:
-                saved_tables = {}
-                self._dsa_prefill_shadow_block_tables = saved_tables
-            saved_plens = getattr(self, "_dsa_prefill_shadow_prompt_lens", None)
-            if saved_plens is None:
-                saved_plens = {}
-                self._dsa_prefill_shadow_prompt_lens = saved_plens
-
-            nrows = min(len(req_ids), int(block_tables.shape[0]))
-            for row in range(nrows):
-                key = _dsa_req_id_key(req_ids[row])
-                saved_tables[key] = block_tables[row].detach().to(
-                    device="cpu", dtype=torch.long, copy=True
-                )
-                if prompt_lens is not None and row < len(prompt_lens):
-                    try:
-                        saved_plens[key] = int(prompt_lens[row])
-                    except Exception:
-                        saved_plens[key] = prompt_lens[row]
-
-            self._dsa_prefill_shadow_ready = True
-        except Exception:
-            if _dsa_kv_debug_error_allowed(self):
-                logger.exception(
-                    "[DSA_KV_DEBUG] cause=prefill_shadow_capture_error layer=%s",
-                    layer_name,
-                )
-
-    def _maybe_compare_prefill_shadow_kv(
-        self,
-        *,
-        layer_name: str,
-        trace_label: str,
-        topk_2d: torch.Tensor,
-        current_valid: torch.Tensor,
-        current_slots: torch.Tensor,
-        current_physical_blocks: torch.Tensor,
-        current_block_table_rows: torch.Tensor,
-        current_kv: torch.Tensor,
-        current_key_rope: torch.Tensor,
-        attn_metadata,
-    ) -> None:
-        if not _dsa_prefill_shadow_enabled():
-            return
-        if getattr(self, "_dsa_prefill_shadow_ready", False) is not True:
-            return
-        if not _dsa_prefill_shadow_layer_enabled(layer_name):
-            return
-        if (
-            getattr(attn_metadata, "attn_state", None)
-            != AscendAttentionState.DecodeOnly
-        ):
-            return
-
-        try:
-            original_topk = getattr(self, "_dsa_last_original_topk", None)
-            prompt_lens = getattr(self, "_dsa_last_prompt_lens", None)
-            if original_topk is None or prompt_lens is None:
-                if _dsa_kv_debug_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_DEBUG] cause=missing_original_topk "
-                        "layer=%s label=%s",
-                        layer_name,
-                        trace_label,
-                    )
-                return
-
-            shadow = getattr(self, "_dsa_prefill_shadow_kv", None)
-            saved_tables = getattr(self, "_dsa_prefill_shadow_block_tables", None)
-            if shadow is None or not saved_tables:
-                if _dsa_kv_debug_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_DEBUG] cause=missing_prefill_shadow_capture "
-                        "layer=%s label=%s",
-                        layer_name,
-                        trace_label,
-                    )
-                return
-
-            num_rows = min(
-                int(topk_2d.shape[0]),
-                int(current_valid.shape[0]),
-                int(current_kv.shape[0]),
-            )
-            topk_cpu = topk_2d[:num_rows].detach().to(device="cpu", dtype=torch.long)
-            current_valid_cpu = current_valid[:num_rows].detach().to(device="cpu")
-            current_slots_cpu = current_slots[:num_rows].detach().to(
-                device="cpu", dtype=torch.long
-            )
-            current_physical_blocks_cpu = current_physical_blocks[
-                :num_rows
-            ].detach().to(device="cpu", dtype=torch.long)
-            current_block_table_rows_cpu = current_block_table_rows[
-                :num_rows
-            ].detach().to(device="cpu", dtype=torch.long)
-            original_2d = _dsa_kv_trace_to_2d_indices(original_topk)[
-                :num_rows
-            ].detach().to(device="cpu", dtype=torch.long)
-            prompt = prompt_lens.reshape(-1)[:num_rows].detach().to(
-                device="cpu", dtype=torch.long
-            )
-            if prompt.shape[0] < num_rows:
-                pad = torch.zeros(
-                    num_rows - prompt.shape[0],
-                    device="cpu",
-                    dtype=torch.long,
-                )
-                prompt = torch.cat([prompt, pad])
-            prefill_mask = (original_2d >= 0) & (
-                original_2d < prompt.reshape(-1, 1)
-            )
-            if not bool(prefill_mask.any().detach().to(device="cpu").item()):
-                return
-            rank = torch.cumsum(prefill_mask.to(torch.long), dim=1) - 1
-            expected_remapped_topk = torch.where(prefill_mask, rank, original_2d)
-            remap_check_mask = original_2d >= 0
-            remapped_ok = bool(
-                (
-                    topk_cpu[remap_check_mask]
-                    == expected_remapped_topk[remap_check_mask]
-                )
-                .all()
-                .item()
-            ) if remap_check_mask.numel() else True
-
-            req_ids = getattr(get_forward_context(), "dsa_req_ids", None)
-            if req_ids is None:
-                if _dsa_kv_debug_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_DEBUG] cause=missing_req_ids "
-                        "layer=%s label=%s",
-                        layer_name,
-                        trace_label,
-                    )
-                return
-
-            rows = []
-            missing_req_ids = []
-            for row in range(num_rows):
-                key = _dsa_req_id_key(req_ids[row])
-                table = saved_tables.get(key)
-                if table is None:
-                    missing_req_ids.append(key)
-                    table = torch.zeros_like(next(iter(saved_tables.values())))
-                rows.append(table.to(device="cpu", dtype=torch.long))
-            if missing_req_ids:
-                if _dsa_kv_debug_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_DEBUG] cause=missing_prefill_block_table layer=%s "
-                        "label=%s missing_req_ids=%s",
-                        layer_name,
-                        trace_label,
-                        missing_req_ids[:4],
-                    )
-                return
-
-            shadow_block_table = torch.stack(rows, dim=0)
-            block_size = int(shadow[0].shape[1])
-            num_logical_blocks = int(shadow_block_table.shape[1])
-            logical_blocks = torch.clamp(original_2d, min=0) // block_size
-            offsets = torch.clamp(original_2d, min=0) % block_size
-            shadow_valid = prefill_mask & (logical_blocks < num_logical_blocks)
-            safe_logical_blocks = torch.clamp(
-                logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
-            )
-            physical_blocks = shadow_block_table.gather(1, safe_logical_blocks)
-            slots = physical_blocks * block_size + offsets
-            shadow_flat_kv = shadow[0].reshape(-1, *shadow[0].shape[2:])
-            shadow_flat_key_rope = shadow[1].reshape(-1, *shadow[1].shape[2:])
-            shadow_valid = (
-                shadow_valid
-                & (physical_blocks >= 0)
-                & (slots >= 0)
-                & (slots < shadow_flat_kv.shape[0])
-                & current_valid_cpu
-            )
-            if not bool(shadow_valid.any().detach().to(device="cpu").item()):
-                if _dsa_kv_debug_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_DEBUG] cause=no_valid_prefill_tokens_to_compare "
-                        "layer=%s label=%s remapped_ok=%s "
-                        "original_topk_sample=%s topk_sample=%s "
-                        "expected_remapped_topk_sample=%s current_valid_sample=%s "
-                        "prefill_mask_sample=%s",
-                        layer_name,
-                        trace_label,
-                        remapped_ok,
-                        _dsa_debug_sample(original_2d),
-                        _dsa_debug_sample(topk_cpu),
-                        _dsa_debug_sample(expected_remapped_topk),
-                        _dsa_debug_sample(current_valid_cpu),
-                        _dsa_debug_sample(prefill_mask),
-                    )
-                return
-
-            safe_slots = torch.clamp(
-                slots, min=0, max=max(shadow_flat_kv.shape[0] - 1, 0)
-            )
-            expected_kv = shadow_flat_kv.index_select(
-                0, safe_slots.reshape(-1)
-            ).reshape(*safe_slots.shape, *shadow_flat_kv.shape[1:])
-            expected_key_rope = shadow_flat_key_rope.index_select(
-                0, safe_slots.reshape(-1)
-            ).reshape(*safe_slots.shape, *shadow_flat_key_rope.shape[1:])
-
-            current_kv_cpu = current_kv[:num_rows].detach().to(device="cpu")
-            current_key_rope_cpu = current_key_rope[:num_rows].detach().to(
-                device="cpu"
-            )
-            current_kv_cmp = current_kv_cpu[shadow_valid]
-            expected_kv_cmp = expected_kv[shadow_valid]
-            current_key_rope_cmp = current_key_rope_cpu[shadow_valid]
-            expected_key_rope_cmp = expected_key_rope[shadow_valid]
-
-            atol = 0.0
-            kv_diff = (current_kv_cmp.float() - expected_kv_cmp.float()).abs()
-            key_rope_diff = (
-                current_key_rope_cmp.float() - expected_key_rope_cmp.float()
-            ).abs()
-            kv_max = float(kv_diff.max().item()) if kv_diff.numel() else 0.0
-            key_rope_max = (
-                float(key_rope_diff.max().item()) if key_rope_diff.numel() else 0.0
-            )
-            if kv_max <= atol and key_rope_max <= atol:
-                return
-
-            if _dsa_kv_debug_error_allowed(self):
-                pre_scratch = getattr(self, "_dsa_pre_lmcache_scratch_kv", None)
-                scratch_changed = None
-                scratch_slots_match = None
-                scratch_kv_delta_max = None
-                scratch_key_rope_delta_max = None
-                pre_kv_cmp = None
-                pre_key_rope_cmp = None
-                if (
-                    isinstance(pre_scratch, dict)
-                    and pre_scratch.get("layer_name") == layer_name
-                ):
-                    pre_valid = pre_scratch["valid"][:num_rows].to(torch.bool)
-                    pre_slots = pre_scratch["slots"][:num_rows].to(torch.long)
-                    scratch_slots_match = (
-                        tuple(pre_slots.shape) == tuple(current_slots_cpu.shape)
-                        and torch.equal(pre_slots, current_slots_cpu)
-                    )
-                    if (
-                        tuple(pre_valid.shape) == tuple(shadow_valid.shape)
-                        and scratch_slots_match
-                    ):
-                        pre_kv_cpu = pre_scratch["kv"][:num_rows]
-                        pre_key_rope_cpu = pre_scratch["key_rope"][:num_rows]
-                        pre_kv_cmp = pre_kv_cpu[shadow_valid]
-                        pre_key_rope_cmp = pre_key_rope_cpu[shadow_valid]
-                        scratch_kv_delta = (
-                            current_kv_cmp.float() - pre_kv_cmp.float()
-                        ).abs()
-                        scratch_key_rope_delta = (
-                            current_key_rope_cmp.float()
-                            - pre_key_rope_cmp.float()
-                        ).abs()
-                        scratch_kv_delta_max = (
-                            float(scratch_kv_delta.max().item())
-                            if scratch_kv_delta.numel()
-                            else 0.0
-                        )
-                        scratch_key_rope_delta_max = (
-                            float(scratch_key_rope_delta.max().item())
-                            if scratch_key_rope_delta.numel()
-                            else 0.0
-                        )
-                        scratch_changed = (
-                            scratch_kv_delta_max > 0.0
-                            or scratch_key_rope_delta_max > 0.0
-                        )
-                selected_matches_expected = getattr(
-                    self, "_dsa_last_lmc_selected_matches_expected", None
-                )
-                selected_matches_raw = getattr(
-                    self, "_dsa_last_lmc_selected_matches_raw", None
-                )
-                if selected_matches_expected is False:
-                    cause = "selected_for_lmcache_mismatch_before_retrieve"
-                elif not remapped_ok:
-                    cause = "scratch_remap_topk_mismatch_before_attention"
-                elif scratch_changed is False:
-                    cause = "lmcache_retrieve_did_not_write_scratch"
-                elif scratch_changed is True:
-                    cause = "lmcache_retrieve_wrote_wrong_scratch_data"
-                else:
-                    cause = "lmcache_retrieve_or_scratch_mapping_mismatch"
-
-                rank_tag = _dsa_kv_trace_rank_tag()
-                layer_key = _dsa_kv_trace_layer_key(layer_name)
-                count = getattr(self, "_dsa_prefill_shadow_dump_count", 0)
-                setattr(self, "_dsa_prefill_shadow_dump_count", count + 1)
-                dump_path = os.path.join(
-                    "/tmp/dsa_kv_debug", rank_tag, layer_key, f"{count:08d}.pt"
-                )
-                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-                torch.save(
-                    {
-                        "meta": {
-                            "layer_name": layer_name,
-                            "trace_label": trace_label,
-                            "rank_tag": rank_tag,
-                            "cause": cause,
-                            "kv_max_abs_diff": kv_max,
-                            "key_rope_max_abs_diff": key_rope_max,
-                            "selected_matches_expected": selected_matches_expected,
-                            "selected_matches_raw": selected_matches_raw,
-                            "remapped_topk_matches_expected": remapped_ok,
-                            "scratch_changed": scratch_changed,
-                            "scratch_slots_match": scratch_slots_match,
-                            "scratch_kv_delta_max_abs": scratch_kv_delta_max,
-                            "scratch_key_rope_delta_max_abs": (
-                                scratch_key_rope_delta_max
-                            ),
-                        },
-                        "topk_indices": topk_cpu,
-                        "expected_remapped_topk": expected_remapped_topk.detach().to(
-                            device="cpu"
-                        ),
-                        "original_topk": original_2d.detach().to(device="cpu"),
-                        "prefill_mask": prefill_mask.detach().to(device="cpu"),
-                        "compare_mask": shadow_valid.detach().to(device="cpu"),
-                        "current_slots": current_slots_cpu,
-                        "current_physical_blocks": current_physical_blocks_cpu,
-                        "current_block_table_rows": current_block_table_rows_cpu,
-                        "shadow_slots": slots.detach().to(device="cpu"),
-                        "current_kv": current_kv_cmp.detach().to(device="cpu"),
-                        "expected_kv": expected_kv_cmp.detach().to(device="cpu"),
-                        "current_key_rope": current_key_rope_cmp.detach().to(
-                            device="cpu"
-                        ),
-                        "expected_key_rope": expected_key_rope_cmp.detach().to(
-                            device="cpu"
-                        ),
-                        "pre_wait_kv": (
-                            None
-                            if pre_kv_cmp is None
-                            else pre_kv_cmp.detach().to(device="cpu")
-                        ),
-                        "pre_wait_key_rope": (
-                            None
-                            if pre_key_rope_cmp is None
-                            else pre_key_rope_cmp.detach().to(device="cpu")
-                        ),
-                    },
-                    dump_path,
-                )
-                logger.error(
-                    "[DSA_KV_DEBUG] cause=%s layer=%s label=%s "
-                    "kv_max_abs_diff=%s key_rope_max_abs_diff=%s "
-                    "compared_tokens=%s selected_matches_expected=%s "
-                    "selected_matches_raw=%s remapped_topk_matches_expected=%s "
-                    "scratch_changed=%s scratch_slots_match=%s "
-                    "scratch_kv_delta_max_abs=%s "
-                    "scratch_key_rope_delta_max_abs=%s "
-                    "topk_sample=%s expected_remapped_topk_sample=%s "
-                    "original_topk_sample=%s current_slots_sample=%s "
-                    "shadow_slots_sample=%s prompt_lens_sample=%s dump_path=%s",
-                    cause,
-                    layer_name,
-                    trace_label,
-                    kv_max,
-                    key_rope_max,
-                    int(shadow_valid.sum().detach().to(device="cpu").item()),
-                    selected_matches_expected,
-                    selected_matches_raw,
-                    remapped_ok,
-                    scratch_changed,
-                    scratch_slots_match,
-                    scratch_kv_delta_max,
-                    scratch_key_rope_delta_max,
-                    _dsa_debug_sample(topk_cpu),
-                    _dsa_debug_sample(expected_remapped_topk),
-                    _dsa_debug_sample(original_2d),
-                    _dsa_debug_sample(current_slots_cpu),
-                    _dsa_debug_sample(slots),
-                    _dsa_debug_sample(prompt),
-                    dump_path,
-                )
-        except Exception:
-            if _dsa_kv_debug_error_allowed(self):
-                logger.exception(
-                    "[DSA_KV_DEBUG] cause=prefill_shadow_compare_error "
-                    "layer=%s label=%s",
-                    layer_name,
-                    trace_label,
-                )
-
-    def _maybe_trace_sparse_attention_kv(
-        self,
-        *,
-        layer_name: str | None,
-        trace_label: str,
-        kv: torch.Tensor,
-        key_rope: torch.Tensor,
-        block_table: torch.Tensor,
-        topk_indices: torch.Tensor,
-        attn_metadata,
-    ) -> None:
-        trace_enabled = _dsa_kv_trace_enabled()
-        shadow_enabled = _dsa_prefill_shadow_enabled()
-        if not trace_enabled and not shadow_enabled:
-            return
-
-        layer_name = layer_name or "unknown_layer"
-        trace_layer_enabled = trace_enabled and _dsa_kv_trace_layer_enabled(layer_name)
-        shadow_layer_enabled = shadow_enabled and _dsa_prefill_shadow_layer_enabled(layer_name)
-        if not trace_layer_enabled and not shadow_layer_enabled:
-            return
-        trace_enabled = trace_layer_enabled
-        shadow_enabled = shadow_layer_enabled
-        attn_state = getattr(attn_metadata, "attn_state", None)
-        if not trace_enabled and shadow_enabled and attn_state != AscendAttentionState.DecodeOnly:
-            return
-        if (
-            trace_enabled
-            and _dsa_kv_trace_decode_only()
-            and attn_state != AscendAttentionState.DecodeOnly
-        ):
-            return
-
-        layer_key = _dsa_kv_trace_layer_key(layer_name)
-        counts = getattr(self, "_dsa_kv_trace_counts", None)
-        if counts is None:
-            counts = {}
-            setattr(self, "_dsa_kv_trace_counts", counts)
-        call_idx = counts.get(layer_key, 0)
-        counts[layer_key] = call_idx + 1
-
-        max_calls = (
-            _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_CALLS", 0)
-            if trace_enabled
-            else 0
-        )
-        if max_calls > 0 and call_idx >= max_calls:
-            return
-        every_n = (
-            max(1, _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_EVERY_N", 1))
-            if trace_enabled
-            else 1
-        )
-        if call_idx % every_n != 0:
-            return
-
-        try:
-            trace_sync = os.environ.get(
-                "VLLM_ASCEND_DSA_KV_TRACE_SYNC", "1"
-            ).lower() in ("1", "true", "yes", "on")
-            if (shadow_enabled or (trace_enabled and trace_sync)) and hasattr(torch, "npu"):
-                torch.npu.synchronize()
-
-            topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices).to(torch.long)
-            if topk_2d.numel() == 0:
-                return
-            num_rows = min(int(topk_2d.shape[0]), int(block_table.shape[0]))
-            max_rows = (
-                _dsa_kv_trace_int_env("VLLM_ASCEND_DSA_KV_TRACE_MAX_ROWS", 0)
-                if trace_enabled
-                else 0
-            )
-            if max_rows > 0:
-                num_rows = min(num_rows, max_rows)
-            if num_rows <= 0:
-                return
-
-            topk_2d = topk_2d[:num_rows]
-            block_table_rows = block_table[:num_rows].to(torch.long)
-            block_size = int(kv.shape[1])
-            num_logical_blocks = int(block_table_rows.shape[1])
-            kv_flat = kv.reshape(-1, *kv.shape[2:])
-            key_rope_flat = key_rope.reshape(-1, *key_rope.shape[2:])
-
-            safe_indices = torch.clamp(topk_2d, min=0)
-            logical_blocks = safe_indices // block_size
-            block_offsets = safe_indices % block_size
-            valid = (topk_2d >= 0) & (logical_blocks < num_logical_blocks)
-            safe_logical_blocks = torch.clamp(
-                logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
-            )
-            physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
-            slots = physical_blocks * block_size + block_offsets
-            valid = valid & (physical_blocks >= 0) & (slots < kv_flat.shape[0])
-            safe_slots = torch.clamp(slots, min=0, max=max(kv_flat.shape[0] - 1, 0))
-
-            flat_slots = safe_slots.reshape(-1)
-            kv_selected = kv_flat.index_select(0, flat_slots).reshape(
-                *safe_slots.shape, *kv_flat.shape[1:]
-            )
-            key_rope_selected = key_rope_flat.index_select(0, flat_slots).reshape(
-                *safe_slots.shape, *key_rope_flat.shape[1:]
-            )
-
-            if not torch.all(valid):
-                kv_selected = torch.where(
-                    valid.reshape(*valid.shape, *([1] * (kv_selected.dim() - 2))),
-                    kv_selected,
-                    torch.zeros_like(kv_selected),
-                )
-                key_rope_selected = torch.where(
-                    valid.reshape(
-                        *valid.shape, *([1] * (key_rope_selected.dim() - 2))
-                    ),
-                    key_rope_selected,
-                    torch.zeros_like(key_rope_selected),
-                )
-
-            self._maybe_compare_prefill_shadow_kv(
-                layer_name=layer_name,
-                trace_label=trace_label,
-                topk_2d=topk_2d,
-                current_valid=valid,
-                current_slots=slots,
-                current_physical_blocks=physical_blocks,
-                current_block_table_rows=block_table_rows,
-                current_kv=kv_selected,
-                current_key_rope=key_rope_selected,
-                attn_metadata=attn_metadata,
-            )
-
-            if not trace_enabled:
-                return
-
-            rank_tag = _dsa_kv_trace_rank_tag()
-            trace_dir = _dsa_kv_trace_dir()
-            event_path = _dsa_kv_trace_event_path(
-                trace_dir, rank_tag, layer_key, call_idx
-            )
-            payload = {
-                "meta": {
-                    "layer_name": layer_name,
-                    "layer_key": layer_key,
-                    "trace_label": trace_label,
-                    "rank_tag": rank_tag,
-                    "call_idx": call_idx,
-                    "attn_state": _dsa_kv_trace_attn_state(attn_metadata),
-                    "kv_shape": tuple(kv.shape),
-                    "key_rope_shape": tuple(key_rope.shape),
-                    "block_table_shape": tuple(block_table.shape),
-                    "topk_shape": tuple(topk_indices.shape),
-                    "block_size": block_size,
-                    "num_rows": num_rows,
-                    "num_valid": int(valid.sum().detach().to(device="cpu").item()),
-                },
-                "topk_indices": topk_2d.detach().to(device="cpu"),
-                "valid": valid.detach().to(device="cpu"),
-                "physical_blocks": physical_blocks.detach().to(device="cpu"),
-                "slots": slots.detach().to(device="cpu"),
-                "block_table_rows": block_table_rows.detach().to(device="cpu"),
-                "kv": kv_selected.detach().to(device="cpu"),
-                "key_rope": key_rope_selected.detach().to(device="cpu"),
-            }
-
-            mode = _dsa_kv_trace_mode()
-            if mode == "record":
-                os.makedirs(os.path.dirname(event_path), exist_ok=True)
-                torch.save(payload, event_path)
-                return
-
-            if mode != "compare":
-                return
-            if not os.path.exists(event_path):
-                if _dsa_kv_trace_error_allowed(self):
-                    logger.error(
-                        "[DSA_KV_TRACE_MISSING] layer=%s call=%s label=%s path=%s",
-                        layer_name,
-                        call_idx,
-                        trace_label,
-                        event_path,
-                    )
-                return
-
-            ref = torch.load(event_path, map_location="cpu")
-            atol = _dsa_kv_trace_float_env("VLLM_ASCEND_DSA_KV_TRACE_ATOL", 0.0)
-            mismatch: list[str] = []
-
-            def _compare_tensor(name: str) -> None:
-                cur = payload[name]
-                old = ref[name]
-                if tuple(cur.shape) != tuple(old.shape):
-                    mismatch.append(
-                        f"{name}:shape current={tuple(cur.shape)} ref={tuple(old.shape)}"
-                    )
-                    return
-                if cur.dtype == torch.bool:
-                    ok = torch.equal(cur, old)
-                    max_diff = 0.0 if ok else 1.0
-                else:
-                    diff = (cur.float() - old.float()).abs()
-                    max_diff = float(diff.max().item()) if diff.numel() > 0 else 0.0
-                    ok = max_diff <= atol
-                if not ok:
-                    mismatch.append(f"{name}:max_abs_diff={max_diff}")
-
-            _compare_tensor("valid")
-            _compare_tensor("kv")
-            _compare_tensor("key_rope")
-
-            if os.environ.get(
-                "VLLM_ASCEND_DSA_KV_TRACE_COMPARE_INDICES", "0"
-            ).lower() in ("1", "true", "yes", "on"):
-                _compare_tensor("topk_indices")
-                _compare_tensor("slots")
-
-            if mismatch and _dsa_kv_trace_error_allowed(self):
-                mismatch_dir = os.path.join(trace_dir, "mismatch", rank_tag, layer_key)
-                os.makedirs(mismatch_dir, exist_ok=True)
-                cur_path = os.path.join(mismatch_dir, f"{call_idx:08d}_current.pt")
-                torch.save(payload, cur_path)
-                logger.error(
-                    "[DSA_KV_TRACE_MISMATCH] layer=%s call=%s label=%s "
-                    "mismatch=%s ref_label=%s ref_path=%s current_path=%s "
-                    "topk_sample=%s ref_topk_sample=%s slots_sample=%s "
-                    "ref_slots_sample=%s",
-                    layer_name,
-                    call_idx,
-                    trace_label,
-                    "; ".join(mismatch),
-                    ref.get("meta", {}).get("trace_label"),
-                    event_path,
-                    cur_path,
-                    payload["topk_indices"].reshape(-1)[:8].tolist(),
-                    ref["topk_indices"].reshape(-1)[:8].tolist(),
-                    payload["slots"].reshape(-1)[:8].tolist(),
-                    ref["slots"].reshape(-1)[:8].tolist(),
-                )
-        except Exception:
-            if _dsa_kv_trace_error_allowed(self):
-                logger.exception(
-                    "[DSA_KV_TRACE_ERROR] layer=%s call=%s label=%s",
-                    layer_name,
-                    call_idx if "call_idx" in locals() else None,
-                    trace_label,
-                )
-
     def _execute_sparse_flash_attention_process(
         self,
         ql_nope,
@@ -2510,22 +1410,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 getattr(attn_metadata, "decode_req_indices", None),
             )
 
-        self._maybe_trace_sparse_attention_kv(
-            layer_name=layer_name,
-            trace_label=trace_label,
-            kv=kv,
-            key_rope=key_rope,
-            block_table=block_table,
-            topk_indices=topk_indices,
-            attn_metadata=attn_metadata,
-        )
-
-        if (
-            _dsa_decode_sparse_fa
-            and _dsa_env_flag("VLLM_ASCEND_DSA_SPARSE_FA_GUARD", True)
-        ):
+        if _dsa_decode_sparse_fa:
             if topk_2d is None:
-                topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+                topk_2d = _dsa_topk_to_2d_indices(topk_indices)
             topk_rows = int(topk_2d.shape[0])
             block_table_rows = int(block_table.shape[0])
             batch_size = int(actual_seq_lengths_query.numel())
@@ -2863,19 +1750,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
-        self._maybe_capture_prefill_shadow_kv(
-            layer_name=layer_name,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
-
-        # DSA latent offload bring-up Round 1: read-only ground-truth dump. Gate on the
-        # env flag BEFORE importing the package so baseline serving never depends on it.
-        if envs.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT:
-            from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
-
-            _dsa_probe.probe_metadata_and_kv_cache(attn_metadata, kv_cache)
-
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(
                 x=hidden_states,
@@ -2888,15 +1762,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
 
-        self._dsa_last_original_topk = topk_indices.detach()
-        if attn_metadata.prompt_lens is not None:
-            self._dsa_last_prompt_lens = attn_metadata.prompt_lens.detach()
-
-        if envs.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT:
-            from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
-
-            _dsa_probe.probe_topk(topk_indices)
-
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap prefill-selected entries to compact scratch rows [0..n_ret) (the
         # request's first ceil(k/block_size) latent blocks) and have LMCache
@@ -2906,40 +1771,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         _has_kv_group = has_kv_transfer_group()
         _is_v1_kv_group = is_v1_kv_transfer_group() if _has_kv_group else False
-        _dsa_wait_log = bool(self.dsa_shrink_latent) and _dsa_debug_should_log(
-            self, "shrink_wait", layer_name
-        )
-        if _dsa_wait_log:
-            _fc_dbg = get_forward_context()
-            logger.info(
-                "[DSA_SHRINK_CHECK] wait_gate layer=%s stage=%s "
-                "prompt_lens_none=%s prompt_lens_shape=%s prompt_lens_device=%s "
-                "prompt_lens_sample=%s prompt_lens_minmax_count=%s "
-                "num_decode_tokens=%s attn_state=%s has_kv_group=%s "
-                "is_v1_kv_group=%s topk_shape=%s topk_dtype=%s "
-                "topk_device=%s topk_sample=%s topk_minmax_count=%s "
-                "dsa_req_ids_preview=%s dsa_prompt_lens_preview=%s",
-                layer_name,
-                self.dsa_shrink_latent,
-                attn_metadata.prompt_lens is None,
-                tuple(attn_metadata.prompt_lens.shape)
-                if attn_metadata.prompt_lens is not None else None,
-                attn_metadata.prompt_lens.device
-                if attn_metadata.prompt_lens is not None else None,
-                _dsa_debug_sample(attn_metadata.prompt_lens),
-                _dsa_debug_minmax_count(attn_metadata.prompt_lens),
-                attn_metadata.num_decode_tokens,
-                attn_metadata.attn_state,
-                _has_kv_group,
-                _is_v1_kv_group,
-                tuple(topk_indices.shape),
-                topk_indices.dtype,
-                topk_indices.device,
-                _dsa_debug_sample(topk_indices),
-                _dsa_debug_minmax_count(topk_indices),
-                _dsa_debug_preview(getattr(_fc_dbg, "dsa_req_ids", None)),
-                _dsa_debug_preview(getattr(_fc_dbg, "dsa_prompt_lens", None)),
-            )
         if (
             self.dsa_shrink_latent
             and attn_metadata.prompt_lens is not None
@@ -2956,17 +1787,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 and _has_kv_group
                 and _is_v1_kv_group
             )
-            _topk_before_remap = topk_indices
-            _topk_2d_before_remap = _dsa_kv_trace_to_2d_indices(topk_indices)
+            _topk_2d_before_remap = _dsa_topk_to_2d_indices(topk_indices)
             _topk_width = int(_topk_2d_before_remap.shape[1])
-            _disable_target_slot_mapping = _dsa_env_flag(
-                "VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING"
-            )
             _scratch_base = None
-            if (
-                attn_metadata.decode_row_offsets is not None
-                and not _disable_target_slot_mapping
-            ):
+            if attn_metadata.decode_row_offsets is not None:
                 _scratch_base = (
                     attn_metadata.decode_row_offsets[: _topk_2d_before_remap.shape[0]]
                     .to(device=topk_indices.device)
@@ -2979,25 +1803,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                 )
-            if _dsa_wait_log:
-                logger.info(
-                    "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
-                    "selected_none=%s selected_shape=%s selected_dtype=%s "
-                    "selected_device=%s selected_sample=%s "
-                    "selected_minmax_count=%s remapped_topk_shape=%s "
-                    "remapped_topk_sample=%s remapped_topk_minmax_count=%s",
-                    layer_name,
-                    _need_packed,
-                    _sel_packed is None,
-                    tuple(_sel_packed.shape) if _sel_packed is not None else None,
-                    _sel_packed.dtype if _sel_packed is not None else None,
-                    _sel_packed.device if _sel_packed is not None else None,
-                    _dsa_debug_sample(_sel_packed),
-                    _dsa_debug_minmax_count(_sel_packed),
-                    tuple(topk_indices.shape),
-                    _dsa_debug_sample(topk_indices),
-                    _dsa_debug_minmax_count(topk_indices),
-                )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
@@ -3006,11 +1811,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _request_ids_for_wait = None
                 _row_req_indices_for_wait = None
                 _row_scratch_base_for_wait = None
-                if _disable_target_slot_mapping:
-                    # Debug fallback: keep the pre-MTP selected-token retrieve path
-                    # so we can isolate explicit target_slot_mapping issues.
-                    _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
-                elif attn_metadata.decode_req_indices is not None and _scratch_base is not None:
+                if attn_metadata.decode_req_indices is not None and _scratch_base is not None:
                     _decode_req_indices = attn_metadata.decode_req_indices[
                         : _sel_packed.shape[0]
                     ]
@@ -3039,16 +1840,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Compatibility fallback for metadata built before row-level DSA
                     # fields existed. Standard MTP should not take this path.
                     _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
-                if (
-                    _target_slot_mapping_for_wait is not None
-                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
-                ):
-                    _dsa_target_slot_sync_checkpoint(
-                        stage="before_target_slot_validate",
-                        layer_name=layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
-                    )
+                if _target_slot_mapping_for_wait is not None:
                     _dsa_validate_target_slot_mapping(
                         layer_name=layer_name,
                         selected_tokens=_selected_for_wait,
@@ -3058,86 +1850,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         row_scratch_base=_row_scratch_base_for_wait,
                         block_table=attn_metadata.block_table,
                     )
-                self._maybe_check_lmcache_selected_tokens(
-                    layer_name=layer_name,
-                    original_topk=_topk_before_remap,
-                    remapped_topk=topk_indices,
-                    selected_for_lmcache=_selected_for_wait,
-                    prompt_lens=attn_metadata.prompt_lens,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                )
-                self._maybe_capture_pre_lmcache_scratch_kv(
-                    layer_name=layer_name,
-                    kv_cache=kv_cache,
-                    block_table=attn_metadata.block_table,
-                    remapped_topk=topk_indices,
-                    attn_metadata=attn_metadata,
-                )
-                if _dsa_wait_log:
-                    _wait_fn = wait_for_kv_layer_from_connector
-                    _wait_fn_code = getattr(_wait_fn, "__code__", None)
-                    _wait_fn_consts = getattr(_wait_fn_code, "co_consts", ())
-                    _wait_fn_has_trace = any(
-                        "DSA wait trace enter" in str(_const)
-                        for _const in _wait_fn_consts
-                    )
-                    _wait_fc = get_forward_context()
-                    _wait_attn_metadata = getattr(_wait_fc, "attn_metadata", None)
-                    logger.warning(
-                        "[DSA_SHRINK_CHECK] wait_precheck layer=%s "
-                        "selected_shape=%s selected_dtype=%s selected_device=%s "
-                        "selected_sample=%s selected_minmax_count=%s "
-                        "has_kv_group=%s is_v1_kv_group=%s forward_context_id=%s "
-                        "attn_metadata=%s attn_state=%s num_decode_tokens=%s "
-                        "wait_fn_has_trace=%s",
-                        layer_name,
-                        tuple(_selected_for_wait.shape),
-                        _selected_for_wait.dtype,
-                        _selected_for_wait.device,
-                        _dsa_debug_sample(_selected_for_wait),
-                        _dsa_debug_minmax_count(_selected_for_wait),
-                        _has_kv_group,
-                        _is_v1_kv_group,
-                        id(_wait_fc),
-                        _wait_attn_metadata.__class__.__name__
-                        if _wait_attn_metadata is not None else None,
-                        getattr(_wait_attn_metadata, "attn_state", None),
-                        getattr(_wait_attn_metadata, "num_decode_tokens", None),
-                        _wait_fn_has_trace,
-                    )
-                    logger.warning(
-                        "[DSA_SHRINK_CHECK] connector_wait_fn layer=%s "
-                        "fn_module=%s fn_file=%s fn_firstlineno=%s fn_id=%s",
-                        layer_name,
-                        getattr(_wait_fn, "__module__", None),
-                        getattr(_wait_fn_code, "co_filename", None),
-                        getattr(_wait_fn_code, "co_firstlineno", None),
-                        id(_wait_fn),
-                    )
-                    logger.warning(
-                        "[DSA_SHRINK_CHECK] calling_connector_wait layer=%s "
-                        "selected_shape=%s selected_dtype=%s selected_device=%s "
-                        "target_slot_shape=%s request_ids=%s",
-                        layer_name,
-                        tuple(_selected_for_wait.shape),
-                        _selected_for_wait.dtype,
-                        _selected_for_wait.device,
-                        tuple(_target_slot_mapping_for_wait.shape)
-                        if _target_slot_mapping_for_wait is not None else None,
-                        _request_ids_for_wait[:4]
-                        if _request_ids_for_wait is not None else None,
-                    )
                 _wait_fn = wait_for_kv_layer_from_connector
-                if (
-                    _target_slot_mapping_for_wait is not None
-                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
-                ):
-                    _dsa_target_slot_sync_checkpoint(
-                        stage="before_connector_wait",
-                        layer_name=layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
-                    )
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
@@ -3145,29 +1858,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
-                if (
-                    _target_slot_mapping_for_wait is not None
-                    and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
-                ):
-                    _dsa_target_slot_sync_checkpoint(
-                        stage="after_connector_wait",
-                        layer_name=layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
-                    )
-                if _dsa_wait_log:
-                    logger.warning(
-                        "[DSA_SHRINK_CHECK] connector_wait_returned layer=%s",
-                        layer_name,
-                    )
-            elif _dsa_wait_log:
-                logger.info(
-                    "[DSA_SHRINK_CHECK] connector_wait_skipped_after_remap "
-                    "layer=%s stage=%s selected_none=%s",
-                    layer_name,
-                    self.dsa_shrink_latent,
-                    _sel_packed is None,
-                )
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
@@ -3215,23 +1905,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
             _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                _adbg = envs.VLLM_ASCEND_DSA_ADAPTER_DEBUG
-                _sync_phases = (
-                    set(p.strip() for p in envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES.split(","))
-                    if envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES
-                    else set()
-                )
-
-                def _dbg(_phase):
-                    # Sync (when DEBUG, or when this phase is in SYNC_PHASES) forces the
-                    # device to catch up here; under DEBUG also log. If a prior phase's
-                    # kernel hung, the sync blocks and the previous line is the last log.
-                    if (_adbg or _phase in _sync_phases) and hasattr(torch, "npu"):
-                        torch.npu.synchronize()
-                    if _adbg:
-                        logger.info("[ADAPTER-DBG] layer=%s phase=%s", layer_name, _phase)
-
-                _dbg("begin")
                 with _dsa_prof.section("ad_prep"):
                     # computed per layer (fresh): a cross-layer memo of these went
                     # stale on batch changes (wrong size) and bought no TPOT, so it was
@@ -3239,7 +1912,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _req_slots_a = _ac.req_slots_tensor(_req_ids_a)
                     _cur_pos_a = (attn_metadata.seq_lens.to(torch.long) - 1).tolist()
                     _topk2d = topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
-                _dbg("cur_pos_done")
                 with _dsa_prof.section("ad_insert"):
                     _insert_meta_op = False
                     for _b in range(len(_req_ids_a)):
@@ -3249,9 +1921,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _insert_meta_op |= _ac.insert_decode_token(
                             layer_name, _req_ids_a[_b], int(_cur_pos_a[_b]), _kn_a[_b], _kp_a[_b]
                         )
-                _dbg("insert_done")
-                # WORKAROUND (verified by SYNC_PHASES=insert_done): the adapter's native
-                # metadata kernels (mark_dirty / load) don't order with retrieve's load
+                # WORKAROUND: the adapter's native metadata kernels (mark_dirty / load)
+                # don't order with retrieve's load
                 # on the device -> retrieve reads torn slot metadata -> bad slot ->
                 # block_table OOB -> device hang. mark_dirty is once-per-block now, so
                 # only block-allocation steps run those kernels; sync ONLY then. Normal
@@ -3261,7 +1932,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     torch.npu.synchronize()
                 with _dsa_prof.section("ad_retrieve"):
                     _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
-                _dbg("retrieve_done")
                 with _dsa_prof.section("ad_fa"):
                     adapter_out = self._execute_sparse_flash_attention_process(
                         ql_nope,
@@ -3280,7 +1950,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dbg("fa_done")
                 with _dsa_prof.section("ad_release"):
                     _ac.release_after_fa(layer_name, _res_a.loaded_ids)
-                _dbg("release_done")
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
                     native_out = self._execute_sparse_flash_attention_process(

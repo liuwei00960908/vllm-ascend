@@ -69,8 +69,8 @@ InMemoryBlockStoreBackend = _kvca.InMemoryBlockStoreBackend
 LMCacheBackend = _kvca.LMCacheBackend
 KVCacheAdapter = _kvca.KVCacheAdapter
 
-# Optional micro-profiler (shares VLLM_ASCEND_DSA_OFFLOAD_PROFILE). Guarded so the
-# CPU parity test, which has no vLLM, falls back to a no-op context.
+# Profiling hooks are no-op in production builds. Guarded so the CPU parity test,
+# which has no vLLM, falls back to the same no-op context.
 try:
     from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _aprof  # noqa: PLC0415
 except Exception:  # pragma: no cover

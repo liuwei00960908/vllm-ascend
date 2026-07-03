@@ -2807,13 +2807,9 @@ class NPUModelRunner(GPUModelRunner):
                     "DSA adapter latent cache enabled for %d MLA layers", len(_mla)
                 )
 
-        if not (
-            envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
-            or envs_ascend.VLLM_ASCEND_DSA_OFFLOAD_INTROSPECT
-        ):
+        if not envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD:
             return
 
-        from vllm_ascend.distributed.kv_transfer.sparse_offload import introspect as _dsa_probe
         from vllm_ascend.distributed.kv_transfer.sparse_offload.runner_integration import (
             config_from_vllm,
             build_manager,
@@ -2821,13 +2817,6 @@ class NPUModelRunner(GPUModelRunner):
 
         mla_layers = get_layers_from_vllm_config(self.vllm_config, MLAAttention)
         layer_names = list(mla_layers.keys())
-
-        if _dsa_probe.enabled():
-            _dsa_probe.probe_runner(
-                getattr(self, "input_batch", None),
-                layer_names,
-                self.model_config.hf_text_config.num_hidden_layers,
-            )
 
         config = config_from_vllm(self.vllm_config, device=self.device)
         if config is None:
