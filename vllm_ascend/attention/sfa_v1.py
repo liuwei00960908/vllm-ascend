@@ -1560,39 +1560,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
-        _dsa_diag_layer0 = ".layers.0." in str(layer_name)
-        if _dsa_diag_layer0:
-            _diag_has_kv_group = has_kv_transfer_group()
-            _diag_is_v1_kv_group = (
-                is_v1_kv_transfer_group() if _diag_has_kv_group else False
-            )
-            logger.info(
-                "[DSA_INDEX_LMCACHE] forward_state layer=%s index_layer=%s "
-                "attn_state=%s is_pure_decode=%s dsa_shrink_latent=%s "
-                "dsa_offload_unbundle=%s index_lmcache_enabled=%s "
-                "has_kv_group=%s is_v1_kv_group=%s num_input_tokens=%s "
-                "num_actual_tokens=%s num_decode_tokens=%s "
-                "num_prefill_tokens=%s num_reqs=%s slot_len=%s "
-                "idx_slot_len=%s kv_len=%s kv_shapes=%s",
-                layer_name,
-                index_layer_name,
-                attn_metadata.attn_state,
-                _is_pure_decode,
-                self.dsa_shrink_latent,
-                self.dsa_offload_unbundle,
-                index_lmcache_enabled,
-                _diag_has_kv_group,
-                _diag_is_v1_kv_group,
-                num_input_tokens,
-                attn_metadata.num_actual_tokens,
-                attn_metadata.num_decode_tokens,
-                getattr(attn_metadata, "num_prefill_tokens", None),
-                getattr(attn_metadata, "num_reqs", None),
-                int(slot_mapping.numel()),
-                int(idx_slot_mapping.numel()),
-                len(kv_cache) if kv_cache is not None else None,
-                [tuple(t.shape) for t in kv_cache] if kv_cache is not None else None,
-            )
 
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
@@ -1637,27 +1604,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
-                if _dsa_diag_layer0:
-                    logger.info(
-                        "[DSA_INDEX_LMCACHE] latent_wait_call layer=%s "
-                        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
-                        "reason=dense_prefill_or_no_decode_rows",
-                        layer_name,
-                        attn_metadata.attn_state,
-                        attn_metadata.num_actual_tokens,
-                        attn_metadata.num_decode_tokens,
-                    )
                 wait_for_kv_layer_from_connector(layer_name)
-            elif _dsa_diag_layer0:
-                logger.info(
-                    "[DSA_INDEX_LMCACHE] latent_wait_skip layer=%s "
-                    "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
-                    "reason=compact_scratch_decode_waits_after_topk",
-                    layer_name,
-                    attn_metadata.attn_state,
-                    attn_metadata.num_actual_tokens,
-                    attn_metadata.num_decode_tokens,
-                )
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -1773,35 +1720,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 index_lmcache_enabled
                 and not _is_pure_decode
             ):
-                logger.info(
-                    "[DSA_INDEX_LMCACHE] load_call layer=%s index_layer=%s "
-                    "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
-                    "kv_shape=%s",
-                    layer_name,
-                    index_layer_name,
-                    attn_metadata.attn_state,
-                    attn_metadata.num_actual_tokens,
-                    attn_metadata.num_decode_tokens,
-                    tuple(kv_cache[2].shape) if len(kv_cache) >= 3 else None,
-                )
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
-            elif _dsa_diag_layer0:
-                logger.info(
-                    "[DSA_INDEX_LMCACHE] index_wait_skip layer=%s index_layer=%s "
-                    "attn_state=%s is_pure_decode=%s "
-                    "index_lmcache_enabled=%s reason=%s",
-                    layer_name,
-                    index_layer_name,
-                    attn_metadata.attn_state,
-                    _is_pure_decode,
-                    index_lmcache_enabled,
-                    (
-                        "pure_decode"
-                        if _is_pure_decode
-                        else "index_lmcache_disabled"
-                    ),
-                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -1921,23 +1841,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
-                    if _dsa_diag_layer0:
-                        logger.info(
-                            "[DSA_INDEX_LMCACHE] selected_wait_call layer=%s "
-                            "attn_state=%s num_decode_tokens=%s "
-                            "selected_shape=%s target_slot_shape=%s "
-                            "request_ids=%s",
-                            layer_name,
-                            attn_metadata.attn_state,
-                            attn_metadata.num_decode_tokens,
-                            tuple(_selected_for_wait.shape)
-                            if _selected_for_wait is not None
-                            else None,
-                            tuple(_target_slot_mapping_for_wait.shape)
-                            if _target_slot_mapping_for_wait is not None
-                            else None,
-                            _request_ids_for_wait,
-                        )
                     _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
@@ -2217,36 +2120,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             bool(self.dsa_shrink_latent)
             and _is_pure_decode
         )
-        if _dsa_diag_layer0:
-            logger.info(
-                "[DSA_INDEX_LMCACHE] save_plan layer=%s index_layer=%s "
-                "attn_state=%s is_pure_decode=%s skip_decode_save=%s "
-                "dsa_offload_unbundle=%s index_lmcache_enabled=%s "
-                "num_actual_tokens=%s num_decode_tokens=%s kv_len=%s "
-                "kv_shapes=%s",
-                layer_name,
-                index_layer_name,
-                attn_metadata.attn_state,
-                _is_pure_decode,
-                _skip_decode_save,
-                self.dsa_offload_unbundle,
-                index_lmcache_enabled,
-                attn_metadata.num_actual_tokens,
-                attn_metadata.num_decode_tokens,
-                len(kv_cache) if kv_cache is not None else None,
-                [tuple(t.shape) for t in kv_cache] if kv_cache is not None else None,
-            )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                if _dsa_diag_layer0:
-                    logger.info(
-                        "[DSA_INDEX_LMCACHE] latent_save_call layer=%s "
-                        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s",
-                        layer_name,
-                        attn_metadata.attn_state,
-                        attn_metadata.num_actual_tokens,
-                        attn_metadata.num_decode_tokens,
-                    )
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
                 if (
                     len(kv_cache) >= 3
@@ -2254,39 +2129,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     and index_lmcache_enabled
                     and not _is_pure_decode
                 ):
-                    logger.info(
-                        "[DSA_INDEX_LMCACHE] save_call layer=%s index_layer=%s "
-                        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
-                        "kv_shape=%s",
-                        layer_name,
-                        index_layer_name,
-                        attn_metadata.attn_state,
-                        attn_metadata.num_actual_tokens,
-                        attn_metadata.num_decode_tokens,
-                        tuple(kv_cache[2].shape),
-                    )
                     maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
-                elif _dsa_diag_layer0:
-                    logger.info(
-                        "[DSA_INDEX_LMCACHE] index_save_skip layer=%s "
-                        "index_layer=%s attn_state=%s is_pure_decode=%s "
-                        "index_lmcache_enabled=%s kv_len=%s",
-                        layer_name,
-                        index_layer_name,
-                        attn_metadata.attn_state,
-                        _is_pure_decode,
-                        index_lmcache_enabled,
-                        len(kv_cache) if kv_cache is not None else None,
-                    )
             else:
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-        elif _dsa_diag_layer0:
-            logger.info(
-                "[DSA_INDEX_LMCACHE] save_skip layer=%s attn_state=%s "
-                "reason=pure_decode_shrink_latent",
-                layer_name,
-                attn_metadata.attn_state,
-            )
 
         _dsa_prof.end(_sfa_t)
         return output_padded
