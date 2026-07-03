@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 import scipy  # type: ignore
+import os
 import numpy as np
 import torch
 import torch_npu
@@ -98,6 +99,12 @@ def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
         return topk_indices
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
+def _decode_window_save_window_size() -> int:
+    value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
 
 def _dsa_mask_padding_sparse_rows(
     topk_indices: torch.Tensor,
@@ -520,10 +527,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
 
-        # DSA shrink-latent: expand per-request prompt lengths to per-ROW values
-        # for scratch_remap — decode rows (position >= prompt_len) get plen,
-        # prefill and padding rows get 0 (= left untouched by the remap). Works
-        # for both pure-decode and mixed chunked-prefill+decode steps.
+        # DSA shrink-latent: expand per-request prompt lengths to per-row cache
+        # boundaries for scratch_remap. Decode rows get prompt_len by default;
+        # decode-window mode later replaces those rows with current_window_start.
+        # Prefill and padding rows get 0 and stay untouched by the remap.
         prompt_lens_rows = None
         decode_req_indices_rows = None
         decode_row_offsets_rows = None
@@ -1763,11 +1770,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
-        # Remap prefill-selected entries to compact scratch rows [0..n_ret) (the
-        # request's first ceil(k/block_size) latent blocks) and have LMCache
-        # scatter exactly those tokens into the scratch; decode-selected entries
-        # keep their ABSOLUTE positions (>= prompt_len >= k, disjoint from the
-        # scratch row space) and are read in place via the same block table.
+        # Remap LMCache-selected entries to compact scratch rows [0..n_ret)
+        # (the request's first ceil(k/block_size) latent blocks) and have
+        # LMCache scatter exactly those tokens into scratch. Live-cache entries
+        # keep their absolute positions and are read in place via the same
+        # block table. Decode-window mode uses current_window_start as the
+        # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         _has_kv_group = has_kv_transfer_group()
         _is_v1_kv_group = is_v1_kv_transfer_group() if _has_kv_group else False
@@ -1776,9 +1784,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.prompt_lens is not None
             and attn_metadata.num_decode_tokens > 0
         ):
-            # prompt_lens is per ROW: decode rows carry their request's prompt
-            # length, prefill/padding rows carry 0 and stay untouched — so this
-            # also covers mixed chunked-prefill + decode steps.
+            # _remap_boundary is per row. Decode rows carry prompt_len by
+            # default; decode-window mode replaces it with current_window_start.
+            # Prefill/padding rows carry 0 and stay untouched, so this also
+            # covers mixed chunked-prefill + decode steps.
             # The packed front-list only feeds LMCache's selected_tokens; skip building
             # it (and its scatter) when no v1 connector will consume it (profiling /
             # no-offload runs). Production with an LMCache connector is unchanged.
@@ -1796,12 +1805,48 @@ class AscendSFAImpl(MLAAttentionImpl):
                     .to(device=topk_indices.device)
                     * _topk_width
                 )
+            
+            _remap_boundary = attn_metadata.prompt_lens
+            _decode_window_size = _decode_window_save_window_size()
+            if _decode_window_size > 0:
+                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                _window_start = (
+                    _cur_pos // _decode_window_size * _decode_window_size
+                ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
+                _decode_rows = torch.arange(
+                    _remap_boundary.shape[0], device=_remap_boundary.device
+                ) < int(attn_metadata.num_decode_tokens)
+                _remap_boundary = torch.where(
+                    _decode_rows, _window_start, _remap_boundary
+                )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
-                    topk_indices,
-                    attn_metadata.prompt_lens,
+                     topk_indices,
+                     _remap_boundary,
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
+                )
+            if _dsa_wait_log:
+                logger.info(
+                    "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
+                    "selected_none=%s selected_shape=%s selected_dtype=%s "
+                    "selected_device=%s selected_sample=%s "
+                    "selected_minmax_count=%s remapped_topk_shape=%s "
+                    "remapped_topk_sample=%s remapped_topk_minmax_count=%s "
+                    "decode_window_size=%s remap_boundary_sample=%s",
+                    layer_name,
+                    _need_packed,
+                    _sel_packed is None,
+                    tuple(_sel_packed.shape) if _sel_packed is not None else None,
+                    _sel_packed.dtype if _sel_packed is not None else None,
+                    _sel_packed.device if _sel_packed is not None else None,
+                    _dsa_debug_sample(_sel_packed),
+                    _dsa_debug_minmax_count(_sel_packed),
+                    tuple(topk_indices.shape),
+                    _dsa_debug_sample(topk_indices),
+                    _dsa_debug_minmax_count(topk_indices),
+                    _decode_window_size,
+                    _dsa_debug_sample(_remap_boundary),
                 )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
@@ -1828,7 +1873,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _row_req_indices,
                         _row_scratch_base,
                         int(_selected_for_wait.shape[1]),
-                        int(kv_cache[0].shape[1]),
+                        int(kv_cache[0].shape[1]), 
                     )
                     _dsa_req_ids = getattr(get_forward_context(), "dsa_req_ids", None)
                     if _dsa_req_ids is not None:
