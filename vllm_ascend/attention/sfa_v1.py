@@ -3002,7 +3002,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
-        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode
+        _decode_window_save_enabled = _decode_window_save_window_size() > 0
+        _skip_decode_save = (
+            bool(self.dsa_shrink_latent)
+            and _is_pure_decode
+            and not _decode_window_save_enabled
+        )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
