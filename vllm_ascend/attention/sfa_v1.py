@@ -37,6 +37,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -2587,6 +2588,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _window_start = (
                     _cur_pos // _decode_window_size * _decode_window_size
                 ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
+                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
+                    getattr(get_forward_context(), "dsa_req_ids", None)
+                )
+                if _lmcache_cached_tokens is not None:
+                    _committed_end = torch.tensor(
+                        _lmcache_cached_tokens,
+                        device=_remap_boundary.device,
+                        dtype=_remap_boundary.dtype,
+                    )
+                    if _committed_end.numel() < _window_start.numel():
+                        _committed_end = torch.nn.functional.pad(
+                            _committed_end,
+                            (0, _window_start.numel() - _committed_end.numel()),
+                        )
+                    _committed_end = _committed_end[: _window_start.numel()]
+                    _window_start = torch.minimum(_window_start, _committed_end)
                 _decode_rows = torch.arange(
                     _remap_boundary.shape[0], device=_remap_boundary.device
                 ) < int(attn_metadata.num_decode_tokens)
