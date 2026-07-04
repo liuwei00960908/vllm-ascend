@@ -108,6 +108,27 @@ def _dsa_debug_should_log(owner: object, site: str, layer_name: str) -> bool:
     return True
 
 
+def _decode_window_diag_should_log(owner: object, layer_name: str) -> bool:
+    if not (
+        _dsa_env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
+        or _dsa_debug_layer_enabled(layer_name)
+    ):
+        return False
+    try:
+        limit = int(os.environ.get("LMCACHE_DECODE_WINDOW_DIAG_LIMIT", "4"))
+    except ValueError:
+        limit = 4
+    counts = getattr(owner, "_decode_window_diag_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_decode_window_diag_counts", counts)
+    count = counts.get(layer_name, 0)
+    if limit >= 0 and count >= limit:
+        return False
+    counts[layer_name] = count + 1
+    return True
+
+
 def _dsa_debug_sample(value, limit: int = 8) -> list:
     if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
         return []
@@ -2583,6 +2604,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             _topk_before_remap = topk_indices
             _remap_boundary = attn_metadata.prompt_lens
             _decode_window_size = _decode_window_save_window_size()
+            _lmcache_cached_tokens = None
+            _committed_end_for_diag = None
             if _decode_window_size > 0:
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
                 _window_start = (
@@ -2603,6 +2626,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             (0, _window_start.numel() - _committed_end.numel()),
                         )
                     _committed_end = _committed_end[: _window_start.numel()]
+                    _committed_end_for_diag = _committed_end
                     _window_start = torch.minimum(_window_start, _committed_end)
                 _decode_rows = torch.arange(
                     _remap_boundary.shape[0], device=_remap_boundary.device
@@ -2614,6 +2638,87 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices, _remap_boundary, need_packed=_need_packed
                 )
+            if (
+                _decode_window_size > 0
+                and _committed_end_for_diag is None
+                and _decode_window_diag_should_log(self, layer_name)
+            ):
+                logger.info(
+                    "[DECODE_WINDOW_TOPK] layer=%s missing_lmcache_cached "
+                    "window_size=%d boundary_sample=%s orig_minmax=%s "
+                    "remap_minmax=%s",
+                    layer_name,
+                    _decode_window_size,
+                    _dsa_debug_sample(_remap_boundary),
+                    _dsa_debug_minmax_count(
+                        _dsa_kv_trace_to_2d_indices(_topk_before_remap)
+                    ),
+                    _dsa_debug_minmax_count(
+                        _dsa_kv_trace_to_2d_indices(topk_indices)
+                    ),
+                )
+            if (
+                _decode_window_size > 0
+                and _committed_end_for_diag is not None
+                and _decode_window_diag_should_log(self, layer_name)
+            ):
+                _orig_2d_diag = _dsa_kv_trace_to_2d_indices(
+                    _topk_before_remap
+                ).to(torch.long)
+                _remap_2d_diag = _dsa_kv_trace_to_2d_indices(topk_indices).to(
+                    torch.long
+                )
+                _diag_rows = min(
+                    int(attn_metadata.num_decode_tokens),
+                    int(_orig_2d_diag.shape[0]),
+                    int(_remap_2d_diag.shape[0]),
+                    int(_remap_boundary.numel()),
+                    int(_committed_end_for_diag.numel()),
+                )
+                if _diag_rows > 0:
+                    _diag_boundary = _remap_boundary.reshape(-1)[
+                        :_diag_rows
+                    ].to(device=_orig_2d_diag.device, dtype=torch.long)
+                    _diag_committed = _committed_end_for_diag.reshape(-1)[
+                        :_diag_rows
+                    ].to(device=_orig_2d_diag.device, dtype=torch.long)
+                    _orig_rows = _orig_2d_diag[:_diag_rows]
+                    _remap_rows = _remap_2d_diag[:_diag_rows]
+                    _valid_orig = _orig_rows >= 0
+                    _should_lmcache = (
+                        _valid_orig
+                        & (_orig_rows < _diag_committed.reshape(-1, 1))
+                    )
+                    _selected_lmcache = (
+                        _valid_orig
+                        & (_orig_rows < _diag_boundary.reshape(-1, 1))
+                    )
+                    _native_below_committed = (
+                        _valid_orig
+                        & (_orig_rows >= _diag_boundary.reshape(-1, 1))
+                        & (_orig_rows < _diag_committed.reshape(-1, 1))
+                    )
+                    logger.info(
+                        "[DECODE_WINDOW_TOPK] layer=%s rows=%d "
+                        "window_size=%d lmcache_cached=%s "
+                        "boundary_sample=%s committed_sample=%s "
+                        "orig_minmax=%s remap_minmax=%s "
+                        "should_lmcache=%d selected_lmcache=%d "
+                        "native_below_committed=%d "
+                        "native_below_committed_sample=%s",
+                        layer_name,
+                        _diag_rows,
+                        _decode_window_size,
+                        _lmcache_cached_tokens,
+                        _dsa_debug_sample(_diag_boundary),
+                        _dsa_debug_sample(_diag_committed),
+                        _dsa_debug_minmax_count(_orig_rows),
+                        _dsa_debug_minmax_count(_remap_rows),
+                        int(_should_lmcache.sum().item()),
+                        int(_selected_lmcache.sum().item()),
+                        int(_native_below_committed.sum().item()),
+                        _dsa_debug_sample(_orig_rows[_native_below_committed]),
+                    )
             if _dsa_wait_log:
                 logger.info(
                     "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
