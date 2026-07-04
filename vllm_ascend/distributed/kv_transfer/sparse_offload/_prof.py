@@ -7,17 +7,21 @@ def set_step_kind(is_decode_only: bool) -> None:
     return None
 
 
-class section:
+class _NoopSection:
     __slots__ = ()
 
-    def __init__(self, name: str) -> None:
-        return None
-
-    def __enter__(self) -> "section":
+    def __enter__(self) -> "_NoopSection":
         return self
 
     def __exit__(self, *exc) -> None:
         return None
+
+
+_NOOP_SECTION = _NoopSection()
+
+
+def section(name: str) -> _NoopSection:
+    return _NOOP_SECTION
 
 
 def begin(name: str):

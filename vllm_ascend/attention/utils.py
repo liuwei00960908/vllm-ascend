@@ -15,9 +15,11 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_de
 
 logger = init_logger(__name__)
 
+_DSA_LMCACHE_TRACE = envs.VLLM_ASCEND_DSA_LMCACHE_TRACE
+
 
 def _dsa_lmcache_log_layer(layer_name: str) -> bool:
-    return "layers.0." in layer_name
+    return _DSA_LMCACHE_TRACE and "layers.0." in layer_name
 
 
 def _tensor_like_debug(value: Any) -> dict[str, Any] | None:
@@ -212,6 +214,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # SFA builder expands them per ROW (decode rows -> plen, prefill/padding
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
+    request_ids: list[str] | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -239,6 +242,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            request_ids=(
+                self.request_ids[:num_actual_reqs]
+                if self.request_ids is not None
+                else None
+            ),
         )
 
 
@@ -323,12 +331,43 @@ def wait_for_kv_layer_from_connector(
         return
 
     connector = get_kv_transfer_group()
+    should_log = _dsa_lmcache_log_layer(layer_name)
+
+    if selected_tokens is not None and request_ids is not None and not should_log:
+        try:
+            if target_slot_mapping is None:
+                connector.wait_for_layer_load(
+                    layer_name, selected_tokens, token_start_index, request_ids
+                )
+            else:
+                connector.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    target_slot_mapping=target_slot_mapping,
+                )
+        except Exception:
+            logger.exception(
+                "[DSA_INDEX_LMCACHE] connector_wait_error layer=%s "
+                "connector=%s selected=%s token_start_index=%s request_ids=%s "
+                "target_slot_mapping=%s attn_metadata=%s",
+                layer_name,
+                type(connector).__name__,
+                _tensor_like_debug(selected_tokens),
+                _tensor_like_debug(token_start_index),
+                request_ids,
+                _tensor_like_debug(target_slot_mapping),
+                None,
+            )
+            raise
+        return
+
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
         return
 
-    should_log = _dsa_lmcache_log_layer(layer_name)
     if should_log:
         logger.info(
             "[DSA_INDEX_LMCACHE] connector_wait_enter layer=%s "
