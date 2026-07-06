@@ -249,13 +249,6 @@ def _decode_window_gather_debug_enabled() -> bool:
     return _dsa_env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
 
 
-def _decode_window_gather_debug_limit() -> int:
-    try:
-        return max(1, int(os.environ.get("LMCACHE_DECODE_WINDOW_DEBUG_LIMIT", "4")))
-    except ValueError:
-        return 4
-
-
 def _decode_window_gather_layer_enabled(layer_name: str) -> bool:
     layer_filter = os.environ.get("LMCACHE_DECODE_WINDOW_DEBUG_LAYER", "").strip()
     if layer_filter:
@@ -266,20 +259,10 @@ def _decode_window_gather_layer_enabled(layer_name: str) -> bool:
     return ".layers.0." in layer_name or ".layers.77." in layer_name
 
 
-def _decode_window_gather_should_log(owner: object, layer_name: str) -> bool:
+def _decode_window_gather_should_log(layer_name: str) -> bool:
     if not _decode_window_gather_debug_enabled():
         return False
-    if not _decode_window_gather_layer_enabled(layer_name):
-        return False
-    counts = getattr(owner, "_decode_window_gather_debug_counts", None)
-    if counts is None:
-        counts = {}
-        setattr(owner, "_decode_window_gather_debug_counts", counts)
-    count = counts.get(layer_name, 0)
-    if count >= _decode_window_gather_debug_limit():
-        return False
-    counts[layer_name] = count + 1
-    return True
+    return _decode_window_gather_layer_enabled(layer_name)
 
 
 def _dsa_kv_debug_enabled() -> bool:
@@ -2922,7 +2905,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _decode_window_gather_log = (
                     bool(self.dsa_shrink_latent)
                     and _decode_window_save_window_size() > 0
-                    and _decode_window_gather_should_log(self, layer_name)
+                    and _decode_window_gather_should_log(layer_name)
                 )
                 if _decode_window_gather_log:
                     logger.warning(
