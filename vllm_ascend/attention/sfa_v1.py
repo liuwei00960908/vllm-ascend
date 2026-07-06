@@ -246,9 +246,7 @@ def _decode_window_save_window_size() -> int:
 
 
 def _decode_window_gather_debug_enabled() -> bool:
-    return _dsa_env_flag("LMCACHE_DECODE_WINDOW_GATHER_DEBUG") or _dsa_env_flag(
-        "LMCACHE_DECODE_WINDOW_SAVE_DEBUG"
-    )
+    return _dsa_env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
 
 
 def _decode_window_gather_debug_limit() -> int:
