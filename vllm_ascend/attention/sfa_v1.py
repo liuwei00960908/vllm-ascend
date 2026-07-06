@@ -245,6 +245,45 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
+def _decode_window_gather_debug_enabled() -> bool:
+    return _dsa_env_flag("LMCACHE_DECODE_WINDOW_GATHER_DEBUG") or _dsa_env_flag(
+        "LMCACHE_DECODE_WINDOW_SAVE_DEBUG"
+    )
+
+
+def _decode_window_gather_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("LMCACHE_DECODE_WINDOW_DEBUG_LIMIT", "4")))
+    except ValueError:
+        return 4
+
+
+def _decode_window_gather_layer_enabled(layer_name: str) -> bool:
+    layer_filter = os.environ.get("LMCACHE_DECODE_WINDOW_DEBUG_LAYER", "").strip()
+    if layer_filter:
+        return any(
+            part.strip() and part.strip() in layer_name
+            for part in layer_filter.split(",")
+        )
+    return ".layers.0." in layer_name or ".layers.77." in layer_name
+
+
+def _decode_window_gather_should_log(owner: object, layer_name: str) -> bool:
+    if not _decode_window_gather_debug_enabled():
+        return False
+    if not _decode_window_gather_layer_enabled(layer_name):
+        return False
+    counts = getattr(owner, "_decode_window_gather_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_decode_window_gather_debug_counts", counts)
+    count = counts.get(layer_name, 0)
+    if count >= _decode_window_gather_debug_limit():
+        return False
+    counts[layer_name] = count + 1
+    return True
+
+
 def _dsa_kv_debug_enabled() -> bool:
     return _dsa_env_flag("VLLM_ASCEND_DSA_KV_DEBUG")
 
@@ -2532,6 +2571,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_wait_log = bool(self.dsa_shrink_latent) and _dsa_debug_should_log(
             self, "shrink_wait", layer_name
         )
+        _decode_window_gather_log = (
+            bool(self.dsa_shrink_latent)
+            and _decode_window_save_window_size() > 0
+            and _decode_window_gather_should_log(self, layer_name)
+        )
         _topk_before_remap_for_gather_debug = None
         _remap_boundary_for_gather_debug = None
         _remapped_topk_for_gather_debug = None
@@ -2881,9 +2925,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                if _dsa_wait_log:
+                if _decode_window_gather_log:
                     logger.warning(
-                        "[DSA_SHRINK_CHECK] gather_decode_input layer=%s "
+                        "[DECODE_WINDOW_GATHER] input layer=%s "
                         "topk_is_remapped_obj=%s original_topk_shape=%s "
                         "original_topk_sample=%s original_topk_minmax_count=%s "
                         "remapped_topk_shape=%s remapped_topk_sample=%s "
@@ -2931,9 +2975,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _kp,
                         store_current=not self.dsa_offload_free_paged,
                     )
-                if _dsa_wait_log:
+                if _decode_window_gather_log:
                     logger.warning(
-                        "[DSA_SHRINK_CHECK] gather_decode_output layer=%s "
+                        "[DECODE_WINDOW_GATHER] output layer=%s "
                         "c_idx_shape=%s c_idx_sample=%s c_idx_minmax_count=%s "
                         "s_bt_shape=%s s_bt_sample=%s s_bt_minmax_count=%s "
                         "s_kv_shape=%s s_kv_sample=%s s_kv_minmax_count=%s "
