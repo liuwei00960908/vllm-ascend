@@ -256,13 +256,55 @@ def _decode_window_gather_layer_enabled(layer_name: str) -> bool:
             part.strip() and part.strip() in layer_name
             for part in layer_filter.split(",")
         )
-    return ".layers.0." in layer_name or ".layers.77." in layer_name
+    return True
 
 
 def _decode_window_gather_should_log(layer_name: str) -> bool:
     if not _decode_window_gather_debug_enabled():
         return False
     return _decode_window_gather_layer_enabled(layer_name)
+
+
+def _decode_window_sync_checkpoint(
+    layer_name: str | None,
+    phase: str,
+    attn_metadata: Any | None = None,
+    trace_label: str | None = None,
+) -> None:
+    if not _decode_window_gather_debug_enabled():
+        return
+    if _decode_window_save_window_size() <= 0:
+        return
+    if layer_name is not None and not _decode_window_gather_layer_enabled(layer_name):
+        return
+    if (
+        attn_metadata is not None
+        and getattr(attn_metadata, "attn_state", None) != AscendAttentionState.DecodeOnly
+    ):
+        return
+
+    logger.warning(
+        "[DECODE_WINDOW_SYNC] begin layer=%s phase=%s label=%s",
+        layer_name,
+        phase,
+        trace_label,
+    )
+    try:
+        torch.npu.current_stream().synchronize()
+    except Exception:
+        logger.exception(
+            "[DECODE_WINDOW_SYNC] failed layer=%s phase=%s label=%s",
+            layer_name,
+            phase,
+            trace_label,
+        )
+        raise
+    logger.warning(
+        "[DECODE_WINDOW_SYNC] done layer=%s phase=%s label=%s",
+        layer_name,
+        phase,
+        trace_label,
+    )
 
 
 def _dsa_kv_debug_enabled() -> bool:
@@ -2253,6 +2295,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata=attn_metadata,
         )
 
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "before_sparse_flash_attention",
+            attn_metadata,
+            trace_label,
+        )
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
@@ -2268,6 +2316,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+        )
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "after_sparse_flash_attention",
+            attn_metadata,
+            trace_label,
         )
         return attn_output
 
@@ -2634,10 +2688,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _remap_boundary = torch.where(
                     _decode_rows, _window_start, _remap_boundary
                 )
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "before_scratch_remap",
+                attn_metadata,
+                "scratch_remap",
+            )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices, _remap_boundary, need_packed=_need_packed
                 )
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "after_scratch_remap",
+                attn_metadata,
+                "scratch_remap",
+            )
             _topk_before_remap_for_gather_debug = _topk_before_remap
             _remap_boundary_for_gather_debug = _remap_boundary
             _remapped_topk_for_gather_debug = topk_indices
@@ -2735,11 +2801,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _selected_for_wait.device,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
+                _decode_window_sync_checkpoint(
+                    layer_name,
+                    "before_lmcache_wait",
+                    attn_metadata,
+                    "lmcache_wait",
+                )
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
                     )
+                _decode_window_sync_checkpoint(
+                    layer_name,
+                    "after_lmcache_wait",
+                    attn_metadata,
+                    "lmcache_wait",
+                )
                 if _dsa_wait_log:
                     logger.warning(
                         "[DSA_SHRINK_CHECK] connector_wait_returned layer=%s",
@@ -2790,8 +2868,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"(dsa_cp={self.enable_dsa_cp}, sparse_c8={self.use_sparse_c8_indexer}, "
                 f"mlapo_native={_dsa_on_native_path}); using native attention."
             )
-
         attn_output = None
+        if (
+            _decode_window_gather_debug_enabled()
+            and _decode_window_save_window_size() > 0
+            and _decode_window_gather_layer_enabled(layer_name)
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        ):
+            logger.warning(
+                "[DECODE_WINDOW_SYNC] path layer=%s dsa_supported=%s "
+                "adapter_supported=%s dsa_mgr=%s dsa_adapter=%s "
+                "attn_output_none=%s",
+                layer_name,
+                _dsa_supported,
+                _adapter_supported,
+                _dsa_mgr is not None,
+                _dsa_adapter is not None,
+                attn_output is None,
+            )
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "after_path_select",
+            attn_metadata,
+            "path",
+        )
+
         if _adapter_supported:
             # Adapter-backed latent hot cache: FA reads the resident pool in place
             # (zero-copy), the adapter owns residency (hit/miss) + eviction.
@@ -2944,6 +3045,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                         getattr(_dsa_mgr.config, "scratch_blocks_per_req", None),
                         getattr(_dsa_mgr.config, "scratch_num_blocks", None),
                     )
+                _decode_window_sync_checkpoint(
+                    layer_name,
+                    "before_gather_decode",
+                    attn_metadata,
+                    "lmcache_scratch",
+                )
                 with _dsa_prof.section("gather"):
                     s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
                         _dsa_mgr,
@@ -2957,6 +3064,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _kp,
                         store_current=not self.dsa_offload_free_paged,
                     )
+                _decode_window_sync_checkpoint(
+                    layer_name,
+                    "after_gather_decode",
+                    attn_metadata,
+                    "lmcache_scratch",
+                )
                 if _decode_window_gather_log:
                     logger.warning(
                         "[DECODE_WINDOW_GATHER] output layer=%s "
@@ -3056,24 +3169,60 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "before_v_up_proj",
+            attn_metadata,
+            "v_up_proj",
+        )
         attn_output = self._v_up_proj(attn_output)
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "after_v_up_proj",
+            attn_metadata,
+            "v_up_proj",
+        )
         weight_prefetch_method = get_weight_prefetch_method()
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "before_weight_prefetch",
+            attn_metadata,
+            "weight_prefetch",
+        )
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
             dependency=attn_output,
             max_size=MAX_O_PROJ_PREFETCH_SIZE,
             linear_layer=self.o_proj,
         )
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "after_weight_prefetch",
+            attn_metadata,
+            "weight_prefetch",
+        )
 
         if self.enable_dsa_cp_with_o_proj_tp:
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "before_o_proj_tp_switch",
+                attn_metadata,
+                "o_proj_tp_switch",
+            )
             result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
                 attn_output=attn_output,
                 output=output,
                 o_proj_full_handle=o_proj_full_handle,
                 should_shard_weight=full_gather_o_proj_enabled,
+            )
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "after_o_proj_tp_switch",
+                attn_metadata,
+                "o_proj_tp_switch",
             )
             if not require_o_proj_forward:
                 _dsa_prof.end(_sfa_t)
@@ -3088,9 +3237,33 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
             attn_output = torch.empty_like(send)
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "before_all_to_all",
+                attn_metadata,
+                "all_to_all",
+            )
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
+            _decode_window_sync_checkpoint(
+                layer_name,
+                "after_all_to_all",
+                attn_metadata,
+                "all_to_all",
+            )
 
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "before_o_proj",
+            attn_metadata,
+            "o_proj",
+        )
         output[...] = self.o_proj(attn_output)[0]
+        _decode_window_sync_checkpoint(
+            layer_name,
+            "after_o_proj",
+            attn_metadata,
+            "o_proj",
+        )
 
         # Offload to LMCache. Un-bundled: save ONLY the latent (k_nope, k_pe) — the
         # indexer key (kv_cache[2]) stays resident on NPU (it scores every step), so it
