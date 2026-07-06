@@ -245,26 +245,6 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
-def _decode_window_gather_debug_enabled() -> bool:
-    return _dsa_env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
-
-
-def _decode_window_gather_layer_enabled(layer_name: str) -> bool:
-    layer_filter = os.environ.get("LMCACHE_DECODE_WINDOW_DEBUG_LAYER", "").strip()
-    if layer_filter:
-        return any(
-            part.strip() and part.strip() in layer_name
-            for part in layer_filter.split(",")
-        )
-    return True
-
-
-def _decode_window_gather_should_log(layer_name: str) -> bool:
-    if not _decode_window_gather_debug_enabled():
-        return False
-    return _decode_window_gather_layer_enabled(layer_name)
-
-
 def _dsa_kv_debug_enabled() -> bool:
     return _dsa_env_flag("VLLM_ASCEND_DSA_KV_DEBUG")
 
@@ -2552,10 +2532,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_wait_log = bool(self.dsa_shrink_latent) and _dsa_debug_should_log(
             self, "shrink_wait", layer_name
         )
-        _decode_window_gather_log = False
-        _topk_before_remap_for_gather_debug = None
-        _remap_boundary_for_gather_debug = None
-        _remapped_topk_for_gather_debug = None
         if _dsa_wait_log:
             _fc_dbg = get_forward_context()
             logger.info(
@@ -2638,9 +2614,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices, _remap_boundary, need_packed=_need_packed
                 )
-            _topk_before_remap_for_gather_debug = _topk_before_remap
-            _remap_boundary_for_gather_debug = _remap_boundary
-            _remapped_topk_for_gather_debug = topk_indices
             if _dsa_wait_log:
                 logger.info(
                     "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
@@ -2902,48 +2875,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                _decode_window_gather_log = (
-                    bool(self.dsa_shrink_latent)
-                    and _decode_window_save_window_size() > 0
-                    and _decode_window_gather_should_log(layer_name)
-                )
-                if _decode_window_gather_log:
-                    logger.warning(
-                        "[DECODE_WINDOW_GATHER] input layer=%s "
-                        "topk_is_remapped_obj=%s original_topk_shape=%s "
-                        "original_topk_sample=%s original_topk_minmax_count=%s "
-                        "remapped_topk_shape=%s remapped_topk_sample=%s "
-                        "remapped_topk_minmax_count=%s gather_topk_shape=%s "
-                        "gather_topk_sample=%s gather_topk_minmax_count=%s "
-                        "remap_boundary_sample=%s remap_boundary_minmax_count=%s "
-                        "dsa_prompt_lens_sample=%s dsa_prompt_lens_minmax_count=%s "
-                        "cur_pos_sample=%s cur_pos_minmax_count=%s block_size=%s "
-                        "scratch_blocks_per_req=%s scratch_num_blocks=%s",
-                        layer_name,
-                        topk_indices is _remapped_topk_for_gather_debug,
-                        tuple(_topk_before_remap_for_gather_debug.shape)
-                        if _topk_before_remap_for_gather_debug is not None
-                        else None,
-                        _dsa_debug_sample(_topk_before_remap_for_gather_debug),
-                        _dsa_debug_minmax_count(_topk_before_remap_for_gather_debug),
-                        tuple(_remapped_topk_for_gather_debug.shape)
-                        if _remapped_topk_for_gather_debug is not None
-                        else None,
-                        _dsa_debug_sample(_remapped_topk_for_gather_debug),
-                        _dsa_debug_minmax_count(_remapped_topk_for_gather_debug),
-                        tuple(topk_indices.shape),
-                        _dsa_debug_sample(topk_indices),
-                        _dsa_debug_minmax_count(topk_indices),
-                        _dsa_debug_sample(_remap_boundary_for_gather_debug),
-                        _dsa_debug_minmax_count(_remap_boundary_for_gather_debug),
-                        _dsa_debug_sample(_dsa_fc.dsa_prompt_lens),
-                        _dsa_debug_minmax_count(_dsa_fc.dsa_prompt_lens),
-                        _dsa_debug_sample(_cur_pos),
-                        _dsa_debug_minmax_count(_cur_pos),
-                        _block_size,
-                        getattr(_dsa_mgr.config, "scratch_blocks_per_req", None),
-                        getattr(_dsa_mgr.config, "scratch_num_blocks", None),
-                    )
                 with _dsa_prof.section("gather"):
                     s_knope, s_kpe, c_idx, s_bt, s_kv = _dsa_hooks.gather_decode(
                         _dsa_mgr,
@@ -2956,26 +2887,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _kn,
                         _kp,
                         store_current=not self.dsa_offload_free_paged,
-                    )
-                if _decode_window_gather_log:
-                    logger.warning(
-                        "[DECODE_WINDOW_GATHER] output layer=%s "
-                        "c_idx_shape=%s c_idx_sample=%s c_idx_minmax_count=%s "
-                        "s_bt_shape=%s s_bt_sample=%s s_bt_minmax_count=%s "
-                        "s_kv_shape=%s s_kv_sample=%s s_kv_minmax_count=%s "
-                        "s_knope_shape=%s s_kpe_shape=%s",
-                        layer_name,
-                        tuple(c_idx.shape),
-                        _dsa_debug_sample(c_idx),
-                        _dsa_debug_minmax_count(c_idx),
-                        tuple(s_bt.shape),
-                        _dsa_debug_sample(s_bt),
-                        _dsa_debug_minmax_count(s_bt),
-                        tuple(s_kv.shape),
-                        _dsa_debug_sample(s_kv),
-                        _dsa_debug_minmax_count(s_kv),
-                        tuple(s_knope.shape),
-                        tuple(s_kpe.shape),
                     )
                 # kernel expects sparse_indices as 3-D [num_tokens, 1, topk].
                 with _dsa_prof.section("kernel"):
