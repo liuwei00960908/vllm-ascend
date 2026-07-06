@@ -2569,11 +2569,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_wait_log = bool(self.dsa_shrink_latent) and _dsa_debug_should_log(
             self, "shrink_wait", layer_name
         )
-        _decode_window_gather_log = (
-            bool(self.dsa_shrink_latent)
-            and _decode_window_save_window_size() > 0
-            and _decode_window_gather_should_log(self, layer_name)
-        )
+        _decode_window_gather_log = False
         _topk_before_remap_for_gather_debug = None
         _remap_boundary_for_gather_debug = None
         _remapped_topk_for_gather_debug = None
@@ -2923,6 +2919,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                _decode_window_gather_log = (
+                    bool(self.dsa_shrink_latent)
+                    and _decode_window_save_window_size() > 0
+                    and _decode_window_gather_should_log(self, layer_name)
+                )
                 if _decode_window_gather_log:
                     logger.warning(
                         "[DECODE_WINDOW_GATHER] input layer=%s "
