@@ -1816,10 +1816,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = self._get_full_kv(k_li, attn_metadata)
 
         if kv_cache is not None:
-            if (
-                index_lmcache_enabled
-                and not _is_pure_decode
-            ):
+            if index_lmcache_enabled:
+                # Shared-cache sparse decode needs prompt index rows before
+                # top-k selection; latent rows are loaded later after top-k.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
 
