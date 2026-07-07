@@ -2285,8 +2285,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Offload to LMCache. Legacy un-bundled connectors save only the latent
         # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
-        # save the sibling indexer layer in prefill; pure decode still skips
-        # indexer save. Bundled path saves the whole tuple as before.
+        # Save the sibling indexer layer whenever the LMCache indexer path is
+        # enabled. Bundled path saves the whole tuple as before.
         # Shrink-latent: a pure-decode step's latent lives in the resident tail and is
         # never reloaded from LMCache, so saving it every decode layer is redundant
         # connector work (scales with batch). Skip save on steps with no prefill tokens
@@ -2309,7 +2309,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     len(kv_cache) >= 3
                     and index_layer_name is not None
                     and index_lmcache_enabled
-                    and not _is_pure_decode
                 ):
                     maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
             else:
