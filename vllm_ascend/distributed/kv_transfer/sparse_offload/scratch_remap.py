@@ -3,10 +3,10 @@
 Decode reads the latent through two disjoint index spaces resolved by the SAME
 per-request block table:
 
-  * prompt positions saved in LMCache (< prompt_len) -> compact scratch rows
-    [0..n_ret) (the request's first ceil(k/block_size) latent blocks, filled by
-    LMCache);
-  * decode positions not saved in LMCache -> kept in place.
+  * LMCache-selected positions (< cache boundary) -> compact scratch rows [0..n_ret)
+    (the request's first ceil(k/block_size) latent blocks, filled by LMCache);
+  * live-cache positions (>= cache boundary >= k) -> kept ABSOLUTE, read in
+    place from their tail blocks. No copy, no [retrieve|decode] assembly.
 
 Everything is fixed-shape tensor math: no D2H sync, graph-mode friendly.
 """
@@ -25,9 +25,10 @@ def scratch_remap(
     Args:
         topk_indices: [bs, 1, k] (or [bs, k]) absolute token positions selected
             by the indexer; negative entries are padding.
-        prompt_lens: [bs] prompt length per decode request. Callers must ensure
-            prompt_len >= k for every row (else scratch rows would alias live
-            decode positions).
+        prompt_lens: [bs] cache boundary per decode request. In the original
+            mode this is the prompt length; decode-window mode passes the
+            current window start. Callers must ensure boundary >= k for every
+            row (else scratch rows would alias live-cache positions).
         need_packed: whether to build the LMCache selected-token payload.
         scratch_base: optional [bs] compact scratch base per row. This lets MTP
             rows for the same request use disjoint compact scratch ranges.
@@ -35,7 +36,7 @@ def scratch_remap(
     Returns:
         new_indices: same shape as topk_indices. LMCache-selected entries are
             replaced by their compact scratch row (scratch_base + rank in
-            top-k order); live decode and padding entries stay unchanged.
+            top-k order); live-cache and padding entries stay unchanged.
         selected_packed: [bs, k] int32. LMCache-selected ABSOLUTE positions
             front-packed in top-k order (the LMCache `selected_tokens` rows; row
             i goes to scratch slot i), tail padded with 0.

@@ -320,6 +320,38 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
+def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
+    if request_ids is None:
+        return None
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return None
+
+    connector = get_kv_transfer_group()
+    get_metadata = getattr(connector, "_get_connector_metadata", None)
+    if get_metadata is None:
+        return None
+    try:
+        metadata = get_metadata()
+    except Exception:
+        return None
+
+    cached_by_req: dict[str, int] = {}
+    for request in getattr(metadata, "requests", ()):
+        if not getattr(request, "is_sparse_decode", False):
+            continue
+        load_spec = getattr(request, "load_spec", None)
+        if load_spec is None or not getattr(load_spec, "can_load", False):
+            cached_by_req[getattr(request, "req_id", "")] = 0
+        else:
+            cached_by_req[getattr(request, "req_id", "")] = int(
+                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
+            )
+
+    if not cached_by_req:
+        return None
+    return [cached_by_req.get(str(req_id), 0) for req_id in list(request_ids)]
+
+
 def wait_for_kv_layer_from_connector(
     layer_name: str,
     selected_tokens=None,

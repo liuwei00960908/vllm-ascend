@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
+import os
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -38,6 +39,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -98,6 +100,14 @@ def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices
     return topk_indices.reshape(topk_indices.shape[0], -1)
+
+
+def _decode_window_save_window_size() -> int:
+    value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
 
 
 def _dsa_mask_padding_sparse_rows(
@@ -548,10 +558,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
 
-        # DSA shrink-latent: expand per-request prompt lengths to per-ROW values
-        # for scratch_remap — decode rows (position >= prompt_len) get plen,
-        # prefill and padding rows get 0 (= left untouched by the remap). Works
-        # for both pure-decode and mixed chunked-prefill+decode steps.
+        # DSA shrink-latent: expand per-request prompt lengths to per-row cache
+        # boundaries for scratch_remap. Decode rows get prompt_len by default;
+        # decode-window mode later replaces those rows with current_window_start.
+        # Prefill and padding rows get 0 and stay untouched by the remap.
         prompt_lens_rows = None
         decode_req_indices_rows = None
         decode_valid_row_indices = None
@@ -1851,20 +1861,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
-        # Remap prefill-selected entries to compact scratch rows [0..n_ret) (the
-        # request's first ceil(k/block_size) latent blocks) and have LMCache
-        # scatter exactly those tokens into the scratch; decode-selected entries
-        # keep their ABSOLUTE positions (>= prompt_len >= k, disjoint from the
-        # scratch row space) and are read in place via the same block table.
+        # Remap LMCache-selected entries to compact scratch rows [0..n_ret)
+        # (the request's first ceil(k/block_size) latent blocks) and have
+        # LMCache scatter exactly those tokens into scratch. Live-cache entries
+        # keep their absolute positions and are read in place via the same
+        # block table. Decode-window mode uses current_window_start as the
+        # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         if (
             self.dsa_shrink_latent
             and attn_metadata.prompt_lens is not None
             and attn_metadata.num_decode_tokens > 0
         ):
-            # prompt_lens is per ROW: decode rows carry their request's prompt
-            # length, prefill/padding rows carry 0 and stay untouched — so this
-            # also covers mixed chunked-prefill + decode steps.
+            # _remap_boundary is per row. Decode rows carry prompt_len by
+            # default; decode-window mode replaces it with current_window_start.
+            # Prefill/padding rows carry 0 and stay untouched, so this also
+            # covers mixed chunked-prefill + decode steps.
             # The packed front-list only feeds LMCache's selected_tokens; skip building
             # it (and its scatter) when no v1 connector will consume it (profiling /
             # no-offload runs). Production with an LMCache connector is unchanged.
@@ -1882,10 +1894,39 @@ class AscendSFAImpl(MLAAttentionImpl):
                     .to(device=topk_indices.device)
                     * _topk_width
                 )
+            _remap_boundary = attn_metadata.prompt_lens
+            _decode_window_size = _decode_window_save_window_size()
+            if _decode_window_size > 0:
+                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                _window_start = (
+                    _cur_pos // _decode_window_size * _decode_window_size
+                ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
+                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
+                    getattr(get_forward_context(), "dsa_req_ids", None)
+                )
+                if _lmcache_cached_tokens is not None:
+                    _committed_end = torch.tensor(
+                        _lmcache_cached_tokens,
+                        device=_remap_boundary.device,
+                        dtype=_remap_boundary.dtype,
+                    )
+                    if _committed_end.numel() < _window_start.numel():
+                        _committed_end = torch.nn.functional.pad(
+                            _committed_end,
+                            (0, _window_start.numel() - _committed_end.numel()),
+                        )
+                    _committed_end = _committed_end[: _window_start.numel()]
+                    _window_start = torch.minimum(_window_start, _committed_end)
+                _decode_rows = torch.arange(
+                    _remap_boundary.shape[0], device=_remap_boundary.device
+                ) < int(attn_metadata.num_decode_tokens)
+                _remap_boundary = torch.where(
+                    _decode_rows, _window_start, _remap_boundary
+                )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
-                    attn_metadata.prompt_lens,
+                    _remap_boundary,
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                 )
@@ -2255,9 +2296,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
+        _decode_window_save_enabled = _decode_window_save_window_size() > 0
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
             and _is_pure_decode
+            and not _decode_window_save_enabled
         )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:

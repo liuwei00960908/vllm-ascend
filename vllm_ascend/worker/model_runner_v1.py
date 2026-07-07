@@ -66,6 +66,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -1637,13 +1638,28 @@ class NPUModelRunner(GPUModelRunner):
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
             if has_kv_transfer_group():
-                get_kv_transfer_group().clear_connector_metadata()
+                if self.speculative_config:
+                    completed_decode_window_saves = self.finalize_kv_connector()
+                    if completed_decode_window_saves:
+                        if kv_connector_output is None:
+                            kv_connector_output = KVConnectorOutput()
+                        for req_id, window_end in completed_decode_window_saves.items():
+                            kv_connector_output.completed_decode_window_saves[
+                                req_id
+                            ] = max(
+                                kv_connector_output.completed_decode_window_saves.get(
+                                    req_id, 0
+                                ),
+                                window_end,
+                            )
+                else:
+                    get_kv_transfer_group().clear_connector_metadata()
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
