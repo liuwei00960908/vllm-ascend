@@ -1917,12 +1917,45 @@ class AscendSFAImpl(MLAAttentionImpl):
                         )
                     _committed_end = _committed_end[: _window_start.numel()]
                     _window_start = torch.minimum(_window_start, _committed_end)
-                _decode_rows = torch.arange(
-                    _remap_boundary.shape[0], device=_remap_boundary.device
-                ) < int(attn_metadata.num_decode_tokens)
-                _remap_boundary = torch.where(
-                    _decode_rows, _window_start, _remap_boundary
+                _row_req_indices = getattr(
+                    attn_metadata, "decode_req_indices", None
                 )
+                if _row_req_indices is not None:
+                    _row_req_indices = _row_req_indices[
+                        : _remap_boundary.shape[0]
+                    ].to(device=_remap_boundary.device, dtype=torch.long)
+                    _valid_decode_rows = _row_req_indices >= 0
+                    if _window_start.numel() == 0:
+                        raise RuntimeError(
+                            "decode-window sparse remap has decode rows but "
+                            "no request seq_lens"
+                        )
+                    _safe_row_req_indices = _row_req_indices.clamp(
+                        min=0, max=int(_window_start.numel()) - 1
+                    )
+                    _window_start_rows = _window_start.index_select(
+                        0, _safe_row_req_indices
+                    ).to(dtype=_remap_boundary.dtype)
+                    _remap_boundary = torch.where(
+                        _valid_decode_rows,
+                        _window_start_rows,
+                        _remap_boundary,
+                    )
+                else:
+                    if _window_start.shape[0] != _remap_boundary.shape[0]:
+                        raise RuntimeError(
+                            "decode-window sparse remap requires per-row "
+                            "decode_req_indices when request and row counts "
+                            "differ: "
+                            f"window_start_shape={tuple(_window_start.shape)} "
+                            f"remap_boundary_shape={tuple(_remap_boundary.shape)}"
+                        )
+                    _decode_rows = torch.arange(
+                        _remap_boundary.shape[0], device=_remap_boundary.device
+                    ) < int(attn_metadata.num_decode_tokens)
+                    _remap_boundary = torch.where(
+                        _decode_rows, _window_start, _remap_boundary
+                    )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
