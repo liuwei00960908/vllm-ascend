@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
+import hashlib
+import json
 import os
+import time
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -75,6 +78,142 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 _DSA_TARGET_SLOT_GUARD = envs.VLLM_ASCEND_DSA_TARGET_SLOT_GUARD
+
+
+# #region agent log
+_DEBUG_05D10F = os.getenv("LMCACHE_DEBUG_05D10F", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def _debug_05d10f_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    if not _DEBUG_05D10F:
+        return
+    payload = {
+        "sessionId": "05d10f",
+        "runId": "baseline",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        encoded = (json.dumps(payload, default=str) + "\n").encode()
+        fd = os.open(
+            "debug-05d10f.log",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _debug_05d10f_tensor_sha256(value: torch.Tensor | None) -> str | None:
+    if value is None:
+        return None
+    raw = (
+        value.detach()
+        .contiguous()
+        .view(torch.uint8)
+        .to(device="cpu")
+        .numpy()
+        .tobytes()
+    )
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _debug_05d10f_layer_id(layer_name: str) -> int | None:
+    marker = "layers."
+    marker_idx = layer_name.find(marker)
+    if marker_idx < 0:
+        return None
+    start = marker_idx + len(marker)
+    end = start
+    while end < len(layer_name) and layer_name[end].isdigit():
+        end += 1
+    return int(layer_name[start:end]) if end > start else None
+
+
+def _debug_05d10f_attention_input_digest(
+    kv_cache: tuple[torch.Tensor, ...],
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+) -> dict:
+    topk_2d = (
+        topk_indices[:, 0, :]
+        if topk_indices.dim() == 3 and topk_indices.shape[1] == 1
+        else topk_indices.reshape(topk_indices.shape[0], -1)
+    ).to(dtype=torch.long)
+    rows = min(int(topk_2d.shape[0]), int(block_table.shape[0]))
+    topk_2d = topk_2d[:rows]
+    table = block_table[:rows]
+    block_size = int(kv_cache[0].shape[1])
+    logical_blocks = torch.div(
+        topk_2d.clamp(min=0),
+        block_size,
+        rounding_mode="floor",
+    )
+    table_width = int(table.shape[1])
+    in_table = (topk_2d >= 0) & (logical_blocks < table_width)
+    safe_logical = logical_blocks.clamp(
+        min=0,
+        max=max(0, table_width - 1),
+    )
+    physical_blocks = table.to(dtype=torch.long).gather(1, safe_logical)
+    physical_slots = (
+        physical_blocks * block_size
+        + torch.remainder(topk_2d.clamp(min=0), block_size)
+    )
+    valid = in_table & (physical_blocks >= 0)
+    consumed_slots = physical_slots[valid].reshape(-1)
+    result = {
+        "topk_sha256": _debug_05d10f_tensor_sha256(topk_2d),
+        "resolved_slots_sha256": _debug_05d10f_tensor_sha256(
+            consumed_slots
+        ),
+        "rows": rows,
+        "width": int(topk_2d.shape[1]),
+        "valid_entries": int(valid.sum().to(device="cpu").item()),
+        "invalid_entries": int((~valid).sum().to(device="cpu").item()),
+        "slot_min": (
+            int(consumed_slots.min().to(device="cpu").item())
+            if consumed_slots.numel()
+            else None
+        ),
+        "slot_max": (
+            int(consumed_slots.max().to(device="cpu").item())
+            if consumed_slots.numel()
+            else None
+        ),
+    }
+    for cache_index, cache_name in ((0, "latent"), (1, "rope")):
+        cache_rows = kv_cache[cache_index].detach().reshape(
+            int(kv_cache[cache_index].shape[0]) * block_size,
+            -1,
+        )
+        consumed = cache_rows.index_select(
+            0,
+            consumed_slots.to(device=cache_rows.device),
+        )
+        result[f"{cache_name}_sha256"] = _debug_05d10f_tensor_sha256(
+            consumed
+        )
+        result[f"{cache_name}_shape"] = list(consumed.shape)
+    return result
+# #endregion
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -1617,6 +1756,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
+        # #region agent log
+        _debug_05d10f_scratch_after_wait = None
+        # #endregion
         index_layer_name = (
             _dsa_indexer_layer_name(layer_name)
             if self.dsa_offload_unbundle
@@ -2071,6 +2213,99 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
+                # #region agent log
+                _debug_layer_id = _debug_05d10f_layer_id(layer_name)
+                if _DEBUG_05D10F and _debug_layer_id in (
+                    0,
+                    39,
+                    77,
+                ):
+                    _debug_rank = None
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                    ):
+                        _debug_rank = int(torch.distributed.get_rank())
+                    _debug_05d10f_scratch_after_wait = (
+                        _debug_05d10f_attention_input_digest(
+                            kv_cache,
+                            topk_indices,
+                            attn_metadata.block_table,
+                        )
+                    )
+                    _debug_05d10f_log(
+                        "H4,H5,H6",
+                        "sfa_v1.py:AscendSFAImpl.forward:post_sparse_wait",
+                        "semantic sparse remap checkpoint",
+                        {
+                            "pid": int(os.getpid()),
+                            "rank": _debug_rank,
+                            "layer_id": _debug_layer_id,
+                            "num_decode_tokens": int(
+                                attn_metadata.num_decode_tokens
+                            ),
+                            "selected_shape": list(
+                                _selected_for_wait.shape
+                            ),
+                            "selected_sha256": (
+                                _debug_05d10f_tensor_sha256(
+                                    _selected_for_wait
+                                )
+                            ),
+                            "selected_min": int(
+                                _selected_for_wait.min()
+                                .to(device="cpu")
+                                .item()
+                            ),
+                            "selected_max": int(
+                                _selected_for_wait.max()
+                                .to(device="cpu")
+                                .item()
+                            ),
+                            "selected_zero_count": int(
+                                torch.count_nonzero(
+                                    _selected_for_wait == 0
+                                )
+                                .to(device="cpu")
+                                .item()
+                            ),
+                            "target_slots_explicit": (
+                                _target_slot_mapping_for_wait is not None
+                            ),
+                            "target_slots_sha256": (
+                                _debug_05d10f_tensor_sha256(
+                                    _target_slot_mapping_for_wait
+                                )
+                            ),
+                            "remapped_topk_sha256": (
+                                _debug_05d10f_tensor_sha256(topk_indices)
+                            ),
+                            "remap_boundary_sha256": (
+                                _debug_05d10f_tensor_sha256(
+                                    _remap_boundary
+                                )
+                            ),
+                            "remap_boundary_min": int(
+                                _remap_boundary.min()
+                                .to(device="cpu")
+                                .item()
+                            ),
+                            "remap_boundary_max": int(
+                                _remap_boundary.max()
+                                .to(device="cpu")
+                                .item()
+                            ),
+                            "request_count": (
+                                len(_request_ids_for_wait)
+                                if _request_ids_for_wait is not None
+                                else None
+                            ),
+                            "attention_input": (
+                                _debug_05d10f_scratch_after_wait
+                            ),
+                        },
+                    )
+                # #endregion
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
@@ -2280,6 +2515,55 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = pool_out
 
         if attn_output is None:
+            # #region agent log
+            if (
+                _DEBUG_05D10F
+                and _debug_05d10f_scratch_after_wait is not None
+            ):
+                _debug_scratch_before_fa = (
+                    _debug_05d10f_attention_input_digest(
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata.block_table,
+                    )
+                )
+                _debug_rank = None
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    _debug_rank = int(torch.distributed.get_rank())
+                _debug_05d10f_log(
+                    "H6",
+                    "sfa_v1.py:AscendSFAImpl.forward:pre_sparse_attention",
+                    "exact sparse attention KV input checkpoint",
+                    {
+                        "pid": int(os.getpid()),
+                        "rank": _debug_rank,
+                        "layer_id": _debug_05d10f_layer_id(layer_name),
+                        "after_wait": _debug_05d10f_scratch_after_wait,
+                        "before_attention": _debug_scratch_before_fa,
+                        "latent_unchanged": (
+                            _debug_05d10f_scratch_after_wait[
+                                "latent_sha256"
+                            ]
+                            == _debug_scratch_before_fa["latent_sha256"]
+                        ),
+                        "rope_unchanged": (
+                            _debug_05d10f_scratch_after_wait["rope_sha256"]
+                            == _debug_scratch_before_fa["rope_sha256"]
+                        ),
+                        "resolved_slots_unchanged": (
+                            _debug_05d10f_scratch_after_wait[
+                                "resolved_slots_sha256"
+                            ]
+                            == _debug_scratch_before_fa[
+                                "resolved_slots_sha256"
+                            ]
+                        ),
+                    },
+                )
+            # #endregion
             with _dsa_prof.section("fa"):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
