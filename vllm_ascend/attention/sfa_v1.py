@@ -87,6 +87,9 @@ _DEBUG_05D10F = os.getenv("LMCACHE_DEBUG_05D10F", "0").lower() in (
     "yes",
     "on",
 )
+_LMCACHE_SPARSE_WAIT_SYNC = os.getenv(
+    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC", "0"
+).lower() in ("1", "true", "yes", "on")
 
 
 def _debug_05d10f_log(
@@ -119,6 +122,62 @@ def _debug_05d10f_log(
             os.close(fd)
     except OSError:
         pass
+
+
+def _debug_05d10f_log_if_enabled(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    if not (_DEBUG_05D10F or _LMCACHE_SPARSE_WAIT_SYNC):
+        return
+    payload = {
+        "sessionId": "05d10f",
+        "runId": "sparse-wait-sync",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        encoded = (json.dumps(payload, default=str) + "\n").encode()
+        fd = os.open(
+            "debug-05d10f.log",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _sync_npu_current_stream_after_lmcache_sparse_wait(layer_name: str) -> None:
+    if not _LMCACHE_SPARSE_WAIT_SYNC:
+        return
+    if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
+        return
+    sync_start = time.perf_counter()
+    torch.npu.current_stream().synchronize()
+    sync_ms = (time.perf_counter() - sync_start) * 1000.0
+    _debug_rank = None
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _debug_rank = int(torch.distributed.get_rank())
+    _debug_05d10f_log_if_enabled(
+        "H6",
+        "sfa_v1.py:_sync_npu_current_stream_after_lmcache_sparse_wait",
+        "explicit sparse-wait NPU stream synchronize",
+        {
+            "pid": int(os.getpid()),
+            "rank": _debug_rank,
+            "layer_id": _debug_05d10f_layer_id(layer_name),
+            "sync_ms": sync_ms,
+        },
+    )
 
 
 def _debug_05d10f_tensor_sha256(value: torch.Tensor | None) -> str | None:
@@ -2213,6 +2272,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
+                _sync_npu_current_stream_after_lmcache_sparse_wait(layer_name)
                 # #region agent log
                 _debug_layer_id = _debug_05d10f_layer_id(layer_name)
                 if _DEBUG_05D10F and _debug_layer_id in (
