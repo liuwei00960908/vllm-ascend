@@ -1873,6 +1873,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.prompt_lens is not None
             and attn_metadata.num_decode_tokens > 0
         ):
+            _remap_prep_t = _dsa_prof.begin("remap_boundary")
             # _remap_boundary is per row. Decode rows carry prompt_len by
             # default; decode-window mode replaces it with current_window_start.
             # Prefill/padding rows carry 0 and stay untouched, so this also
@@ -1956,6 +1957,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _remap_boundary = torch.where(
                         _decode_rows, _window_start, _remap_boundary
                     )
+            _dsa_prof.end(_remap_prep_t)
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
@@ -1967,6 +1969,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
+                _lmc_wait_prep_t = _dsa_prof.begin("lmc_wait_prep")
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
                 _row_req_indices_for_wait = None
@@ -2052,6 +2055,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         row_scratch_base=_row_scratch_base_for_wait,
                         block_table=attn_metadata.block_table,
                     )
+                _dsa_prof.end(_lmc_wait_prep_t)
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
