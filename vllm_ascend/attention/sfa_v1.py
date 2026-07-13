@@ -503,6 +503,7 @@ class AscendSFAMetadata:
     decode_scratch_base_compact: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
+    decode_remap_boundary: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1957,82 +1958,111 @@ class AscendSFAImpl(MLAAttentionImpl):
             _remap_boundary = attn_metadata.prompt_lens
             _decode_window_size = _decode_window_save_window_size()
             if _decode_window_size > 0:
-                _remap_boundary_prof_inc("decode_window")
-                _prof_start = _remap_boundary_prof_begin()
-                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                _window_start = (
-                    _cur_pos // _decode_window_size * _decode_window_size
-                ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
-                _remap_boundary_prof_add("window_start_build", _prof_start)
-                _prof_start = _remap_boundary_prof_begin()
-                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
-                    getattr(get_forward_context(), "dsa_req_ids", None)
-                )
-                _remap_boundary_prof_add("committed_lookup", _prof_start)
-                if _lmcache_cached_tokens is not None:
-                    _remap_boundary_prof_inc("has_committed")
+                _cached_boundary = attn_metadata.decode_remap_boundary
+                if (
+                    _cached_boundary is not None
+                    and _cached_boundary.shape == _remap_boundary.shape
+                    and _cached_boundary.device == _remap_boundary.device
+                    and _cached_boundary.dtype == _remap_boundary.dtype
+                ):
+                    _remap_boundary = _cached_boundary
+                    _remap_boundary_prof_inc("cache_hit")
+                else:
+                    _remap_boundary_prof_inc("cache_miss")
+                    _remap_boundary_prof_inc("decode_window")
                     _prof_start = _remap_boundary_prof_begin()
-                    _committed_end = torch.tensor(
-                        _lmcache_cached_tokens,
+                    _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
+                    _window_start = (
+                        _cur_pos // _decode_window_size * _decode_window_size
+                    ).to(
                         device=_remap_boundary.device,
                         dtype=_remap_boundary.dtype,
                     )
-                    if _committed_end.numel() < _window_start.numel():
-                        _committed_end = torch.nn.functional.pad(
-                            _committed_end,
-                            (0, _window_start.numel() - _committed_end.numel()),
-                        )
-                    _committed_end = _committed_end[: _window_start.numel()]
-                    _window_start = torch.minimum(_window_start, _committed_end)
-                    _remap_boundary_prof_add("committed_apply", _prof_start)
-                _row_req_indices = getattr(
-                    attn_metadata, "decode_req_indices", None
-                )
-                if _row_req_indices is not None:
-                    _remap_boundary_prof_inc("has_row_req_indices")
+                    _remap_boundary_prof_add("window_start_build", _prof_start)
                     _prof_start = _remap_boundary_prof_begin()
-                    _row_req_indices = _row_req_indices[
-                        : _remap_boundary.shape[0]
-                    ].to(device=_remap_boundary.device, dtype=torch.long)
-                    _valid_decode_rows = _row_req_indices >= 0
-                    if _window_start.numel() == 0:
-                        raise RuntimeError(
-                            "decode-window sparse remap has decode rows but "
-                            "no request seq_lens"
-                        )
-                    _safe_row_req_indices = _row_req_indices.clamp(
-                        min=0, max=int(_window_start.numel()) - 1
+                    _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
+                        getattr(get_forward_context(), "dsa_req_ids", None)
                     )
-                    _window_start_rows = _window_start.index_select(
-                        0, _safe_row_req_indices
-                    ).to(dtype=_remap_boundary.dtype)
-                    _remap_boundary_prof_add("row_select", _prof_start)
-                    _prof_start = _remap_boundary_prof_begin()
-                    _remap_boundary = torch.where(
-                        _valid_decode_rows,
-                        _window_start_rows,
-                        _remap_boundary,
-                    )
-                    _remap_boundary_prof_add("torch_where", _prof_start)
-                else:
-                    if _window_start.shape[0] != _remap_boundary.shape[0]:
-                        raise RuntimeError(
-                            "decode-window sparse remap requires per-row "
-                            "decode_req_indices when request and row counts "
-                            "differ: "
-                            f"window_start_shape={tuple(_window_start.shape)} "
-                            f"remap_boundary_shape={tuple(_remap_boundary.shape)}"
+                    _remap_boundary_prof_add("committed_lookup", _prof_start)
+                    if _lmcache_cached_tokens is not None:
+                        _remap_boundary_prof_inc("has_committed")
+                        _prof_start = _remap_boundary_prof_begin()
+                        _committed_end = torch.tensor(
+                            _lmcache_cached_tokens,
+                            device=_remap_boundary.device,
+                            dtype=_remap_boundary.dtype,
                         )
-                    _prof_start = _remap_boundary_prof_begin()
-                    _decode_rows = torch.arange(
-                        _remap_boundary.shape[0], device=_remap_boundary.device
-                    ) < int(attn_metadata.num_decode_tokens)
-                    _remap_boundary_prof_add("row_select", _prof_start)
-                    _prof_start = _remap_boundary_prof_begin()
-                    _remap_boundary = torch.where(
-                        _decode_rows, _window_start, _remap_boundary
+                        if _committed_end.numel() < _window_start.numel():
+                            _committed_end = torch.nn.functional.pad(
+                                _committed_end,
+                                (
+                                    0,
+                                    _window_start.numel()
+                                    - _committed_end.numel(),
+                                ),
+                            )
+                        _committed_end = _committed_end[: _window_start.numel()]
+                        _window_start = torch.minimum(
+                            _window_start, _committed_end
+                        )
+                        _remap_boundary_prof_add("committed_apply", _prof_start)
+                    _row_req_indices = getattr(
+                        attn_metadata, "decode_req_indices", None
                     )
-                    _remap_boundary_prof_add("torch_where", _prof_start)
+                    if _row_req_indices is not None:
+                        _remap_boundary_prof_inc("has_row_req_indices")
+                        _prof_start = _remap_boundary_prof_begin()
+                        _row_req_indices = _row_req_indices[
+                            : _remap_boundary.shape[0]
+                        ].to(
+                            device=_remap_boundary.device, dtype=torch.long
+                        )
+                        _valid_decode_rows = _row_req_indices >= 0
+                        if _window_start.numel() == 0:
+                            raise RuntimeError(
+                                "decode-window sparse remap has decode rows "
+                                "but no request seq_lens"
+                            )
+                        _safe_row_req_indices = _row_req_indices.clamp(
+                            min=0, max=int(_window_start.numel()) - 1
+                        )
+                        _window_start_rows = _window_start.index_select(
+                            0, _safe_row_req_indices
+                        ).to(dtype=_remap_boundary.dtype)
+                        _remap_boundary_prof_add("row_select", _prof_start)
+                        _prof_start = _remap_boundary_prof_begin()
+                        _remap_boundary = torch.where(
+                            _valid_decode_rows,
+                            _window_start_rows,
+                            _remap_boundary,
+                        )
+                        _remap_boundary_prof_add("torch_where", _prof_start)
+                    else:
+                        if (
+                            _window_start.shape[0]
+                            != _remap_boundary.shape[0]
+                        ):
+                            raise RuntimeError(
+                                "decode-window sparse remap requires per-row "
+                                "decode_req_indices when request and row "
+                                "counts differ: "
+                                f"window_start_shape="
+                                f"{tuple(_window_start.shape)} "
+                                f"remap_boundary_shape="
+                                f"{tuple(_remap_boundary.shape)}"
+                            )
+                        _prof_start = _remap_boundary_prof_begin()
+                        _decode_rows = torch.arange(
+                            _remap_boundary.shape[0],
+                            device=_remap_boundary.device,
+                        ) < int(attn_metadata.num_decode_tokens)
+                        _remap_boundary_prof_add("row_select", _prof_start)
+                        _prof_start = _remap_boundary_prof_begin()
+                        _remap_boundary = torch.where(
+                            _decode_rows, _window_start, _remap_boundary
+                        )
+                        _remap_boundary_prof_add("torch_where", _prof_start)
+                    attn_metadata.decode_remap_boundary = _remap_boundary
             _dsa_prof.end(_remap_prep_t)
             _remap_boundary_prof_add("total", _remap_prof_total)
             _remap_boundary_prof_step()
