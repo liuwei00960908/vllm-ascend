@@ -90,6 +90,11 @@ _DEBUG_05D10F = os.getenv("LMCACHE_DEBUG_05D10F", "0").lower() in (
 _LMCACHE_SPARSE_WAIT_SYNC = os.getenv(
     "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC", "0"
 ).lower() in ("1", "true", "yes", "on")
+# Process-local, logging-free one-shot variant for first-use diagnosis.
+_LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
+    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "0"
+).lower() in ("1", "true", "yes", "on")
+_lmcache_sparse_wait_sync_once_done = False
 
 
 def _debug_05d10f_log(
@@ -157,12 +162,26 @@ def _debug_05d10f_log_if_enabled(
 
 
 def _sync_npu_current_stream_after_lmcache_sparse_wait(layer_name: str) -> None:
-    if not _LMCACHE_SPARSE_WAIT_SYNC:
+    global _lmcache_sparse_wait_sync_once_done
+
+    sync_once = (
+        _LMCACHE_SPARSE_WAIT_SYNC_ONCE
+        and not _lmcache_sparse_wait_sync_once_done
+    )
+    if not (_LMCACHE_SPARSE_WAIT_SYNC or sync_once):
         return
     if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
         return
-    sync_start = time.perf_counter()
+
+    should_log = _DEBUG_05D10F or _LMCACHE_SPARSE_WAIT_SYNC
+    sync_start = time.perf_counter() if should_log else None
     torch.npu.current_stream().synchronize()
+    if sync_once:
+        _lmcache_sparse_wait_sync_once_done = True
+    if not should_log:
+        return
+
+    assert sync_start is not None
     sync_ms = (time.perf_counter() - sync_start) * 1000.0
     _debug_rank = None
     if torch.distributed.is_available() and torch.distributed.is_initialized():
