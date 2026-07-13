@@ -208,6 +208,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
     ),
+    # Diagnostic fence after the model runner has completed LMCache's
+    # wait_for_save(). This waits all NPU streams and can significantly reduce
+    # throughput, so it is disabled by default.
+    "VLLM_ASCEND_LMCACHE_SAVE_DEVICE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LMCACHE_SAVE_DEVICE_SYNC", "0"))
+    ),
     # Validate DSA sparse/block/target-slot mappings on device and report rich
     # diagnostics. Default OFF because the validation reads NPU predicates back
     # to CPU on every decode layer.

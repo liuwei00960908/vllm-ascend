@@ -1,11 +1,35 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _maybe_synchronize_npu_after_lmcache_save,
+)
+
+
+class TestLMCacheSaveDeviceSync(unittest.TestCase):
+
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.synchronize")
+    @patch("vllm_ascend.worker.model_runner_v1.envs_ascend")
+    def test_disabled_does_not_synchronize(self, mock_envs, mock_synchronize):
+        mock_envs.VLLM_ASCEND_LMCACHE_SAVE_DEVICE_SYNC = False
+
+        _maybe_synchronize_npu_after_lmcache_save()
+
+        mock_synchronize.assert_not_called()
+
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.synchronize")
+    @patch("vllm_ascend.worker.model_runner_v1.envs_ascend")
+    def test_enabled_synchronizes_device(self, mock_envs, mock_synchronize):
+        mock_envs.VLLM_ASCEND_LMCACHE_SAVE_DEVICE_SYNC = True
+
+        _maybe_synchronize_npu_after_lmcache_save()
+
+        mock_synchronize.assert_called_once_with()
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
