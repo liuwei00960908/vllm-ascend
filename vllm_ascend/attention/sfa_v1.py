@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 import os
+import time
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -75,6 +76,55 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 _DSA_TARGET_SLOT_GUARD = envs.VLLM_ASCEND_DSA_TARGET_SLOT_GUARD
+_DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+_DSA_PROF_LAYERS = int(os.getenv("VLLM_ASCEND_DSA_PROF_LAYERS", "61"))
+_remap_boundary_prof_acc: dict[str, float] = {}
+_remap_boundary_prof_meta: dict[str, int] = {}
+_remap_boundary_prof_count = 0
+
+
+def _remap_boundary_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _remap_boundary_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _remap_boundary_prof_acc[name] = _remap_boundary_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _remap_boundary_prof_inc(name: str, amount: int = 1) -> None:
+    if not _DSA_PROF:
+        return
+    _remap_boundary_prof_meta[name] = _remap_boundary_prof_meta.get(name, 0) + amount
+
+
+def _remap_boundary_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _remap_boundary_prof_count, _remap_boundary_prof_acc
+    global _remap_boundary_prof_meta
+    _remap_boundary_prof_count += 1
+    if _remap_boundary_prof_count < _DSA_PROF_LAYERS:
+        return
+    meta = [
+        f"{key}={value}" for key, value in sorted(_remap_boundary_prof_meta.items())
+    ]
+    parts = [
+        f"{key}={value:.2f}ms" for key, value in _remap_boundary_prof_acc.items()
+    ]
+    print(
+        f"[REMAP_BOUNDARY_PROF] calls={_remap_boundary_prof_count} "
+        + " ".join(meta + parts),
+        flush=True,
+    )
+    _remap_boundary_prof_count = 0
+    _remap_boundary_prof_acc = {}
+    _remap_boundary_prof_meta = {}
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -1874,6 +1924,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.num_decode_tokens > 0
         ):
             _remap_prep_t = _dsa_prof.begin("remap_boundary")
+            _remap_prof_total = _remap_boundary_prof_begin()
             # _remap_boundary is per row. Decode rows carry prompt_len by
             # default; decode-window mode replaces it with current_window_start.
             # Prefill/padding rows carry 0 and stay untouched, so this also
@@ -1882,30 +1933,45 @@ class AscendSFAImpl(MLAAttentionImpl):
             # it (and its scatter) when no v1 connector will consume it (profiling /
             # no-offload runs). Production with an LMCache connector is unchanged.
             _need_packed = attn_metadata.need_sparse_lmcache_payload
+            if _need_packed:
+                _remap_boundary_prof_inc("need_packed")
             _topk_rows = int(topk_indices.shape[0])
             _scratch_base = getattr(attn_metadata, "decode_scratch_base", None)
             if _scratch_base is not None:
+                _remap_boundary_prof_inc("has_scratch_base")
+                _prof_start = _remap_boundary_prof_begin()
                 _scratch_base = _scratch_base[:_topk_rows]
                 if _scratch_base.device != topk_indices.device:
                     _scratch_base = _scratch_base.to(device=topk_indices.device)
+                _remap_boundary_prof_add("scratch_base", _prof_start)
             elif attn_metadata.decode_row_offsets is not None:
+                _remap_boundary_prof_inc("has_row_offsets")
+                _prof_start = _remap_boundary_prof_begin()
                 _topk_width = int(topk_indices.numel() // max(_topk_rows, 1))
                 _scratch_base = (
                     attn_metadata.decode_row_offsets[:_topk_rows]
                     .to(device=topk_indices.device)
                     * _topk_width
                 )
+                _remap_boundary_prof_add("scratch_base", _prof_start)
             _remap_boundary = attn_metadata.prompt_lens
             _decode_window_size = _decode_window_save_window_size()
             if _decode_window_size > 0:
+                _remap_boundary_prof_inc("decode_window")
+                _prof_start = _remap_boundary_prof_begin()
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
                 _window_start = (
                     _cur_pos // _decode_window_size * _decode_window_size
                 ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
+                _remap_boundary_prof_add("window_start_build", _prof_start)
+                _prof_start = _remap_boundary_prof_begin()
                 _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
                     getattr(get_forward_context(), "dsa_req_ids", None)
                 )
+                _remap_boundary_prof_add("committed_lookup", _prof_start)
                 if _lmcache_cached_tokens is not None:
+                    _remap_boundary_prof_inc("has_committed")
+                    _prof_start = _remap_boundary_prof_begin()
                     _committed_end = torch.tensor(
                         _lmcache_cached_tokens,
                         device=_remap_boundary.device,
@@ -1918,10 +1984,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                         )
                     _committed_end = _committed_end[: _window_start.numel()]
                     _window_start = torch.minimum(_window_start, _committed_end)
+                    _remap_boundary_prof_add("committed_apply", _prof_start)
                 _row_req_indices = getattr(
                     attn_metadata, "decode_req_indices", None
                 )
                 if _row_req_indices is not None:
+                    _remap_boundary_prof_inc("has_row_req_indices")
+                    _prof_start = _remap_boundary_prof_begin()
                     _row_req_indices = _row_req_indices[
                         : _remap_boundary.shape[0]
                     ].to(device=_remap_boundary.device, dtype=torch.long)
@@ -1937,11 +2006,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _window_start_rows = _window_start.index_select(
                         0, _safe_row_req_indices
                     ).to(dtype=_remap_boundary.dtype)
+                    _remap_boundary_prof_add("row_select", _prof_start)
+                    _prof_start = _remap_boundary_prof_begin()
                     _remap_boundary = torch.where(
                         _valid_decode_rows,
                         _window_start_rows,
                         _remap_boundary,
                     )
+                    _remap_boundary_prof_add("torch_where", _prof_start)
                 else:
                     if _window_start.shape[0] != _remap_boundary.shape[0]:
                         raise RuntimeError(
@@ -1951,13 +2023,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                             f"window_start_shape={tuple(_window_start.shape)} "
                             f"remap_boundary_shape={tuple(_remap_boundary.shape)}"
                         )
+                    _prof_start = _remap_boundary_prof_begin()
                     _decode_rows = torch.arange(
                         _remap_boundary.shape[0], device=_remap_boundary.device
                     ) < int(attn_metadata.num_decode_tokens)
+                    _remap_boundary_prof_add("row_select", _prof_start)
+                    _prof_start = _remap_boundary_prof_begin()
                     _remap_boundary = torch.where(
                         _decode_rows, _window_start, _remap_boundary
                     )
+                    _remap_boundary_prof_add("torch_where", _prof_start)
             _dsa_prof.end(_remap_prep_t)
+            _remap_boundary_prof_add("total", _remap_prof_total)
+            _remap_boundary_prof_step()
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
