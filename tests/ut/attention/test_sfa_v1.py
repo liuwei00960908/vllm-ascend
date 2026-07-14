@@ -2,19 +2,17 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm.distributed.parallel_state import GroupCoordinator
 
 if 'torch_npu._inductor' not in sys.modules:
     sys.modules['torch_npu._inductor'] = MagicMock()
 
 import vllm_ascend.attention.sfa_v1 as sfa_v1
-from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
-                                          AscendSFAMetadata,
-                                          AscendSFAMetadataBuilder)
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -30,42 +28,33 @@ class TestLMCacheSparseWaitSync(TestBase):
     def test_once_mode_synchronizes_only_first_sparse_wait(self):
         stream = MagicMock()
         with (
-            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC", False),
             patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", True),
-            patch.object(sfa_v1, "_DEBUG_05D10F", False),
             patch.object(sfa_v1.torch.npu, "current_stream", return_value=stream),
-            patch.object(sfa_v1, "_debug_05d10f_log_if_enabled") as debug_log,
         ):
-            sfa_v1._sync_npu_current_stream_after_lmcache_sparse_wait("layer.0")
-            sfa_v1._sync_npu_current_stream_after_lmcache_sparse_wait("layer.1")
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
 
         stream.synchronize.assert_called_once_with()
-        debug_log.assert_not_called()
         self.assertTrue(sfa_v1._lmcache_sparse_wait_sync_once_done)
 
-    def test_existing_mode_still_synchronizes_every_sparse_wait(self):
-        stream = MagicMock()
+    def test_disabled_mode_does_not_synchronize(self):
         with (
-            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC", True),
-            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", False),
-            patch.object(sfa_v1.torch.npu, "current_stream", return_value=stream),
-            patch.object(sfa_v1, "_debug_05d10f_log_if_enabled"),
-        ):
-            sfa_v1._sync_npu_current_stream_after_lmcache_sparse_wait("layer.0")
-            sfa_v1._sync_npu_current_stream_after_lmcache_sparse_wait("layer.1")
-
-        self.assertEqual(stream.synchronize.call_count, 2)
-        self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
-
-    def test_disabled_modes_do_not_synchronize(self):
-        with (
-            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC", False),
             patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", False),
             patch.object(sfa_v1.torch.npu, "current_stream") as current_stream,
         ):
-            sfa_v1._sync_npu_current_stream_after_lmcache_sparse_wait("layer.0")
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
 
         current_stream.assert_not_called()
+        self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
+    def test_sync_compute_stream_skips_when_npu_unavailable(self):
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", True),
+            patch.object(sfa_v1.torch, "npu", None),
+        ):
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
 
 
 class TestAscendSFABackend(TestBase):

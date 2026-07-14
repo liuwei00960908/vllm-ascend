@@ -165,11 +165,6 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
-def _maybe_synchronize_npu_after_lmcache_save() -> None:
-    if envs_ascend.VLLM_ASCEND_LMCACHE_SAVE_DEVICE_SYNC:
-        torch.npu.synchronize()
-
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1460,8 +1455,6 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        if has_kv_transfer_group() and clear_kv_metadata:
-            _maybe_synchronize_npu_after_lmcache_save()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1653,7 +1646,6 @@ class NPUModelRunner(GPUModelRunner):
             if has_kv_transfer_group():
                 if self.speculative_config:
                     completed_decode_window_saves = self.finalize_kv_connector()
-                    _maybe_synchronize_npu_after_lmcache_save()
                     if completed_decode_window_saves:
                         if kv_connector_output is None:
                             kv_connector_output = KVConnectorOutput()
