@@ -75,7 +75,6 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
-_DSA_TARGET_SLOT_GUARD = envs.VLLM_ASCEND_DSA_TARGET_SLOT_GUARD
 # Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
     "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1"
@@ -101,23 +100,6 @@ def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
 
         torch.npu.current_stream().synchronize()
         _lmcache_sparse_wait_sync_once_done = True
-
-
-def _dsa_debug_sample(value, limit: int = 8) -> list:
-    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
-        return []
-    return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
-
-
-def _dsa_debug_minmax_count(value) -> tuple[object, object, int] | None:
-    if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
-        return None
-    flat = value.detach().reshape(-1)
-    return (
-        flat.min().to(device="cpu").item(),
-        flat.max().to(device="cpu").item(),
-        int(flat.numel()),
-    )
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -175,101 +157,6 @@ def _dsa_mask_padding_sparse_rows(
     return topk_indices, _dsa_topk_to_2d_indices(topk_indices)
 
 
-def _dsa_sparse_fa_bad_block_hit(
-    topk_2d: torch.Tensor,
-    block_table: torch.Tensor,
-    row_req_indices: torch.Tensor | None,
-    block_size: int,
-) -> dict[str, object] | None:
-    if row_req_indices is None or topk_2d.numel() == 0 or block_table.numel() == 0:
-        return None
-    num_rows = int(topk_2d.shape[0])
-    width = int(topk_2d.reshape(num_rows, -1).shape[1])
-    if num_rows <= 0 or width <= 0 or block_size <= 0:
-        return None
-
-    topk_2d = topk_2d.reshape(num_rows, width).to(
-        device=block_table.device, dtype=torch.long
-    )
-    row_req_indices = row_req_indices[:num_rows].to(
-        device=block_table.device, dtype=torch.long
-    )
-    if int(row_req_indices.numel()) < num_rows:
-        pad = torch.full(
-            (num_rows - int(row_req_indices.numel()),),
-            -1,
-            dtype=torch.long,
-            device=block_table.device,
-        )
-        row_req_indices = torch.cat((row_req_indices, pad), dim=0)
-
-    real_row_mask = row_req_indices >= 0
-    if not bool(real_row_mask.any().to(device="cpu").item()):
-        return None
-
-    real_rows = real_row_mask.nonzero(as_tuple=False).flatten()
-    real_req_indices = row_req_indices.index_select(0, real_rows)
-    req_in_range = real_req_indices < int(block_table.shape[0])
-    if not bool(req_in_range.all().to(device="cpu").item()):
-        bad_idx = int((~req_in_range).nonzero(as_tuple=False)[0].item())
-        sparse_row = int(real_rows[bad_idx].to(device="cpu").item())
-        req_idx = int(real_req_indices[bad_idx].to(device="cpu").item())
-        return {
-            "reason": "req_index_out_of_range",
-            "sparse_row": sparse_row,
-            "req_idx": req_idx,
-            "batch_size": int(block_table.shape[0]),
-        }
-
-    real_topk = topk_2d.index_select(0, real_rows)
-    block_table_rows = block_table.index_select(0, real_req_indices).to(torch.long)
-    num_logical_blocks = int(block_table_rows.shape[1])
-    if num_logical_blocks <= 0:
-        return {
-            "reason": "empty_block_table",
-            "batch_size": int(block_table.shape[0]),
-        }
-
-    safe_indices = torch.clamp(real_topk, min=0)
-    logical_blocks = safe_indices // block_size
-    logical_oob = (real_topk >= 0) & (logical_blocks >= num_logical_blocks)
-    safe_logical_blocks = torch.clamp(
-        logical_blocks, min=0, max=num_logical_blocks - 1
-    )
-    physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
-    bad_hits = (real_topk >= 0) & ((physical_blocks == 0) | logical_oob)
-    if not bool(bad_hits.any().to(device="cpu").item()):
-        return None
-
-    flat_idx = int(bad_hits.reshape(-1).nonzero(as_tuple=False)[0].item())
-    row_in_real = flat_idx // width
-    col = flat_idx % width
-    sparse_row = int(real_rows[row_in_real].to(device="cpu").item())
-    req_idx = int(real_req_indices[row_in_real].to(device="cpu").item())
-    first_topk = int(real_topk[row_in_real, col].to(device="cpu").item())
-    first_logical_block = int(
-        logical_blocks[row_in_real, col].to(device="cpu").item()
-    )
-    first_physical_block = int(
-        physical_blocks[row_in_real, col].to(device="cpu").item()
-    )
-    return {
-        "reason": "null_or_oob_block",
-        "sparse_row": sparse_row,
-        "req_idx": req_idx,
-        "col": col,
-        "topk": first_topk,
-        "logical_block": first_logical_block,
-        "physical_block": first_physical_block,
-        "num_logical_blocks": num_logical_blocks,
-        "row_req_indices_sample": _dsa_debug_sample(row_req_indices),
-        "topk_row_sample": _dsa_debug_sample(real_topk[row_in_real]),
-        "logical_blocks_sample": _dsa_debug_sample(logical_blocks[row_in_real]),
-        "physical_blocks_sample": _dsa_debug_sample(physical_blocks[row_in_real]),
-        "block_table_row_sample": _dsa_debug_sample(block_table_rows[row_in_real]),
-    }
-
-
 def _dsa_build_target_slot_mapping(
     block_table: torch.Tensor,
     row_req_indices: torch.Tensor,
@@ -297,64 +184,6 @@ def _dsa_build_target_slot_mapping(
     safe_logical_blocks = torch.clamp(logical_blocks, min=0, max=max_logical_block)
     physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
     return physical_blocks * block_size + offsets
-
-
-def _dsa_validate_target_slot_mapping(
-    *,
-    layer_name: str | None,
-    selected_tokens: torch.Tensor,
-    target_slot_mapping: torch.Tensor,
-    kv_cache_layer: torch.Tensor,
-    row_req_indices: torch.Tensor | None,
-    row_scratch_base: torch.Tensor | None,
-    block_table: torch.Tensor | None,
-) -> None:
-    if target_slot_mapping.numel() == 0:
-        return
-    if kv_cache_layer.dim() < 2:
-        raise RuntimeError(
-            "DSA target_slot_mapping guard requires paged KV cache: "
-            f"layer={layer_name} kv_shape={tuple(kv_cache_layer.shape)}"
-        )
-    if selected_tokens.shape != target_slot_mapping.shape:
-        raise RuntimeError(
-            "DSA target_slot_mapping shape mismatch: "
-            f"layer={layer_name} selected_shape={tuple(selected_tokens.shape)} "
-            f"target_slot_shape={tuple(target_slot_mapping.shape)}"
-        )
-
-    block_size = int(kv_cache_layer.shape[1])
-    max_slots = int(kv_cache_layer.shape[0]) * block_size
-    target_slots = target_slot_mapping.to(device=kv_cache_layer.device, dtype=torch.long)
-    min_slot = int(target_slots.min().to(device="cpu").item())
-    max_slot = int(target_slots.max().to(device="cpu").item())
-    physical_blocks = target_slots // block_size
-    bad_slots = (target_slots < 0) | (target_slots >= max_slots) | (physical_blocks == 0)
-    if not bool(bad_slots.any().to(device="cpu").item()):
-        return
-
-    width = int(target_slots.reshape(target_slots.shape[0], -1).shape[1])
-    flat_idx = int(bad_slots.reshape(-1).nonzero(as_tuple=False)[0].item())
-    row = flat_idx // width
-    col = flat_idx % width
-    first_slot = int(target_slots.reshape(target_slots.shape[0], -1)[row, col]
-                     .to(device="cpu").item())
-    first_physical_block = first_slot // block_size
-    raise RuntimeError(
-        "DSA target_slot_mapping contains invalid write slot: "
-        f"layer={layer_name} selected_shape={tuple(selected_tokens.shape)} "
-        f"target_slot_shape={tuple(target_slot_mapping.shape)} "
-        f"kv_shape={tuple(kv_cache_layer.shape)} block_size={block_size} "
-        f"max_slots={max_slots} min_slot={min_slot} max_slot={max_slot} "
-        f"first_bad_row={row} first_bad_col={col} "
-        f"first_bad_slot={first_slot} "
-        f"first_bad_physical_block={first_physical_block} "
-        f"selected_sample={_dsa_debug_sample(selected_tokens)} "
-        f"target_slot_sample={_dsa_debug_sample(target_slot_mapping)} "
-        f"row_req_indices_sample={_dsa_debug_sample(row_req_indices)} "
-        f"row_scratch_base_sample={_dsa_debug_sample(row_scratch_base)} "
-        f"block_table_shape={tuple(block_table.shape) if block_table is not None else None}"
-    )
 
 
 def _dsa_indexer_layer_name(layer_name: str) -> str:
@@ -1575,30 +1404,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
                     f"decode_req_indices_sample={decode_req_indices_sample}"
                 )
-            if _DSA_TARGET_SLOT_GUARD:
-                bad_block_hit = _dsa_sparse_fa_bad_block_hit(
-                    topk_2d=topk_2d,
-                    block_table=block_table,
-                    row_req_indices=getattr(attn_metadata, "decode_req_indices", None),
-                    block_size=int(kv.shape[1]),
-                )
-                if bad_block_hit is not None:
-                    raise RuntimeError(
-                        "DSA sparse FA topk resolves to a null/freed block: "
-                        f"layer={layer_name} trace_label={trace_label} "
-                        f"attn_state={attn_metadata.attn_state} "
-                        f"topk_shape={tuple(topk_indices.shape)} "
-                        f"block_table_shape={tuple(block_table.shape)} "
-                        f"block_size={int(kv.shape[1])} "
-                        f"num_decode_tokens={attn_metadata.num_decode_tokens} "
-                        f"actual_seq_lengths_query_sample="
-                        f"{_dsa_debug_sample(actual_seq_lengths_query)} "
-                        f"actual_seq_lengths_key_sample="
-                        f"{_dsa_debug_sample(actual_seq_lengths_key)} "
-                        f"topk_minmax_count={_dsa_debug_minmax_count(topk_indices)} "
-                        f"bad_hit={bad_block_hit}"
-                    )
-
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
@@ -2006,8 +1811,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
-                _row_req_indices_for_wait = None
-                _row_scratch_base_for_wait = None
                 _valid_rows_all = getattr(
                     attn_metadata, "decode_valid_rows_all", False
                 )
@@ -2021,12 +1824,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _selected_for_wait = _sel_packed.index_select(
                             0, _valid_row_indices
                         )
-                    _row_req_indices_for_wait = getattr(
-                        attn_metadata, "decode_req_indices_compact", None
-                    )
-                    _row_scratch_base_for_wait = getattr(
-                        attn_metadata, "decode_scratch_base_compact", None
-                    )
                     _target_slot_mapping_for_wait = getattr(
                         attn_metadata, "decode_target_slot_mapping", None
                     )
@@ -2043,8 +1840,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _row_scratch_base = _scratch_base[: _sel_packed.shape[0]][
                         _decode_row_mask
                     ]
-                    _row_req_indices_for_wait = _row_req_indices
-                    _row_scratch_base_for_wait = _row_scratch_base
                     _target_slot_mapping_for_wait = _dsa_build_target_slot_mapping(
                         attn_metadata.block_table,
                         _row_req_indices,
@@ -2076,19 +1871,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Compatibility fallback for metadata built before row-level DSA
                     # fields existed. Standard MTP should not take this path.
                     _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
-                if (
-                    _target_slot_mapping_for_wait is not None
-                    and _DSA_TARGET_SLOT_GUARD
-                ):
-                    _dsa_validate_target_slot_mapping(
-                        layer_name=layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
-                        kv_cache_layer=kv_cache[0],
-                        row_req_indices=_row_req_indices_for_wait,
-                        row_scratch_base=_row_scratch_base_for_wait,
-                        block_table=attn_metadata.block_table,
-                    )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
