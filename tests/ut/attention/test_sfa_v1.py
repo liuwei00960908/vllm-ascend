@@ -29,13 +29,25 @@ class TestLMCacheSparseWaitSync(TestBase):
         stream = MagicMock()
         with (
             patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", True),
-            patch.object(sfa_v1.torch.npu, "current_stream", return_value=stream),
+            patch.object(
+                sfa_v1.torch.npu,
+                "current_stream",
+                return_value=stream,
+            ) as current_stream,
         ):
             sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
             sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
 
+        current_stream.assert_called_once_with()
         stream.synchronize.assert_called_once_with()
         self.assertTrue(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
+    def test_completed_mode_does_not_touch_npu_stream(self):
+        sfa_v1._lmcache_sparse_wait_sync_once_done = True
+        with patch.object(sfa_v1.torch.npu, "current_stream") as current_stream:
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        current_stream.assert_not_called()
 
     def test_disabled_mode_does_not_synchronize(self):
         with (

@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -80,6 +81,7 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
     "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1"
 ).lower() in ("1", "true", "yes", "on")
 _lmcache_sparse_wait_sync_once_done = False
+_lmcache_sparse_wait_sync_once_lock = Lock()
 
 
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
@@ -90,11 +92,15 @@ def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
         or _lmcache_sparse_wait_sync_once_done
     ):
         return
-    if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
-        return
 
-    torch.npu.current_stream().synchronize()
-    _lmcache_sparse_wait_sync_once_done = True
+    with _lmcache_sparse_wait_sync_once_lock:
+        if _lmcache_sparse_wait_sync_once_done:
+            return
+        if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
+            return
+
+        torch.npu.current_stream().synchronize()
+        _lmcache_sparse_wait_sync_once_done = True
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -2091,7 +2097,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
-                _sync_compute_stream_after_lmcache_sparse_wait()
+                if (
+                    _LMCACHE_SPARSE_WAIT_SYNC_ONCE
+                    and not _lmcache_sparse_wait_sync_once_done
+                ):
+                    _sync_compute_stream_after_lmcache_sparse_wait()
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
