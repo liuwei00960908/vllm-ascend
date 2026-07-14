@@ -75,8 +75,9 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 _DSA_TARGET_SLOT_GUARD = envs.VLLM_ASCEND_DSA_TARGET_SLOT_GUARD
+# Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
-    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "0"
+    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1"
 ).lower() in ("1", "true", "yes", "on")
 _lmcache_sparse_wait_sync_once_done = False
 
