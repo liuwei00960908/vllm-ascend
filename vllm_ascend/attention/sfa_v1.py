@@ -95,6 +95,12 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
     "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "0"
 ).lower() in ("1", "true", "yes", "on")
 _lmcache_sparse_wait_sync_once_done = False
+# Synchronize before the first sparse LMCache load, independently of the
+# post-load experiments above.
+_LMCACHE_SPARSE_PRE_LOAD_SYNC_ONCE = os.getenv(
+    "VLLM_ASCEND_LMCACHE_SPARSE_PRE_LOAD_SYNC_ONCE", "0"
+).lower() in ("1", "true", "yes", "on")
+_lmcache_sparse_pre_load_sync_once_done = False
 
 
 def _debug_05d10f_log(
@@ -197,6 +203,21 @@ def _sync_npu_current_stream_after_lmcache_sparse_wait(layer_name: str) -> None:
             "sync_ms": sync_ms,
         },
     )
+
+
+def _sync_npu_current_stream_before_first_lmcache_sparse_load() -> None:
+    global _lmcache_sparse_pre_load_sync_once_done
+
+    if (
+        not _LMCACHE_SPARSE_PRE_LOAD_SYNC_ONCE
+        or _lmcache_sparse_pre_load_sync_once_done
+    ):
+        return
+    if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
+        return
+
+    torch.npu.current_stream().synchronize()
+    _lmcache_sparse_pre_load_sync_once_done = True
 
 
 def _debug_05d10f_tensor_sha256(value: torch.Tensor | None) -> str | None:
@@ -2284,6 +2305,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         block_table=attn_metadata.block_table,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
+                _sync_npu_current_stream_before_first_lmcache_sparse_load()
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,

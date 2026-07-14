@@ -22,10 +22,38 @@ class TestLMCacheSparseWaitSync(TestBase):
 
     def setUp(self):
         self.original_once_done = sfa_v1._lmcache_sparse_wait_sync_once_done
+        self.original_pre_load_once_done = (
+            sfa_v1._lmcache_sparse_pre_load_sync_once_done
+        )
         sfa_v1._lmcache_sparse_wait_sync_once_done = False
+        sfa_v1._lmcache_sparse_pre_load_sync_once_done = False
 
     def tearDown(self):
         sfa_v1._lmcache_sparse_wait_sync_once_done = self.original_once_done
+        sfa_v1._lmcache_sparse_pre_load_sync_once_done = (
+            self.original_pre_load_once_done
+        )
+
+    def test_pre_load_once_mode_synchronizes_only_first_sparse_load(self):
+        stream = MagicMock()
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_PRE_LOAD_SYNC_ONCE", True),
+            patch.object(sfa_v1.torch.npu, "current_stream", return_value=stream),
+        ):
+            sfa_v1._sync_npu_current_stream_before_first_lmcache_sparse_load()
+            sfa_v1._sync_npu_current_stream_before_first_lmcache_sparse_load()
+
+        stream.synchronize.assert_called_once_with()
+        self.assertTrue(sfa_v1._lmcache_sparse_pre_load_sync_once_done)
+
+    def test_pre_load_once_disabled_does_not_synchronize(self):
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_PRE_LOAD_SYNC_ONCE", False),
+            patch.object(sfa_v1.torch.npu, "current_stream") as current_stream,
+        ):
+            sfa_v1._sync_npu_current_stream_before_first_lmcache_sparse_load()
+
+        current_stream.assert_not_called()
 
     def test_once_mode_synchronizes_only_first_sparse_wait(self):
         stream = MagicMock()
