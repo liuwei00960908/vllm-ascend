@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -84,6 +85,18 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return envs.VLLM_ASCEND_MTP_DW_DIAG
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "vllm_ascend_sfa"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
@@ -1715,6 +1728,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _scratch_base = _scratch_base.to(device=topk_indices.device)
             _split_boundary = attn_metadata.split_boundary
             _decode_window_size = _decode_window_save_window_size()
+            _diag_remap_build = False
+            _diag_current_window_start = None
+            _diag_committed_end = None
             _cached_split_boundary = attn_metadata.decode_split_boundary
             if (
                 _cached_split_boundary is not None
@@ -1743,6 +1759,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         device=_split_boundary.device,
                         dtype=_split_boundary.dtype,
                     )
+                    _diag_current_window_start = _window_start
                     if _lmcache_split_boundary is not None:
                         if _lmcache_split_boundary.numel() < _window_start.numel():
                             _lmcache_split_boundary = torch.nn.functional.pad(
@@ -1756,6 +1773,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _committed_end = _lmcache_split_boundary[
                             : _window_start.numel()
                         ]
+                        _diag_committed_end = _committed_end
                         _window_start = torch.minimum(_window_start, _committed_end)
                     _split_boundary_override = _window_start
                 elif _lmcache_split_boundary is not None:
@@ -1814,6 +1832,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # Connector frontier expansion is step metadata, not layer
                 # data. Reuse it for every remaining SFA layer in this step.
                 attn_metadata.decode_split_boundary = _split_boundary
+                _diag_remap_build = True
+            _absolute_topk_for_diag = topk_indices
             _padding_row_req_indices = (
                 attn_metadata.decode_req_indices if _is_pure_decode else None
             )
@@ -1829,6 +1849,186 @@ class AscendSFAImpl(MLAAttentionImpl):
             _sparse_indices_padding_zeroed = (
                 _padding_row_req_indices is not None
             )
+            _diag_context = (
+                get_forward_context()
+                if _mtp_dw_diag_enabled() and _diag_remap_build
+                else None
+            )
+            if (
+                _diag_context is not None
+                and getattr(_diag_context, "mtp_dw_diag_req_ids", None)
+            ):
+                _diag_req_ids = getattr(_diag_context, "dsa_req_ids", None)
+                _diag_sampled_req_ids = getattr(
+                    _diag_context, "mtp_dw_diag_req_ids", set()
+                )
+                _diag_row_req_indices = getattr(
+                    attn_metadata, "decode_req_indices_cpu", None
+                )
+                if _diag_row_req_indices is None:
+                    _diag_row_req_indices = getattr(
+                        attn_metadata, "decode_req_indices", None
+                    )
+                _diag_row_req_indices_list = (
+                    _diag_row_req_indices.detach().cpu().tolist()
+                    if isinstance(_diag_row_req_indices, torch.Tensor)
+                    else list(_diag_row_req_indices or [])
+                )
+                _diag_positions = (
+                    (attn_metadata.seq_lens.to(torch.long) - 1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _diag_boundaries = _split_boundary.detach().cpu().tolist()
+                _diag_prompt_lens = (
+                    attn_metadata.prompt_lens.detach().cpu().tolist()
+                )
+                _diag_windows = (
+                    _diag_current_window_start.detach().cpu().tolist()
+                    if _diag_current_window_start is not None
+                    else []
+                )
+                _diag_committed = (
+                    _diag_committed_end.detach().cpu().tolist()
+                    if _diag_committed_end is not None
+                    else []
+                )
+                _diag_scratch = (
+                    _scratch_base.detach().cpu().tolist()
+                    if _scratch_base is not None
+                    else []
+                )
+                _diag_absolute = _absolute_topk_for_diag.detach().cpu()
+                _diag_packed = (
+                    _sel_packed.detach().cpu() if _sel_packed is not None else None
+                )
+                seen_scratch: dict[str, set[int]] = {}
+                for row, req_index in enumerate(_diag_row_req_indices_list):
+                    if req_index < 0 or row >= len(_diag_boundaries):
+                        continue
+                    req_id = (
+                        _diag_req_ids[req_index]
+                        if _diag_req_ids is not None
+                        and req_index < len(_diag_req_ids)
+                        else None
+                    )
+                    if req_id not in _diag_sampled_req_ids:
+                        continue
+                    boundary = int(_diag_boundaries[row])
+                    absolute_row = _diag_absolute[row].reshape(-1)
+                    selected_absolute = absolute_row[
+                        (absolute_row >= 0) & (absolute_row < boundary)
+                    ]
+                    packed_row = (
+                        _diag_packed[row].reshape(-1)
+                        if _diag_packed is not None
+                        and row < _diag_packed.shape[0]
+                        else torch.empty(0, dtype=torch.long)
+                    )
+                    scratch_base = (
+                        int(_diag_scratch[row]) if row < len(_diag_scratch) else None
+                    )
+                    current_position = (
+                        int(_diag_positions[row])
+                        if row < len(_diag_positions)
+                        else 0
+                    )
+                    prompt_len = (
+                        int(_diag_prompt_lens[row])
+                        if row < len(_diag_prompt_lens)
+                        else current_position
+                    )
+                    distance = min(
+                        current_position % _decode_window_size,
+                        (-current_position) % _decode_window_size,
+                    )
+                    sample_row = current_position - prompt_len < 3 or distance <= 4
+                    committed = (
+                        int(_diag_committed[req_index])
+                        if req_index < len(_diag_committed)
+                        else None
+                    )
+                    current_window = (
+                        int(_diag_windows[req_index])
+                        if req_index < len(_diag_windows)
+                        else None
+                    )
+                    if req_id is not None and scratch_base is not None:
+                        bases = seen_scratch.setdefault(req_id, set())
+                        if scratch_base in bases:
+                            _mtp_dw_event(
+                                "fail",
+                                req=req_id,
+                                frontier=current_position,
+                                invariant="distinct_mtp_scratch_bases",
+                                row=row,
+                                scratch_base=scratch_base,
+                            )
+                        bases.add(scratch_base)
+                    if (
+                        committed is not None
+                        and current_window is not None
+                        and boundary != min(current_window, committed)
+                    ):
+                        _mtp_dw_event(
+                            "fail",
+                            req=req_id,
+                            frontier=current_position,
+                            invariant="remap_boundary",
+                            current_window_start=current_window,
+                            committed_end=committed,
+                            remap_boundary=boundary,
+                        )
+                    if not sample_row:
+                        continue
+                    _mtp_dw_event(
+                        "remap",
+                        req=req_id,
+                        frontier=current_position,
+                        row=row,
+                        req_index=int(req_index),
+                        current_position=current_position,
+                        window_start=(
+                            int(_diag_windows[req_index])
+                            if req_index < len(_diag_windows)
+                            else None
+                        ),
+                        window_end=None,
+                        committed_end=(
+                            int(_diag_committed[req_index])
+                            if req_index < len(_diag_committed)
+                            else None
+                        ),
+                        remap_boundary=boundary,
+                        scratch_base=scratch_base,
+                        selected_absolute_count=int(selected_absolute.numel()),
+                        selected_absolute_min=(
+                            int(selected_absolute.min())
+                            if selected_absolute.numel()
+                            else None
+                        ),
+                        selected_absolute_max=(
+                            int(selected_absolute.max())
+                            if selected_absolute.numel()
+                            else None
+                        ),
+                        selected_absolute_sample=selected_absolute[:8].tolist(),
+                        selected_packed_count=int(selected_absolute.numel()),
+                        selected_packed_min=(
+                            int(packed_row[: selected_absolute.numel()].min())
+                            if selected_absolute.numel()
+                            else None
+                        ),
+                        selected_packed_max=(
+                            int(packed_row[: selected_absolute.numel()].max())
+                            if selected_absolute.numel()
+                            else None
+                        ),
+                        selected_packed_sample=packed_row[
+                            : min(8, selected_absolute.numel())
+                        ].tolist(),
+                    )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).

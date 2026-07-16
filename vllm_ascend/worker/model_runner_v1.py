@@ -17,7 +17,9 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -152,6 +154,77 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
+
+
+def _mtp_dw_window_size() -> int:
+    try:
+        return max(
+            int(os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")), 0
+        )
+    except ValueError:
+        return 0
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "vllm_ascend_runner"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _mtp_dw_for_requests(
+    owner: Any,
+    scheduler_output: SchedulerOutput,
+    stage: str,
+    event: str,
+    req_ids: set[str] | None = None,
+    **fields: Any,
+) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    for req_id in scheduler_output.num_scheduled_tokens:
+        if req_ids is not None and req_id not in req_ids:
+            continue
+        frontier = getattr(owner, "_mtp_dw_diag_current_frontiers", {}).get(
+            req_id
+        )
+        _mtp_dw_event(
+            stage, req=req_id, event=event, frontier=frontier, **fields
+        )
+
+
+def _mtp_dw_sample_requests(
+    owner: Any, scheduler_output: SchedulerOutput
+) -> set[str]:
+    if not _mtp_dw_diag_enabled():
+        return set()
+    counts = getattr(owner, "_mtp_dw_diag_step_counts", None)
+    if counts is None:
+        counts = {}
+        owner._mtp_dw_diag_step_counts = counts
+    window_size = max(_mtp_dw_window_size(), 1)
+    sampled: set[str] = set()
+    frontiers: dict[str, int] = {}
+    for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
+        req_index = owner.input_batch.req_id_to_index.get(req_id)
+        if req_index is None:
+            continue
+        frontier = int(
+            owner.input_batch.num_computed_tokens_cpu[req_index] + scheduled
+        )
+        frontiers[req_id] = frontier
+        step = counts.get(req_id, 0)
+        counts[req_id] = step + 1
+        distance = min(frontier % window_size, (-frontier) % window_size)
+        if step < 3 or distance <= 4:
+            sampled.add(req_id)
+    owner._mtp_dw_diag_current_frontiers = frontiers
+    return sampled
 
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -1427,6 +1500,28 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        diag_req_ids = _mtp_dw_sample_requests(self, scheduler_output)
+        self._mtp_dw_diag_current_req_ids = diag_req_ids
+        if _mtp_dw_diag_enabled():
+            _mtp_dw_for_requests(
+                self,
+                scheduler_output,
+                "config",
+                "target_forward",
+                req_ids=diag_req_ids,
+                mtp_enabled=self.speculative_config is not None,
+                decode_window_size=_mtp_dw_window_size(),
+                diag_enabled=True,
+            )
+            _mtp_dw_for_requests(
+                self,
+                scheduler_output,
+                "finalize",
+                "target_forward",
+                req_ids=diag_req_ids,
+                deferred=not clear_kv_metadata,
+                order=0,
+            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -1444,6 +1539,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
+                mtp_dw_diag_req_ids=diag_req_ids,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1626,6 +1722,15 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        _mtp_dw_for_requests(
+            self,
+            scheduler_output,
+            "finalize",
+            "bookkeeping",
+            req_ids=getattr(self, "_mtp_dw_diag_current_req_ids", set()),
+            deferred=self.speculative_config is not None,
+            order=1,
+        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1643,9 +1748,58 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
+                if _mtp_dw_diag_enabled():
+                    draft_counts = {}
+                    if self._draft_token_ids is not None:
+                        for index, req_id in enumerate(
+                            scheduler_output.num_scheduled_tokens
+                        ):
+                            try:
+                                draft_counts[req_id] = len(
+                                    self._draft_token_ids[index]
+                                )
+                            except (IndexError, TypeError):
+                                draft_counts[req_id] = None
+                    diag_req_ids = getattr(
+                        self, "_mtp_dw_diag_current_req_ids", set()
+                    )
+                    for req_id in scheduler_output.num_scheduled_tokens:
+                        if req_id not in diag_req_ids:
+                            continue
+                        _mtp_dw_event(
+                            "finalize",
+                            req=req_id,
+                            frontier=self._mtp_dw_diag_current_frontiers.get(
+                                req_id
+                            ),
+                            event="draft_proposal",
+                            deferred=True,
+                            order=2,
+                            draft_count=draft_counts.get(req_id),
+                        )
+
             if has_kv_transfer_group():
                 if self.speculative_config:
                     completed_decode_window_saves = self.finalize_kv_connector()
+                    diag_req_ids = getattr(
+                        self, "_mtp_dw_diag_current_req_ids", set()
+                    )
+                    for req_id in scheduler_output.num_scheduled_tokens:
+                        if req_id not in diag_req_ids:
+                            continue
+                        _mtp_dw_event(
+                            "finalize",
+                            req=req_id,
+                            frontier=self._mtp_dw_diag_current_frontiers.get(
+                                req_id
+                            ),
+                            event="connector_finalize",
+                            deferred=True,
+                            order=3,
+                            completed_window_end=(
+                                completed_decode_window_saves.get(req_id)
+                            ),
+                        )
                     if completed_decode_window_saves:
                         if kv_connector_output is None:
                             kv_connector_output = KVConnectorOutput()
