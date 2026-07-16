@@ -37,6 +37,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.mtp_dw_diag import diagnostic_values_to_list
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -1869,10 +1870,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _diag_row_req_indices = getattr(
                         attn_metadata, "decode_req_indices", None
                     )
-                _diag_row_req_indices_list = (
-                    _diag_row_req_indices.detach().cpu().tolist()
-                    if isinstance(_diag_row_req_indices, torch.Tensor)
-                    else list(_diag_row_req_indices or [])
+                _diag_row_req_indices_list = diagnostic_values_to_list(
+                    _diag_row_req_indices
                 )
                 _diag_positions = (
                     (attn_metadata.seq_lens.to(torch.long) - 1)
