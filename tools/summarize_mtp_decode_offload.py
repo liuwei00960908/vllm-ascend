@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 MARKER = "[MTP_DW] "
+MAX_DISPLAY_EVENTS = 6
+MAX_EVENT_CHARS = 1000
+MAX_DETAIL_CHARS = 500
+MAX_MISSING_ITEMS = 20
 REQUIRED_STAGES = {
     "config",
     "step",
@@ -51,20 +55,22 @@ def select_request(
     events: list[dict[str, Any]], request_prefix: str | None = None
 ) -> str | None:
     """Select the latest request matching the optional external-ID prefix."""
-    latest_lines: dict[str, int] = {}
+    first_lines: dict[str, int] = {}
     for event in events:
         req = event.get("req")
         if not isinstance(req, str) or not req:
             continue
         if request_prefix is not None and not req.startswith(request_prefix):
             continue
-        latest_lines[req] = max(latest_lines.get(req, 0), event["_line"])
-    if not latest_lines:
+        first_lines.setdefault(req, event["_line"])
+    if not first_lines:
         return None
-    return max(latest_lines, key=latest_lines.__getitem__)
+    return max(first_lines, key=first_lines.__getitem__)
 
 
 def _failure(name: str, event: dict[str, Any], detail: str) -> dict[str, Any]:
+    if len(detail) > MAX_DETAIL_CHARS:
+        detail = detail[: MAX_DETAIL_CHARS - 3] + "..."
     return {
         "invariant": name,
         "line": event.get("_line"),
@@ -98,7 +104,14 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                 )
             )
 
-    for event in (event for event in events if event["stage"] == "step"):
+    step_events = [
+        event
+        for event in events
+        if event["stage"] == "step" and event.get("event") != "request_finish"
+    ]
+    if "step" in stages and not step_events:
+        missing.append("step:decode_sample")
+    for event in step_events:
         generated = event.get("generated_count")
         accepted = event.get("accepted_count")
         draft = event.get("draft_count")
@@ -128,7 +141,14 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                 )
             )
 
-    for event in (event for event in events if event["stage"] == "meta"):
+    meta_events = [
+        event
+        for event in events
+        if event["stage"] == "meta" and event.get("event") != "window_decision"
+    ]
+    if "meta" in stages and not meta_events:
+        missing.append("meta:synthetic_window")
+    for event in meta_events:
         start, end = event.get("window_start"), event.get("window_end")
         frontier, size = event.get("frontier"), event.get("window_size")
         if not all(isinstance(value, int) for value in (start, end, frontier, size)):
@@ -146,15 +166,36 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                 )
             )
 
-    finalize_by_frontier: dict[Any, dict[str, dict[str, Any]]] = defaultdict(dict)
+    finalize_by_frontier: dict[Any, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for event in events:
         if event["stage"] == "finalize" and event.get("event") in {
             "bookkeeping",
             "draft_proposal",
             "connector_finalize",
         }:
-            finalize_by_frontier[event.get("frontier")][event["event"]] = event
+            frontier = event.get("frontier")
+            if not isinstance(frontier, int):
+                failures.append(
+                    _failure(
+                        "finalize_fields",
+                        event,
+                        "frontier must be an integer",
+                    )
+                )
+                continue
+            finalize_by_frontier[frontier][event["event"]].append(event)
     required_finalize = {"bookkeeping", "draft_proposal", "connector_finalize"}
+    expected_finalize_order = {
+        "bookkeeping": 1,
+        "draft_proposal": 2,
+        "connector_finalize": 3,
+    }
+    if "finalize" in stages and not finalize_by_frontier:
+        missing.extend(
+            f"finalize:{name}" for name in sorted(required_finalize)
+        )
     for frontier, finalize in finalize_by_frontier.items():
         if not required_finalize <= finalize.keys():
             missing_finalize = sorted(required_finalize - finalize.keys())
@@ -162,21 +203,18 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                 f"finalize:{frontier}:{name}" for name in missing_finalize
             )
             continue
-        names = ("bookkeeping", "draft_proposal", "connector_finalize")
-        order = [finalize[name].get("order") for name in names]
-        line_order = [finalize[name].get("_line") for name in names]
-        if (
-            order != sorted(order)
-            or len(set(order)) != len(order)
-            or line_order != sorted(line_order)
-        ):
-            failures.append(
-                _failure(
-                    "deferred_finalize_order",
-                    finalize["connector_finalize"],
-                    f"order={order} lines={line_order}",
+        for name, expected_order in expected_finalize_order.items():
+            observed_orders = [event.get("order") for event in finalize[name]]
+            if not all(order == expected_order for order in observed_orders):
+                failures.append(
+                    _failure(
+                        "deferred_finalize_order",
+                        finalize[name][0],
+                        f"frontier={frontier} event={name} "
+                        f"order={sorted(observed_orders, key=str)} "
+                        f"expected={expected_order}",
+                    )
                 )
-            )
 
     stores: dict[tuple[int, int], dict[int, dict[str, Any]]] = defaultdict(dict)
     for event in events:
@@ -215,12 +253,17 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
     if store_group_events != {0, 1}:
         missing.append("store:group_complete")
 
-    previous_commit = -1
-    group_complete_lines: dict[tuple[int, int], set[int]] = defaultdict(set)
+    completed_groups: dict[tuple[int, int], set[int]] = defaultdict(set)
     for event in events:
         if event["stage"] == "store" and event.get("event") == "group_complete":
-            window = (event.get("window_start"), event.get("window_end"))
-            group_complete_lines[window].add(event.get("kv_group"))
+            start, end, group = (
+                event.get("window_start"),
+                event.get("window_end"),
+                event.get("kv_group"),
+            )
+            if all(isinstance(value, int) for value in (start, end, group)):
+                completed_groups[(start, end)].add(group)
+    for event in events:
         if event["stage"] == "commit" and event.get("event") == "frontier_update":
             before, after = event.get("committed_before"), event.get("committed_after")
             if (
@@ -235,24 +278,24 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                         f"{before}->{after}",
                     )
                 )
-            if isinstance(after, int) and after < previous_commit:
+        if event["stage"] == "commit" and event.get("event") == "publish_completed":
+            start, end = event.get("window_start"), event.get("window_end")
+            if not isinstance(start, int) or not isinstance(end, int):
                 failures.append(
                     _failure(
-                        "committed_frontier_global",
+                        "commit_fields",
                         event,
-                        f"{previous_commit}->{after}",
+                        "published window bounds must be integers",
                     )
                 )
-            if isinstance(after, int):
-                previous_commit = after
-        if event["stage"] == "commit" and event.get("event") == "publish_completed":
-            window = (event.get("window_start"), event.get("window_end"))
-            if group_complete_lines.get(window) != {0, 1}:
+                continue
+            window = (start, end)
+            if completed_groups.get(window) != {0, 1}:
                 failures.append(
                     _failure(
                         "commit_after_required_groups",
                         event,
-                        str(group_complete_lines.get(window)),
+                        str(completed_groups.get(window)),
                     )
                 )
 
@@ -265,7 +308,6 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
         if event_name not in commit_events:
             missing.append(f"commit:{event_name}")
 
-    scratch_by_frontier: dict[int, list[int]] = defaultdict(list)
     for event in (event for event in events if event["stage"] == "remap"):
         current, committed, boundary = (
             event.get("window_start"),
@@ -297,20 +339,6 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
                     f"{selected_max} >= {boundary}",
                 )
             )
-        if isinstance(event.get("frontier"), int) and isinstance(
-            event.get("scratch_base"), int
-        ):
-            scratch_by_frontier[event["frontier"]].append(event["scratch_base"])
-    for frontier, bases in scratch_by_frontier.items():
-        if len(bases) != len(set(bases)):
-            event = next(
-                event
-                for event in events
-                if event.get("frontier") == frontier
-                and event["stage"] == "remap"
-            )
-            failures.append(_failure("distinct_mtp_scratch_bases", event, str(bases)))
-
     for event in (event for event in events if event["stage"] == "retrieve"):
         maximum, available = event.get("selected_max"), event.get("actual_cpu_tokens")
         if event.get("selected_oob") or (
@@ -352,7 +380,15 @@ def evaluate(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[s
         )
         release_fields = (start, end, scratch, saved_end, block_size)
         if all(isinstance(value, int) for value in release_fields):
-            if start < scratch or end * block_size > saved_end:
+            freed = event.get("freed_blocks")
+            invalid_noop = end <= start and isinstance(freed, int) and freed != 0
+            if (
+                min(start, end, scratch, saved_end) < 0
+                or block_size <= 0
+                or start < scratch
+                or end * block_size > saved_end
+                or invalid_noop
+            ):
                 failures.append(
                     _failure(
                         "release_range",
@@ -404,7 +440,11 @@ def _format(summary: dict[str, Any], failures_only: bool, stage: str | None) -> 
         f"{summary['status']} req={summary['req'] or '-'} events={len(summary['events'])}"
     ]
     if summary["missing"]:
-        lines.append("missing=" + ",".join(summary["missing"]))
+        displayed_missing = summary["missing"][:MAX_MISSING_ITEMS]
+        missing_text = ",".join(displayed_missing)
+        if len(summary["missing"]) > MAX_MISSING_ITEMS:
+            missing_text += f",...(+{len(summary['missing']) - MAX_MISSING_ITEMS})"
+        lines.append("missing=" + missing_text)
     if summary["failures"]:
         first = summary["failures"][0]
         lines.append(
@@ -420,12 +460,12 @@ def _format(summary: dict[str, Any], failures_only: bool, stage: str | None) -> 
             for event in display
             if event["_line"] in failure_lines or event["stage"] == "fail"
         ]
-    for event in display[:6]:
+    for event in display[:MAX_DISPLAY_EVENTS]:
         bounded = {key: value for key, value in event.items() if key != "_line"}
-        lines.append(
-            f"line={event['_line']} "
-            + json.dumps(bounded, separators=(",", ":"))
-        )
+        rendered = json.dumps(bounded, separators=(",", ":"))
+        if len(rendered) > MAX_EVENT_CHARS:
+            rendered = rendered[: MAX_EVENT_CHARS - 3] + "..."
+        lines.append(f"line={event['_line']} {rendered}")
     return "\n".join(lines)
 
 

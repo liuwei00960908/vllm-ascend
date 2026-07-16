@@ -95,7 +95,12 @@ from vllm.v1.worker.utils import AttentionGroup
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.attention.mtp_dw_diag import post_commit_sample_requests
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    get_lmcache_sparse_cached_tokens,
+    using_paged_attention,
+)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -1500,9 +1505,58 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        diag_req_ids = _mtp_dw_sample_requests(self, scheduler_output)
-        self._mtp_dw_diag_current_req_ids = diag_req_ids
-        if _mtp_dw_diag_enabled():
+        diag_enabled = _mtp_dw_diag_enabled()
+        diag_req_ids: set[str] | None = None
+        diag_post_commit_req_ids: set[str] | None = None
+        if diag_enabled:
+            diag_req_ids = _mtp_dw_sample_requests(self, scheduler_output)
+            previous_frontiers = getattr(
+                self, "_mtp_dw_diag_committed_frontiers", None
+            )
+            active_req_ids = (
+                {str(req_id) for req_id in dsa_req_ids}
+                if dsa_req_ids is not None
+                else set()
+            )
+            if previous_frontiers is not None:
+                for req_id in set(previous_frontiers) - active_req_ids:
+                    previous_frontiers.pop(req_id, None)
+            if dsa_req_ids is not None:
+                committed_frontiers = get_lmcache_sparse_cached_tokens(
+                    dsa_req_ids
+                )
+                if committed_frontiers is not None:
+                    decode_req_ids: list[str] = []
+                    decode_committed_frontiers: list[int] = []
+                    for req_index, (raw_req_id, committed) in enumerate(
+                        zip(dsa_req_ids, committed_frontiers)
+                    ):
+                        req_id = str(raw_req_id)
+                        if req_id not in scheduler_output.num_scheduled_tokens:
+                            continue
+                        num_computed = int(
+                            self.input_batch.num_computed_tokens_cpu[req_index]
+                        )
+                        num_prompt = int(
+                            self.input_batch.num_prompt_tokens[req_index]
+                        )
+                        if num_computed < num_prompt:
+                            continue
+                        decode_req_ids.append(req_id)
+                        decode_committed_frontiers.append(int(committed))
+                    if decode_req_ids:
+                        if previous_frontiers is None:
+                            previous_frontiers = {}
+                            self._mtp_dw_diag_committed_frontiers = (
+                                previous_frontiers
+                            )
+                        diag_post_commit_req_ids = post_commit_sample_requests(
+                            previous_frontiers,
+                            decode_req_ids,
+                            decode_committed_frontiers,
+                        )
+                        diag_req_ids.update(diag_post_commit_req_ids)
+            self._mtp_dw_diag_current_req_ids = diag_req_ids
             _mtp_dw_for_requests(
                 self,
                 scheduler_output,
@@ -1540,6 +1594,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
                 mtp_dw_diag_req_ids=diag_req_ids,
+                mtp_dw_diag_post_commit_req_ids=diag_post_commit_req_ids,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

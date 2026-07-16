@@ -1907,7 +1907,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if req_index < 0 or row >= len(_diag_boundaries):
                         continue
                     req_id = (
-                        _diag_req_ids[req_index]
+                        str(_diag_req_ids[req_index])
                         if _diag_req_ids is not None
                         and req_index < len(_diag_req_ids)
                         else None
@@ -1943,6 +1943,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         (-current_position) % _decode_window_size,
                     )
                     sample_row = current_position - prompt_len < 3 or distance <= 4
+                    _post_commit_req_ids = getattr(
+                        _diag_context,
+                        "mtp_dw_diag_post_commit_req_ids",
+                        None,
+                    )
+                    if (
+                        _post_commit_req_ids is not None
+                        and req_id in _post_commit_req_ids
+                    ):
+                        sample_row = True
                     committed = (
                         int(_diag_committed[req_index])
                         if req_index < len(_diag_committed)
