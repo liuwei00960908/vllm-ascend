@@ -33,12 +33,16 @@ REQUIRED_STAGES = {
 def parse_lines(lines: Iterable[str]) -> list[dict[str, Any]]:
     """Parse schema-1 diagnostic records, ignoring unrelated or malformed lines."""
     events: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
     for line_number, line in enumerate(lines, 1):
         marker_at = line.find(MARKER)
         if marker_at < 0:
             continue
+        payload = line[marker_at + len(MARKER) :].lstrip()
+        if not payload.startswith("{"):
+            continue
         try:
-            event = json.loads(line[marker_at + len(MARKER) :])
+            event, _ = decoder.raw_decode(payload)
         except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(event, dict) or event.get("schema") != 1:

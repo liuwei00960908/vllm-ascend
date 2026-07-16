@@ -1521,41 +1521,6 @@ class NPUModelRunner(GPUModelRunner):
             if previous_frontiers is not None:
                 for req_id in set(previous_frontiers) - active_req_ids:
                     previous_frontiers.pop(req_id, None)
-            if dsa_req_ids is not None:
-                committed_frontiers = get_lmcache_sparse_cached_tokens(
-                    dsa_req_ids
-                )
-                if committed_frontiers is not None:
-                    decode_req_ids: list[str] = []
-                    decode_committed_frontiers: list[int] = []
-                    for req_index, (raw_req_id, committed) in enumerate(
-                        zip(dsa_req_ids, committed_frontiers)
-                    ):
-                        req_id = str(raw_req_id)
-                        if req_id not in scheduler_output.num_scheduled_tokens:
-                            continue
-                        num_computed = int(
-                            self.input_batch.num_computed_tokens_cpu[req_index]
-                        )
-                        num_prompt = int(
-                            self.input_batch.num_prompt_tokens[req_index]
-                        )
-                        if num_computed < num_prompt:
-                            continue
-                        decode_req_ids.append(req_id)
-                        decode_committed_frontiers.append(int(committed))
-                    if decode_req_ids:
-                        if previous_frontiers is None:
-                            previous_frontiers = {}
-                            self._mtp_dw_diag_committed_frontiers = (
-                                previous_frontiers
-                            )
-                        diag_post_commit_req_ids = post_commit_sample_requests(
-                            previous_frontiers,
-                            decode_req_ids,
-                            decode_committed_frontiers,
-                        )
-                        diag_req_ids.update(diag_post_commit_req_ids)
             self._mtp_dw_diag_current_req_ids = diag_req_ids
             _mtp_dw_for_requests(
                 self,
@@ -1603,6 +1568,50 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            # Connector metadata is bound by maybe_get_kv_connector_output's
+            # __enter__. Sample committed frontiers only after that point so the
+            # first forward that can retrieve a new window also forces a remap
+            # diagnostic for the same window.
+            if diag_enabled and dsa_req_ids is not None:
+                committed_frontiers = get_lmcache_sparse_cached_tokens(
+                    dsa_req_ids
+                )
+                if committed_frontiers is not None:
+                    decode_req_ids: list[str] = []
+                    decode_committed_frontiers: list[int] = []
+                    for req_index, (raw_req_id, committed) in enumerate(
+                        zip(dsa_req_ids, committed_frontiers)
+                    ):
+                        req_id = str(raw_req_id)
+                        if req_id not in scheduler_output.num_scheduled_tokens:
+                            continue
+                        num_computed = int(
+                            self.input_batch.num_computed_tokens_cpu[req_index]
+                        )
+                        num_prompt = int(
+                            self.input_batch.num_prompt_tokens[req_index]
+                        )
+                        if num_computed < num_prompt:
+                            continue
+                        decode_req_ids.append(req_id)
+                        decode_committed_frontiers.append(int(committed))
+                    if decode_req_ids:
+                        if previous_frontiers is None:
+                            previous_frontiers = {}
+                            self._mtp_dw_diag_committed_frontiers = (
+                                previous_frontiers
+                            )
+                        diag_post_commit_req_ids = post_commit_sample_requests(
+                            previous_frontiers,
+                            decode_req_ids,
+                            decode_committed_frontiers,
+                        )
+                        diag_req_ids.update(diag_post_commit_req_ids)
+                        forward_context = get_forward_context()
+                        forward_context.mtp_dw_diag_req_ids = diag_req_ids
+                        forward_context.mtp_dw_diag_post_commit_req_ids = (
+                            diag_post_commit_req_ids
+                        )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )

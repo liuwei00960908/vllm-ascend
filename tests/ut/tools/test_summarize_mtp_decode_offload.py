@@ -169,6 +169,70 @@ def test_latest_and_malformed_lines() -> None:
     assert summary["req"] == "latest"
 
 
+def test_parse_lines_accepts_plain_events_and_lmcache_logger_suffixes() -> None:
+    suffixes = {
+        "meta": " (vllm_v1_adapter.py:78:lmcache.integration.vllm.vllm_v1_adapter)",
+        "store": " (cache_engine.py:47:lmcache_ascend.v1.cache_engine)",
+        "commit": " (vllm_v1_adapter.py:78:lmcache.integration.vllm.vllm_v1_adapter)",
+        "retrieve": (
+            " (npu_connectors.py:57:"
+            "lmcache_ascend.v1.npu_connector.npu_connectors)"
+        ),
+    }
+    lines = [MARKER + json.dumps({"schema": 1, "stage": "step", "req": "req"})]
+    lines.extend(
+        "LMCache INFO: "
+        + MARKER
+        + json.dumps({"schema": 1, "stage": stage, "req": "req"})
+        + suffix
+        for stage, suffix in suffixes.items()
+    )
+
+    events = parse_lines(lines)
+
+    assert [event["stage"] for event in events] == ["step", *suffixes]
+    assert [event["_line"] for event in events] == [1, 2, 3, 4, 5]
+
+
+def test_parse_lines_ignores_malformed_or_prefixed_payloads() -> None:
+    valid = json.dumps({"schema": 1, "stage": "meta", "req": "req"})
+    events = parse_lines(
+        [
+            MARKER + "not-json " + valid,
+            MARKER + '{"schema":1,"stage":"meta"',
+            MARKER + "[" + valid + "]",
+            MARKER + json.dumps({"schema": 2, "stage": "meta"}),
+            MARKER + " \t" + valid,
+            MARKER + valid + " logger suffix",
+        ]
+    )
+
+    assert [event["_line"] for event in events] == [5, 6]
+
+
+def test_complete_mixed_source_summary_accepts_logger_suffixes() -> None:
+    logger_suffix_by_stage = {
+        "meta": " (vllm_v1_adapter.py:78:lmcache.integration.vllm.vllm_v1_adapter)",
+        "store": " (cache_engine.py:47:lmcache_ascend.v1.cache_engine)",
+        "commit": " (vllm_v1_adapter.py:78:lmcache.integration.vllm.vllm_v1_adapter)",
+        "retrieve": (
+            " (npu_connectors.py:57:"
+            "lmcache_ascend.v1.npu_connector.npu_connectors)"
+        ),
+    }
+    lines = []
+    for line in _lines():
+        event = json.loads(line[len(MARKER) :])
+        suffix = logger_suffix_by_stage.get(event["stage"], "")
+        source_prefix = "LMCache INFO: " if suffix else "Worker INFO: "
+        lines.append(source_prefix + line + suffix)
+
+    summary = summarize_events(parse_lines(lines))
+
+    assert summary["status"] == "PASS"
+    assert not ({"meta", "store", "commit", "retrieve"} & set(summary["missing"]))
+
+
 def test_latest_does_not_hide_incomplete_request() -> None:
     events = parse_lines([*_lines("complete"), *_lines("newest")[:-1]])
     summary = summarize_events(events)
