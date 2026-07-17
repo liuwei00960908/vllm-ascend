@@ -1926,7 +1926,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _sel_packed.detach().cpu() if _sel_packed is not None else None
                 )
                 _diag_deep_req_ids = (
-                    getattr(_diag_context, "mtp_dw_deep_diag_req_ids", set())
+                    (getattr(_diag_context, "mtp_dw_deep_diag_req_ids", None) or set())
                     if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG
                     and self.dsa_shrink_latent == 2
                     else set()
