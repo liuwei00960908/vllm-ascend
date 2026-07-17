@@ -4,8 +4,12 @@ import numpy as np
 import torch
 
 from vllm_ascend.attention.mtp_dw_diag import (
+    diagnostic_int_checksum,
     diagnostic_values_to_list,
+    first_post_commit_requests,
+    logical_to_physical_slots,
     post_commit_sample_requests,
+    scratch_live_slot_aliases,
 )
 
 
@@ -25,3 +29,79 @@ def test_post_commit_sampling_forces_first_nonzero_and_changes() -> None:
     ) == {"req"}
     assert post_commit_sample_requests(previous, ["req"], [256]) == set()
     assert post_commit_sample_requests(previous, ["req"], [512]) == {"req"}
+
+
+def test_deep_sampling_only_uses_first_post_commit_transition() -> None:
+    previous = {"old": 256, "new": 0}
+
+    assert first_post_commit_requests(
+        previous, ["old", "new", "zero"], [512, 256, 0]
+    ) == {"new"}
+
+
+def test_diagnostic_int_checksum_is_stable_ordered_and_bounded() -> None:
+    values = [12, -1, 999_999_999_999]
+    checksum = diagnostic_int_checksum(values)
+
+    assert checksum == diagnostic_int_checksum(tuple(values))
+    assert checksum != diagnostic_int_checksum(reversed(values))
+    assert 0 <= checksum <= (1 << 64) - 1
+    assert diagnostic_int_checksum(values + list(range(40))) == diagnostic_int_checksum(
+        (values + list(range(40)))[:32] + [999] * 8
+    )
+    assert diagnostic_int_checksum([]) == 0xCBF29CE484222325
+
+
+def test_scratch_live_slot_aliases_use_physical_block_mapping() -> None:
+    block_table = [7, 3, 7, 9]
+
+    assert logical_to_physical_slots(block_table, [0, 5, 8], 4) == [28, 13, 28]
+    target, live, aliases = scratch_live_slot_aliases(
+        block_table,
+        scratch_positions=[0, 1],
+        live_start=8,
+        current_position=9,
+        block_size=4,
+    )
+    assert target == [28, 29]
+    assert live == [28, 29]
+    assert aliases == [28, 29]
+
+
+def test_scratch_live_slot_aliases_reports_disjoint_ranges() -> None:
+    _, _, aliases = scratch_live_slot_aliases([7, 3, 5], [0, 1], 8, 9, 4)
+    assert aliases == []
+
+
+def test_scratch_alias_check_excludes_intentionally_reused_offloaded_region() -> None:
+    target, live, aliases = scratch_live_slot_aliases(
+        [7, 3, 7, 9], [0, 1], live_start=12, current_position=13, block_size=4
+    )
+
+    assert target == [28, 29]
+    assert live == [36, 37]
+    assert aliases == []
+
+
+def test_scratch_alias_check_ignores_unallocated_block_table_tail() -> None:
+    target, live, aliases = scratch_live_slot_aliases(
+        [7, 3, -1, -1],
+        [0, 1],
+        live_start=6,
+        current_position=31,
+        block_size=4,
+    )
+
+    assert target == [28, 29]
+    assert live == [14, 15]
+    assert aliases == []
+
+
+def test_scratch_alias_check_accepts_one_shot_block_iterables() -> None:
+    target, live, aliases = scratch_live_slot_aliases(
+        iter([7, 3, 5]), [0], live_start=8, current_position=8, block_size=4
+    )
+
+    assert target == [28]
+    assert live == [20]
+    assert aliases == []

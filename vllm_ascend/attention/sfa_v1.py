@@ -37,7 +37,11 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
-from vllm_ascend.attention.mtp_dw_diag import diagnostic_values_to_list
+from vllm_ascend.attention.mtp_dw_diag import (
+    diagnostic_int_checksum,
+    diagnostic_values_to_list,
+    scratch_live_slot_aliases,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -311,6 +315,8 @@ class AscendSFAMetadata:
     decode_req_indices: torch.Tensor | None = None
     decode_valid_row_indices: torch.Tensor | None = None
     decode_request_ids_compact: list[str] | None = None
+    decode_row_offsets: torch.Tensor | None = None
+    decode_current_positions_cpu: Any = None
     decode_scratch_base: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
@@ -449,6 +455,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             rows = np.zeros(num_input_tokens, dtype=np.int32)
             req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
             row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
+            current_positions = (
+                np.zeros(num_input_tokens, dtype=np.int64)
+                if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG
+                and self.dsa_shrink_latent == 2
+                else None
+            )
             n_real = min(len(plens_cpu), num_reqs)
             qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
@@ -462,6 +474,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     rows[first_decode:e] = plen
                     req_rows[first_decode:e] = r
                     row_offsets[first_decode:e] = offsets
+                    if current_positions is not None:
+                        current_positions[first_decode:e] = int(computed[r]) + np.arange(
+                            first_decode - s, e - s, dtype=np.int64
+                        )
             num_decode_rows = int(np.count_nonzero(req_rows >= 0))
             split_boundary_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
@@ -617,6 +633,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_req_indices=decode_req_indices_rows,
             decode_valid_row_indices=decode_valid_row_indices,
             decode_request_ids_compact=decode_request_ids_compact,
+            decode_row_offsets=(
+                torch.from_numpy(row_offsets).to(block_table.device)
+                if num_decode_rows > 0 else None
+            ),
+            decode_current_positions_cpu=(
+                current_positions if decode_req_indices_rows is not None else None
+            ),
             decode_scratch_base=decode_scratch_base_rows,
             decode_target_slot_mapping=decode_target_slot_mapping,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
@@ -1902,6 +1925,61 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _diag_packed = (
                     _sel_packed.detach().cpu() if _sel_packed is not None else None
                 )
+                _diag_deep_req_ids = (
+                    getattr(_diag_context, "mtp_dw_deep_diag_req_ids", set())
+                    if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG
+                    and self.dsa_shrink_latent == 2
+                    else set()
+                )
+                _diag_deep_emitted_req_ids = getattr(
+                    _diag_context, "mtp_dw_deep_diag_emitted_req_ids", None
+                )
+                if _diag_deep_req_ids:
+                    if _diag_deep_emitted_req_ids is None:
+                        _diag_deep_emitted_req_ids = set()
+                        _diag_context.mtp_dw_deep_diag_emitted_req_ids = (
+                            _diag_deep_emitted_req_ids
+                        )
+                    _diag_deep_req_ids = (
+                        _diag_deep_req_ids - _diag_deep_emitted_req_ids
+                    )
+                _diag_row_offsets = (
+                    diagnostic_values_to_list(
+                        getattr(attn_metadata, "decode_row_offsets", None)
+                    )
+                    if _diag_deep_req_ids
+                    else []
+                )
+                _diag_current_positions = (
+                    diagnostic_values_to_list(
+                        getattr(attn_metadata, "decode_current_positions_cpu", None)
+                    )
+                    if _diag_deep_req_ids
+                    else []
+                )
+                _diag_target_slots = (
+                    diagnostic_values_to_list(
+                        getattr(attn_metadata, "decode_target_slot_mapping", None)
+                    )
+                    if _diag_deep_req_ids
+                    else []
+                )
+                _diag_compact_row = (
+                    {
+                        source_row: compact_row
+                        for compact_row, source_row in enumerate(
+                            row
+                            for row, req_index in enumerate(
+                                _diag_row_req_indices_list
+                            )
+                            if int(req_index) >= 0
+                        )
+                    }
+                    if _diag_deep_req_ids
+                    else {}
+                )
+                _diag_deep_emitted_this_layer: set[str] = set()
+                _diag_deep_payloads: dict[str, dict[str, Any]] = {}
                 seen_scratch: dict[str, set[int]] = {}
                 for row, req_index in enumerate(_diag_row_req_indices_list):
                     if req_index < 0 or row >= len(_diag_boundaries):
@@ -1929,8 +2007,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         int(_diag_scratch[row]) if row < len(_diag_scratch) else None
                     )
                     current_position = (
-                        int(_diag_positions[row])
-                        if row < len(_diag_positions)
+                        int(_diag_current_positions[row])
+                        if row < len(_diag_current_positions)
+                        else int(_diag_positions[req_index])
+                        if req_index < len(_diag_positions)
                         else 0
                     )
                     prompt_len = (
@@ -1963,6 +2043,156 @@ class AscendSFAImpl(MLAAttentionImpl):
                         if req_index < len(_diag_windows)
                         else None
                     )
+                    if req_id in _diag_deep_req_ids:
+                        _diag_deep_emitted_this_layer.add(req_id)
+                        row_offset = (
+                            int(_diag_row_offsets[row])
+                            if row < len(_diag_row_offsets)
+                            else 0
+                        )
+                        effective_scratch_base = scratch_base or 0
+                        selected_count = int(selected_absolute.numel())
+                        packed_values = packed_row.tolist()
+                        absolute_values = absolute_row.tolist()
+                        selected_absolute_values = selected_absolute.tolist()
+                        payload_width = len(packed_values)
+                        block_size = int(kv_cache[0].shape[1])
+                        block_table_row = (
+                            attn_metadata.block_table[int(req_index)]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        try:
+                            derived_target_slots, live_slots, _ = scratch_live_slot_aliases(
+                                block_table_row,
+                                range(
+                                    effective_scratch_base,
+                                    effective_scratch_base + payload_width,
+                                ),
+                                boundary,
+                                current_position,
+                                block_size,
+                            )
+                            compact_row = _diag_compact_row.get(row)
+                            target_slots = (
+                                [int(value) for value in _diag_target_slots[compact_row]]
+                                if compact_row is not None
+                                and compact_row < len(_diag_target_slots)
+                                else derived_target_slots
+                            )
+                            aliases = sorted(
+                                set(target_slots).intersection(live_slots)
+                            )
+                            if target_slots != derived_target_slots:
+                                _mtp_dw_event(
+                                    "fail",
+                                    invariant="deep_target_slot_mapping",
+                                    tp_rank=self.tp_rank,
+                                    tp_world=self.tp_size,
+                                    req=req_id,
+                                    row=row,
+                                    req_index=int(req_index),
+                                    derived_sample=derived_target_slots[:8],
+                                    actual_sample=target_slots[:8],
+                                )
+                        except ValueError as error:
+                            _mtp_dw_event(
+                                "fail",
+                                invariant="deep_physical_slot_mapping",
+                                tp_rank=self.tp_rank,
+                                tp_world=self.tp_size,
+                                req=req_id,
+                                row=row,
+                                req_index=int(req_index),
+                                row_offset=row_offset,
+                                scratch_base=effective_scratch_base,
+                                current_position=current_position,
+                                prompt_len=prompt_len,
+                                committed_end=committed,
+                                boundary=boundary,
+                                detail=str(error),
+                            )
+                            target_slots, live_slots, aliases = [], [], []
+                        deep_common = {
+                            "tp_rank": self.tp_rank,
+                            "tp_world": self.tp_size,
+                            "worker_rank": self.tp_rank,
+                            "layer": layer_name,
+                            "req": req_id,
+                            "frontier": current_position,
+                            "window_start": current_window,
+                            "window_end": committed,
+                            "kv_group": 0,
+                            "row": row,
+                            "req_index": int(req_index),
+                            "row_offset": row_offset,
+                            "scratch_base": effective_scratch_base,
+                            "current_position": current_position,
+                            "prompt_len": prompt_len,
+                            "committed_end": committed,
+                            "boundary": boundary,
+                        }
+                        _mtp_dw_event(
+                            "deep",
+                            event="row_mapping",
+                            **deep_common,
+                            selection_width=len(absolute_values),
+                            lmcache_selected_count=selected_count,
+                            selected_absolute_sample=selected_absolute_values[:8],
+                            selected_absolute_checksum=diagnostic_int_checksum(
+                                selected_absolute_values
+                            ),
+                            live_physical_count=len(live_slots),
+                            live_physical_sample=live_slots[:8],
+                            live_physical_checksum=diagnostic_int_checksum(live_slots),
+                            checksum_scope="first32",
+                        )
+                        payload = _diag_deep_payloads.setdefault(
+                            req_id,
+                            {
+                                "common": {
+                                    "tp_rank": self.tp_rank,
+                                    "tp_world": self.tp_size,
+                                    "worker_rank": self.tp_rank,
+                                    "layer": layer_name,
+                                    "req": req_id,
+                                    "frontier": committed,
+                                    "window_start": (
+                                        max(0, committed - _decode_window_size)
+                                        if committed is not None
+                                        else None
+                                    ),
+                                    "window_end": committed,
+                                    "kv_group": 0,
+                                    "committed_end": committed,
+                                    "boundary": boundary,
+                                },
+                                "selection": [],
+                                "slots": [],
+                                "payload_count": 0,
+                                "target_count": 0,
+                                "selected_count": 0,
+                                "aliases": set(),
+                                "rows": [],
+                            },
+                        )
+                        remaining = max(0, 32 - len(payload["selection"]))
+                        payload["selection"].extend(packed_values[:remaining])
+                        payload["slots"].extend(target_slots[:remaining])
+                        payload["payload_count"] += len(packed_values)
+                        payload["target_count"] += len(target_slots)
+                        payload["selected_count"] += selected_count
+                        payload["aliases"].update(aliases)
+                        payload["rows"].append(row)
+                        if aliases:
+                            _mtp_dw_event(
+                                "fail",
+                                invariant="scratch_live_slot_alias",
+                                **deep_common,
+                                intersection_count=len(aliases),
+                                intersection_sample=aliases[:8],
+                            )
                     if req_id is not None and scratch_base is not None:
                         bases = seen_scratch.setdefault(req_id, set())
                         if scratch_base in bases:
@@ -2037,6 +2267,34 @@ class AscendSFAImpl(MLAAttentionImpl):
                         selected_packed_sample=packed_row[
                             : min(8, selected_absolute.numel())
                         ].tolist(),
+                    )
+                for payload in _diag_deep_payloads.values():
+                    packed_values = payload["selection"]
+                    target_slots = payload["slots"]
+                    aliases = sorted(payload["aliases"])
+                    _mtp_dw_event(
+                        "deep",
+                        event="connector_payload",
+                        **payload["common"],
+                        rows=payload["rows"],
+                        row_count=len(payload["rows"]),
+                        payload_count=payload["payload_count"],
+                        lmcache_selected_count=payload["selected_count"],
+                        selection_sample=packed_values[:8],
+                        selection_checksum=diagnostic_int_checksum(packed_values),
+                        target_physical_count=payload["target_count"],
+                        target_slot_sample=target_slots[:8],
+                        target_slot_checksum=diagnostic_int_checksum(target_slots),
+                        checksum_scope="first32",
+                        live_slot_intersection_count=len(aliases),
+                        live_slot_intersection_sample=aliases[:8],
+                    )
+                if (
+                    _diag_deep_emitted_req_ids is not None
+                    and _diag_deep_emitted_this_layer
+                ):
+                    _diag_deep_emitted_req_ids.update(
+                        _diag_deep_emitted_this_layer
                     )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash

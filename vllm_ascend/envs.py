@@ -213,6 +213,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
     ),
+    # Emit one CPU-synchronized, first-post-commit mapping diagnostic for the
+    # SHRINK_LATENT=2 compact-scratch path. Requires MTP_DW_DIAG. Default off;
+    # diagnostic only, with no inference fallback or output changes.
+    "VLLM_ASCEND_MTP_DW_DEEP_DIAG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
+        and int(os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"))
+    ),
     # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.

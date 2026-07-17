@@ -443,3 +443,46 @@ def test_formatted_event_context_is_bounded() -> None:
     summary = summarize_events(parse_lines(lines))
     rendered = _format(summary, failures_only=False, stage="remap")
     assert len(rendered.splitlines()[-1]) <= MAX_EVENT_CHARS + 20
+
+
+def test_deep_events_parse_filter_without_becoming_required() -> None:
+    lines = _lines()
+    lines.append(
+        MARKER
+        + json.dumps(
+            {
+                "schema": 1,
+                "req": "chatcmpl-1-internal",
+                "stage": "deep",
+                "event": "row_mapping",
+                "selected_absolute_checksum": 17,
+            }
+        )
+    )
+
+    summary = summarize_events(parse_lines(lines))
+    rendered = _format(summary, failures_only=False, stage="deep")
+    assert summary["status"] == "PASS"
+    assert '"stage":"deep"' in rendered
+    assert '"stage":"remap"' not in rendered
+
+
+def test_deep_alias_failure_is_reported() -> None:
+    lines = _lines()
+    lines.append(
+        MARKER
+        + json.dumps(
+            {
+                "schema": 1,
+                "req": "chatcmpl-1-internal",
+                "stage": "fail",
+                "invariant": "scratch_live_slot_alias",
+                "intersection_count": 1,
+                "intersection_sample": [128],
+            }
+        )
+    )
+
+    summary = summarize_events(parse_lines(lines))
+    assert summary["status"] == "FAIL"
+    assert summary["failures"][-1]["invariant"] == "scratch_live_slot_alias"

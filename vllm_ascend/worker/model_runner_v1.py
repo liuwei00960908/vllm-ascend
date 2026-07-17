@@ -95,7 +95,10 @@ from vllm.v1.worker.utils import AttentionGroup
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.mtp_dw_diag import post_commit_sample_requests
+from vllm_ascend.attention.mtp_dw_diag import (
+    first_post_commit_requests,
+    post_commit_sample_requests,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_lmcache_sparse_cached_tokens,
@@ -1508,6 +1511,7 @@ class NPUModelRunner(GPUModelRunner):
         diag_enabled = _mtp_dw_diag_enabled()
         diag_req_ids: set[str] | None = None
         diag_post_commit_req_ids: set[str] | None = None
+        diag_deep_req_ids: set[str] | None = None
         if diag_enabled:
             diag_req_ids = _mtp_dw_sample_requests(self, scheduler_output)
             previous_frontiers = getattr(
@@ -1560,6 +1564,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_adapter_cache=dsa_adapter_cache,
                 mtp_dw_diag_req_ids=diag_req_ids,
                 mtp_dw_diag_post_commit_req_ids=diag_post_commit_req_ids,
+                mtp_dw_deep_diag_req_ids=diag_deep_req_ids,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1601,6 +1606,12 @@ class NPUModelRunner(GPUModelRunner):
                             self._mtp_dw_diag_committed_frontiers = (
                                 previous_frontiers
                             )
+                        if envs_ascend.VLLM_ASCEND_MTP_DW_DEEP_DIAG:
+                            diag_deep_req_ids = first_post_commit_requests(
+                                previous_frontiers,
+                                decode_req_ids,
+                                decode_committed_frontiers,
+                            )
                         diag_post_commit_req_ids = post_commit_sample_requests(
                             previous_frontiers,
                             decode_req_ids,
@@ -1611,6 +1622,9 @@ class NPUModelRunner(GPUModelRunner):
                         forward_context.mtp_dw_diag_req_ids = diag_req_ids
                         forward_context.mtp_dw_diag_post_commit_req_ids = (
                             diag_post_commit_req_ids
+                        )
+                        forward_context.mtp_dw_deep_diag_req_ids = (
+                            diag_deep_req_ids
                         )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs

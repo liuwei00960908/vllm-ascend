@@ -482,7 +482,9 @@ def main() -> int:
     )
     selection.add_argument("--request-prefix")
     parser.add_argument("--failures-only", action="store_true")
-    parser.add_argument("--stage", choices=sorted(REQUIRED_STAGES | {"fail"}))
+    parser.add_argument(
+        "--stage", choices=sorted(REQUIRED_STAGES | {"deep", "fail"})
+    )
     args = parser.parse_args()
 
     with args.log.open("r", encoding="utf-8", errors="replace") as log_file:
