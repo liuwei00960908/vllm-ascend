@@ -1911,10 +1911,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             graph_inputs,
         )
 
-        # Keep the proof outside the captured work: retain each full one-token
-        # output on CPU, poison the persistent output buffer, replay, then
-        # compare every representable captured value. Avoiding NPU-side clones
-        # prevents the proof from adding allocator work between the captures.
+        # Keep the proof outside the captured work: inspect each full one-token
+        # output on CPU, poison the persistent output buffer, then replay. Dummy
+        # inputs can create tied top-k scores, so integer outputs only prove that
+        # every probed value was overwritten; requiring the same tied indices is
+        # not a reliable replay check. Floating outputs retain their numerical
+        # comparison. Avoiding NPU-side clones prevents the proof from adding
+        # allocator work between the captures.
         references = []
         for output_index, graph_output in enumerate(graph_outputs):
             if int(graph_output.numel()) == 0:
@@ -1948,14 +1951,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     poison = False if graph_output.dtype == torch.bool else 0
                     restorable_mask = torch.ne(capture_probe, poison)
             graph_output.fill_(poison)
-            references.append((capture_probe, restorable_mask))
+            references.append((capture_probe, restorable_mask, poison))
 
         graph_wrapper(*graph_inputs)
         torch.npu.current_stream().synchronize()
         for output_index, (graph_output, proof_reference) in enumerate(
             zip(graph_outputs, references)
         ):
-            capture_probe, restorable_mask = proof_reference
+            capture_probe, restorable_mask, poison = proof_reference
             restored_probe = (
                 graph_output.detach()
                 .cpu()
@@ -1975,21 +1978,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                     atol=atol,
                     equal_nan=False,
                 )
+                if not restored:
+                    raise RuntimeError(
+                        "[SFA staged graph POC] the "
+                        f"{region_name} replay did not reproduce floating "
+                        f"captured output {output_index} after poisoning."
+                    )
             else:
-                restored = torch.equal(restored_values, reference_values)
-            if not restored:
-                raise RuntimeError(
-                    "[SFA staged graph POC] the "
-                    f"{region_name} replay did not reproduce captured output "
-                    f"{output_index} after poisoning."
+                poisoned_remaining = int(
+                    torch.eq(restored_values, poison).sum().item()
                 )
+                if poisoned_remaining:
+                    checked_values = int(restored_values.numel())
+                    raise RuntimeError(
+                        "[SFA staged graph POC] the "
+                        f"{region_name} replay left {poisoned_remaining}/"
+                        f"{checked_values} probed values poisoned in captured "
+                        f"output {output_index}."
+                    )
 
         replay_proved.add(region_name)
         if {"pre", "post"}.issubset(replay_proved):
             logger.info_once(
                 "[SFA staged graph POC] startup graph-replay output-write "
                 "smoke passed: both staged runnables executed inside NPU "
-                "stream capture and replay rewrote every representable "
+                "stream capture and replay rewrote every probed "
                 "captured output value after poisoning; LMCache was not "
                 "invoked. This smoke test alone does not prove full or "
                 "input-sensitive compute capture. Treat two distinct live "

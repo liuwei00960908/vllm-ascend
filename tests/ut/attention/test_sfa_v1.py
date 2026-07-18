@@ -1046,6 +1046,60 @@ class TestStagedSFAGraphPoc(TestBase):
         graph_wrapper.assert_called_once_with(graph_input)
         stream.synchronize.assert_called_once_with()
 
+    def test_startup_replay_proof_accepts_changed_integer_output(self):
+        impl = self._make_eligible_impl()
+        impl._staged_sfa_capture_phases = {"pre:enter", "pre:exit"}
+        graph_input = torch.tensor([3.0])
+        graph_output = torch.tensor([1, 2, 3], dtype=torch.int32)
+        replay_output = torch.tensor([7, 8, 9], dtype=torch.int32)
+        batch_descriptor = BatchDescriptor(num_tokens=1)
+        forward_context = MagicMock()
+        forward_context.batch_descriptor = batch_descriptor
+        graph_entry = MagicMock()
+        graph_entry.aclgraph = object()
+        graph_entry.input_addresses = [graph_input.data_ptr()]
+        graph_wrapper = MagicMock(
+            side_effect=lambda *args: graph_output.copy_(replay_output)
+        )
+        graph_wrapper.concrete_aclgraph_entries = {
+            batch_descriptor: graph_entry,
+        }
+        stream = MagicMock()
+
+        with (
+            patch.object(
+                impl,
+                "_staged_sfa_capture_dummy_active",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                sfa_v1.torch.npu,
+                "is_current_stream_capturing",
+                return_value=False,
+            ),
+            patch.object(
+                sfa_v1.torch.npu,
+                "current_stream",
+                return_value=stream,
+            ),
+        ):
+            impl._prove_staged_sfa_graph_replay(
+                "pre",
+                graph_wrapper,
+                (graph_input,),
+                (graph_output,),
+            )
+
+        self.assertEqual(impl._staged_sfa_replay_proved, {"pre"})
+        self.assertTrue(torch.equal(graph_output, replay_output))
+        graph_wrapper.assert_called_once_with(graph_input)
+        stream.synchronize.assert_called_once_with()
+
     def test_startup_replay_proof_requires_both_capture_phases(self):
         impl = self._make_eligible_impl()
         impl._staged_sfa_capture_phases = {"pre:enter"}
@@ -1108,7 +1162,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "replay did not reproduce captured output",
+                "replay did not reproduce floating captured output",
             ),
         ):
             impl._prove_staged_sfa_graph_replay(
@@ -1170,7 +1224,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "replay did not reproduce captured output",
+                "replay did not reproduce floating captured output",
             ),
         ):
             impl._prove_staged_sfa_graph_replay(
@@ -1183,6 +1237,70 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(impl._staged_sfa_replay_proved, set())
         self.assertTrue(torch.equal(graph_output[:16], reference[:16]))
         self.assertTrue(torch.isnan(graph_output[16:]).all())
+        graph_wrapper.assert_called_once_with(graph_input)
+        stream.synchronize.assert_called_once_with()
+
+    def test_startup_replay_proof_rejects_partial_integer_write(self):
+        impl = self._make_eligible_impl()
+        impl._staged_sfa_capture_phases = {"pre:enter", "pre:exit"}
+        graph_input = torch.tensor([3.0])
+        graph_output = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        replay_output = torch.tensor([7, 8], dtype=torch.int32)
+        batch_descriptor = BatchDescriptor(num_tokens=1)
+        forward_context = MagicMock()
+        forward_context.batch_descriptor = batch_descriptor
+        graph_entry = MagicMock()
+        graph_entry.aclgraph = object()
+        graph_entry.input_addresses = [graph_input.data_ptr()]
+
+        def restore_only_former_probe(*args):
+            graph_output[:2].copy_(replay_output)
+
+        graph_wrapper = MagicMock(
+            side_effect=restore_only_former_probe
+        )
+        graph_wrapper.concrete_aclgraph_entries = {
+            batch_descriptor: graph_entry,
+        }
+        stream = MagicMock()
+
+        with (
+            patch.object(
+                impl,
+                "_staged_sfa_capture_dummy_active",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                sfa_v1.torch.npu,
+                "is_current_stream_capturing",
+                return_value=False,
+            ),
+            patch.object(
+                sfa_v1.torch.npu,
+                "current_stream",
+                return_value=stream,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "replay left 2/4 probed values poisoned in captured output 0",
+            ),
+        ):
+            impl._prove_staged_sfa_graph_replay(
+                "pre",
+                graph_wrapper,
+                (graph_input,),
+                (graph_output,),
+            )
+
+        self.assertEqual(impl._staged_sfa_replay_proved, set())
+        self.assertTrue(torch.equal(graph_output[:2], replay_output))
+        poison = torch.iinfo(torch.int32).max
+        self.assertTrue(torch.eq(graph_output[2:], poison).all())
         graph_wrapper.assert_called_once_with(graph_input)
         stream.synchronize.assert_called_once_with()
 
