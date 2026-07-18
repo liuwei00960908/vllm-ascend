@@ -1695,15 +1695,17 @@ class TestAscendSFABackend(TestBase):
         self.assertEqual(AscendSFABackend.get_name(), "ASCEND_SFA")
 
     def test_get_builder_cls(self):
-        self.assertEqual(AscendSFABackend.get_builder_cls(),
-                         AscendSFAMetadataBuilder)
+        with patch.object(sfa_v1, "enable_cp", return_value=False):
+            self.assertEqual(AscendSFABackend.get_builder_cls(),
+                             AscendSFAMetadataBuilder)
 
     def test_get_kv_cache_shape(self):
         result = AscendSFABackend.get_kv_cache_shape(2, 4, 8, 128)
         self.assertEqual(result, (2, 4, 8, 128))
 
     def test_get_impl_cls(self):
-        result = AscendSFABackend.get_impl_cls()
+        with patch.object(sfa_v1, "enable_cp", return_value=False):
+            result = AscendSFABackend.get_impl_cls()
         self.assertEqual(result, AscendSFAImpl)
 
 

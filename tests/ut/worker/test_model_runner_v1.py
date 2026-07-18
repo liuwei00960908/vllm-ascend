@@ -18,6 +18,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
         runner.use_sparse = False
+        runner.dsa_shared_pool = False
+        runner.dsa_unbundle = False
         runner.use_sparse_c8_indexer = False
         runner.use_hybrid_blocks = False
         runner.hybrid_with_attn_and_mamba = False
