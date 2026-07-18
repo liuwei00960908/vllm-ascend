@@ -992,12 +992,12 @@ class TestStagedSFAGraphPoc(TestBase):
         ):
             impl._observe_staged_sfa_capture_phase("pre", "enter")
 
-    def test_startup_replay_proof_restores_poisoned_output(self):
+    def test_startup_replay_proof_accepts_changed_floating_output(self):
         impl = self._make_eligible_impl()
         impl._staged_sfa_capture_phases = {"pre:enter", "pre:exit"}
         graph_input = torch.tensor([3.0])
         graph_output = torch.tensor([1.0, 2.0])
-        reference = graph_output.clone()
+        replay_output = torch.tensor([7.5, -3.25])
         batch_descriptor = BatchDescriptor(num_tokens=1)
         forward_context = MagicMock()
         forward_context.batch_descriptor = batch_descriptor
@@ -1005,7 +1005,7 @@ class TestStagedSFAGraphPoc(TestBase):
         graph_entry.aclgraph = object()
         graph_entry.input_addresses = [graph_input.data_ptr()]
         graph_wrapper = MagicMock(
-            side_effect=lambda *args: graph_output.copy_(reference)
+            side_effect=lambda *args: graph_output.copy_(replay_output)
         )
         graph_wrapper.concrete_aclgraph_entries = {
             batch_descriptor: graph_entry,
@@ -1042,7 +1042,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         self.assertEqual(impl._staged_sfa_replay_proved, {"pre"})
-        self.assertTrue(torch.equal(graph_output, reference))
+        self.assertTrue(torch.equal(graph_output, replay_output))
         graph_wrapper.assert_called_once_with(graph_input)
         stream.synchronize.assert_called_once_with()
 
@@ -1162,7 +1162,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "replay did not reproduce floating captured output",
+                "replay left 2/2 probed values poisoned in captured output 0",
             ),
         ):
             impl._prove_staged_sfa_graph_replay(
@@ -1224,7 +1224,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "replay did not reproduce floating captured output",
+                "replay left 16/32 probed values poisoned in captured output 0",
             ),
         ):
             impl._prove_staged_sfa_graph_replay(
