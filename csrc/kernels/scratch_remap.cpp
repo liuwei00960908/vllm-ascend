@@ -13,7 +13,11 @@
 namespace {
 
 constexpr uint32_t kUbAlignBytes = 32;
-constexpr AscendC::CumSumConfig kCumSumConfig{true, true, false};
+constexpr uint32_t kCumSumTileWidth = 512;
+constexpr uint32_t kCumSumTransposeRows = 16;
+constexpr uint32_t kCumSumWorkspaceBytes =
+    2 * kCumSumTransposeRows * kCumSumTileWidth * sizeof(float);
+constexpr AscendC::CumSumConfig kCumSumConfig{true, false, false};
 
 // A complete source row is the ownership unit. validRows must be unique, and
 // every row is at least one 256-byte transaction, so two AIVs never write the
@@ -59,6 +63,7 @@ public:
         }
         pipe_.InitBuffer(selectionFlagsBuf_, rowBytes);
         pipe_.InitBuffer(prefixRanksBuf_, rowBytes);
+        pipe_.InitBuffer(cumSumWorkspaceBuf_, kCumSumWorkspaceBytes);
         pipe_.InitBuffer(nonNegativeMaskBuf_, maskBufferBytes);
         pipe_.InitBuffer(beforeBoundaryMaskBuf_, maskBufferBytes);
         pipe_.InitBuffer(selectedMaskBuf_, maskBufferBytes);
@@ -90,6 +95,8 @@ private:
         LocalTensor<int32_t> clampedInput = clampedInputBuf_.Get<int32_t>();
         LocalTensor<float> selectionFlags = selectionFlagsBuf_.Get<float>();
         LocalTensor<float> prefixRanks = prefixRanksBuf_.Get<float>();
+        LocalTensor<uint8_t> cumSumWorkspace =
+            cumSumWorkspaceBuf_.Get<uint8_t>();
         LocalTensor<uint8_t> nonNegativeMask =
             nonNegativeMaskBuf_.Get<uint8_t>();
         LocalTensor<uint8_t> beforeBoundaryMask =
@@ -174,14 +181,44 @@ private:
             rowWidth_);
         PipeBarrier<PIPE_V>();
 
+        // CumSum along [1, K] needs 2 * 16 * K float bytes of temporary
+        // storage. A whole K=2048/4096 row does not fit in UB, so scan fixed
+        // tiles and carry the final rank into the next tile. This keeps the
+        // per-element work on the vector pipeline while bounding workspace at
+        // 64 KiB for every supported row width.
         LocalTensor<float> lastRow = clampedInput.ReinterpretCast<float>();
-        const CumSumInfo cumSumInfo{1, rowWidth_};
-        CumSum<float, kCumSumConfig>(
-            prefixRanks,
-            lastRow,
-            selectionFlags,
-            cumSumInfo);
-        PipeBarrier<PIPE_V>();
+        float carry = 0.0F;
+        for (uint32_t tileOffset = 0; tileOffset < rowWidth_;
+             tileOffset += kCumSumTileWidth) {
+            const uint32_t remaining = rowWidth_ - tileOffset;
+            const uint32_t tileWidth =
+                remaining < kCumSumTileWidth ? remaining : kCumSumTileWidth;
+            const CumSumInfo cumSumInfo{1, tileWidth};
+            LocalTensor<float> tilePrefix = prefixRanks[tileOffset];
+            LocalTensor<float> tileFlags = selectionFlags[tileOffset];
+            CumSum<float, kCumSumConfig>(
+                tilePrefix,
+                lastRow,
+                tileFlags,
+                cumSumWorkspace,
+                cumSumInfo);
+            PipeBarrier<PIPE_V>();
+
+            if (tileOffset != 0) {
+                SetFlag<HardEvent::S_V>(0);
+                WaitFlag<HardEvent::S_V>(0);
+                Adds(
+                    tilePrefix,
+                    tilePrefix,
+                    carry,
+                    tileWidth);
+                PipeBarrier<PIPE_V>();
+            }
+
+            SetFlag<HardEvent::V_S>(0);
+            WaitFlag<HardEvent::V_S>(0);
+            carry = prefixRanks.GetValue(tileOffset + tileWidth - 1);
+        }
 
         // Convert only the small exact ranks to int32. The final float Select
         // is a bitwise 32-bit mux over reinterpreted int32 tensors; token
@@ -219,6 +256,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> selectionFlagsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> prefixRanksBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> cumSumWorkspaceBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> nonNegativeMaskBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> beforeBoundaryMaskBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
