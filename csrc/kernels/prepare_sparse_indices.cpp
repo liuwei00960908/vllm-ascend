@@ -22,9 +22,9 @@ constexpr AscendC::CumSumConfig kCumSumConfig{true, false, false};
 // A complete source row is the ownership unit. validRows must be unique, and
 // every row is at least one 256-byte transaction, so two AIVs never write the
 // same transaction while top-k indices are updated in place.
-class DSAScratchRemapKernel {
+class DSAPrepareSparseIndicesKernel {
 public:
-    __aicore__ inline DSAScratchRemapKernel() = default;
+    __aicore__ inline DSAPrepareSparseIndicesKernel() = default;
 
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
@@ -32,15 +32,20 @@ public:
         __gm__ int32_t* validRows,
         __gm__ int32_t* scratchBase,
         __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* rowReqIndices,
+        uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t validRowCount,
         uint32_t coreCount,
-        uint32_t needPacked)
+        uint32_t needPacked,
+        uint32_t clearInvalidRows)
     {
+        rowCount_ = rowCount;
         rowWidth_ = rowWidth;
         validRowCount_ = validRowCount;
         coreCount_ = coreCount;
         needPacked_ = needPacked != 0;
+        clearInvalidRows_ = clearInvalidRows != 0;
 
         topkIndicesGm_.SetGlobalBuffer(topkIndices);
         splitBoundaryGm_.SetGlobalBuffer(splitBoundary);
@@ -50,6 +55,9 @@ public:
             selectedPackedGm_.SetGlobalBuffer(
                 selectedPacked,
                 static_cast<uint64_t>(validRowCount) * rowWidth);
+        }
+        if (clearInvalidRows_) {
+            rowReqIndicesGm_.SetGlobalBuffer(rowReqIndices, rowCount);
         }
 
         const uint32_t rowBytes = rowWidth * sizeof(int32_t);
@@ -75,6 +83,14 @@ public:
         for (uint32_t packedRow = coreIdx; packedRow < validRowCount_;
              packedRow += coreCount_) {
             ProcessRow(packedRow);
+        }
+        if (clearInvalidRows_) {
+            for (uint32_t sourceRow = coreIdx; sourceRow < rowCount_;
+                 sourceRow += coreCount_) {
+                if (rowReqIndicesGm_.GetValue(sourceRow) < 0) {
+                    ZeroPaddingRow(sourceRow);
+                }
+            }
         }
     }
 
@@ -249,6 +265,27 @@ private:
         WaitFlag<HardEvent::MTE3_MTE2>(0);
     }
 
+    __aicore__ inline void ZeroPaddingRow(uint32_t sourceRow)
+    {
+        using namespace AscendC;
+
+        // Wait for this core's preceding row write before reusing inputBuf_.
+        // Complete rows remain the ownership unit, so no other AIV writes the
+        // same 256-byte transaction.
+        SetFlag<HardEvent::MTE3_V>(0);
+        WaitFlag<HardEvent::MTE3_V>(0);
+
+        LocalTensor<int32_t> input = inputBuf_.Get<int32_t>();
+        Duplicate(input, static_cast<int32_t>(0), rowWidth_);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        DataCopy(
+            topkIndicesGm_[static_cast<uint64_t>(sourceRow) * rowWidth_],
+            input,
+            rowWidth_);
+    }
+
 private:
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
@@ -266,64 +303,79 @@ private:
     AscendC::GlobalTensor<int32_t> validRowsGm_;
     AscendC::GlobalTensor<int32_t> scratchBaseGm_;
     AscendC::GlobalTensor<int32_t> selectedPackedGm_;
+    AscendC::GlobalTensor<int32_t> rowReqIndicesGm_;
 
+    uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t validRowCount_ = 0;
     uint32_t coreCount_ = 0;
     bool needPacked_ = false;
+    bool clearInvalidRows_ = false;
 };
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void dsa_scratch_remap_kernel(
+extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
     __gm__ int32_t* topkIndices,
     __gm__ int32_t* splitBoundary,
     __gm__ int32_t* validRows,
     __gm__ int32_t* scratchBase,
     __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* rowReqIndices,
+    uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t validRowCount,
     uint32_t coreCount,
-    uint32_t needPacked)
+    uint32_t needPacked,
+    uint32_t clearInvalidRows)
 {
-    DSAScratchRemapKernel op;
+    DSAPrepareSparseIndicesKernel op;
     op.Init(
         topkIndices,
         splitBoundary,
         validRows,
         scratchBase,
         selectedPacked,
+        rowReqIndices,
+        rowCount,
         rowWidth,
         validRowCount,
         coreCount,
-        needPacked);
+        needPacked,
+        clearInvalidRows);
     op.Process();
 }
 
 namespace vllm_ascend {
 
-void dsa_scratch_remap_impl(
+void dsa_prepare_sparse_indices_impl(
     void* stream,
     void* topkIndices,
     void* splitBoundary,
     void* validRows,
     void* scratchBase,
     void* selectedPacked,
+    void* rowReqIndices,
+    uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t validRowCount,
     uint32_t coreCount,
-    bool needPacked)
+    bool needPacked,
+    bool clearInvalidRows)
 {
-    dsa_scratch_remap_kernel<<<coreCount, nullptr, stream>>>(
+    dsa_prepare_sparse_indices_kernel<<<coreCount, nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(splitBoundary),
         static_cast<int32_t*>(validRows),
         static_cast<int32_t*>(scratchBase),
         static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(rowReqIndices),
+        rowCount,
         rowWidth,
         validRowCount,
         coreCount,
-        needPacked ? 1U : 0U);
+        needPacked ? 1U : 0U,
+        clearInvalidRows ? 1U : 0U);
 }
 
 }  // namespace vllm_ascend

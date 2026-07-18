@@ -1,4 +1,4 @@
-"""Device-only top-k remap for the DSA latent scratch (Step B2).
+"""Device-only sparse-index preparation for DSA latent scratch (Step B2).
 
 Decode reads the latent through two disjoint index spaces resolved by the SAME
 per-request block table:
@@ -14,12 +14,13 @@ Everything is fixed-shape tensor math: no D2H sync, graph-mode friendly.
 import torch
 
 
-def _scratch_remap_torch(
+def _prepare_sparse_indices_torch(
     topk_indices: torch.Tensor,
     split_boundary: torch.Tensor,
     need_packed: bool = True,
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
+    row_req_indices: torch.Tensor | None = None,
 ):
     """Original Torch implementation, retained only as a test oracle."""
     orig_shape = topk_indices.shape
@@ -36,6 +37,9 @@ def _scratch_remap_torch(
     # kernel requires int32 indices, so pin the dtype explicitly.
     rank = torch.cumsum(is_lmcache, dim=1, dtype=sel.dtype) - 1
     new_indices = torch.where(is_lmcache, base + rank, sel)
+    if row_req_indices is not None:
+        invalid_rows = row_req_indices.reshape(-1)[: sel.shape[0]] < 0
+        new_indices.masked_fill_(invalid_rows.reshape(-1, 1), 0)
 
     if not need_packed:
         return new_indices.reshape(orig_shape), None
@@ -54,12 +58,13 @@ def _scratch_remap_torch(
     return new_indices.reshape(orig_shape), packed
 
 
-def scratch_remap(
+def prepare_sparse_indices(
     topk_indices: torch.Tensor,
     split_boundary: torch.Tensor,
     need_packed: bool = True,
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
+    row_req_indices: torch.Tensor | None = None,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -77,6 +82,10 @@ def scratch_remap(
             indices. Only those rows are remapped; selected_packed follows this
             order with shape [num_decode_rows, k]. The custom op mutates these
             topk_indices rows in place.
+        row_req_indices: [bs] request index for each row; negative entries are
+            zeroed in the same kernel. Pass this only for pure
+            decode/spec-decode; a mixed prefill row also has a negative request
+            index but is real.
 
     Returns:
         new_indices: same shape as topk_indices. LMCache-selected entries are
@@ -88,16 +97,19 @@ def scratch_remap(
     """
     if topk_indices.device.type != "npu":
         raise RuntimeError(
-            "scratch_remap requires the NPU custom op; use _scratch_remap_torch only as a test reference"
+            "prepare_sparse_indices requires the NPU custom op; use "
+            "_prepare_sparse_indices_torch only as a test reference"
         )
     if valid_row_indices is None or scratch_base is None:
-        raise ValueError("scratch_remap requires valid_row_indices and scratch_base")
-
+        raise ValueError(
+            "prepare_sparse_indices requires valid_row_indices and scratch_base"
+        )
     try:
-        fused_op = torch.ops._C_ascend.npu_dsa_scratch_remap_
+        fused_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_
     except AttributeError as exc:
         raise RuntimeError(
-            "vllm_ascend_C does not expose npu_dsa_scratch_remap_; rebuild the custom-op extension"
+            "vllm_ascend_C does not expose npu_dsa_prepare_sparse_indices_; "
+            "rebuild the custom-op extension"
         ) from exc
 
     packed = fused_op(
@@ -106,5 +118,6 @@ def scratch_remap(
         valid_row_indices,
         scratch_base,
         need_packed,
+        row_req_indices,
     )
     return topk_indices, packed if need_packed else None

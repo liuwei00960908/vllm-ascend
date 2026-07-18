@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, TypeVar
 
@@ -47,7 +48,9 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
-from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+    prepare_sparse_indices,
+)
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -110,6 +113,7 @@ def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
+@lru_cache(maxsize=1)
 def _decode_window_save_window_size() -> int:
     value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
     try:
@@ -121,18 +125,14 @@ def _decode_window_save_window_size() -> int:
 def _dsa_mask_padding_sparse_rows(
     topk_indices: torch.Tensor,
     row_req_indices: torch.Tensor | None,
-    num_actual_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep graph padding rows from referencing freed DSA logical blocks."""
     topk_2d = _dsa_topk_to_2d_indices(topk_indices)
     num_rows = int(topk_2d.shape[0])
     if row_req_indices is None:
         return topk_indices, topk_2d
-    if num_actual_rows is not None and num_rows <= int(num_actual_rows):
-        return topk_indices, topk_2d
-
     row_req_indices = row_req_indices[:num_rows].to(
-        device=topk_indices.device, dtype=torch.long
+        device=topk_indices.device
     )
     if int(row_req_indices.numel()) < num_rows:
         pad = torch.full(
@@ -143,18 +143,11 @@ def _dsa_mask_padding_sparse_rows(
         )
         row_req_indices = torch.cat((row_req_indices, pad), dim=0)
     padding_mask = row_req_indices < 0
-    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
-        topk_indices = topk_indices.masked_fill(
-            padding_mask.reshape(-1, 1, 1), 0
-        )
-    elif topk_indices.dim() == 2:
-        topk_indices = topk_indices.masked_fill(padding_mask.reshape(-1, 1), 0)
-    else:
-        topk_indices = topk_indices.clone()
-        topk_indices.reshape(num_rows, -1).masked_fill_(
-            padding_mask.reshape(-1, 1), 0
-        )
-    return topk_indices, _dsa_topk_to_2d_indices(topk_indices)
+    if not topk_indices.is_contiguous():
+        topk_indices = topk_indices.contiguous()
+        topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+    topk_2d.masked_fill_(padding_mask.reshape(-1, 1), 0)
+    return topk_indices, topk_2d
 
 
 def _dsa_build_target_slot_mapping(
@@ -163,6 +156,7 @@ def _dsa_build_target_slot_mapping(
     scratch_base: torch.Tensor,
     width: int,
     block_size: int,
+    position_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build per-row target slots for compact DSA scratch loads."""
     if width <= 0 or row_req_indices.numel() == 0:
@@ -175,9 +169,13 @@ def _dsa_build_target_slot_mapping(
     row_req_indices = row_req_indices.to(device=block_table.device, dtype=torch.long)
     scratch_base = scratch_base.to(device=block_table.device, dtype=torch.long)
     block_table_rows = block_table.index_select(0, row_req_indices).to(torch.long)
-    positions = scratch_base.reshape(-1, 1) + torch.arange(
-        width, dtype=torch.long, device=block_table.device
-    ).reshape(1, -1)
+    if position_offsets is None:
+        position_offsets = torch.arange(
+            width, dtype=torch.long, device=block_table.device
+        )
+    positions = scratch_base.reshape(-1, 1) + position_offsets[:width].reshape(
+        1, -1
+    )
     logical_blocks = positions // block_size
     offsets = positions % block_size
     max_logical_block = max(int(block_table_rows.shape[1]) - 1, 0)
@@ -363,6 +361,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 getattr(hf_text_config or hf_config, "index_topk", 2048),
             )
         )
+        self._dsa_target_position_offsets = (
+            torch.arange(self.index_topk, dtype=torch.long, device=device)
+            if self.dsa_shrink_latent
+            else None
+        )
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -409,7 +412,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
 
         # DSA shrink-latent: expand per-request prompt lengths to per-row cache
-        # split boundaries for scratch_remap. Decode rows start at prompt length;
+        # Split boundaries for sparse-index preparation. Decode rows start at
+        # prompt length;
         # decode-window mode later replaces those rows with current_window_start.
         # Prefill and padding rows get 0 and stay untouched by the remap.
         split_boundary_rows = None
@@ -488,6 +492,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         decode_scratch_base_compact,
                         self.index_topk,
                         self.block_size,
+                        self._dsa_target_position_offsets,
                     )
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
@@ -1324,6 +1329,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         block_table_override=None,
         layer_name: str | None = None,
         trace_label: str = "native",
+        padding_rows_zeroed: bool = False,
     ):
         # DSA latent offload: when overrides are given, read latent from the A1 scratch
         # (kv_override/key_rope_override) via the scratch block_table instead of the
@@ -1347,11 +1353,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         )
         topk_2d = None
-        if _dsa_decode_sparse_fa:
+        if _dsa_decode_sparse_fa and not padding_rows_zeroed:
             topk_indices, topk_2d = _dsa_mask_padding_sparse_rows(
                 topk_indices,
                 getattr(attn_metadata, "decode_req_indices", None),
-                getattr(attn_metadata, "num_actual_tokens", None),
             )
 
         if _dsa_decode_sparse_fa:
@@ -1428,6 +1433,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
+        _sparse_indices_padding_zeroed = False
         index_layer_name = (
             _dsa_indexer_layer_name(layer_name)
             if self.dsa_offload_unbundle
@@ -1683,6 +1689,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.dsa_shrink_latent
             and attn_metadata.split_boundary is not None
             and attn_metadata.num_decode_tokens > 0
+            and (
+                attn_metadata.need_sparse_lmcache_payload
+                or self.dsa_shrink_latent == 3
+            )
         ):
             # _split_boundary is per row. Decode rows start at prompt length by
             # default; decode-window mode replaces it with current_window_start.
@@ -1697,7 +1707,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             _scratch_base = attn_metadata.decode_scratch_base
             if _valid_row_indices is None or _scratch_base is None:
                 raise RuntimeError(
-                    "DSA scratch remap metadata is incomplete: "
+                    "DSA sparse-index metadata is incomplete: "
                     "decode_valid_row_indices and decode_scratch_base are required"
                 )
             _scratch_base = _scratch_base[:_topk_rows]
@@ -1705,11 +1715,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _scratch_base = _scratch_base.to(device=topk_indices.device)
             _split_boundary = attn_metadata.split_boundary
             _decode_window_size = _decode_window_save_window_size()
-            _cached_split_boundary = (
-                attn_metadata.decode_split_boundary
-                if _decode_window_size > 0
-                else None
-            )
+            _cached_split_boundary = attn_metadata.decode_split_boundary
             if (
                 _cached_split_boundary is not None
                 and _cached_split_boundary.shape == _split_boundary.shape
@@ -1805,16 +1811,24 @@ class AscendSFAImpl(MLAAttentionImpl):
                             _split_boundary_override,
                             _split_boundary,
                         )
-                if _decode_window_size > 0:
-                    attn_metadata.decode_split_boundary = _split_boundary
-            with _dsa_prof.section("scratch_remap"):
-                topk_indices, _sel_packed = scratch_remap(
+                # Connector frontier expansion is step metadata, not layer
+                # data. Reuse it for every remaining SFA layer in this step.
+                attn_metadata.decode_split_boundary = _split_boundary
+            _padding_row_req_indices = (
+                attn_metadata.decode_req_indices if _is_pure_decode else None
+            )
+            with _dsa_prof.section("prepare_sparse_indices"):
+                topk_indices, _sel_packed = prepare_sparse_indices(
                     topk_indices,
                     _split_boundary,
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                     valid_row_indices=_valid_row_indices,
+                    row_req_indices=_padding_row_req_indices,
                 )
+            _sparse_indices_padding_zeroed = (
+                _padding_row_req_indices is not None
+            )
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
@@ -1935,6 +1949,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         actual_seq_lengths_query, actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="adapter_parity_native",
+                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
                     )
                     diff = (native_out.float() - adapter_out.float()).abs().max()
                     logger.info("[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -2000,6 +2015,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         actual_seq_lengths_query, actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="lmcache_parity_native",
+                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
                     )
                     diff = (native_out.float() - scratch_out.float()).abs().max()
                     logger.info("[DSA-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -2030,6 +2046,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
                     layer_name=layer_name,
                     trace_label="pool_prefill",
+                    padding_rows_zeroed=_sparse_indices_padding_zeroed,
                 )
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
@@ -2037,6 +2054,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         actual_seq_lengths_query, actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="pool_prefill_parity_native",
+                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
                     )
                     diff = (native_out.float() - pool_out.float()).abs().max()
                     logger.info("[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s", layer_name, float(diff))
@@ -2051,6 +2069,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query, actual_seq_lengths_key,
                     layer_name=layer_name,
                     trace_label="native",
+                    padding_rows_zeroed=_sparse_indices_padding_zeroed,
                 )
             # one step per layer-call on the native (user) path so the profiler
             # logs mean ms/layer-call periodically (mirrors the manager path).

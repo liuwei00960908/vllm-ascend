@@ -51,15 +51,17 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
     return {masked_input, mask};
 }
 
-at::Tensor npu_dsa_scratch_remap_meta(
+at::Tensor npu_dsa_prepare_sparse_indices_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
     const at::Tensor &valid_rows,
     const at::Tensor &scratch_base,
-    bool need_packed)
+    bool need_packed,
+    const c10::optional<at::Tensor> &row_req_indices)
 {
     (void)split_boundary;
     (void)scratch_base;
+    (void)row_req_indices;
     const int64_t rows = topk_indices.size(0);
     TORCH_CHECK(rows > 0, "topk_indices must contain at least one row");
     const int64_t row_width = topk_indices.numel() / rows;
@@ -597,10 +599,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // Masked input and mask meta implementation
     ops.impl("get_masked_input_and_mask", &vllm_ascend::meta::get_masked_input_and_mask_meta);
-    // Compact DSA scratch remap
+    // Prepare compact DSA sparse indices and optional LMCache payload.
     ops.impl(
-        "npu_dsa_scratch_remap_",
-        &vllm_ascend::meta::npu_dsa_scratch_remap_meta);
+        "npu_dsa_prepare_sparse_indices_",
+        &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

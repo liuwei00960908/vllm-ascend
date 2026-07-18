@@ -69,6 +69,24 @@ class TestLMCacheSparseWaitSync(TestBase):
         self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
 
 
+class TestDSASparsePadding(TestBase):
+
+    def test_trailing_graph_padding_is_zeroed_in_place(self):
+        topk = torch.arange(4 * 64, dtype=torch.int32).reshape(4, 1, 64)
+        original_actual = topk[:2].clone()
+        input_ptr = topk.data_ptr()
+
+        result, result_2d = sfa_v1._dsa_mask_padding_sparse_rows(
+            topk,
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+
+        self.assertEqual(result.data_ptr(), input_ptr)
+        self.assertEqual(result_2d.data_ptr(), input_ptr)
+        self.assertTrue(torch.equal(result[:2], original_actual))
+        self.assertEqual(torch.count_nonzero(result[2:]).item(), 0)
+
+
 class TestAscendSFABackend(TestBase):
 
     def test_get_name(self):
