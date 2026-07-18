@@ -325,7 +325,9 @@ class TestScratchRemap:
     """Step B2: compact-scratch remap of decode top-k."""
 
     def test_remap_splits_prefill_compact_and_decode_absolute(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
 
         # req0: prompt 100; selected mixes prefill (5,7,99) and decode (100,103)
         # req1: prompt 200; all prefill
@@ -333,7 +335,12 @@ class TestScratchRemap:
             [[[5, 100, 7, 103, 99]],
              [[10, 11, 12, 13, 14]]], dtype=torch.int32)
         plen = torch.tensor([100, 200])
-        new_idx, packed = scratch_remap(topk, plen)
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.arange(2, dtype=torch.int32),
+        )
 
         # prefill entries -> compact ranks in topk order; decode stay absolute
         assert new_idx.tolist() == [[[0, 100, 1, 103, 2]],
@@ -346,31 +353,118 @@ class TestScratchRemap:
         assert new_idx.dtype == topk.dtype
 
     def test_remap_padding_entries_untouched(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
 
         topk = torch.tensor([[[3, -1, 8, -1, 4]]], dtype=torch.int32)
         plen = torch.tensor([10])
-        new_idx, packed = scratch_remap(topk, plen)
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            scratch_base=torch.zeros(1, dtype=torch.int32),
+            valid_row_indices=torch.zeros(1, dtype=torch.int32),
+        )
         assert new_idx.tolist() == [[[0, -1, 1, -1, 2]]]
         assert packed.tolist() == [[3, 8, 4, 0, 0]]
 
     def test_remap_shape_2d_input(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
 
         topk = torch.tensor([[2, 50, 1]], dtype=torch.int32)
-        new_idx, packed = scratch_remap(topk, torch.tensor([40]))
+        new_idx, packed = scratch_remap(
+            topk,
+            torch.tensor([40]),
+            scratch_base=torch.zeros(1, dtype=torch.int32),
+            valid_row_indices=torch.zeros(1, dtype=torch.int32),
+        )
         assert new_idx.shape == topk.shape
         assert new_idx.tolist() == [[0, 50, 1]]
         assert packed.tolist() == [[2, 1, 0]]
 
     def test_remap_mixed_rows_plen_zero_untouched(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
 
         # row0: decode row (plen 100) -> remapped; row1: prefill row (plen 0) -> untouched
         topk = torch.tensor([[[5, 100, 7]],
                              [[5, 100, 7]]], dtype=torch.int32)
         plen = torch.tensor([100, 0])
-        new_idx, packed = scratch_remap(topk, plen)
+        new_idx, packed = scratch_remap(
+            topk,
+            plen,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.arange(2, dtype=torch.int32),
+        )
         assert new_idx.tolist() == [[[0, 100, 1]],
                                     [[5, 100, 7]]]      # prefill row unchanged
         assert packed.tolist()[0] == [5, 7, 0]
+
+    def test_remap_compacts_only_explicit_decode_rows(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
+
+        topk = torch.tensor(
+            [
+                [[5, 100, 7, -1]],
+                [[20, 21, 22, 23]],
+                [[3, 200, 4, 201]],
+            ],
+            dtype=torch.int32,
+        )
+        split_boundary = torch.tensor([100, 0, 200], dtype=torch.int32)
+        valid_rows = torch.tensor([0, 2], dtype=torch.int32)
+        scratch_base = torch.tensor([0, 0, 4], dtype=torch.int32)
+
+        new_idx, packed = scratch_remap(
+            topk,
+            split_boundary,
+            scratch_base=scratch_base,
+            valid_row_indices=valid_rows,
+        )
+
+        assert new_idx.tolist() == [
+            [[0, 100, 1, -1]],
+            [[20, 21, 22, 23]],
+            [[4, 200, 5, 201]],
+        ]
+        assert packed.tolist() == [[5, 7, 0, 0], [3, 4, 0, 0]]
+        assert packed.shape == (2, 4)
+
+    def test_remap_compact_without_payload(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            _scratch_remap_torch as scratch_remap,
+        )
+
+        topk = torch.tensor(
+            [[5, 100, 7], [10, 11, 12]], dtype=torch.int32
+        )
+        new_idx, packed = scratch_remap(
+            topk,
+            torch.tensor([100, 0], dtype=torch.int32),
+            need_packed=False,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.tensor([0], dtype=torch.int32),
+        )
+
+        assert new_idx.tolist() == [[0, 100, 1], [10, 11, 12]]
+        assert packed is None
+
+    def test_public_remap_does_not_fall_back_to_torch_on_cpu(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import (
+            scratch_remap,
+        )
+
+        with pytest.raises(RuntimeError, match="requires the NPU custom op"):
+            scratch_remap(
+                torch.zeros((1, 64), dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                scratch_base=torch.zeros(1, dtype=torch.int32),
+                valid_row_indices=torch.zeros(1, dtype=torch.int32),
+            )
