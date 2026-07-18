@@ -453,6 +453,37 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
     vllm_config.compilation_config.post_init_cudagraph_sizes()
 
 
+def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
+    """Whether this config can instantiate the staged SFA graph POC.
+
+    Keep resource budgeting, startup capture, and the attention implementation
+    on one predicate. Merely exporting the experimental flag must not shrink
+    unrelated models' graph-size or KV-cache budgets.
+    """
+    from vllm.config import CUDAGraphMode
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    return bool(
+        envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
+        and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE
+        and envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS
+        and envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT == 2
+        and getattr(
+            getattr(vllm_config, "compilation_config", None),
+            "cudagraph_mode",
+            None,
+        )
+        == CUDAGraphMode.PIECEWISE
+        and bool(getattr(model_config, "use_mla", False))
+        and hf_text_config is not None
+        and hasattr(hf_text_config, "index_topk")
+        and getattr(vllm_config, "kv_transfer_config", None) is not None
+        and getattr(vllm_config, "speculative_config", None) is None
+        and getattr(vllm_config, "lora_config", None) is None
+    )
+
+
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
     # NOTE: Currently, we can only capture 1800 graphs at most,
@@ -502,6 +533,28 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             parallel_config.tensor_parallel_size,
         ]
     )
+
+    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
+    if staged_sfa_graph_active:
+        # The size-1 SFA POC owns two extra persistent graphs per layer.
+        # Conservatively charge both staged graphs the same communication
+        # stream expansion as an ordinary per-layer graph. Reserve those
+        # resources before sampling regular capture sizes so the one-flag POC
+        # does not push TP jobs past the empirical ACL/HCCL stream ceiling.
+        staged_sfa_resources = (
+            2 * num_hidden_layers * (1 + 2 * num_comm_groups)
+        )
+        if staged_sfa_resources >= MAX_CAPTURE_SIZE:
+            raise ValueError(
+                "Insufficient ACL graph resources for the staged SFA graph "
+                f"POC: required reservation={staged_sfa_resources}, "
+                f"available={MAX_CAPTURE_SIZE}."
+            )
+        MAX_CAPTURE_SIZE -= staged_sfa_resources
+        logger.info(
+            "Reserved %d ACL graph resources for staged SFA capture",
+            staged_sfa_resources,
+        )
 
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
         # TODO: Find out whether we need to take into account the pp_size
@@ -556,6 +609,26 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
 
     arch_name = vllm_config.model_config.architecture
 
+    if staged_sfa_graph_active and max_num_batch_sizes < 1:
+        raise ValueError(
+            "The staged SFA graph POC has no ACL graph capture slots left "
+            "after resource budgeting."
+        )
+    if staged_sfa_graph_active and 1 not in original_sizes:
+        original_sizes = sorted({1, *original_sizes})
+
+    if (
+        staged_sfa_graph_active
+        and max_num_batch_sizes == 1
+        and len(original_sizes) > 1
+    ):
+        # The POC only requires its normalized PIECEWISE size-1 key. Prefer a
+        # useful staged graph over imposing two unrelated capture sizes.
+        update_cudagraph_capture_sizes(vllm_config, [1])
+        logger.info(
+            "Adjusted ACL graph batch sizes for staged SFA capture to [1]"
+        )
+        return
     # If original sizes exceed maximum, sample a representative subset
     if max_num_batch_sizes < len(original_sizes):
         # Sample uniformly from original sizes

@@ -168,6 +168,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
     ),
+    # Experimental SFA graph-capture proof of concept. When enabled, the
+    # one-token DecodeOnly / SHRINK_LATENT=2 path is executed as two piecewise
+    # ACL graphs with selective LMCache retrieval left eager between them.
+    # Unsupported live batch shapes keep using the existing eager SFA forward;
+    # incompatible model/runtime features fail fast during startup capture so
+    # an explicitly requested POC cannot silently remain inactive.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))
+    ),
     # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
     # default from max_num_seqs. The pool holds prefill latent during prefill (freed
     # after) + decode latent, sized far below full-context. Tune up for long prompts.

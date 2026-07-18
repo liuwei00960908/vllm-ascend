@@ -2,7 +2,13 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
-from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    ProfilerConfig,
+    VllmConfig,
+)
 
 from tests.ut.base import TestBase
 
@@ -637,6 +643,33 @@ class TestNPUWorker(TestBase):
             with self.assertRaises(RuntimeError) as cm:
                 worker._create_profiler("test_trace")
             self.assertIn("torch_profiler_dir cannot be empty", str(cm.exception))
+
+    def test_staged_sfa_graph_memory_reserve(self):
+        import vllm_ascend.worker.worker as worker_module
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.hf_text_config.num_hidden_layers = 80
+
+        with patch.object(
+            worker_module,
+            "staged_sfa_graph_configured",
+            return_value=False,
+        ):
+            disabled = worker_module._staged_sfa_graph_reserved_bytes(
+                vllm_config
+            )
+
+        with patch.object(
+            worker_module,
+            "staged_sfa_graph_configured",
+            return_value=True,
+        ):
+            reserved = worker_module._staged_sfa_graph_reserved_bytes(
+                vllm_config
+            )
+
+        self.assertEqual(disabled, 0)
+        self.assertEqual(reserved, 160 * (1 << 20))
 
     @patch("torch.npu.reset_peak_memory_stats")
     @patch("torch.npu.empty_cache")

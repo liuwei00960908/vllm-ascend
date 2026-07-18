@@ -55,9 +55,9 @@ class ACLGraphWrapper:
     runtime inputs into that buffers for replay. We assume implementing them
     is done outside of the wrapper. That is because we do not make any
     assumption on the dynamic shape (batch size) of the runtime inputs, as a
-    trade-off for staying orthogonal to compilation logic. Nevertheless,
-    tracing and checking the input addresses to be consistent during replay is
-    guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
+    trade-off for staying orthogonal to compilation logic. Input addresses are
+    recorded for every capture; the wrapper's automatic replay assertion is
+    enabled when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
     def __init__(
@@ -66,10 +66,15 @@ class ACLGraphWrapper:
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
         cudagraph_options: CUDAGraphOptions | None = None,
+        synchronize_before_replay: bool = True,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
+        # Generic wrappers keep the historical host fence because their input
+        # buffers can be updated by async scheduling. Narrow staged wrappers
+        # may opt out when their same-stream/event ordering is explicit.
+        self.synchronize_before_replay = synchronize_before_replay
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
@@ -202,7 +207,11 @@ class ACLGraphWrapper:
             if self.vllm_config.speculative_config
             else False
         )
-        if self.runtime_mode != CUDAGraphMode.FULL or not _EXTRA_CTX.is_draft_model or not use_eagle:
+        if self.synchronize_before_replay and (
+            self.runtime_mode != CUDAGraphMode.FULL
+            or not _EXTRA_CTX.is_draft_model
+            or not use_eagle
+        ):
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
         return entry.output

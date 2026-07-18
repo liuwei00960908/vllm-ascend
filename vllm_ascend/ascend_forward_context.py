@@ -1,5 +1,6 @@
 import math
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -30,6 +31,22 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
+@dataclass
+class StagedSFALiveParityState:
+    """Forward-scoped eager-vs-graph validation for the staged SFA POC."""
+
+    request_id: str
+    seq_len: int
+    expected_layers: int
+    checked_impl_ids: set[int] = field(default_factory=set)
+    checked_layer_names: list[str] = field(default_factory=list)
+    match_flags: list[tuple[str, torch.Tensor]] = field(default_factory=list)
+    pending_saves: list[
+        tuple[str, list[torch.Tensor]]
+    ] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -50,6 +67,8 @@ def set_ascend_forward_context(
     dsa_req_ids=None,
     dsa_prompt_lens=None,
     dsa_adapter_cache=None,
+    staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_live_parity_state: StagedSFALiveParityState | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -78,6 +97,13 @@ def set_ascend_forward_context(
         forward_context.dsa_prompt_lens = dsa_prompt_lens
         # Adapter-backed latent hot cache (None unless VLLM_ASCEND_DSA_USE_ADAPTER_CACHE).
         forward_context.dsa_adapter_cache = dsa_adapter_cache
+        # True only for the explicit one-token eager warmup / graph-capture
+        # passes used by the staged SFA proof of concept. Connector generators
+        # and save hooks must not advance during either dummy pass.
+        forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
+        forward_context.staged_sfa_live_parity_state = (
+            staged_sfa_live_parity_state
+        )
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

@@ -9,7 +9,7 @@ import torch
 import torch_npu
 import vllm.envs as envs_vllm
 from torch import nn
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -30,7 +30,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    StagedSFALiveParityState,
+)
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
@@ -67,6 +70,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp_with_o_proj_tp,
     get_weight_prefetch_method,
     maybe_trans_nz,
+    staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -116,6 +120,95 @@ def _decode_window_save_window_size() -> int:
         return max(0, int(value or 0))
     except ValueError:
         return 0
+
+
+def _prepare_staged_sfa_remap_boundary(
+    attn_metadata: Any,
+    request_ids: Any,
+    *,
+    is_dummy_run: bool,
+) -> torch.Tensor:
+    """Fill the stable Graph-A remap-boundary input once per step.
+
+    Connector metadata and request/row mapping are host objects and therefore
+    cannot be frozen into the captured runnable. Resolve them eagerly on CPU,
+    then copy the final per-row boundary into the builder-owned NPU tensor.
+    """
+    boundary = attn_metadata.decode_remap_boundary
+    if boundary is None:
+        raise RuntimeError(
+            "[SFA staged graph POC] remap-boundary storage is unavailable."
+        )
+    if attn_metadata.decode_remap_boundary_ready:
+        return boundary
+
+    prompt_rows = attn_metadata.prompt_lens_cpu_rows
+    row_req_indices = attn_metadata.decode_req_indices_cpu
+    seq_lens_cpu = attn_metadata.seq_lens_cpu
+    if (
+        prompt_rows is None
+        or row_req_indices is None
+        or seq_lens_cpu is None
+    ):
+        raise RuntimeError(
+            "[SFA staged graph POC] CPU remap metadata is incomplete."
+        )
+
+    prompt_rows_np = np.asarray(prompt_rows, dtype=np.int32).reshape(-1)
+    row_req_indices_np = np.asarray(
+        row_req_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
+    if (
+        int(boundary.numel()) != int(prompt_rows_np.size)
+        or row_req_indices_np.size != prompt_rows_np.size
+    ):
+        raise RuntimeError(
+            "[SFA staged graph POC] remap-boundary shapes differ: "
+            f"boundary={tuple(boundary.shape)}, "
+            f"prompt_rows={tuple(prompt_rows_np.shape)}, "
+            f"row_req_indices={tuple(row_req_indices_np.shape)}."
+        )
+
+    cached_tokens = (
+        None
+        if is_dummy_run
+        else get_lmcache_sparse_cached_tokens(request_ids)
+    )
+    decode_window_size = _decode_window_save_window_size()
+    boundary_rows = prompt_rows_np.copy()
+    for row_index, request_index_value in enumerate(row_req_indices_np):
+        request_index = int(request_index_value)
+        if request_index < 0:
+            continue
+        if request_index >= len(seq_lens):
+            raise RuntimeError(
+                "[SFA staged graph POC] decode row references request "
+                f"{request_index}, but only {len(seq_lens)} sequence lengths "
+                "are available."
+            )
+        cached_for_request = None
+        if cached_tokens is not None:
+            cached_for_request = (
+                int(cached_tokens[request_index])
+                if request_index < len(cached_tokens)
+                else 0
+            )
+        if decode_window_size > 0:
+            current_position = max(seq_lens[request_index] - 1, 0)
+            row_boundary = (
+                current_position // decode_window_size * decode_window_size
+            )
+            if cached_for_request is not None:
+                row_boundary = min(row_boundary, cached_for_request)
+            boundary_rows[row_index] = row_boundary
+        elif cached_for_request is not None:
+            boundary_rows[row_index] = cached_for_request
+
+    boundary.copy_(torch.from_numpy(boundary_rows))
+    attn_metadata.decode_remap_boundary_ready = True
+    return boundary
 
 
 def _dsa_mask_padding_sparse_rows(
@@ -308,7 +401,9 @@ class AscendSFAMetadata:
     decode_scratch_base_compact: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
+    prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
+    decode_remap_boundary_ready: bool = False
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -373,6 +468,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
+        # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
+        # rebuilds across decode steps, so keep one builder-owned device buffer
+        # and overwrite only its contents before Graph A replay.
+        self.decode_remap_boundary = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -622,6 +725,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_scratch_base_compact=decode_scratch_base_compact,
             decode_target_slot_mapping=decode_target_slot_mapping,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
+            prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
+            decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
+            decode_remap_boundary_ready=False,
             num_decode_tokens=num_decode_rows,
         )
 
@@ -745,6 +851,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.dsa_shrink_latent = (
             int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
         )
+        self.enable_staged_sfa_graph = staged_sfa_graph_configured(
+            self.vllm_config
+        )
+        self._staged_sfa_pre_graph = None
+        self._staged_sfa_post_graph = None
+        self._staged_sfa_capture_phases: set[str] = set()
+        self._staged_sfa_replay_proved: set[str] = set()
+        self._staged_sfa_live_capture_validated = False
+        self._staged_sfa_live_validated_request_ids = None
+        self._staged_sfa_dummy_cache_initialized = False
+        self._staged_sfa_parity_output = None
+        self._staged_sfa_parity_latent_scratch = None
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1244,19 +1362,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         x: torch.Tensor,
         q_c: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        attn_metadata: M,
+        attn_metadata: M | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table_override: torch.Tensor | None = None,
     ):
         # DSA two-group mode: the indexer cache has its own block ids; fall back
         # to the (shared) latent block table in single-group mode.
-        indexer_block_table = (
-            attn_metadata.indexer_block_table
-            if attn_metadata.indexer_block_table is not None
-            else attn_metadata.block_table
-        )
+        if indexer_block_table_override is not None:
+            indexer_block_table = indexer_block_table_override
+        else:
+            assert attn_metadata is not None
+            indexer_block_table = (
+                attn_metadata.indexer_block_table
+                if attn_metadata.indexer_block_table is not None
+                else attn_metadata.block_table
+            )
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -1349,17 +1472,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         # DSA latent offload: when overrides are given, read latent from the A1 scratch
         # (kv_override/key_rope_override) via the scratch block_table instead of the
         # full paged latent cache. Used by the decode-gather path.
-        if kv_override is not None:
+        if block_table_override is not None:
             block_table = block_table_override
+        else:
+            assert attn_metadata is not None
+            block_table = attn_metadata.block_table
+
+        if kv_override is not None:
             kv = kv_override
             key_rope = key_rope_override
         else:
-            block_table = attn_metadata.block_table
             kv = kv_cache[0]
             key_rope = kv_cache[1]
 
         _dsa_decode_sparse_fa = (
             self.dsa_shrink_latent
+            and attn_metadata is not None
             and block_table is not None
             and attn_metadata.num_decode_tokens > 0
             and attn_metadata.attn_state in (
@@ -1423,6 +1551,1196 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return attn_output
 
+    def _staged_sfa_graph_ineligible_reason(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+    ) -> str | None:
+        """Return why the conservative staged-graph POC cannot run.
+
+        The first version deliberately targets the exact A/B measurement case:
+        one-token native compact-scratch decode (SHRINK_LATENT=2). Other live
+        batch shapes keep using the existing SFA forward; incompatible startup
+        configuration fails the explicit POC capture.
+        """
+        forward_context = get_forward_context()
+        runtime_mode = getattr(
+            forward_context,
+            "cudagraph_runtime_mode",
+            None,
+        )
+        staged_dummy_run = bool(
+            getattr(
+                forward_context,
+                "staged_sfa_graph_dummy_run",
+                False,
+            )
+        )
+        if runtime_mode != CUDAGraphMode.PIECEWISE and not (
+            staged_dummy_run and runtime_mode == CUDAGraphMode.NONE
+        ):
+            return "the runtime graph mode is not PIECEWISE"
+        batch_descriptor = getattr(
+            forward_context,
+            "batch_descriptor",
+            None,
+        )
+        if (
+            batch_descriptor is None
+            or batch_descriptor.num_tokens != 1
+            or batch_descriptor.uniform
+            or batch_descriptor.has_lora
+            or batch_descriptor.num_reqs is not None
+            or batch_descriptor.num_active_loras != 0
+        ):
+            return "the graph key is not the normalized PIECEWISE size 1 key"
+        if self.vllm_config.speculative_config is not None:
+            return "speculative decoding is enabled"
+        if self.vllm_config.lora_config is not None:
+            return "LoRA is configured"
+        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            return "only DecodeOnly is supported"
+        if (
+            hidden_states.shape[0] != 1
+            or attn_metadata.num_input_tokens != 1
+            or attn_metadata.num_actual_tokens != 1
+        ):
+            return "only a single, unpadded decode token is supported"
+        if self.dsa_shrink_latent != 2:
+            return "SHRINK_LATENT must be 2"
+        if self.enable_mlapo:
+            return "MLAPO is enabled"
+        weight_prefetch_method = get_weight_prefetch_method()
+        if (
+            weight_prefetch_method is not None
+            and weight_prefetch_method.mla_sfa_prefetch_enable
+        ):
+            return "weight prefetch is enabled"
+        if self.enable_dsa_cp:
+            return "DSA context parallelism is enabled"
+        if self.enable_dsa_cp_with_o_proj_tp:
+            return "DSA o_proj tensor parallelism is enabled"
+        if self.use_sparse_c8_indexer:
+            return "the sparse C8 indexer is enabled"
+        if self.dsa_offload_free_paged:
+            return "the free-paged offload path is enabled"
+        if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
+            return "the DSA parity path is enabled"
+        if getattr(forward_context, "dsa_offload_manager", None) is not None:
+            return "the DSA offload manager is active"
+        if getattr(forward_context, "dsa_adapter_cache", None) is not None:
+            return "the DSA adapter cache is active"
+        if len(kv_cache) != 3:
+            return "the POC requires exactly three KV tensors"
+        if any(cache.ndim != 4 for cache in kv_cache):
+            return "the POC requires rank-4 PA_BSND KV tensors"
+        if self.num_kv_heads != 1 or any(
+            int(cache.shape[-2]) != 1 for cache in kv_cache
+        ):
+            return "the POC requires one KV head in every cache tensor"
+        expected_hidden_dims = (
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.head_dim,
+        )
+        if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(
+            int(dim) for dim in expected_hidden_dims
+        ):
+            return (
+                "the staged KV cache hidden dimensions do not match SFA"
+            )
+        cache_block_sizes = {
+            int(cache.shape[1]) for cache in kv_cache
+        }
+        if len(cache_block_sizes) != 1:
+            return "the staged KV cache block sizes do not agree"
+        configured_block_size = int(
+            self.vllm_config.cache_config.block_size
+        )
+        if next(iter(cache_block_sizes)) != configured_block_size:
+            return (
+                "the staged KV cache block size does not match the "
+                "configured block size"
+            )
+        if len({cache.device for cache in kv_cache}) != 1:
+            return "the staged KV caches are on different devices"
+        cache_dtypes = {cache.dtype for cache in kv_cache}
+        if len(cache_dtypes) != 1:
+            return "the staged KV caches must share one dtype"
+        if next(iter(cache_dtypes)) not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return (
+                "the staged KV cache dtype must be float16 or bfloat16"
+            )
+        if self.q_lora_rank is None or self.fused_qkv_a_proj is None:
+            return "the native Q-LoRA preprocessing path is unavailable"
+        if self.q_a_layernorm is None:
+            return "q_a_layernorm is unavailable"
+        if (
+            attn_metadata.cos is None
+            or attn_metadata.sin is None
+            or attn_metadata.slot_mapping is None
+            or attn_metadata.cum_query_lens is None
+            or attn_metadata.seq_lens is None
+            or attn_metadata.block_table is None
+            or attn_metadata.indexer_slot_mapping is None
+            or attn_metadata.indexer_block_table is None
+        ):
+            return "required fixed-shape attention metadata is unavailable"
+        if attn_metadata.num_decode_tokens != 1:
+            return "the compact-scratch metadata does not contain one decode row"
+        if not attn_metadata.need_sparse_lmcache_payload:
+            return "the v1 sparse LMCache payload path is unavailable"
+        if not attn_metadata.decode_valid_rows_all:
+            return "the single decode row is not the complete compact payload"
+        if (
+            attn_metadata.decode_valid_row_indices is not None
+            or attn_metadata.decode_scratch_base is not None
+            or attn_metadata.decode_scratch_base_compact is not None
+            or attn_metadata.decode_target_slot_mapping is not None
+        ):
+            return "row-specific MTP scratch placement is unsupported"
+        request_ids = attn_metadata.decode_request_ids_compact
+        if request_ids is None or len(request_ids) != 1:
+            return "the compact LMCache request id is unavailable"
+        if (
+            attn_metadata.prompt_lens_cpu_rows is None
+            or attn_metadata.decode_req_indices_cpu is None
+            or attn_metadata.seq_lens_cpu is None
+            or attn_metadata.decode_remap_boundary is None
+        ):
+            return "the persistent remap-boundary metadata is unavailable"
+        prompt_rows = np.asarray(
+            attn_metadata.prompt_lens_cpu_rows,
+            dtype=np.int64,
+        ).reshape(-1)
+        if prompt_rows.size != 1 or int(prompt_rows[0]) < self.index_topk:
+            return "the prompt boundary is smaller than index_topk"
+        return None
+
+    def _get_staged_sfa_graph_wrappers(self):
+        """Lazily construct the two inner PIECEWISE ACL graph wrappers."""
+        if (
+            self._staged_sfa_pre_graph is None
+            or self._staged_sfa_post_graph is None
+        ):
+            from vllm.compilation.cuda_graph import CUDAGraphOptions
+
+            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+            options = CUDAGraphOptions(
+                debug_log_enable=False,
+                gc_disable=True,
+                weak_ref_output=False,
+            )
+            self._staged_sfa_pre_graph = ACLGraphWrapper(
+                runnable=self._staged_sfa_graph_pre_poc,
+                vllm_config=self.vllm_config,
+                runtime_mode=CUDAGraphMode.PIECEWISE,
+                cudagraph_options=options,
+                synchronize_before_replay=False,
+            )
+            self._staged_sfa_post_graph = ACLGraphWrapper(
+                runnable=self._staged_sfa_graph_post_poc,
+                vllm_config=self.vllm_config,
+                runtime_mode=CUDAGraphMode.PIECEWISE,
+                cudagraph_options=CUDAGraphOptions(
+                    debug_log_enable=False,
+                    gc_disable=True,
+                    weak_ref_output=False,
+                ),
+                synchronize_before_replay=False,
+            )
+            logger.warning_once(
+                "[SFA staged graph POC] active: compact-scratch decode "
+                "compute is captured before and after an eager LMCache layer "
+                "retrieve. Staged replay uses stream/event ordering without "
+                "per-graph host synchronization. Dynamic sequence-length "
+                "replay of the torch_npu lightning indexer remains "
+                "experimental and requires live numerical parity."
+            )
+        return self._staged_sfa_pre_graph, self._staged_sfa_post_graph
+
+    def _validate_staged_sfa_graph_entry(
+        self,
+        region_name: str,
+        graph_wrapper,
+        graph_inputs: tuple[torch.Tensor, ...] | None = None,
+    ):
+        """Require a captured entry and optionally verify live input storage."""
+        batch_descriptor = get_forward_context().batch_descriptor
+        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(
+            batch_descriptor
+        )
+        if graph_entry is None or graph_entry.aclgraph is None:
+            raise RuntimeError(
+                "[SFA staged graph POC] the "
+                f"{region_name} region was not captured during startup "
+                f"for {batch_descriptor}."
+            )
+        if graph_inputs is None:
+            return graph_entry
+
+        captured_addresses = graph_entry.input_addresses
+        live_addresses = [
+            value.data_ptr()
+            for value in graph_inputs
+            if isinstance(value, torch.Tensor)
+        ]
+        if captured_addresses is None:
+            raise RuntimeError(
+                "[SFA staged graph POC] the "
+                f"{region_name} graph did not record its input addresses."
+            )
+        if captured_addresses != live_addresses:
+            mismatch_indices = [
+                index
+                for index, (captured, live) in enumerate(
+                    zip(captured_addresses, live_addresses)
+                )
+                if captured != live
+            ]
+            if len(captured_addresses) != len(live_addresses):
+                mismatch_indices.extend(
+                    range(
+                        min(len(captured_addresses), len(live_addresses)),
+                        max(len(captured_addresses), len(live_addresses)),
+                    )
+                )
+            raise RuntimeError(
+                "[SFA staged graph POC] the positional tensor storage for "
+                f"the {region_name} graph changed before live replay; "
+                f"differing input indices={mismatch_indices}."
+            )
+        return graph_entry
+
+    @staticmethod
+    def _staged_sfa_capture_dummy_active() -> bool:
+        forward_context = get_forward_context()
+        return bool(
+            getattr(
+                forward_context,
+                "staged_sfa_graph_dummy_run",
+                False,
+            )
+            and getattr(
+                forward_context,
+                "cudagraph_runtime_mode",
+                None,
+            )
+            == CUDAGraphMode.PIECEWISE
+        )
+
+    def _observe_staged_sfa_capture_phase(
+        self,
+        region_name: str,
+        phase: str,
+    ) -> None:
+        """Record that a staged runnable executed inside NPU stream capture."""
+        if not self._staged_sfa_capture_dummy_active():
+            return
+        if not torch.npu.is_current_stream_capturing():
+            raise RuntimeError(
+                "[SFA staged graph POC] the "
+                f"{region_name} runnable reached its {phase} phase outside "
+                "NPU stream capture."
+            )
+        capture_phases = getattr(
+            self,
+            "_staged_sfa_capture_phases",
+            None,
+        )
+        if capture_phases is None:
+            capture_phases = set()
+            self._staged_sfa_capture_phases = capture_phases
+        capture_phases.add(f"{region_name}:{phase}")
+
+    def _prove_staged_sfa_graph_replay(
+        self,
+        region_name: str,
+        graph_wrapper,
+        graph_inputs: tuple[torch.Tensor, ...],
+        graph_outputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Smoke-test that replay rewrites each captured output buffer.
+
+        This deliberately does not claim that every intended kernel is present
+        or that replay is input-sensitive. The authoritative POC evidence is
+        two distinct live eager-parity lengths plus an NPU profiler trace of
+        both graph regions around the eager LMCache interval.
+        """
+        if not self._staged_sfa_capture_dummy_active():
+            return
+        replay_proved = getattr(
+            self,
+            "_staged_sfa_replay_proved",
+            None,
+        )
+        if replay_proved is None:
+            replay_proved = set()
+            self._staged_sfa_replay_proved = replay_proved
+        if region_name in replay_proved:
+            return
+
+        required_phases = {
+            f"{region_name}:enter",
+            f"{region_name}:exit",
+        }
+        observed_phases = getattr(
+            self,
+            "_staged_sfa_capture_phases",
+            set(),
+        )
+        missing_phases = required_phases - observed_phases
+        if missing_phases:
+            raise RuntimeError(
+                "[SFA staged graph POC] the capture-phase proof for "
+                f"{region_name} is incomplete: {sorted(missing_phases)}."
+            )
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError(
+                "[SFA staged graph POC] cannot run the "
+                f"{region_name} replay proof before stream capture ends."
+            )
+        self._validate_staged_sfa_graph_entry(
+            region_name,
+            graph_wrapper,
+            graph_inputs,
+        )
+
+        # Keep the proof outside the captured work: retain each full one-token
+        # output on CPU, poison the persistent output buffer, replay, then
+        # compare every representable captured value. Avoiding NPU-side clones
+        # prevents the proof from adding allocator work between the captures.
+        references = []
+        for output_index, graph_output in enumerate(graph_outputs):
+            if int(graph_output.numel()) == 0:
+                raise RuntimeError(
+                    "[SFA staged graph POC] cannot prove the "
+                    f"{region_name} replay because captured output "
+                    f"{output_index} is empty."
+                )
+            capture_probe = (
+                graph_output.detach()
+                .cpu()
+                .reshape(-1)
+                .clone()
+            )
+            if graph_output.is_floating_point():
+                restorable_mask = torch.isfinite(capture_probe)
+                if not bool(restorable_mask.any().item()):
+                    raise RuntimeError(
+                        "[SFA staged graph POC] cannot prove the "
+                        f"{region_name} replay because captured output "
+                        f"{output_index} has no finite values."
+                    )
+                poison = float("nan")
+            else:
+                if graph_output.dtype == torch.bool:
+                    poison = True
+                else:
+                    poison = torch.iinfo(graph_output.dtype).max
+                restorable_mask = torch.ne(capture_probe, poison)
+                if not bool(restorable_mask.any().item()):
+                    poison = False if graph_output.dtype == torch.bool else 0
+                    restorable_mask = torch.ne(capture_probe, poison)
+            graph_output.fill_(poison)
+            references.append((capture_probe, restorable_mask))
+
+        graph_wrapper(*graph_inputs)
+        torch.npu.current_stream().synchronize()
+        for output_index, (graph_output, proof_reference) in enumerate(
+            zip(graph_outputs, references)
+        ):
+            capture_probe, restorable_mask = proof_reference
+            restored_probe = (
+                graph_output.detach()
+                .cpu()
+                .reshape(-1)
+            )
+            reference_values = capture_probe[restorable_mask]
+            restored_values = restored_probe[restorable_mask]
+            if graph_output.is_floating_point():
+                if capture_probe.dtype in (torch.float16, torch.bfloat16):
+                    rtol, atol = 1e-2, 1e-3
+                else:
+                    rtol, atol = 1e-4, 1e-5
+                restored = torch.allclose(
+                    restored_values,
+                    reference_values,
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=False,
+                )
+            else:
+                restored = torch.equal(restored_values, reference_values)
+            if not restored:
+                raise RuntimeError(
+                    "[SFA staged graph POC] the "
+                    f"{region_name} replay did not reproduce captured output "
+                    f"{output_index} after poisoning."
+                )
+
+        replay_proved.add(region_name)
+        if {"pre", "post"}.issubset(replay_proved):
+            logger.info_once(
+                "[SFA staged graph POC] startup graph-replay output-write "
+                "smoke passed: both staged runnables executed inside NPU "
+                "stream capture and replay rewrote every representable "
+                "captured output value after poisoning; LMCache was not "
+                "invoked. This smoke test alone does not prove full or "
+                "input-sensitive compute capture. Treat two distinct live "
+                "eager-parity lengths plus an NPU profiler trace showing the "
+                "pre/post graph kernels around the eager LMCache interval as "
+                "the authoritative capture evidence."
+            )
+
+    def _require_staged_sfa_startup_proof(self) -> None:
+        required_phases = {
+            "pre:enter",
+            "pre:exit",
+            "post:enter",
+            "post:exit",
+        }
+        missing_phases = required_phases - getattr(
+            self,
+            "_staged_sfa_capture_phases",
+            set(),
+        )
+        missing_replays = {"pre", "post"} - getattr(
+            self,
+            "_staged_sfa_replay_proved",
+            set(),
+        )
+        if missing_phases or missing_replays:
+            raise RuntimeError(
+                "[SFA staged graph POC] startup replay smoke test is "
+                "incomplete: "
+                f"missing capture phases={sorted(missing_phases)}, "
+                f"missing replay proofs={sorted(missing_replays)}."
+            )
+
+    @staticmethod
+    def _staged_sfa_parity_match_tensor(
+        actual: torch.Tensor,
+        reference: torch.Tensor,
+        *,
+        exact: bool,
+    ) -> torch.Tensor:
+        """Return a device scalar without branching on a local TP result."""
+        if (
+            actual.shape != reference.shape
+            or actual.dtype != reference.dtype
+            or actual.device != reference.device
+        ):
+            return actual.new_zeros((), dtype=torch.bool)
+        if exact:
+            return torch.eq(actual, reference).all()
+        if not actual.is_floating_point():
+            return actual.new_zeros((), dtype=torch.bool)
+        if actual.dtype in (torch.float16, torch.bfloat16):
+            rtol, atol = 1e-2, 1e-3
+        else:
+            rtol, atol = 1e-4, 1e-5
+        finite = torch.logical_and(
+            torch.isfinite(actual).all(),
+            torch.isfinite(reference).all(),
+        )
+        close = torch.isclose(
+            actual,
+            reference,
+            rtol=rtol,
+            atol=atol,
+            equal_nan=False,
+        ).all()
+        return torch.logical_and(finite, close)
+
+    @classmethod
+    def _staged_sfa_parity_flags(
+        cls,
+        comparisons: tuple[
+            tuple[str, torch.Tensor, torch.Tensor, bool],
+            ...,
+        ],
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Build device flags; the runner materializes all layers at once."""
+        return [
+            (
+                label,
+                cls._staged_sfa_parity_match_tensor(
+                    actual,
+                    reference,
+                    exact=exact,
+                ),
+            )
+            for label, actual, reference, exact in comparisons
+        ]
+
+    def _submit_sfa_save_operations(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        """Publish saves normally, but hold parity-token saves for consensus."""
+        parity_state = getattr(
+            get_forward_context(),
+            "staged_sfa_live_parity_state",
+            None,
+        )
+        if isinstance(parity_state, StagedSFALiveParityState):
+            parity_state.pending_saves.extend(save_operations)
+            return
+        for layer_name, kv_caches in save_operations:
+            maybe_save_kv_layer_to_connector(
+                layer_name,
+                kv_caches,
+            )
+
+    def _get_staged_sfa_parity_latent_scratch(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return private one-block buffers for eager latent computation."""
+        live_caches = (kv_cache[0], kv_cache[1])
+        scratch = getattr(
+            self,
+            "_staged_sfa_parity_latent_scratch",
+            None,
+        )
+        if (
+            scratch is None
+            or any(
+                private.shape != live[:1].shape
+                or private.dtype != live.dtype
+                or private.device != live.device
+                for private, live in zip(scratch, live_caches)
+            )
+        ):
+            scratch = (
+                torch.empty_like(live_caches[0][:1]),
+                torch.empty_like(live_caches[1][:1]),
+            )
+            self._staged_sfa_parity_latent_scratch = scratch
+        return scratch
+
+    def _staged_sfa_eager_pre_reference_poc(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        indexer_slot_mapping: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table: torch.Tensor,
+        remap_boundary: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Graph-A reference with no live-cache write or connector call."""
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_lora_rank is not None
+        assert self.q_a_layernorm is not None
+        assert self.kv_a_layernorm is not None
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_no_split = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+        k_li, k_li_scale = self.indexer_select_pre_process(
+            hidden_states,
+            cos,
+            sin,
+        )
+        assert k_li_scale is None
+        k_li = self._get_full_kv(k_li, None)
+
+        private_nope, private_pe = (
+            self._get_staged_sfa_parity_latent_scratch(kv_cache)
+        )
+        kv_input = kv_no_split.view(
+            kv_no_split.shape[0],
+            self.num_kv_heads,
+            1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        _, _, ref_k_pe, ref_k_nope = (
+            torch_npu.npu_kv_rmsnorm_rope_cache(
+                kv_input,
+                self.kv_a_layernorm.weight,
+                cos,
+                sin,
+                torch.zeros_like(slot_mapping).to(torch.int64),
+                private_pe,
+                private_nope,
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA",
+                is_output_kv=True,
+            )
+        )
+        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+        q_pe = self.rope_single(q_pe, cos, sin)
+        topk_indices = self.indexer_select_post_process(
+            x=hidden_states,
+            q_c=q_c,
+            kv_cache=kv_cache,
+            attn_metadata=None,
+            cos=cos,
+            sin=sin,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            indexer_block_table_override=indexer_block_table,
+        )
+        topk_indices, selected_packed = scratch_remap(
+            topk_indices,
+            remap_boundary,
+            need_packed=True,
+        )
+        assert selected_packed is not None
+        return (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            selected_packed,
+            ref_k_nope.reshape(-1, kv_cache[0].shape[-1]),
+            ref_k_pe.reshape(-1, kv_cache[1].shape[-1]),
+            k_li.reshape(-1, kv_cache[2].shape[-1]),
+        )
+
+    def _staged_sfa_graph_pre_poc(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        indexer_slot_mapping: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table: torch.Tensor,
+        remap_boundary: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Graph A: preprocess, cache writes, top-k and scratch remap."""
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_lora_rank is not None
+        assert self.q_a_layernorm is not None
+        self._observe_staged_sfa_capture_phase("pre", "enter")
+
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+            inputs=self.fused_qkv_a_proj.weight,
+            dependency=hidden_states,
+        )
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_no_split = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+        k_li, k_li_scale = self.indexer_select_pre_process(
+            x=hidden_states,
+            cos=cos,
+            sin=sin,
+        )
+        assert k_li_scale is None
+        kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+        self.exec_kv(
+            kv_no_split,
+            cos,
+            sin,
+            kv_cache,
+            slot_mapping,
+            None,
+        )
+
+        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+        q_pe = self.rope_single(q_pe, cos, sin)
+        k_li = self._get_full_kv(k_li, None)
+
+        torch_npu.npu_scatter_nd_update_(
+            indexer_cache.view(-1, k_li.shape[-1]),
+            indexer_slot_mapping.view(-1, 1),
+            k_li.view(-1, k_li.shape[-1]),
+        )
+        topk_indices = self.indexer_select_post_process(
+            x=hidden_states,
+            q_c=q_c,
+            kv_cache=kv_cache,
+            attn_metadata=None,
+            cos=cos,
+            sin=sin,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            indexer_block_table_override=indexer_block_table,
+        )
+        topk_indices, selected_packed = scratch_remap(
+            topk_indices,
+            remap_boundary,
+            need_packed=True,
+        )
+        assert selected_packed is not None
+        self._observe_staged_sfa_capture_phase("pre", "exit")
+        return ql_nope, q_pe, topk_indices, selected_packed
+
+    def _staged_sfa_post_compute_poc(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        trace_label: str,
+    ) -> torch.Tensor:
+        kv_cache = (kv_cache_nope, kv_cache_pe)
+        attn_output = self._execute_sparse_flash_attention_process(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            None,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            block_table_override=block_table,
+            trace_label=trace_label,
+        )
+        attn_output = self._v_up_proj(attn_output)
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+            inputs=self.o_proj.weight,
+            dependency=attn_output,
+            max_size=MAX_O_PROJ_PREFETCH_SIZE,
+            linear_layer=self.o_proj,
+        )
+        output[...] = self.o_proj(attn_output)[0]
+        return output
+
+    def _staged_sfa_graph_post_poc(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Graph B: scratch-backed SFA, value-up and output projection."""
+        self._observe_staged_sfa_capture_phase("post", "enter")
+        output = self._staged_sfa_post_compute_poc(
+            ql_nope,
+            q_pe,
+            topk_indices,
+            kv_cache_nope,
+            kv_cache_pe,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            block_table,
+            output,
+            trace_label="staged_graph_poc",
+        )
+        self._observe_staged_sfa_capture_phase("post", "exit")
+        return output
+
+    def _staged_sfa_eager_post_reference_poc(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure Graph-B reference using one private persistent output."""
+        reference_output = self._staged_sfa_parity_output
+        if (
+            reference_output is None
+            or reference_output.shape != output.shape
+            or reference_output.dtype != output.dtype
+            or reference_output.device != output.device
+        ):
+            reference_output = torch.empty_like(output)
+            self._staged_sfa_parity_output = reference_output
+        return self._staged_sfa_post_compute_poc(
+            ql_nope,
+            q_pe,
+            topk_indices,
+            kv_cache_nope,
+            kv_cache_pe,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            block_table,
+            reference_output,
+            trace_label="staged_graph_live_reference",
+        )
+
+    def _forward_staged_sfa_graph_poc(
+        self,
+        layer_name: str,
+        index_layer_name: str | None,
+        index_lmcache_enabled: bool,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run graph A -> eager LMCache retrieve -> graph B."""
+        pre_graph, post_graph = self._get_staged_sfa_graph_wrappers()
+        forward_context = get_forward_context()
+        parity_state = getattr(
+            forward_context,
+            "staged_sfa_live_parity_state",
+            None,
+        )
+        if not isinstance(parity_state, StagedSFALiveParityState):
+            parity_state = None
+        run_live_parity = (
+            parity_state is not None
+            and id(self) not in parity_state.checked_impl_ids
+        )
+        parity_failures: list[str] = []
+        is_dummy_run = bool(
+            getattr(
+                forward_context,
+                "staged_sfa_graph_dummy_run",
+                False,
+            )
+        )
+        live_request_ids = (
+            None
+            if is_dummy_run
+            else tuple(attn_metadata.decode_request_ids_compact or ())
+        )
+        validate_live_inputs = not is_dummy_run
+        log_live_validation = (
+            validate_live_inputs
+            and (
+                not self._staged_sfa_live_capture_validated
+                or self._staged_sfa_live_validated_request_ids
+                != live_request_ids
+            )
+        )
+        if validate_live_inputs:
+            self._require_staged_sfa_startup_proof()
+
+        runtime_mode = getattr(
+            forward_context,
+            "cudagraph_runtime_mode",
+            None,
+        )
+        if is_dummy_run and not self._staged_sfa_dummy_cache_initialized:
+            if runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "[SFA staged graph POC] cache block 0 was not initialized "
+                    "by the eager dummy warmup before graph capture."
+                )
+            # The worker resets both dummy block tables to physical block 0.
+            # Initialize only that block, outside capture, so the startup replay
+            # proof cannot inherit NaNs from uninitialized cache allocation.
+            for cache in kv_cache:
+                if cache.shape[0] == 0:
+                    raise RuntimeError(
+                        "[SFA staged graph POC] a dummy KV cache has no blocks."
+                    )
+                cache[0].zero_()
+            self._staged_sfa_dummy_cache_initialized = True
+
+        cos = attn_metadata.cos
+        sin = attn_metadata.sin
+        slot_mapping = attn_metadata.slot_mapping
+        indexer_slot_mapping = attn_metadata.indexer_slot_mapping
+        indexer_block_table = attn_metadata.indexer_block_table
+        remap_boundary = _prepare_staged_sfa_remap_boundary(
+            attn_metadata,
+            attn_metadata.decode_request_ids_compact,
+            is_dummy_run=is_dummy_run,
+        )
+
+        # In two-group mode start_load only primes a cold index retriever. The
+        # group-1 wait materializes it without advancing the latent-layer cursor;
+        # on a warm/resident request this is an inexpensive connector no-op.
+        if not is_dummy_run and index_lmcache_enabled:
+            assert index_layer_name is not None
+            with torch.profiler.record_function(
+                "sfa_staged_graph_poc::lmcache_index_retrieve"
+            ):
+                wait_for_kv_layer_from_connector(index_layer_name)
+
+        pre_graph_inputs = (
+            hidden_states,
+            kv_cache[0],
+            kv_cache[1],
+            kv_cache[2],
+            cos,
+            sin,
+            slot_mapping,
+            indexer_slot_mapping,
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            indexer_block_table,
+            remap_boundary,
+        )
+        if validate_live_inputs:
+            self._validate_staged_sfa_graph_entry(
+                "pre",
+                pre_graph,
+                pre_graph_inputs,
+            )
+            self._validate_staged_sfa_graph_entry("post", post_graph)
+        with torch.profiler.record_function("sfa_staged_graph_poc::pre"):
+            ql_nope, q_pe, topk_indices, selected_packed = pre_graph(
+                *pre_graph_inputs
+            )
+        self._prove_staged_sfa_graph_replay(
+            "pre",
+            pre_graph,
+            pre_graph_inputs,
+            (ql_nope, q_pe, topk_indices, selected_packed),
+        )
+
+        if run_live_parity:
+            with torch.profiler.record_function(
+                "sfa_staged_graph_poc::live_parity_pre"
+            ):
+                try:
+                    (
+                        ref_ql_nope,
+                        ref_q_pe,
+                        ref_topk_indices,
+                        ref_selected_packed,
+                        ref_cache_nope,
+                        ref_cache_pe,
+                        ref_cache_index,
+                    ) = self._staged_sfa_eager_pre_reference_poc(
+                        hidden_states,
+                        kv_cache,
+                        cos,
+                        sin,
+                        slot_mapping,
+                        indexer_slot_mapping,
+                        attn_metadata.cum_query_lens,
+                        attn_metadata.seq_lens,
+                        indexer_block_table,
+                        remap_boundary,
+                    )
+                    latent_slots = slot_mapping.reshape(-1).to(torch.int64)
+                    index_slots = (
+                        indexer_slot_mapping.reshape(-1).to(torch.int64)
+                    )
+                    actual_cache_nope = kv_cache[0].reshape(
+                        -1,
+                        kv_cache[0].shape[-1],
+                    ).index_select(0, latent_slots)
+                    actual_cache_pe = kv_cache[1].reshape(
+                        -1,
+                        kv_cache[1].shape[-1],
+                    ).index_select(0, latent_slots)
+                    actual_cache_index = kv_cache[2].reshape(
+                        -1,
+                        kv_cache[2].shape[-1],
+                    ).index_select(0, index_slots)
+                    parity_state.match_flags.extend(
+                        (f"{layer_name}: pre.{name}", match_flag)
+                        for name, match_flag in self._staged_sfa_parity_flags(
+                            (
+                                (
+                                    "ql_nope",
+                                    ql_nope,
+                                    ref_ql_nope,
+                                    False,
+                                ),
+                                ("q_pe", q_pe, ref_q_pe, False),
+                                (
+                                    "topk_indices",
+                                    topk_indices,
+                                    ref_topk_indices,
+                                    True,
+                                ),
+                                (
+                                    "selected_packed",
+                                    selected_packed,
+                                    ref_selected_packed,
+                                    True,
+                                ),
+                                (
+                                    "cache_nope",
+                                    actual_cache_nope,
+                                    ref_cache_nope,
+                                    False,
+                                ),
+                                (
+                                    "cache_pe",
+                                    actual_cache_pe,
+                                    ref_cache_pe,
+                                    False,
+                                ),
+                                (
+                                    "cache_index",
+                                    actual_cache_index,
+                                    ref_cache_index,
+                                    False,
+                                ),
+                            )
+                        )
+                    )
+                except Exception as exc:
+                    parity_failures.append(
+                        "pre.exception="
+                        f"{type(exc).__name__}: {str(exc)[:256]}"
+                    )
+
+        # Match the native producer fence: it follows current-token latent and
+        # index writes, but precedes LMCache's scratch writes.
+        if not is_dummy_run and self.is_kv_producer:
+            attn_metadata.reshape_cache_event = torch.npu.Event()
+            attn_metadata.reshape_cache_event.record()
+
+        post_graph_inputs = (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            kv_cache[0],
+            kv_cache[1],
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            attn_metadata.block_table,
+            output,
+        )
+        if validate_live_inputs:
+            self._validate_staged_sfa_graph_entry(
+                "post",
+                post_graph,
+                post_graph_inputs,
+            )
+
+        # This selective latent call intentionally stays outside both wrappers.
+        # Its load stream waits for Graph A, scatters the selected prompt rows,
+        # and makes the compute stream wait before Graph B consumes scratch.
+        with torch.profiler.record_function(
+            "sfa_staged_graph_poc::lmcache_retrieve"
+        ):
+            if not is_dummy_run:
+                wait_for_kv_layer_from_connector(
+                    layer_name,
+                    selected_tokens=selected_packed,
+                    token_start_index=None,
+                    request_ids=attn_metadata.decode_request_ids_compact,
+                    target_slot_mapping=None,
+                )
+                if (
+                    _LMCACHE_SPARSE_WAIT_SYNC_ONCE
+                    and not _lmcache_sparse_wait_sync_once_done
+                ):
+                    _sync_compute_stream_after_lmcache_sparse_wait()
+
+        with torch.profiler.record_function("sfa_staged_graph_poc::post"):
+            post_graph(*post_graph_inputs)
+        self._prove_staged_sfa_graph_replay(
+            "post",
+            post_graph,
+            post_graph_inputs,
+            (output,),
+        )
+        if run_live_parity:
+            with torch.profiler.record_function(
+                "sfa_staged_graph_poc::live_parity_post"
+            ):
+                try:
+                    ref_output = self._staged_sfa_eager_post_reference_poc(
+                        ql_nope,
+                        q_pe,
+                        topk_indices,
+                        kv_cache[0],
+                        kv_cache[1],
+                        attn_metadata.cum_query_lens,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_table,
+                        output,
+                    )
+                    parity_state.match_flags.extend(
+                        (
+                            f"{layer_name}: post.{name}",
+                            match_flag,
+                        )
+                        for name, match_flag in self._staged_sfa_parity_flags(
+                            (("output", output, ref_output, False),)
+                        )
+                    )
+                except Exception as exc:
+                    parity_failures.append(
+                        "post.exception="
+                        f"{type(exc).__name__}: {str(exc)[:256]}"
+                    )
+
+            parity_state.checked_impl_ids.add(id(self))
+            parity_state.checked_layer_names.append(layer_name)
+            parity_state.failures.extend(
+                f"{layer_name}: {failure}"
+                for failure in parity_failures
+            )
+        if validate_live_inputs:
+            self._staged_sfa_live_capture_validated = True
+            self._staged_sfa_live_validated_request_ids = live_request_ids
+        if log_live_validation:
+            logger.info_once(
+                "[SFA staged graph POC] verified pre/post startup capture "
+                "and enabled always-on captured-input address validation for "
+                "live replay; LMCache retrieval remains eager."
+            )
+
+        # Preserve the native pure-decode gate. Ordinary saves remain eager;
+        # parity-token saves are queued until the model-boundary TP verdict.
+        if not is_dummy_run:
+            skip_decode_save = (
+                bool(self.dsa_shrink_latent)
+                and _decode_window_save_window_size() == 0
+            )
+            save_operations: list[
+                tuple[str, list[torch.Tensor]]
+            ] = []
+            if not skip_decode_save:
+                if self.dsa_offload_unbundle:
+                    save_operations.append(
+                        (layer_name, [kv_cache[0], kv_cache[1]])
+                    )
+                    if index_layer_name is not None and index_lmcache_enabled:
+                        save_operations.append(
+                            (index_layer_name, [kv_cache[2]])
+                        )
+                else:
+                    save_operations.append((layer_name, list(kv_cache)))
+
+            self._submit_sfa_save_operations(save_operations)
+
+            _dsa_prof.step()
+        return output
+
     def forward(
         self,
         layer_name,
@@ -1478,6 +2796,49 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
                 self._dsa_idx_cache_t = _idx_t
             kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
+
+        if self.enable_staged_sfa_graph:
+            staged_reason = self._staged_sfa_graph_ineligible_reason(
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+            )
+            if staged_reason is None:
+                staged_output = self._forward_staged_sfa_graph_poc(
+                    layer_name=layer_name,
+                    index_layer_name=index_layer_name,
+                    index_lmcache_enabled=index_lmcache_enabled,
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    output=output,
+                )
+                _dsa_prof.end(_sfa_t)
+                return staged_output
+            staged_forward_context = get_forward_context()
+            if bool(
+                getattr(
+                    staged_forward_context,
+                    "staged_sfa_graph_dummy_run",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "[SFA staged graph POC] the one-token dummy pass "
+                    f"is ineligible: {staged_reason}."
+                )
+            if (
+                getattr(
+                    get_forward_context(),
+                    "cudagraph_runtime_mode",
+                    None,
+                )
+                == CUDAGraphMode.PIECEWISE
+            ):
+                logger.warning_once(
+                    "[SFA staged graph POC] using the existing forward: "
+                    f"{staged_reason}."
+                )
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
@@ -1658,9 +3019,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = self._get_full_kv(k_li, attn_metadata)
 
         if kv_cache is not None:
-            if index_lmcache_enabled and not _is_pure_decode:
-                # Shared-cache sparse decode needs prompt index rows before
-                # top-k selection; latent rows are loaded later after top-k.
+            if index_lmcache_enabled:
+                # A cold shared-cache decode needs prompt index rows before
+                # top-k selection. The group-1 wait is a no-op when resident
+                # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
 
@@ -1730,7 +3092,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             _decode_window_size = _decode_window_save_window_size()
             _cached_boundary = (
                 attn_metadata.decode_remap_boundary
-                if _decode_window_size > 0
+                if attn_metadata.decode_remap_boundary_ready
                 else None
             )
             if (
@@ -1819,8 +3181,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _remap_boundary = torch.where(
                             _decode_rows, _boundary_override, _remap_boundary
                         )
-                if _decode_window_size > 0:
+                _boundary_buffer = attn_metadata.decode_remap_boundary
+                if (
+                    _boundary_buffer is not None
+                    and _boundary_buffer.shape == _remap_boundary.shape
+                    and _boundary_buffer.device == _remap_boundary.device
+                    and _boundary_buffer.dtype == _remap_boundary.dtype
+                ):
+                    _boundary_buffer.copy_(_remap_boundary)
+                    _remap_boundary = _boundary_buffer
+                else:
                     attn_metadata.decode_remap_boundary = _remap_boundary
+                attn_metadata.decode_remap_boundary_ready = True
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
@@ -2181,17 +3553,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             and _is_pure_decode
             and not _decode_window_save_enabled
         )
+        save_operations: list[
+            tuple[str, list[torch.Tensor]]
+        ] = []
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+                save_operations.append(
+                    (layer_name, [kv_cache[0], kv_cache[1]])
+                )
                 if (
                     len(kv_cache) >= 3
                     and index_layer_name is not None
                     and index_lmcache_enabled
                 ):
-                    maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
+                    save_operations.append(
+                        (index_layer_name, [kv_cache[2]])
+                    )
             else:
-                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+                save_operations.append((layer_name, list(kv_cache)))
+
+        self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)
         return output_padded

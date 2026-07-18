@@ -58,7 +58,9 @@ from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_sp,
     get_ascend_device_type,
+    get_max_hidden_layers,
     register_ascend_customop,
+    staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -72,6 +74,24 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _staged_sfa_graph_reserved_bytes(vllm_config: VllmConfig) -> int:
+    if not staged_sfa_graph_configured(vllm_config):
+        return 0
+    hf_text_config = vllm_config.model_config.hf_text_config
+    num_hidden_layers = getattr(
+        hf_text_config,
+        "num_hidden_layers",
+        None,
+    )
+    if not isinstance(num_hidden_layers, int):
+        num_hidden_layers = get_max_hidden_layers(hf_text_config)
+    # The two nested wrappers per SFA layer are intentionally not created by
+    # temporary memory profiling. Match upstream's 1 MiB/graph driver floor.
+    # This is an unmeasured startup safety floor, not a guarantee that every
+    # model/operator combination will capture within this amount.
+    return 2 * num_hidden_layers * (1 << 20)
 
 
 class NPUWorker(WorkerBase):
@@ -353,6 +373,17 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+
+        staged_graph_reserved_bytes = _staged_sfa_graph_reserved_bytes(
+            self.vllm_config
+        )
+        if staged_graph_reserved_bytes:
+            self.available_kv_cache_memory_bytes -= staged_graph_reserved_bytes
+            logger.info_once(
+                "Reserved a %.2f MiB heuristic floor for staged SFA graphs",
+                staged_graph_reserved_bytes / (1 << 20),
+                scope="local",
+            )
 
         # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
         # buffers out of the KV budget *before* the scheduler splits it into blocks,

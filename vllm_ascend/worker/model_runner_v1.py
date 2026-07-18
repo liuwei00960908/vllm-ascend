@@ -93,7 +93,11 @@ from vllm.v1.worker.utils import AttentionGroup
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    maybe_save_kv_layer_to_connector,
+    using_paged_attention,
+)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -129,6 +133,7 @@ from vllm_ascend.utils import (
     is_moe_model,
     lmhead_tp_enable,
     set_weight_prefetch_method,
+    staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -136,6 +141,7 @@ from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
+    StagedSFALiveParityState,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
     set_ascend_forward_context,
@@ -262,6 +268,11 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
+        self._staged_sfa_expected_layer_count = 0
+        self._staged_sfa_live_parity_request_id: str | None = None
+        self._staged_sfa_live_parity_validated_seq_lens: list[int] = []
+        self._staged_sfa_live_parity_last_seq_len: int | None = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1424,6 +1435,13 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
+        staged_sfa_live_parity_state = self._prepare_staged_sfa_live_parity(
+            cudagraph_mode=cudagraph_mode,
+            batch_descriptor=batch_desc,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            request_ids=dsa_req_ids,
+        )
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
@@ -1444,6 +1462,9 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
+                staged_sfa_live_parity_state=(
+                    staged_sfa_live_parity_state
+                ),
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1454,6 +1475,9 @@ class NPUModelRunner(GPUModelRunner):
         ):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+            self._finalize_staged_sfa_live_parity(
+                staged_sfa_live_parity_state
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2101,6 +2125,7 @@ class NPUModelRunner(GPUModelRunner):
         logits_indices: torch.Tensor | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
+        staged_sfa_graph_dummy_run: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
@@ -2191,6 +2216,30 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
 
+        staged_dummy_prompt_len = None
+        staged_dummy_computed_tokens = None
+        staged_dummy_request_ids = None
+        if staged_sfa_graph_dummy_run:
+            if num_tokens != 1 or num_reqs != 1:
+                raise RuntimeError(
+                    "The staged SFA graph dummy metadata requires exactly "
+                    "one scheduled decode token."
+                )
+            staged_dummy_prompt_len = int(self.seq_lens.np[0]) - 1
+            if staged_dummy_prompt_len < self.dsa_index_topk:
+                raise RuntimeError(
+                    "The staged SFA graph dummy prompt boundary must be at "
+                    f"least index_topk={self.dsa_index_topk}, got "
+                    f"{staged_dummy_prompt_len}."
+                )
+            staged_dummy_computed_tokens = torch.full_like(
+                self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs_padded
+                ],
+                staged_dummy_prompt_len,
+            )
+            staged_dummy_request_ids = ["staged-sfa-graph-dummy"]
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2198,7 +2247,13 @@ class NPUModelRunner(GPUModelRunner):
             # TODO
             seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
             # TODO
-            num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
+            num_computed_tokens_cpu=(
+                staged_dummy_computed_tokens
+                if staged_dummy_computed_tokens is not None
+                else self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs_padded
+                ]
+            ),
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -2213,9 +2268,13 @@ class NPUModelRunner(GPUModelRunner):
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
             request_ids=(
-                self.input_batch.req_ids[:num_reqs]
-                if self.dsa_shrink_latent
-                else None
+                staged_dummy_request_ids
+                if staged_dummy_request_ids is not None
+                else (
+                    self.input_batch.req_ids[:num_reqs]
+                    if self.dsa_shrink_latent
+                    else None
+                )
             ),
         )
 
@@ -2306,7 +2365,15 @@ class NPUModelRunner(GPUModelRunner):
                     # (CPU) to the SFA builder, which expands them to per-ROW
                     # values (decode rows -> plen, prefill/padding rows -> 0 =
                     # no remap) and ships them to device.
-                    plens_np = self.input_batch.num_prompt_tokens[:num_reqs]
+                    plens_np = (
+                        np.full(
+                            num_reqs,
+                            staged_dummy_prompt_len,
+                            dtype=np.int32,
+                        )
+                        if staged_dummy_prompt_len is not None
+                        else self.input_batch.num_prompt_tokens[:num_reqs]
+                    )
                     if (
                         not self._dsa_short_prompt_warned
                         and (plens_np > 0).any()
@@ -2476,8 +2543,29 @@ class NPUModelRunner(GPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
+        staged_sfa_graph_dummy_run = (
+            staged_sfa_graph_configured(self.vllm_config)
+            and not is_profile
+            and cudagraph_runtime_mode
+            in (
+                CUDAGraphMode.NONE,
+                CUDAGraphMode.PIECEWISE,
+            )
+            and skip_eplb
+            and not remove_lora
+            and num_tokens_unpadded == 1
+            and num_reqs == 1
+            and num_active_loras == 0
+        )
         # Build attention metadata for dummy_run
-        if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
+        if (
+            self._should_build_dummy_attn_metadata(
+                force_attention,
+                is_profile,
+                cudagraph_runtime_mode,
+            )
+            or staged_sfa_graph_dummy_run
+        ):
             if create_mixed_batch:
                 raise NotImplementedError(
                     "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
@@ -2494,12 +2582,24 @@ class NPUModelRunner(GPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
+            # The staged SFA POC reuses 6144 only as bounded dummy data. Its
+            # indexer/SFA capacity is fixed by the max-model-length block-table
+            # width, while seq_lens remains a live tensor input during replay.
+            # That makes changing lengths plausible, but the torch_npu
+            # lightning-indexer branch still requires live numerical parity.
             if profile_seq_lens is not None:
                 seq_lens = profile_seq_lens
             else:
                 seq_lens = (
                     SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                    if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
+                    if staged_sfa_graph_dummy_run
+                    or (
+                        is_graph_capturing
+                        and using_paged_attention(
+                            num_tokens,
+                            self.vllm_config,
+                        )
+                    )
                     else max_query_len
                 )  # type: ignore[assignment]
             self.seq_lens.np[:num_reqs_padded] = seq_lens
@@ -2522,6 +2622,7 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
+                staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -2601,6 +2702,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 dsa_offload_manager=getattr(self, "dsa_offload_manager", None),
                 dsa_adapter_cache=getattr(self, "dsa_adapter_cache", None),
+                staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3682,13 +3784,359 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(self.cudagraph_batch_sizes)
 
-    def capture_model(self) -> None:
+    def _prepare_staged_sfa_live_parity(
+        self,
+        *,
+        cudagraph_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+        num_tokens_unpadded: int,
+        num_reqs: int,
+        request_ids: Any,
+    ) -> StagedSFALiveParityState | None:
+        """Select the first two distinct live staged-graph decode lengths."""
+        expected_layers = getattr(
+            self,
+            "_staged_sfa_expected_layer_count",
+            0,
+        )
+        if (
+            expected_layers <= 0
+            or self.attn_state != AscendAttentionState.DecodeOnly
+            or cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or num_tokens_unpadded != 1
+            or num_reqs != 1
+            or batch_descriptor is None
+            or batch_descriptor.num_tokens != 1
+            or batch_descriptor.uniform
+            or batch_descriptor.has_lora
+            or batch_descriptor.num_reqs is not None
+            or batch_descriptor.num_active_loras != 0
+            or self.speculative_config is not None
+            or self.vllm_config.lora_config is not None
+            or getattr(self, "dsa_shrink_latent", 0) != 2
+            or getattr(self, "dsa_offload_manager", None) is not None
+            or getattr(self, "dsa_adapter_cache", None) is not None
+            or request_ids is None
+            or len(request_ids) != 1
+        ):
+            return None
+
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        if prompt_len < self.dsa_index_topk:
+            return None
+
+        request_id = str(request_ids[0])
+        seq_len = int(self.seq_lens.np[0])
+        tracked_request_id = getattr(
+            self,
+            "_staged_sfa_live_parity_request_id",
+            None,
+        )
+        last_seq_len = getattr(
+            self,
+            "_staged_sfa_live_parity_last_seq_len",
+            None,
+        )
+        if (
+            request_id != tracked_request_id
+            or (
+                last_seq_len is not None
+                and seq_len < last_seq_len
+            )
+        ):
+            self._staged_sfa_live_parity_request_id = request_id
+            self._staged_sfa_live_parity_validated_seq_lens = []
+
+        self._staged_sfa_live_parity_last_seq_len = seq_len
+        validated_seq_lens = getattr(
+            self,
+            "_staged_sfa_live_parity_validated_seq_lens",
+            [],
+        )
+        if (
+            seq_len in validated_seq_lens
+            or len(validated_seq_lens) >= 2
+        ):
+            return None
+
+        return StagedSFALiveParityState(
+            request_id=request_id,
+            seq_len=seq_len,
+            expected_layers=expected_layers,
+        )
+
+    def _finalize_staged_sfa_live_parity(
+        self,
+        parity_state: StagedSFALiveParityState | None,
+    ) -> None:
+        """Make one rank-consistent verdict after all local SFA layers."""
+        if parity_state is None:
+            return
+
+        tracked_request_id = getattr(
+            self,
+            "_staged_sfa_live_parity_request_id",
+            None,
+        )
+        last_seq_len = getattr(
+            self,
+            "_staged_sfa_live_parity_last_seq_len",
+            None,
+        )
+        if (
+            parity_state.request_id != tracked_request_id
+            or parity_state.seq_len != last_seq_len
+        ):
+            parity_state.failures.append(
+                "runner parity tracking changed during model forward"
+            )
+
+        if parity_state.match_flags:
+            match_values = (
+                torch.stack(
+                    [
+                        match_flag
+                        for _, match_flag in parity_state.match_flags
+                    ]
+                )
+                .detach()
+                .to(device="cpu")
+                .tolist()
+            )
+            parity_state.failures.extend(
+                label
+                for (label, _), matched in zip(
+                    parity_state.match_flags,
+                    match_values,
+                )
+                if not bool(matched)
+            )
+
+        local_checked = len(parity_state.checked_impl_ids)
+        checked_layer_names = parity_state.checked_layer_names
+        match_labels = [
+            label for label, _ in parity_state.match_flags
+        ]
+        expected_flags_per_layer = 8
+        expected_flag_count = expected_flags_per_layer * local_checked
+        if len(checked_layer_names) != local_checked:
+            parity_state.failures.append(
+                "parity layer-name count mismatch: "
+                f"names={len(checked_layer_names)}, "
+                f"checked_impls={local_checked}"
+            )
+        if len(set(checked_layer_names)) != len(checked_layer_names):
+            parity_state.failures.append(
+                "duplicate parity layer names were recorded"
+            )
+        if len(match_labels) != expected_flag_count:
+            parity_state.failures.append(
+                "parity comparison-count mismatch: "
+                f"flags={len(match_labels)}, expected={expected_flag_count} "
+                f"({expected_flags_per_layer} per checked layer)"
+            )
+
+        seen_labels: set[str] = set()
+        duplicate_labels: set[str] = set()
+        for label in match_labels:
+            if label in seen_labels:
+                duplicate_labels.add(label)
+            seen_labels.add(label)
+        if duplicate_labels:
+            parity_state.failures.append(
+                "duplicate parity comparison labels: "
+                + ", ".join(sorted(duplicate_labels)[:8])
+            )
+
+        for layer_name in checked_layer_names:
+            label_prefix = f"{layer_name}: "
+            layer_flag_count = sum(
+                label.startswith(label_prefix) for label in match_labels
+            )
+            if layer_flag_count != expected_flags_per_layer:
+                parity_state.failures.append(
+                    f"{layer_name}: recorded {layer_flag_count} parity "
+                    f"flags, expected {expected_flags_per_layer}"
+                )
+
+        expected_layers = parity_state.expected_layers
+        local_failed = bool(parity_state.failures) or (
+            local_checked != expected_layers
+        )
+        # MAX of count and negative count yields the TP-wide max and min
+        # without a second collective. This uses the explicitly-created Gloo
+        # group, not the NPU compute communicator.
+        status = torch.tensor(
+            [
+                int(local_failed),
+                local_checked,
+                -local_checked,
+            ],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            dist.all_reduce(
+                status,
+                op=dist.ReduceOp.MAX,
+                group=tp_group.cpu_group,
+            )
+        failed_any, max_checked, negative_min_checked = (
+            int(value) for value in status.tolist()
+        )
+        min_checked = -negative_min_checked
+
+        global_failed = (
+            bool(failed_any)
+            or min_checked != max_checked
+            or max_checked != expected_layers
+        )
+        if global_failed:
+            local_details = (
+                "; ".join(parity_state.failures[:8])
+                if parity_state.failures
+                else "none on this TP rank"
+            )
+            raise RuntimeError(
+                "[SFA staged graph POC] live eager-vs-graph parity failed "
+                f"(request_id={parity_state.request_id!r}, "
+                f"seq_len={parity_state.seq_len}, "
+                f"local_checked={local_checked}, "
+                f"TP checked range={min_checked}..{max_checked}, "
+                f"expected={expected_layers}; "
+                f"local failures: {local_details})."
+            )
+
+        for layer_name, kv_caches in parity_state.pending_saves:
+            maybe_save_kv_layer_to_connector(
+                layer_name,
+                kv_caches,
+            )
+
+        validated_seq_lens = (
+            self._staged_sfa_live_parity_validated_seq_lens
+        )
+        if parity_state.seq_len not in validated_seq_lens:
+            validated_seq_lens.append(parity_state.seq_len)
+        logger.info(
+            "[SFA staged graph POC] live eager-vs-graph parity passed "
+            "for request %r at sequence length %d (%d/%d live lengths, "
+            "%d local SFA layers).",
+            parity_state.request_id,
+            parity_state.seq_len,
+            len(validated_seq_lens),
+            2,
+            expected_layers,
+        )
+
+    def _validate_staged_sfa_startup_capture(self) -> None:
+        """Require both staged size-1 graph smoke checks for every SFA layer.
+
+        Each SFA implementation records active-capture markers and an
+        output-write replay smoke test while the upstream startup loop visits
+        the PIECEWISE size-1 descriptor. This model-level postcondition
+        prevents a partial (or zero-layer) smoke check from being mistaken for
+        successful startup setup. Two distinct live eager-parity lengths plus
+        an NPU profiler trace remain the authoritative compute-capture proof.
+        """
+        self._staged_sfa_impls = ()
+        self._staged_sfa_expected_layer_count = 0
+        self._staged_sfa_live_parity_request_id = None
+        self._staged_sfa_live_parity_validated_seq_lens = []
+        self._staged_sfa_live_parity_last_seq_len = None
+        if not staged_sfa_graph_configured(self.vllm_config):
+            return
+
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+        )
+        staged_impls: dict[int, tuple[str, Any]] = {}
+        for layer_name, attn_layer in attn_layers.items():
+            impl = getattr(attn_layer, "impl", None)
+            if impl is None or not getattr(
+                impl,
+                "enable_staged_sfa_graph",
+                False,
+            ):
+                continue
+            staged_impls.setdefault(id(impl), (layer_name, impl))
+
+        if not staged_impls:
+            raise RuntimeError(
+                "[SFA staged graph POC] startup capture did not find any "
+                "local staged SFA implementations."
+            )
+
+        required_phases = {
+            "pre:enter",
+            "pre:exit",
+            "post:enter",
+            "post:exit",
+        }
+        required_replays = {"pre", "post"}
+        size_one_descriptor = BatchDescriptor(num_tokens=1)
+        failures = []
+        for layer_name, impl in staged_impls.values():
+            missing_phases = required_phases - getattr(
+                impl,
+                "_staged_sfa_capture_phases",
+                set(),
+            )
+            missing_replays = required_replays - getattr(
+                impl,
+                "_staged_sfa_replay_proved",
+                set(),
+            )
+            missing_entries = []
+            for region_name, wrapper_attr in (
+                ("pre", "_staged_sfa_pre_graph"),
+                ("post", "_staged_sfa_post_graph"),
+            ):
+                wrapper = getattr(impl, wrapper_attr, None)
+                entry = (
+                    wrapper.concrete_aclgraph_entries.get(
+                        size_one_descriptor,
+                    )
+                    if wrapper is not None
+                    else None
+                )
+                if entry is None or entry.aclgraph is None:
+                    missing_entries.append(region_name)
+            if missing_phases or missing_replays or missing_entries:
+                failures.append(
+                    f"{layer_name}: entries={missing_entries}, "
+                    f"phases={sorted(missing_phases)}, "
+                    f"replays={sorted(missing_replays)}"
+                )
+
+        if failures:
+            raise RuntimeError(
+                "[SFA staged graph POC] startup capture is incomplete for "
+                "one or more local SFA layers: "
+                + "; ".join(failures)
+            )
+
+        self._staged_sfa_impls = tuple(staged_impls.values())
+        self._staged_sfa_expected_layer_count = len(staged_impls)
+
+        logger.info(
+            "[SFA staged graph POC] startup capture/replay-smoke completeness "
+            "check passed for %d local SFA layers (%d staged graphs).",
+            len(staged_impls),
+            2 * len(staged_impls),
+        )
+
+    def capture_model(self) -> int:
         gpu_model_runner_cls = next((cls for cls in self.__class__.__mro__ if cls.__name__ == "GPUModelRunner"), None)
         if gpu_model_runner_cls is None:
             raise TypeError("Could not find GPUModelRunner in the MRO. The class hierarchy may have changed.")
         parent_module_name = gpu_model_runner_cls.__module__
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            GPUModelRunner.capture_model(self)
+            graph_memory_bytes = GPUModelRunner.capture_model(self)
+        self._validate_staged_sfa_startup_capture()
+        return graph_memory_bytes
 
     def _prepare_multimodal_fields(self):
         """

@@ -125,11 +125,12 @@ class TestACLGraphWrapper(TestBase):
         self.assertFalse(wrapper.is_debugging_mode)
         self.assertIsInstance(wrapper.aclgraph_options, CUDAGraphOptions)
         self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+        self.assertTrue(wrapper.synchronize_before_replay)
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
     def test_initialization_with_custom_options(self, mock_envs,
-                                                mock_current_platform):
+                                                 mock_current_platform):
         """Test ACLGraphWrapper initialization with custom CUDAGraphOptions"""
         mock_envs.VLLM_LOGGING_LEVEL = "DEBUG"
         mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
@@ -147,6 +148,56 @@ class TestACLGraphWrapper(TestBase):
         self.assertTrue(wrapper.is_debugging_mode)
         self.assertEqual(wrapper.aclgraph_options, self.mock_cudagraph_options)
         self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_replay_can_skip_host_stream_synchronization(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        self.mock_vllm_config.speculative_config = None
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_options=self.mock_cudagraph_options,
+            synchronize_before_replay=False,
+        )
+        graph = MagicMock()
+        captured_output = object()
+        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = (
+            ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=graph,
+                output=captured_output,
+            )
+        )
+        self.mock_forward_context.cudagraph_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+        )
+        stream = MagicMock()
+
+        with (
+            patch(
+                'vllm_ascend.compilation.acl_graph.get_forward_context',
+                return_value=self.mock_forward_context,
+            ),
+            patch.object(
+                torch.npu,
+                'current_stream',
+                return_value=stream,
+            ),
+        ):
+            result = wrapper()
+
+        self.assertIs(result, captured_output)
+        stream.synchronize.assert_not_called()
+        graph.replay.assert_called_once_with()
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
@@ -278,6 +329,7 @@ class TestACLGraphWrapper(TestBase):
         entry = wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor]
         self.assertEqual(entry.aclgraph, mock_npu_graph)
         self.assertEqual(entry.output, "weak_ref_output")
+        self.assertEqual(entry.input_addresses, [test_tensor.data_ptr()])
 
         # Verify compilation counter was incremented
         self.assertEqual(mock_compilation_counter.num_cudagraph_captured, 1)
