@@ -857,7 +857,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_pre_graph = None
         self._staged_sfa_post_graph = None
         self._staged_sfa_capture_phases: set[str] = set()
+        self._staged_sfa_capture_records: set[str] = set()
+        self._staged_sfa_capture_failures: list[str] = []
+        self._staged_sfa_graph_input_signatures: dict[str, tuple] = {}
         self._staged_sfa_replay_proved: set[str] = set()
+        self._staged_sfa_pre_output_buffers = None
+        self._staged_sfa_replay_canaries: dict[str, torch.Tensor] = {}
         self._staged_sfa_live_capture_validated = False
         self._staged_sfa_live_validated_request_ids = None
         self._staged_sfa_dummy_cache_initialized = False
@@ -1764,6 +1769,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return self._staged_sfa_pre_graph, self._staged_sfa_post_graph
 
+    @staticmethod
+    def _staged_sfa_tensor_signature(tensor: torch.Tensor) -> tuple:
+        """Describe every tensor property that must stay fixed for replay."""
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.storage_offset(),
+            tensor.dtype,
+            tensor.device,
+        )
+
     def _validate_staged_sfa_graph_entry(
         self,
         region_name: str,
@@ -1815,6 +1832,43 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"the {region_name} graph changed before live replay; "
                 f"differing input indices={mismatch_indices}."
             )
+
+        captured_signatures = getattr(
+            self,
+            "_staged_sfa_graph_input_signatures",
+            {},
+        ).get(region_name)
+        live_signatures = tuple(
+            self._staged_sfa_tensor_signature(value)
+            for value in graph_inputs
+            if isinstance(value, torch.Tensor)
+        )
+        if captured_signatures is None:
+            raise RuntimeError(
+                "[SFA staged graph POC] the "
+                f"{region_name} graph did not record its full input "
+                "signatures."
+            )
+        if captured_signatures != live_signatures:
+            signature_mismatches = [
+                index
+                for index, (captured, live) in enumerate(
+                    zip(captured_signatures, live_signatures)
+                )
+                if captured != live
+            ]
+            if len(captured_signatures) != len(live_signatures):
+                signature_mismatches.extend(
+                    range(
+                        min(len(captured_signatures), len(live_signatures)),
+                        max(len(captured_signatures), len(live_signatures)),
+                    )
+                )
+            raise RuntimeError(
+                "[SFA staged graph POC] the full tensor signature for the "
+                f"{region_name} graph changed before live replay; differing "
+                f"input indices={signature_mismatches}."
+            )
         return graph_entry
 
     @staticmethod
@@ -1843,11 +1897,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         if not self._staged_sfa_capture_dummy_active():
             return
         if not torch.npu.is_current_stream_capturing():
-            raise RuntimeError(
-                "[SFA staged graph POC] the "
-                f"{region_name} runnable reached its {phase} phase outside "
-                "NPU stream capture."
+            capture_failures = getattr(
+                self,
+                "_staged_sfa_capture_failures",
+                None,
             )
+            if capture_failures is None:
+                capture_failures = []
+                self._staged_sfa_capture_failures = capture_failures
+            capture_failures.append(
+                f"{region_name}: runnable reached its {phase} phase outside "
+                "NPU stream capture"
+            )
+            return
         capture_phases = getattr(
             self,
             "_staged_sfa_capture_phases",
@@ -1858,32 +1920,41 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._staged_sfa_capture_phases = capture_phases
         capture_phases.add(f"{region_name}:{phase}")
 
-    def _prove_staged_sfa_graph_replay(
+    def _record_staged_sfa_graph_capture(
         self,
         region_name: str,
         graph_wrapper,
-        graph_inputs: tuple[torch.Tensor, ...],
+        graph_inputs: tuple,
         graph_outputs: tuple[torch.Tensor, ...],
     ) -> None:
-        """Smoke-test that replay rewrites each captured output buffer.
+        """Record capture structure without replaying or mutating graph data.
 
-        This deliberately does not claim that every intended kernel is present
-        or that replay is input-sensitive. The authoritative POC evidence is
-        two distinct live eager-parity lengths plus an NPU profiler trace of
-        both graph regions around the eager LMCache interval.
+        All staged graphs share the process-global graph pool. Replaying an
+        inner graph while later graphs are still being captured violates the
+        pool's capture/replay ordering contract, so startup replay is deferred
+        to one ordered, full-model dummy pass after capture_model completes.
         """
         if not self._staged_sfa_capture_dummy_active():
             return
-        replay_proved = getattr(
+        capture_records = getattr(
             self,
-            "_staged_sfa_replay_proved",
+            "_staged_sfa_capture_records",
             None,
         )
-        if replay_proved is None:
-            replay_proved = set()
-            self._staged_sfa_replay_proved = replay_proved
-        if region_name in replay_proved:
+        if capture_records is None:
+            capture_records = set()
+            self._staged_sfa_capture_records = capture_records
+        if region_name in capture_records:
             return
+
+        capture_failures = getattr(
+            self,
+            "_staged_sfa_capture_failures",
+            None,
+        )
+        if capture_failures is None:
+            capture_failures = []
+            self._staged_sfa_capture_failures = capture_failures
 
         required_phases = {
             f"{region_name}:enter",
@@ -1896,102 +1967,63 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         missing_phases = required_phases - observed_phases
         if missing_phases:
-            raise RuntimeError(
-                "[SFA staged graph POC] the capture-phase proof for "
-                f"{region_name} is incomplete: {sorted(missing_phases)}."
+            capture_failures.append(
+                f"{region_name}: missing capture phases "
+                f"{sorted(missing_phases)}"
             )
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError(
-                "[SFA staged graph POC] cannot run the "
-                f"{region_name} replay proof before stream capture ends."
+
+        batch_descriptor = get_forward_context().batch_descriptor
+        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(
+            batch_descriptor
+        )
+        tensor_inputs = tuple(
+            value
+            for value in graph_inputs
+            if isinstance(value, torch.Tensor)
+        )
+        live_addresses = [value.data_ptr() for value in tensor_inputs]
+        if graph_entry is None or graph_entry.aclgraph is None:
+            capture_failures.append(
+                f"{region_name}: no captured graph entry for "
+                f"{batch_descriptor}"
             )
-        self._validate_staged_sfa_graph_entry(
-            region_name,
-            graph_wrapper,
-            graph_inputs,
+        elif graph_entry.input_addresses is None:
+            capture_failures.append(
+                f"{region_name}: captured graph entry has no input addresses"
+            )
+        elif graph_entry.input_addresses != live_addresses:
+            capture_failures.append(
+                f"{region_name}: captured input addresses do not match "
+                "the tensors returned from the capture call"
+            )
+
+        input_signatures = getattr(
+            self,
+            "_staged_sfa_graph_input_signatures",
+            None,
+        )
+        if input_signatures is None:
+            input_signatures = {}
+            self._staged_sfa_graph_input_signatures = input_signatures
+        input_signatures[region_name] = tuple(
+            self._staged_sfa_tensor_signature(value)
+            for value in tensor_inputs
         )
 
-        # Keep the proof outside the captured work: inspect each full one-token
-        # output on CPU, poison the persistent output buffer, then replay. Dummy
-        # outputs need not be numerically repeatable (for example, tied top-k
-        # indices or low-precision projection drift), so this smoke only proves
-        # that every probed value was overwritten. Live eager parity remains the
-        # fail-closed numerical correctness check. Avoiding NPU-side clones
-        # prevents the proof from adding allocator work between the captures.
-        references = []
+        if not graph_outputs:
+            capture_failures.append(
+                f"{region_name}: capture returned no graph outputs"
+            )
         for output_index, graph_output in enumerate(graph_outputs):
-            if int(graph_output.numel()) == 0:
-                raise RuntimeError(
-                    "[SFA staged graph POC] cannot prove the "
-                    f"{region_name} replay because captured output "
-                    f"{output_index} is empty."
+            if not isinstance(graph_output, torch.Tensor):
+                capture_failures.append(
+                    f"{region_name}: output {output_index} is not a tensor"
                 )
-            capture_probe = (
-                graph_output.detach()
-                .cpu()
-                .reshape(-1)
-                .clone()
-            )
-            if graph_output.is_floating_point():
-                restorable_mask = torch.isfinite(capture_probe)
-                if not bool(restorable_mask.any().item()):
-                    raise RuntimeError(
-                        "[SFA staged graph POC] cannot prove the "
-                        f"{region_name} replay because captured output "
-                        f"{output_index} has no finite values."
-                    )
-                poison = float("nan")
-            else:
-                if graph_output.dtype == torch.bool:
-                    poison = True
-                else:
-                    poison = torch.iinfo(graph_output.dtype).max
-                restorable_mask = torch.ne(capture_probe, poison)
-                if not bool(restorable_mask.any().item()):
-                    poison = False if graph_output.dtype == torch.bool else 0
-                    restorable_mask = torch.ne(capture_probe, poison)
-            graph_output.fill_(poison)
-            references.append((restorable_mask, poison))
-
-        graph_wrapper(*graph_inputs)
-        torch.npu.current_stream().synchronize()
-        for output_index, (graph_output, proof_reference) in enumerate(
-            zip(graph_outputs, references)
-        ):
-            restorable_mask, poison = proof_reference
-            restored_probe = (
-                graph_output.detach()
-                .cpu()
-                .reshape(-1)
-            )
-            restored_values = restored_probe[restorable_mask]
-            if graph_output.is_floating_point():
-                poisoned_mask = torch.isnan(restored_values)
-            else:
-                poisoned_mask = torch.eq(restored_values, poison)
-            poisoned_remaining = int(poisoned_mask.sum().item())
-            if poisoned_remaining:
-                checked_values = int(restored_values.numel())
-                raise RuntimeError(
-                    "[SFA staged graph POC] the "
-                    f"{region_name} replay left {poisoned_remaining}/"
-                    f"{checked_values} probed values poisoned in captured "
-                    f"output {output_index}."
+            elif int(graph_output.numel()) == 0:
+                capture_failures.append(
+                    f"{region_name}: output {output_index} is empty"
                 )
-
-        replay_proved.add(region_name)
-        if {"pre", "post"}.issubset(replay_proved):
-            logger.info_once(
-                "[SFA staged graph POC] startup graph-replay output-write "
-                "smoke passed: both staged runnables executed inside NPU "
-                "stream capture and replay rewrote every probed "
-                "captured output value after poisoning; LMCache was not "
-                "invoked. This smoke test alone does not prove full or "
-                "input-sensitive compute capture. Treat two distinct live "
-                "eager-parity lengths plus an NPU profiler trace showing the "
-                "pre/post graph kernels around the eager LMCache interval as "
-                "the authoritative capture evidence."
-            )
+        capture_records.add(region_name)
 
     def _require_staged_sfa_startup_proof(self) -> None:
         required_phases = {
@@ -2012,10 +2044,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if missing_phases or missing_replays:
             raise RuntimeError(
-                "[SFA staged graph POC] startup replay smoke test is "
+                "[SFA staged graph POC] startup ordered replay-canary check is "
                 "incomplete: "
                 f"missing capture phases={sorted(missing_phases)}, "
-                f"missing replay proofs={sorted(missing_replays)}."
+                f"missing replay canaries={sorted(missing_replays)}."
             )
 
     @staticmethod
@@ -2226,6 +2258,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table: torch.Tensor,
         remap_boundary: torch.Tensor,
+        ql_nope_output: torch.Tensor | None = None,
+        q_pe_output: torch.Tensor | None = None,
+        topk_indices_output: torch.Tensor | None = None,
+        selected_packed_output: torch.Tensor | None = None,
+        replay_canary: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2291,8 +2328,52 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_packed=True,
         )
         assert selected_packed is not None
+        computed_outputs = (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            selected_packed,
+        )
+        persistent_outputs = (
+            ql_nope_output,
+            q_pe_output,
+            topk_indices_output,
+            selected_packed_output,
+        )
+        if any(value is not None for value in persistent_outputs):
+            if not all(value is not None for value in persistent_outputs):
+                raise RuntimeError(
+                    "[SFA staged graph POC] Graph A requires either all four "
+                    "persistent output buffers or none of them."
+                )
+            for output_index, (persistent, computed) in enumerate(
+                zip(persistent_outputs, computed_outputs)
+            ):
+                assert persistent is not None
+                if (
+                    persistent.shape != computed.shape
+                    or persistent.dtype != computed.dtype
+                    or persistent.device != computed.device
+                ):
+                    raise RuntimeError(
+                        "[SFA staged graph POC] persistent Graph-A output "
+                        f"{output_index} does not match the computed tensor."
+                    )
+                persistent.copy_(computed)
+            assert ql_nope_output is not None
+            assert q_pe_output is not None
+            assert topk_indices_output is not None
+            assert selected_packed_output is not None
+            computed_outputs = (
+                ql_nope_output,
+                q_pe_output,
+                topk_indices_output,
+                selected_packed_output,
+            )
+        if replay_canary is not None:
+            replay_canary.fill_(1)
         self._observe_staged_sfa_capture_phase("pre", "exit")
-        return ql_nope, q_pe, topk_indices, selected_packed
+        return computed_outputs
 
     def _staged_sfa_post_compute_poc(
         self,
@@ -2342,6 +2423,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_key: torch.Tensor,
         block_table: torch.Tensor,
         output: torch.Tensor,
+        replay_canary: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Graph B: scratch-backed SFA, value-up and output projection."""
         self._observe_staged_sfa_capture_phase("post", "enter")
@@ -2357,6 +2439,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             output,
             trace_label="staged_graph_poc",
         )
+        if replay_canary is not None:
+            replay_canary.fill_(1)
         self._observe_staged_sfa_capture_phase("post", "exit")
         return output
 
@@ -2394,6 +2478,131 @@ class AscendSFAImpl(MLAAttentionImpl):
             reference_output,
             trace_label="staged_graph_live_reference",
         )
+
+    def _ensure_staged_sfa_replay_canaries(
+        self,
+        device: torch.device,
+        runtime_mode: CUDAGraphMode | None,
+    ) -> dict[str, torch.Tensor]:
+        canaries = getattr(self, "_staged_sfa_replay_canaries", None)
+        if canaries is None:
+            canaries = {}
+            self._staged_sfa_replay_canaries = canaries
+        if set(canaries) == {"pre", "post"}:
+            for region_name, canary in canaries.items():
+                if (
+                    not isinstance(canary, torch.Tensor)
+                    or canary.shape != (1,)
+                    or canary.dtype != torch.int32
+                    or canary.device != device
+                ):
+                    raise RuntimeError(
+                        "[SFA staged graph POC] the persistent "
+                        f"{region_name} replay canary has an invalid signature."
+                    )
+            if canaries["pre"].data_ptr() == canaries["post"].data_ptr():
+                raise RuntimeError(
+                    "[SFA staged graph POC] pre/post replay canaries alias."
+                )
+            return canaries
+        if canaries:
+            raise RuntimeError(
+                "[SFA staged graph POC] replay-canary initialization is "
+                f"partial: {sorted(canaries)}."
+            )
+        if runtime_mode != CUDAGraphMode.NONE:
+            raise RuntimeError(
+                "[SFA staged graph POC] replay canaries were not allocated "
+                "by the eager dummy warmup before graph capture."
+            )
+        canaries.update(
+            {
+                "pre": torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "post": torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            }
+        )
+        return canaries
+
+    def _bind_staged_sfa_pre_output_buffers(
+        self,
+        graph_outputs: tuple[torch.Tensor, ...],
+        *,
+        is_dummy_run: bool,
+        runtime_mode: CUDAGraphMode | None,
+    ) -> tuple[torch.Tensor, ...]:
+        if len(graph_outputs) != 4 or not all(
+            isinstance(output, torch.Tensor)
+            for output in graph_outputs
+        ):
+            raise RuntimeError(
+                "[SFA staged graph POC] Graph A must return exactly four "
+                "tensor outputs."
+            )
+        persistent_outputs = getattr(
+            self,
+            "_staged_sfa_pre_output_buffers",
+            None,
+        )
+        if persistent_outputs is None:
+            if not is_dummy_run or runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "[SFA staged graph POC] persistent Graph-A outputs were "
+                    "not allocated by the eager dummy warmup before capture."
+                )
+            persistent_outputs = tuple(
+                torch.empty_like(output) for output in graph_outputs
+            )
+            for persistent, output in zip(
+                persistent_outputs,
+                graph_outputs,
+            ):
+                persistent.copy_(output)
+            self._staged_sfa_pre_output_buffers = persistent_outputs
+            return persistent_outputs
+
+        mismatches = [
+            output_index
+            for output_index, (persistent, returned) in enumerate(
+                zip(persistent_outputs, graph_outputs)
+            )
+            if (
+                self._staged_sfa_tensor_signature(persistent)
+                != self._staged_sfa_tensor_signature(returned)
+            )
+        ]
+        if len(persistent_outputs) != len(graph_outputs):
+            mismatches.extend(
+                range(
+                    min(len(persistent_outputs), len(graph_outputs)),
+                    max(len(persistent_outputs), len(graph_outputs)),
+                )
+            )
+        if mismatches:
+            message = (
+                "Graph A did not return its persistent output storage; "
+                f"differing output indices={mismatches}"
+            )
+            if self._staged_sfa_capture_dummy_active():
+                failures = getattr(
+                    self,
+                    "_staged_sfa_capture_failures",
+                    None,
+                )
+                if failures is None:
+                    failures = []
+                    self._staged_sfa_capture_failures = failures
+                failures.append(f"pre: {message}")
+            else:
+                raise RuntimeError(f"[SFA staged graph POC] {message}.")
+        return persistent_outputs
 
     def _forward_staged_sfa_graph_poc(
         self,
@@ -2456,8 +2665,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "by the eager dummy warmup before graph capture."
                 )
             # The worker resets both dummy block tables to physical block 0.
-            # Initialize only that block, outside capture, so the startup replay
-            # proof cannot inherit NaNs from uninitialized cache allocation.
+            # Initialize only that block outside capture so the later ordered
+            # replay smoke cannot inherit uninitialized cache data.
             for cache in kv_cache:
                 if cache.shape[0] == 0:
                     raise RuntimeError(
@@ -2465,6 +2674,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 cache[0].zero_()
             self._staged_sfa_dummy_cache_initialized = True
+
+        replay_canaries = self._ensure_staged_sfa_replay_canaries(
+            hidden_states.device,
+            runtime_mode,
+        )
+        persistent_pre_outputs = getattr(
+            self,
+            "_staged_sfa_pre_output_buffers",
+            None,
+        )
+        pre_output_args = (
+            persistent_pre_outputs
+            if persistent_pre_outputs is not None
+            else (None, None, None, None)
+        )
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
@@ -2500,6 +2724,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.seq_lens,
             indexer_block_table,
             remap_boundary,
+            *pre_output_args,
+            replay_canaries["pre"],
         )
         if validate_live_inputs:
             self._validate_staged_sfa_graph_entry(
@@ -2509,10 +2735,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             self._validate_staged_sfa_graph_entry("post", post_graph)
         with torch.profiler.record_function("sfa_staged_graph_poc::pre"):
-            ql_nope, q_pe, topk_indices, selected_packed = pre_graph(
-                *pre_graph_inputs
-            )
-        self._prove_staged_sfa_graph_replay(
+            captured_pre_outputs = tuple(pre_graph(*pre_graph_inputs))
+        (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            selected_packed,
+        ) = self._bind_staged_sfa_pre_output_buffers(
+            captured_pre_outputs,
+            is_dummy_run=is_dummy_run,
+            runtime_mode=runtime_mode,
+        )
+        self._record_staged_sfa_graph_capture(
             "pre",
             pre_graph,
             pre_graph_inputs,
@@ -2626,6 +2860,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.seq_lens,
             attn_metadata.block_table,
             output,
+            replay_canaries["post"],
         )
         if validate_live_inputs:
             self._validate_staged_sfa_graph_entry(
@@ -2655,8 +2890,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _sync_compute_stream_after_lmcache_sparse_wait()
 
         with torch.profiler.record_function("sfa_staged_graph_poc::post"):
-            post_graph(*post_graph_inputs)
-        self._prove_staged_sfa_graph_replay(
+            post_graph_output = post_graph(*post_graph_inputs)
+        if (
+            not isinstance(post_graph_output, torch.Tensor)
+            or self._staged_sfa_tensor_signature(post_graph_output)
+            != self._staged_sfa_tensor_signature(output)
+        ):
+            message = "Graph B did not return its caller-owned output storage"
+            if self._staged_sfa_capture_dummy_active():
+                self._staged_sfa_capture_failures.append(
+                    f"post: {message}"
+                )
+            else:
+                raise RuntimeError(f"[SFA staged graph POC] {message}.")
+        self._record_staged_sfa_graph_capture(
             "post",
             post_graph,
             post_graph_inputs,
@@ -2705,7 +2952,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if log_live_validation:
             logger.info_once(
                 "[SFA staged graph POC] verified pre/post startup capture "
-                "and enabled always-on captured-input address validation for "
+                "and enabled always-on captured-input signature validation for "
                 "live replay; LMCache retrieval remains eager."
             )
 

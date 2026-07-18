@@ -109,13 +109,42 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             speculative_config=None,
             lora_config=None,
         )
+        runner._staged_sfa_startup_capture_attempted = False
+        runner._staged_sfa_startup_capture_complete = False
         return runner
 
     @staticmethod
-    def _make_proved_impl():
+    def _signature(tensor):
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.storage_offset(),
+            tensor.dtype,
+            tensor.device,
+        )
+
+    @classmethod
+    def _make_captured_impl(cls):
         descriptor = BatchDescriptor(num_tokens=1)
-        pre_entry = SimpleNamespace(aclgraph=object())
-        post_entry = SimpleNamespace(aclgraph=object())
+        pre_input = torch.zeros(2)
+        post_input = torch.zeros(3)
+        pre_outputs = tuple(torch.zeros(2) for _ in range(4))
+        post_output = torch.zeros(2)
+        pre_canary = torch.ones(1, dtype=torch.int32)
+        post_canary = torch.ones(1, dtype=torch.int32)
+        pre_inputs = (pre_input, *pre_outputs, pre_canary)
+        post_inputs = (post_input, post_output, post_canary)
+        pre_entry = SimpleNamespace(
+            aclgraph=object(),
+            input_addresses=[value.data_ptr() for value in pre_inputs],
+            output=pre_outputs,
+        )
+        post_entry = SimpleNamespace(
+            aclgraph=object(),
+            input_addresses=[value.data_ptr() for value in post_inputs],
+            output=post_output,
+        )
         return SimpleNamespace(
             enable_staged_sfa_graph=True,
             _staged_sfa_capture_phases={
@@ -124,54 +153,71 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 "post:enter",
                 "post:exit",
             },
-            _staged_sfa_replay_proved={"pre", "post"},
+            _staged_sfa_capture_records={"pre", "post"},
+            _staged_sfa_capture_failures=[],
+            _staged_sfa_graph_input_signatures={
+                "pre": tuple(cls._signature(value) for value in pre_inputs),
+                "post": tuple(cls._signature(value) for value in post_inputs),
+            },
+            _staged_sfa_replay_proved=set(),
+            _staged_sfa_pre_output_buffers=pre_outputs,
+            _staged_sfa_replay_canaries={
+                "pre": pre_canary,
+                "post": post_canary,
+            },
             _staged_sfa_pre_graph=SimpleNamespace(
                 concrete_aclgraph_entries={descriptor: pre_entry},
             ),
             _staged_sfa_post_graph=SimpleNamespace(
                 concrete_aclgraph_entries={descriptor: post_entry},
             ),
+            _test_input_tensors=(*pre_inputs, *post_inputs),
         )
+
+    @staticmethod
+    def _layers(*impls):
+        return {
+            f"model.layers.{index}.self_attn.attn": SimpleNamespace(
+                impl=impl,
+            )
+            for index, impl in enumerate(impls)
+        }
 
     @patch.object(
         model_runner_module,
         "staged_sfa_graph_configured",
         return_value=True,
     )
-    def test_accepts_complete_capture_for_every_local_sfa_layer(
+    def test_accepts_complete_structural_capture_for_every_local_layer(
         self,
         _staged_sfa_graph_configured,
     ):
         runner = self._build_runner()
-        layers = {
-            "model.layers.0.self_attn.attn": SimpleNamespace(
-                impl=self._make_proved_impl(),
-            ),
-            "model.layers.1.self_attn.attn": SimpleNamespace(
-                impl=self._make_proved_impl(),
-            ),
-        }
+        impls = (self._make_captured_impl(), self._make_captured_impl())
         with (
             patch.object(
                 model_runner_module,
                 "get_layers_from_vllm_config",
-                return_value=layers,
+                return_value=self._layers(*impls),
             ),
-            patch.object(model_runner_module.logger, "info") as info,
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
         ):
             runner._validate_staged_sfa_startup_capture()
 
-        info.assert_called_once()
-        self.assertEqual(info.call_args.args[1:], (2, 4))
         self.assertEqual(runner._staged_sfa_expected_layer_count, 2)
         self.assertEqual(len(runner._staged_sfa_impls), 2)
+        self.assertTrue(all(not impl._staged_sfa_replay_proved for impl in impls))
 
     @patch.object(
         model_runner_module,
         "staged_sfa_graph_configured",
         return_value=True,
     )
-    def test_rejects_zero_local_staged_sfa_layers(
+    def test_zero_local_layers_fails_after_consensus(
         self,
         _staged_sfa_graph_configured,
     ):
@@ -182,9 +228,179 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 "get_layers_from_vllm_config",
                 return_value={},
             ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 0, 0),
+            ) as consensus,
             self.assertRaisesRegex(
                 RuntimeError,
                 "did not find any local staged SFA implementations",
+            ),
+        ):
+            runner._validate_staged_sfa_startup_capture()
+
+        consensus.assert_called_once_with(local_failed=True, local_count=0)
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_reports_all_structural_defects_after_consensus(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impl = self._make_captured_impl()
+        impl._staged_sfa_capture_phases.remove("post:exit")
+        impl._staged_sfa_capture_records.remove("post")
+        impl._staged_sfa_capture_failures.append("pre capture failed")
+        impl._staged_sfa_graph_input_signatures.pop("pre")
+        impl._staged_sfa_pre_output_buffers = None
+        impl._staged_sfa_replay_canaries.pop("post")
+        impl._staged_sfa_post_graph.concrete_aclgraph_entries.clear()
+        with (
+            patch.object(
+                model_runner_module,
+                "get_layers_from_vllm_config",
+                return_value=self._layers(impl),
+            ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
+            ) as consensus,
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"entries=\['post'\].*pre capture failed",
+            ),
+        ):
+            runner._validate_staged_sfa_startup_capture()
+
+        consensus.assert_called_once_with(local_failed=True, local_count=1)
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_rejects_owned_storage_tail_and_post_output_binding_drift(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impl = self._make_captured_impl()
+        descriptor = BatchDescriptor(num_tokens=1)
+        pre_entry = impl._staged_sfa_pre_graph.concrete_aclgraph_entries[
+            descriptor
+        ]
+        pre_signatures = list(
+            impl._staged_sfa_graph_input_signatures["pre"]
+        )
+        pre_signatures[-5] = (
+            pre_signatures[-4][0],
+            *pre_signatures[-5][1:],
+        )
+        impl._staged_sfa_graph_input_signatures["pre"] = tuple(
+            pre_signatures
+        )
+        pre_entry.input_addresses[-5] = pre_signatures[-5][0]
+
+        post_entry = impl._staged_sfa_post_graph.concrete_aclgraph_entries[
+            descriptor
+        ]
+        post_signatures = list(
+            impl._staged_sfa_graph_input_signatures["post"]
+        )
+        post_signatures[-1] = (
+            post_signatures[-2][0],
+            *post_signatures[-1][1:],
+        )
+        impl._staged_sfa_graph_input_signatures["post"] = tuple(
+            post_signatures
+        )
+        post_entry.input_addresses[-1] = post_signatures[-1][0]
+        impl._test_drift_output = torch.empty_like(post_entry.output)
+        post_entry.output = impl._test_drift_output
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_layers_from_vllm_config",
+                return_value=self._layers(impl),
+            ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
+            ) as consensus,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "pre_signature_tail_mismatch=True.*"
+                "post_signature_tail_mismatch=True.*"
+                "post_output_binding_mismatch=True",
+            ),
+        ):
+            runner._validate_staged_sfa_startup_capture()
+
+        consensus.assert_called_once_with(local_failed=True, local_count=1)
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_rejects_aliasing_strong_pre_output_buffers(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impl = self._make_captured_impl()
+        descriptor = BatchDescriptor(num_tokens=1)
+        shared_storage = torch.zeros(4)
+        pre_outputs = (
+            shared_storage[:2],
+            shared_storage[2:],
+            torch.zeros(2),
+            torch.zeros(2),
+        )
+        impl._staged_sfa_pre_output_buffers = pre_outputs
+        pre_entry = impl._staged_sfa_pre_graph.concrete_aclgraph_entries[
+            descriptor
+        ]
+        pre_entry.output = pre_outputs
+        pre_signatures = list(
+            impl._staged_sfa_graph_input_signatures["pre"]
+        )
+        expected_tail = (
+            *pre_outputs,
+            impl._staged_sfa_replay_canaries["pre"],
+        )
+        pre_signatures[-5:] = [
+            self._signature(value) for value in expected_tail
+        ]
+        impl._staged_sfa_graph_input_signatures["pre"] = tuple(
+            pre_signatures
+        )
+        pre_entry.input_addresses[-5:] = [
+            value.data_ptr() for value in expected_tail
+        ]
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_layers_from_vllm_config",
+                return_value=self._layers(impl),
+            ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "pre_output_storage_alias=True",
             ),
         ):
             runner._validate_staged_sfa_startup_capture()
@@ -194,30 +410,106 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         "staged_sfa_graph_configured",
         return_value=True,
     )
-    def test_rejects_partial_layer_capture_proof(
+    def test_rejects_non_int32_vector_canary_signature(
         self,
         _staged_sfa_graph_configured,
     ):
         runner = self._build_runner()
-        impl = self._make_proved_impl()
-        impl._staged_sfa_capture_phases.remove("post:exit")
-        impl._staged_sfa_replay_proved.remove("post")
-        impl._staged_sfa_post_graph.concrete_aclgraph_entries.clear()
-        layers = {
-            "model.layers.7.self_attn.attn": SimpleNamespace(impl=impl),
-        }
+        impl = self._make_captured_impl()
+        descriptor = BatchDescriptor(num_tokens=1)
+        malformed_canary = torch.ones((), dtype=torch.float32)
+        impl._staged_sfa_replay_canaries["pre"] = malformed_canary
+        pre_signatures = list(
+            impl._staged_sfa_graph_input_signatures["pre"]
+        )
+        pre_signatures[-1] = self._signature(malformed_canary)
+        impl._staged_sfa_graph_input_signatures["pre"] = tuple(
+            pre_signatures
+        )
+        pre_entry = impl._staged_sfa_pre_graph.concrete_aclgraph_entries[
+            descriptor
+        ]
+        pre_entry.input_addresses[-1] = malformed_canary.data_ptr()
+
         with (
             patch.object(
                 model_runner_module,
                 "get_layers_from_vllm_config",
-                return_value=layers,
+                return_value=self._layers(impl),
+            ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "model.layers.7.self_attn.attn: entries=\\['post'\\]",
+                r"malformed_canaries=\['pre'\]",
             ),
         ):
             runner._validate_staged_sfa_startup_capture()
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_remote_structural_failure_forces_local_raise(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impl = self._make_captured_impl()
+        with (
+            patch.object(
+                model_runner_module,
+                "get_layers_from_vllm_config",
+                return_value=self._layers(impl),
+            ),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "local failures: none on this TP rank",
+            ),
+        ):
+            runner._validate_staged_sfa_startup_capture()
+
+    def test_tp_consensus_uses_cpu_group_and_reports_count_range(self):
+        runner = self._build_runner()
+        cpu_group = object()
+
+        def reduce_remote_status(status, **_kwargs):
+            status[0] = 1
+            status[1] = 4
+            status[2] = -2
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    world_size=2,
+                    cpu_group=cpu_group,
+                ),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=reduce_remote_status,
+            ) as all_reduce,
+        ):
+            result = runner._staged_sfa_tp_consensus(
+                local_failed=False,
+                local_count=3,
+            )
+
+        self.assertEqual(result, (True, 2, 4))
+        self.assertIs(all_reduce.call_args.kwargs["group"], cpu_group)
+        self.assertEqual(all_reduce.call_args.kwargs["op"], torch.distributed.ReduceOp.MAX)
 
     @patch.object(
         model_runner_module,
@@ -236,30 +528,155 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             runner._validate_staged_sfa_startup_capture()
 
         get_layers.assert_not_called()
+        self.assertEqual(runner._staged_sfa_impls, ())
+        self.assertEqual(runner._staged_sfa_expected_layer_count, 0)
 
-    def test_validation_delegates_to_shared_configuration_gate(self):
+    def test_reset_discards_stale_profiling_entries_and_impl_state(self):
         runner = self._build_runner()
+        runner._staged_sfa_startup_capture_attempted = True
+        impl = self._make_captured_impl()
+        impl._staged_sfa_replay_proved = {"pre", "post"}
+        impl._staged_sfa_dummy_cache_initialized = True
+        impl._staged_sfa_live_capture_validated = True
+        impl._staged_sfa_live_validated_request_ids = ("stale",)
+        impl._staged_sfa_parity_output = torch.ones(1)
+        impl._staged_sfa_parity_latent_scratch = torch.ones(1)
+        old_pre_entries = impl._staged_sfa_pre_graph.concrete_aclgraph_entries
+        old_post_entries = impl._staged_sfa_post_graph.concrete_aclgraph_entries
+        with patch.object(
+            runner,
+            "_collect_staged_sfa_impls",
+            return_value=(("layer-0", impl),),
+        ):
+            runner._reset_staged_sfa_startup_capture()
+
+        self.assertEqual(old_pre_entries, {})
+        self.assertEqual(old_post_entries, {})
+        self.assertIsNone(impl._staged_sfa_pre_graph)
+        self.assertIsNone(impl._staged_sfa_post_graph)
+        self.assertEqual(impl._staged_sfa_capture_phases, set())
+        self.assertEqual(impl._staged_sfa_capture_records, set())
+        self.assertEqual(impl._staged_sfa_capture_failures, [])
+        self.assertEqual(impl._staged_sfa_graph_input_signatures, {})
+        self.assertEqual(impl._staged_sfa_replay_proved, set())
+        self.assertIsNone(impl._staged_sfa_pre_output_buffers)
+        self.assertEqual(impl._staged_sfa_replay_canaries, {})
+        self.assertFalse(impl._staged_sfa_dummy_cache_initialized)
+        self.assertFalse(impl._staged_sfa_live_capture_validated)
+        self.assertIsNone(impl._staged_sfa_live_validated_request_ids)
+        self.assertIsNone(impl._staged_sfa_parity_output)
+        self.assertIsNone(impl._staged_sfa_parity_latent_scratch)
+        self.assertTrue(runner._staged_sfa_startup_capture_attempted)
+        self.assertFalse(runner._staged_sfa_startup_capture_complete)
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_ordered_full_model_replay_proves_every_canary(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impls = (self._make_captured_impl(), self._make_captured_impl())
+        runner._staged_sfa_impls = tuple(
+            (f"layer-{index}", impl)
+            for index, impl in enumerate(impls)
+        )
+
+        def ordered_dummy_replay(*args, **kwargs):
+            self.assertEqual(args, (1,))
+            self.assertEqual(
+                kwargs,
+                {
+                    "cudagraph_runtime_mode": CUDAGraphMode.PIECEWISE,
+                    "uniform_decode": False,
+                    "allow_microbatching": False,
+                    "skip_eplb": True,
+                    "remove_lora": False,
+                    "num_active_loras": 0,
+                },
+            )
+            for impl in impls:
+                self.assertEqual(impl._staged_sfa_replay_canaries["pre"].item(), 0)
+                self.assertEqual(impl._staged_sfa_replay_canaries["post"].item(), 0)
+                impl._staged_sfa_replay_canaries["pre"].fill_(1)
+                impl._staged_sfa_replay_canaries["post"].fill_(1)
+
+        runner._dummy_run = MagicMock(side_effect=ordered_dummy_replay)
+        with (
+            patch.object(torch.npu, "synchronize") as synchronize,
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
+            patch.object(model_runner_module.logger, "info") as info,
+        ):
+            runner._prove_staged_sfa_ordered_startup_replay()
+
+        self.assertEqual(synchronize.call_count, 2)
+        runner._dummy_run.assert_called_once()
+        self.assertTrue(runner._staged_sfa_startup_capture_complete)
+        self.assertTrue(
+            all(
+                impl._staged_sfa_replay_proved == {"pre", "post"}
+                for impl in impls
+            )
+        )
+        info.assert_called_once_with(
+            "[SFA staged graph POC] startup capture and ordered replay-canary "
+            "completeness check passed for %d local SFA layers (%d staged "
+            "graphs).",
+            2,
+            4,
+        )
+
+    @patch.object(
+        model_runner_module,
+        "staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_missing_canary_write_fails_after_tp_consensus(
+        self,
+        _staged_sfa_graph_configured,
+    ):
+        runner = self._build_runner()
+        impl = self._make_captured_impl()
+        runner._staged_sfa_impls = (("layer-0", impl),)
+        runner._dummy_run = MagicMock(
+            side_effect=lambda *_args, **_kwargs: impl._staged_sfa_replay_canaries[
+                "pre"
+            ].fill_(1)
+        )
+        with (
+            patch.object(torch.npu, "synchronize"),
+            patch.object(
+                runner,
+                "_staged_sfa_tp_consensus",
+                return_value=(True, 1, 1),
+            ) as consensus,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "post replay canary is 0, expected 1",
+            ),
+        ):
+            runner._prove_staged_sfa_ordered_startup_replay()
+
+        consensus.assert_called_once_with(local_failed=True, local_count=1)
+        self.assertFalse(runner._staged_sfa_startup_capture_complete)
+        self.assertEqual(impl._staged_sfa_replay_proved, set())
+
+    def test_capture_model_preserves_result_and_orders_all_checks(self):
+        runner = self._build_runner()
+        calls = []
         with (
             patch.object(
                 model_runner_module,
                 "staged_sfa_graph_configured",
-                return_value=False,
-            ) as staged_sfa_graph_configured,
-            patch.object(
-                model_runner_module,
-                "get_layers_from_vllm_config",
-            ) as get_layers,
-        ):
-            runner._validate_staged_sfa_startup_capture()
-
-        staged_sfa_graph_configured.assert_called_once_with(
-            runner.vllm_config
-        )
-        get_layers.assert_not_called()
-
-    def test_capture_model_preserves_parent_memory_result(self):
-        runner = self._build_runner()
-        with (
+                return_value=True,
+            ),
             patch.object(
                 model_runner_module,
                 "_torch_cuda_wrapper",
@@ -271,20 +688,100 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+                side_effect=lambda: calls.append("reset"),
+            ),
+            patch.object(
                 model_runner_module.GPUModelRunner,
                 "capture_model",
-                return_value=123,
+                side_effect=lambda _runner: calls.append("parent") or 123,
             ) as parent_capture,
             patch.object(
                 runner,
                 "_validate_staged_sfa_startup_capture",
-            ) as validate_capture,
+                side_effect=lambda: calls.append("validate"),
+            ),
+            patch.object(
+                runner,
+                "_prove_staged_sfa_ordered_startup_replay",
+                side_effect=lambda: calls.append("replay"),
+            ),
         ):
             result = runner.capture_model()
 
         self.assertEqual(result, 123)
+        self.assertEqual(calls, ["reset", "parent", "validate", "replay"])
+        self.assertTrue(runner._staged_sfa_startup_capture_attempted)
         parent_capture.assert_called_once_with(runner)
-        validate_capture.assert_called_once_with()
+
+    def test_failed_parent_capture_cannot_retry_stale_outer_graphs(self):
+        runner = self._build_runner()
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                side_effect=RuntimeError("capture failed"),
+            ) as parent_capture,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                runner.capture_model()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "startup graph capture was already attempted",
+            ):
+                runner.capture_model()
+
+        self.assertTrue(runner._staged_sfa_startup_capture_attempted)
+        self.assertFalse(runner._staged_sfa_startup_capture_complete)
+        parent_capture.assert_called_once_with(runner)
+
+    def test_second_capture_attempt_is_rejected_before_parent(self):
+        runner = self._build_runner()
+        runner._staged_sfa_startup_capture_attempted = True
+        runner._staged_sfa_startup_capture_complete = True
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ) as reset,
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+            ) as parent_capture,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "startup graph capture was already attempted",
+            ),
+        ):
+            runner.capture_model()
+
+        reset.assert_not_called()
+        parent_capture.assert_not_called()
 
 
 class TestStagedSFALiveParity(unittest.TestCase):

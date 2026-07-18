@@ -78,10 +78,12 @@ parity steps should therefore have completed before collection. Increase
 
 The automated gate requires all of the following:
 
-1. the startup graph-replay output-write smoke rewrote the poisoned buffers
-   after both capture regions were created;
-2. every local staged SFA implementation has both captured entries;
-3. always-on captured-input address validation is enabled for live replay;
+1. every local staged SFA implementation has both captured entries and fixed,
+   strongly owned Graph-A handoff buffers;
+2. one size-one full-model replay, run only after all captures finish, writes
+   the dedicated pre/post canary for every local SFA layer;
+3. always-on captured-input signature validation (pointer, shape, stride,
+   storage offset, dtype, and device) is enabled for live replay;
 4. eager and graph results pass at two distinct sequence lengths on all TP
    ranks;
 5. at least eight new worker/rank traces contain `pre`, `lmcache_retrieve`, and
@@ -89,9 +91,10 @@ The automated gate requires all of the following:
    ranges are reported and ignored;
 6. the steady-state trace does not contain the eager live-parity ranges.
 
-The output-write smoke only shows that invoking each wrapper writes its output;
-it does not prove that CANN replayed the intended captured kernels. These gates
-are necessary, but trace-name/API presence alone is not a capture proof.
+The canary smoke proves that ordered replay reached the terminal operation in
+each staged graph without modifying production activations. It does not prove
+that every intended compute kernel was captured or is input-sensitive. These
+gates are necessary, but trace-name/API presence alone is not a capture proof.
 
 ## 3. Complete the hardware proof in MindStudio Insight
 
@@ -129,8 +132,8 @@ does not replace the named-range proof.
 | --- | --- |
 | No staged-SFA startup messages | Confirm the feature flag, `UNBUNDLE=1`, `TWO_GROUPS=1`, `SHRINK_LATENT=2`, `PIECEWISE`, an MLA model with `index_topk`, and a KV connector. |
 | Dummy pass is ineligible | The exception gives the incompatible feature or missing fixed-shape metadata; remove that feature for this POC run. |
-| Startup smoke/completeness fails | Inspect the reported layer and missing `pre`/`post` entry, capture phase, or output rewrite. |
-| Captured address check fails | A live positional tensor no longer uses startup-captured storage; inspect the reported pre/post input index. |
+| Startup capture/replay-canary completeness fails | Inspect the reported layer and missing `pre`/`post` entry, capture phase, persistent output binding, or replay-canary failure. |
+| Captured input-signature check fails | A live positional tensor's storage, shape, stride, offset, dtype, or device differs from capture; inspect the reported pre/post input index. |
 | `pre.*` parity fails | Suspect dynamic-length indexer/top-k replay, remap, or captured cache writes. |
 | `post.output` parity fails | Suspect LMCache scratch visibility/stream ordering or dynamic-length sparse-attention replay. |
 | TP checked count differs | At least one local layer/rank fell back; find the nearby `using the existing forward` reason. |

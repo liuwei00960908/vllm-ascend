@@ -273,6 +273,8 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_live_parity_request_id: str | None = None
         self._staged_sfa_live_parity_validated_seq_lens: list[int] = []
         self._staged_sfa_live_parity_last_seq_len: int | None = None
+        self._staged_sfa_startup_capture_attempted = False
+        self._staged_sfa_startup_capture_complete = False
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -4030,24 +4032,8 @@ class NPUModelRunner(GPUModelRunner):
             expected_layers,
         )
 
-    def _validate_staged_sfa_startup_capture(self) -> None:
-        """Require both staged size-1 graph smoke checks for every SFA layer.
-
-        Each SFA implementation records active-capture markers and an
-        output-write replay smoke test while the upstream startup loop visits
-        the PIECEWISE size-1 descriptor. This model-level postcondition
-        prevents a partial (or zero-layer) smoke check from being mistaken for
-        successful startup setup. Two distinct live eager-parity lengths plus
-        an NPU profiler trace remain the authoritative compute-capture proof.
-        """
-        self._staged_sfa_impls = ()
-        self._staged_sfa_expected_layer_count = 0
-        self._staged_sfa_live_parity_request_id = None
-        self._staged_sfa_live_parity_validated_seq_lens = []
-        self._staged_sfa_live_parity_last_seq_len = None
-        if not staged_sfa_graph_configured(self.vllm_config):
-            return
-
+    def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
+        """Return each local staged SFA implementation exactly once."""
         attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,
@@ -4062,73 +4048,495 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 continue
             staged_impls.setdefault(id(impl), (layer_name, impl))
+        return tuple(staged_impls.values())
 
-        if not staged_impls:
-            raise RuntimeError(
-                "[SFA staged graph POC] startup capture did not find any "
-                "local staged SFA implementations."
+    def _reset_staged_sfa_startup_capture(self) -> None:
+        """Discard profiling captures before the one real startup capture.
+
+        Upstream graph-memory profiling clears upstream CUDAGraphWrapper
+        instances, but the two inner ACLGraphWrapper instances are independent
+        and retain their size-one entries. Reusing those entries would turn the
+        real startup capture into a replay of profiling-pool state.
+        """
+        self._staged_sfa_impls = ()
+        self._staged_sfa_expected_layer_count = 0
+        self._staged_sfa_startup_capture_complete = False
+        self._staged_sfa_live_parity_request_id = None
+        self._staged_sfa_live_parity_validated_seq_lens = []
+        self._staged_sfa_live_parity_last_seq_len = None
+        for _layer_name, impl in self._collect_staged_sfa_impls():
+            impl._staged_sfa_capture_phases = set()
+            impl._staged_sfa_capture_records = set()
+            impl._staged_sfa_capture_failures = []
+            impl._staged_sfa_graph_input_signatures = {}
+            impl._staged_sfa_replay_proved = set()
+            impl._staged_sfa_pre_output_buffers = None
+            impl._staged_sfa_replay_canaries = {}
+            impl._staged_sfa_dummy_cache_initialized = False
+            impl._staged_sfa_live_capture_validated = False
+            impl._staged_sfa_live_validated_request_ids = None
+            impl._staged_sfa_parity_output = None
+            impl._staged_sfa_parity_latent_scratch = None
+            for wrapper_attr in (
+                "_staged_sfa_pre_graph",
+                "_staged_sfa_post_graph",
+            ):
+                wrapper = getattr(impl, wrapper_attr, None)
+                entries = getattr(
+                    wrapper,
+                    "concrete_aclgraph_entries",
+                    None,
+                )
+                if entries is not None:
+                    entries.clear()
+                setattr(impl, wrapper_attr, None)
+
+    @staticmethod
+    def _staged_sfa_tp_consensus(
+        *,
+        local_failed: bool,
+        local_count: int,
+    ) -> tuple[bool, int, int]:
+        """Make one TP-wide verdict on a CPU collective group."""
+        status = torch.tensor(
+            [int(local_failed), local_count, -local_count],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            dist.all_reduce(
+                status,
+                op=dist.ReduceOp.MAX,
+                group=tp_group.cpu_group,
             )
+        failed_any, max_count, negative_min_count = (
+            int(value) for value in status.tolist()
+        )
+        return bool(failed_any), -negative_min_count, max_count
 
+    def _validate_staged_sfa_startup_capture(self) -> None:
+        """Validate every local staged graph after all startup capture work."""
+        if not staged_sfa_graph_configured(self.vllm_config):
+            self._staged_sfa_impls = ()
+            self._staged_sfa_expected_layer_count = 0
+            return
+
+        staged_impls = self._collect_staged_sfa_impls()
         required_phases = {
             "pre:enter",
             "pre:exit",
             "post:enter",
             "post:exit",
         }
-        required_replays = {"pre", "post"}
+        required_regions = {"pre", "post"}
         size_one_descriptor = BatchDescriptor(num_tokens=1)
-        failures = []
-        for layer_name, impl in staged_impls.values():
-            missing_phases = required_phases - getattr(
-                impl,
-                "_staged_sfa_capture_phases",
-                set(),
+        failures: list[str] = []
+        if not staged_impls:
+            failures.append(
+                "startup capture did not find any local staged SFA "
+                "implementations"
             )
-            missing_replays = required_replays - getattr(
+
+        for layer_name, impl in staged_impls:
+            observed_phases = set(
+                getattr(impl, "_staged_sfa_capture_phases", set()) or ()
+            )
+            missing_phases = required_phases - observed_phases
+            capture_records = set(
+                getattr(impl, "_staged_sfa_capture_records", set()) or ()
+            )
+            missing_records = required_regions - capture_records
+            unexpected_records = capture_records - required_regions
+            raw_capture_failures = getattr(
                 impl,
-                "_staged_sfa_replay_proved",
-                set(),
+                "_staged_sfa_capture_failures",
+                [],
+            )
+            recorded_failures = (
+                list(raw_capture_failures)
+                if isinstance(raw_capture_failures, (list, tuple))
+                else [f"malformed failure record {raw_capture_failures!r}"]
+            )
+            premature_replays = set(
+                getattr(impl, "_staged_sfa_replay_proved", set()) or ()
             )
             missing_entries = []
+            missing_signatures = []
+            signature_mismatches = []
+            graph_entries = {}
+            captured_signatures = {}
+            input_signatures = getattr(
+                impl,
+                "_staged_sfa_graph_input_signatures",
+                {},
+            )
+            malformed_signature_map = not isinstance(input_signatures, dict)
+            if malformed_signature_map:
+                input_signatures = {}
             for region_name, wrapper_attr in (
                 ("pre", "_staged_sfa_pre_graph"),
                 ("post", "_staged_sfa_post_graph"),
             ):
                 wrapper = getattr(impl, wrapper_attr, None)
+                entries = getattr(
+                    wrapper,
+                    "concrete_aclgraph_entries",
+                    {},
+                )
                 entry = (
-                    wrapper.concrete_aclgraph_entries.get(
-                        size_one_descriptor,
-                    )
-                    if wrapper is not None
+                    entries.get(size_one_descriptor)
+                    if isinstance(entries, dict)
                     else None
                 )
-                if entry is None or entry.aclgraph is None:
+                if entry is None or getattr(entry, "aclgraph", None) is None:
                     missing_entries.append(region_name)
-            if missing_phases or missing_replays or missing_entries:
+                    continue
+                graph_entries[region_name] = entry
+                signatures = input_signatures.get(region_name)
+                if not isinstance(signatures, tuple) or not signatures:
+                    missing_signatures.append(region_name)
+                    continue
+                captured_signatures[region_name] = signatures
+                signature_addresses = [
+                    signature[0]
+                    for signature in signatures
+                    if isinstance(signature, tuple)
+                    and len(signature) == 6
+                ]
+                if (
+                    len(signature_addresses) != len(signatures)
+                    or getattr(entry, "input_addresses", None)
+                    != signature_addresses
+                ):
+                    signature_mismatches.append(region_name)
+
+            pre_outputs = getattr(
+                impl,
+                "_staged_sfa_pre_output_buffers",
+                None,
+            )
+            missing_pre_outputs = not (
+                isinstance(pre_outputs, tuple)
+                and len(pre_outputs) == 4
+                and all(
+                    isinstance(output, torch.Tensor)
+                    for output in pre_outputs
+                )
+            )
+            pre_output_storage_alias = (
+                not missing_pre_outputs
+                and len(
+                    {
+                        output.untyped_storage().data_ptr()
+                        for output in pre_outputs
+                    }
+                )
+                != len(pre_outputs)
+            )
+            pre_output_binding_mismatch = False
+            if not missing_pre_outputs and "pre" in graph_entries:
+                entry_outputs = getattr(graph_entries["pre"], "output", None)
+                if not isinstance(entry_outputs, tuple):
+                    entry_outputs = (entry_outputs,)
+                pre_output_binding_mismatch = (
+                    len(entry_outputs) != len(pre_outputs)
+                    or any(
+                        not isinstance(entry_output, torch.Tensor)
+                        or entry_output.data_ptr() != strong_output.data_ptr()
+                        for entry_output, strong_output in zip(
+                            entry_outputs,
+                            pre_outputs,
+                        )
+                    )
+                )
+            canaries = getattr(
+                impl,
+                "_staged_sfa_replay_canaries",
+                {},
+            )
+            malformed_canary_map = not isinstance(canaries, dict)
+            if malformed_canary_map:
+                canaries = {}
+            missing_canaries = required_regions - set(canaries)
+            unexpected_canaries = set(canaries) - required_regions
+            malformed_canaries = [
+                region_name
+                for region_name in required_regions & set(canaries)
+                if not isinstance(canaries[region_name], torch.Tensor)
+                or canaries[region_name].shape != (1,)
+                or canaries[region_name].dtype != torch.int32
+                or (
+                    not missing_pre_outputs
+                    and canaries[region_name].device
+                    != pre_outputs[0].device
+                )
+            ]
+            valid_canaries = [
+                canaries[region_name]
+                for region_name in sorted(required_regions)
+                if region_name in canaries
+                and isinstance(canaries[region_name], torch.Tensor)
+                and canaries[region_name].shape == (1,)
+                and canaries[region_name].dtype == torch.int32
+                and (
+                    missing_pre_outputs
+                    or canaries[region_name].device
+                    == pre_outputs[0].device
+                )
+            ]
+            shared_canary_storage = (
+                len(valid_canaries) == 2
+                and valid_canaries[0].data_ptr()
+                == valid_canaries[1].data_ptr()
+            )
+
+            pre_signature_tail_mismatch = True
+            pre_signatures = captured_signatures.get("pre")
+            if (
+                not missing_pre_outputs
+                and "pre" in canaries
+                and isinstance(canaries["pre"], torch.Tensor)
+                and isinstance(pre_signatures, tuple)
+                and len(pre_signatures) >= 5
+                and all(
+                    isinstance(signature, tuple) and len(signature) == 6
+                    for signature in pre_signatures[-5:]
+                )
+            ):
+                expected_tail = [
+                    output.data_ptr() for output in pre_outputs
+                ] + [canaries["pre"].data_ptr()]
+                pre_signature_tail_mismatch = (
+                    [signature[0] for signature in pre_signatures[-5:]]
+                    != expected_tail
+                )
+
+            post_signature_tail_mismatch = True
+            post_output_binding_mismatch = True
+            post_signatures = captured_signatures.get("post")
+            post_entry = graph_entries.get("post")
+            if (
+                "post" in canaries
+                and isinstance(canaries["post"], torch.Tensor)
+                and isinstance(post_signatures, tuple)
+                and len(post_signatures) >= 2
+                and all(
+                    isinstance(signature, tuple) and len(signature) == 6
+                    for signature in post_signatures[-2:]
+                )
+            ):
+                post_signature_tail_mismatch = (
+                    post_signatures[-1][0]
+                    != canaries["post"].data_ptr()
+                )
+                if post_entry is not None:
+                    post_entry_output = getattr(post_entry, "output", None)
+                    post_output_binding_mismatch = (
+                        not isinstance(post_entry_output, torch.Tensor)
+                        or post_entry_output.data_ptr()
+                        != post_signatures[-2][0]
+                    )
+
+            if (
+                missing_phases
+                or missing_records
+                or unexpected_records
+                or recorded_failures
+                or premature_replays
+                or missing_entries
+                or missing_signatures
+                or signature_mismatches
+                or malformed_signature_map
+                or missing_pre_outputs
+                or pre_output_storage_alias
+                or pre_output_binding_mismatch
+                or malformed_canary_map
+                or missing_canaries
+                or unexpected_canaries
+                or malformed_canaries
+                or shared_canary_storage
+                or pre_signature_tail_mismatch
+                or post_signature_tail_mismatch
+                or post_output_binding_mismatch
+            ):
                 failures.append(
                     f"{layer_name}: entries={missing_entries}, "
                     f"phases={sorted(missing_phases)}, "
-                    f"replays={sorted(missing_replays)}"
+                    f"records={sorted(missing_records)}, "
+                    f"unexpected_records={sorted(unexpected_records)}, "
+                    f"signatures={sorted(missing_signatures)}, "
+                    f"signature_mismatches={sorted(signature_mismatches)}, "
+                    f"malformed_signature_map={malformed_signature_map}, "
+                    f"pre_outputs_missing={missing_pre_outputs}, "
+                    f"pre_output_storage_alias={pre_output_storage_alias}, "
+                    f"pre_output_binding_mismatch="
+                    f"{pre_output_binding_mismatch}, "
+                    f"malformed_canary_map={malformed_canary_map}, "
+                    f"canaries={sorted(missing_canaries)}, "
+                    f"unexpected_canaries={sorted(unexpected_canaries)}, "
+                    f"malformed_canaries={sorted(malformed_canaries)}, "
+                    f"shared_canary_storage={shared_canary_storage}, "
+                    f"pre_signature_tail_mismatch="
+                    f"{pre_signature_tail_mismatch}, "
+                    f"post_signature_tail_mismatch="
+                    f"{post_signature_tail_mismatch}, "
+                    f"post_output_binding_mismatch="
+                    f"{post_output_binding_mismatch}, "
+                    f"premature_replays={sorted(premature_replays)}, "
+                    f"capture_failures={recorded_failures}"
                 )
 
-        if failures:
+        failed_any, min_layers, max_layers = (
+            self._staged_sfa_tp_consensus(
+                local_failed=bool(failures),
+                local_count=len(staged_impls),
+            )
+        )
+        global_failed = (
+            failed_any
+            or min_layers != max_layers
+            or max_layers == 0
+        )
+        if global_failed:
+            local_details = (
+                "; ".join(failures[:8])
+                if failures
+                else "none on this TP rank"
+            )
             raise RuntimeError(
                 "[SFA staged graph POC] startup capture is incomplete for "
-                "one or more local SFA layers: "
-                + "; ".join(failures)
+                "one or more local SFA layers "
+                f"(local_layers={len(staged_impls)}, "
+                f"TP layer range={min_layers}..{max_layers}; "
+                f"local failures: {local_details})."
             )
 
-        self._staged_sfa_impls = tuple(staged_impls.values())
+        self._staged_sfa_impls = staged_impls
         self._staged_sfa_expected_layer_count = len(staged_impls)
 
+    def _prove_staged_sfa_ordered_startup_replay(self) -> None:
+        """Replay the full model once and require every staged canary write."""
+        if not staged_sfa_graph_configured(self.vllm_config):
+            return
+
+        staged_impls = self._staged_sfa_impls
+        failures: list[str] = []
+        for layer_name, impl in staged_impls:
+            for region_name in ("pre", "post"):
+                try:
+                    impl._staged_sfa_replay_canaries[region_name].zero_()
+                except Exception as exc:
+                    failures.append(
+                        f"{layer_name}: zeroing the {region_name} canary "
+                        f"raised {type(exc).__name__}: {exc}"
+                    )
+        try:
+            torch.npu.synchronize()
+        except Exception as exc:
+            failures.append(
+                "device synchronization before ordered replay raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        try:
+            self._dummy_run(
+                1,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                uniform_decode=False,
+                allow_microbatching=False,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=0,
+            )
+        except Exception as exc:
+            failures.append(
+                "ordered full-model dummy replay raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+        try:
+            torch.npu.synchronize()
+        except Exception as exc:
+            failures.append(
+                "device synchronization after ordered replay raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # This is a startup-only check after a device-wide synchronize, not a
+        # decode hot-path item() synchronization.
+        passed_canaries = 0
+        for layer_name, impl in staged_impls:
+            for region_name in ("pre", "post"):
+                canary = impl._staged_sfa_replay_canaries[region_name]
+                try:
+                    value = canary.item()
+                except Exception as exc:
+                    failures.append(
+                        f"{layer_name}: {region_name} canary read raised "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if value != 1:
+                    failures.append(
+                        f"{layer_name}: {region_name} replay canary is "
+                        f"{value!r}, expected 1"
+                    )
+                else:
+                    passed_canaries += 1
+
+        expected_canaries = 2 * len(staged_impls)
+        failed_any, min_passed, max_passed = (
+            self._staged_sfa_tp_consensus(
+                local_failed=bool(failures),
+                local_count=passed_canaries,
+            )
+        )
+        global_failed = (
+            failed_any
+            or min_passed != max_passed
+            or max_passed != expected_canaries
+        )
+        if global_failed:
+            local_details = (
+                "; ".join(failures[:8])
+                if failures
+                else "none on this TP rank"
+            )
+            raise RuntimeError(
+                "[SFA staged graph POC] startup ordered replay-canary "
+                f"check failed (local passed={passed_canaries}/"
+                f"{expected_canaries}, TP passed range="
+                f"{min_passed}..{max_passed}; local failures: "
+                f"{local_details})."
+            )
+
+        for _layer_name, impl in staged_impls:
+            impl._staged_sfa_replay_proved = {"pre", "post"}
+        self._staged_sfa_startup_capture_complete = True
         logger.info(
-            "[SFA staged graph POC] startup capture/replay-smoke completeness "
-            "check passed for %d local SFA layers (%d staged graphs).",
+            "[SFA staged graph POC] startup capture and ordered replay-canary "
+            "completeness check passed for %d local SFA layers (%d staged "
+            "graphs).",
             len(staged_impls),
-            2 * len(staged_impls),
+            expected_canaries,
         )
 
     def capture_model(self) -> int:
+        staged_graph_configured = staged_sfa_graph_configured(
+            self.vllm_config
+        )
+        if staged_graph_configured and getattr(
+            self,
+            "_staged_sfa_startup_capture_attempted",
+            False,
+        ):
+            raise RuntimeError(
+                "[SFA staged graph POC] startup graph capture was already "
+                "attempted; retrying could reuse stale outer graph entries."
+            )
+        if staged_graph_configured:
+            self._staged_sfa_startup_capture_attempted = True
+            self._reset_staged_sfa_startup_capture()
         gpu_model_runner_cls = next((cls for cls in self.__class__.__mro__ if cls.__name__ == "GPUModelRunner"), None)
         if gpu_model_runner_cls is None:
             raise TypeError("Could not find GPUModelRunner in the MRO. The class hierarchy may have changed.")
@@ -4136,6 +4544,7 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             graph_memory_bytes = GPUModelRunner.capture_model(self)
         self._validate_staged_sfa_startup_capture()
+        self._prove_staged_sfa_ordered_startup_replay()
         return graph_memory_bytes
 
     def _prepare_multimodal_fields(self):

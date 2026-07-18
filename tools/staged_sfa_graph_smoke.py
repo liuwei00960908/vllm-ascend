@@ -7,11 +7,12 @@ client sends one long, streaming completion.  It starts the online Ascend
 PyTorch profiler only after the first four streamed token chunks so the first
 two eager-vs-graph parity steps are normally outside the steady-state trace.
 
-Automated checks require the startup graph-replay output-write smoke and two
-live numerical parity steps to pass, and require at least eight new staged
-worker traces to contain all three ranges plus an ACL model-replay API. They do not prove
-timeline nesting or device execution density; finish the checklist below in
-MindStudio Insight before calling the hardware proof successful.
+Automated checks require the model-level startup capture and ordered
+replay-canary completeness check and two live numerical parity steps to pass.
+They also require at least eight new staged worker traces to contain all three
+ranges plus an ACL model-replay API. They do not prove timeline nesting or
+device execution density; finish the checklist below in MindStudio Insight
+before calling the hardware proof successful.
 """
 
 from __future__ import annotations
@@ -41,25 +42,25 @@ _ACL_REPLAY_APIS = (
     "aclmdlExecuteAsync",
     "aclmdlExecuteAsyncV2",
 )
-_STARTUP_OUTPUT_WRITE_SMOKE = (
-    "[SFA staged graph POC] startup graph-replay output-write smoke passed"
+_STARTUP_REPLAY_CANARY_COMPLETE = (
+    "[SFA staged graph POC] startup capture and ordered replay-canary "
+    "completeness check passed"
 )
-_STARTUP_COMPLETE = (
-    "[SFA staged graph POC] startup capture completeness check passed"
-)
-_LIVE_ADDRESS_VALIDATION = (
+_LIVE_SIGNATURE_VALIDATION = (
     "[SFA staged graph POC] verified pre/post startup capture and enabled "
-    "always-on captured-input address validation for live replay; LMCache "
+    "always-on captured-input signature validation for live replay; LMCache "
     "retrieval remains eager."
 )
 _PARITY_PASS = "[SFA staged graph POC] live eager-vs-graph parity passed"
 _FAILURE_MARKERS = (
     "[SFA staged graph POC] live eager-vs-graph parity failed",
     "[SFA staged graph POC] startup capture is incomplete",
-    "[SFA staged graph POC] startup replay smoke test is incomplete",
+    "[SFA staged graph POC] startup ordered replay-canary check failed",
+    "[SFA staged graph POC] startup ordered replay-canary check is incomplete",
     "[SFA staged graph POC] the one-token dummy pass is ineligible",
     "positional tensor storage for the pre graph changed",
     "positional tensor storage for the post graph changed",
+    "full tensor signature for the",
 )
 
 
@@ -257,30 +258,31 @@ def check_server_log(path: Path) -> int:
     if not path.is_file():
         raise SmokeFailure(f"server log does not exist: {path}")
 
-    proof_seen = False
-    completeness_seen = False
-    address_seen = False
+    replay_canary_complete_seen = False
+    signature_seen = False
     first_parity_seen = False
     second_parity_seen = False
     parity_passes = 0
     expected_layers: int | None = None
+    expected_graphs: int | None = None
     failures: list[str] = []
     completeness_pattern = re.compile(
-        r"startup capture completeness check passed for (\d+) local SFA layers"
+        re.escape(_STARTUP_REPLAY_CANARY_COMPLETE)
+        + r" for (\d+) local SFA layers \((\d+) staged graphs\)\."
     )
 
     with path.open("r", encoding="utf-8", errors="replace") as log_file:
         for line_number, line in enumerate(log_file, start=1):
-            proof_seen |= _STARTUP_OUTPUT_WRITE_SMOKE in line
-            completeness_seen |= _STARTUP_COMPLETE in line
-            address_seen |= _LIVE_ADDRESS_VALIDATION in line
+            signature_seen |= _LIVE_SIGNATURE_VALIDATION in line
             if _PARITY_PASS in line:
                 parity_passes += 1
                 first_parity_seen |= "(1/2 live lengths" in line
                 second_parity_seen |= "(2/2 live lengths" in line
             match = completeness_pattern.search(line)
             if match is not None:
+                replay_canary_complete_seen = True
                 layer_count = int(match.group(1))
+                graph_count = int(match.group(2))
                 if expected_layers is None:
                     expected_layers = layer_count
                 elif expected_layers != layer_count:
@@ -288,33 +290,50 @@ def check_server_log(path: Path) -> int:
                         "startup logs disagree on local SFA layer count: "
                         f"{expected_layers} versus {layer_count}"
                     )
+                if expected_graphs is None:
+                    expected_graphs = graph_count
+                elif expected_graphs != graph_count:
+                    failures.append(
+                        "startup logs disagree on staged graph count: "
+                        f"{expected_graphs} versus {graph_count}"
+                    )
             for marker in _FAILURE_MARKERS:
                 if marker in line:
                     failures.append(f"line {line_number}: {line.strip()}")
 
     missing = []
-    if not proof_seen:
-        missing.append("startup graph-replay output-write smoke")
-    if not completeness_seen:
-        missing.append("model-level startup capture completeness proof")
-    if not address_seen:
-        missing.append("always-on live captured-input address validation")
+    if not replay_canary_complete_seen:
+        missing.append(
+            "model-level startup capture and ordered replay-canary "
+            "completeness check"
+        )
+    if not signature_seen:
+        missing.append("always-on live captured-input signature validation")
     if not first_parity_seen:
         missing.append("first live eager-vs-graph parity pass")
     if not second_parity_seen:
         missing.append("second distinct-length eager-vs-graph parity pass")
     if expected_layers is None or expected_layers <= 0:
         missing.append("positive local staged-SFA layer count")
+    if expected_graphs is None or expected_graphs <= 0:
+        missing.append("positive staged graph count")
+    elif expected_layers is not None and expected_graphs != 2 * expected_layers:
+        failures.append(
+            "startup completeness marker reported "
+            f"{expected_graphs} staged graphs for {expected_layers} local SFA "
+            "layers; expected exactly one pre and one post graph per layer"
+        )
     if missing:
         failures.append("missing log gates: " + ", ".join(missing))
     if failures:
         raise SmokeFailure("server-log validation failed:\n  " + "\n  ".join(failures))
 
     print(
-        "server-log gates passed: startup graph-replay output-write smoke, "
-        "capture completeness, "
-        "always-on live input-address validation, and two parity lengths "
-        f"({expected_layers} local layers; {parity_passes} rank-visible "
+        "server-log gates passed: model-level startup capture and ordered "
+        "replay-canary completeness, "
+        "always-on live input-signature validation, and two parity lengths "
+        f"({expected_layers} local layers; {expected_graphs} staged graphs; "
+        f"{parity_passes} rank-visible "
         "parity messages)"
     )
     assert expected_layers is not None
