@@ -3826,6 +3826,14 @@ class NPUModelRunner(GPUModelRunner):
         prompt_len = int(self.input_batch.num_prompt_tokens[0])
         if prompt_len < self.dsa_index_topk:
             return None
+        # A full LMCache prefix hit can schedule one recalc-last prompt token
+        # while the runner is otherwise in the one-token DecodeOnly shape. The
+        # SFA metadata builder does not classify that row as decode until the
+        # computed-token count reaches the prompt boundary, so do not arm a
+        # parity state that no SFA layer can consume.
+        num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[0])
+        if num_computed_tokens < prompt_len:
+            return None
 
         request_id = str(request_ids[0])
         seq_len = int(self.seq_lens.np[0])

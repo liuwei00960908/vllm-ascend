@@ -867,7 +867,10 @@ class TestStagedSFALiveParity(unittest.TestCase):
         runner.dsa_offload_manager = None
         runner.dsa_adapter_cache = None
         runner.dsa_index_topk = 2048
-        runner.input_batch = SimpleNamespace(num_prompt_tokens=[4096])
+        runner.input_batch = SimpleNamespace(
+            num_prompt_tokens=[4096],
+            num_computed_tokens_cpu=[4096],
+        )
         runner.seq_lens = SimpleNamespace(np=[4096])
         return runner
 
@@ -919,6 +922,54 @@ class TestStagedSFALiveParity(unittest.TestCase):
             [4096, 4097],
         )
         self.assertIsNone(self._prepare(runner, 4098))
+
+    def test_recalc_last_prefix_hit_does_not_arm_or_mutate_tracking(self):
+        runner = self._build_runner()
+        runner._staged_sfa_live_parity_request_id = "request-before"
+        runner._staged_sfa_live_parity_validated_seq_lens = [5000, 5001]
+        runner._staged_sfa_live_parity_last_seq_len = 5001
+        runner.input_batch.num_prompt_tokens[0] = 6400
+        runner.input_batch.num_computed_tokens_cpu[0] = 6399
+
+        recalc_last = self._prepare(
+            runner,
+            6400,
+            request_id="full-prefix-hit",
+        )
+
+        self.assertIsNone(recalc_last)
+        self.assertEqual(
+            runner._staged_sfa_live_parity_request_id,
+            "request-before",
+        )
+        self.assertEqual(
+            runner._staged_sfa_live_parity_validated_seq_lens,
+            [5000, 5001],
+        )
+        self.assertEqual(
+            runner._staged_sfa_live_parity_last_seq_len,
+            5001,
+        )
+
+        runner.input_batch.num_computed_tokens_cpu[0] = 6400
+        true_decode = self._prepare(
+            runner,
+            6401,
+            request_id="full-prefix-hit",
+        )
+        self.assertIsNotNone(true_decode)
+        self.assertEqual(
+            runner._staged_sfa_live_parity_request_id,
+            "full-prefix-hit",
+        )
+        self.assertEqual(
+            runner._staged_sfa_live_parity_validated_seq_lens,
+            [],
+        )
+        self.assertEqual(
+            runner._staged_sfa_live_parity_last_seq_len,
+            6401,
+        )
 
     def test_request_change_and_strict_decrease_reset_length_history(self):
         runner = self._build_runner()
