@@ -25,6 +25,8 @@ LOG=/workspace/qzy/staged-sfa-${RUN_ID}.log
 PROFILE_DIR=/workspace/qzy/staged_sfa_profile_${RUN_ID}
 printf 'LOG=%q\nPROFILE_DIR=%q\n' "${LOG}" "${PROFILE_DIR}"
 mkdir -p "${PROFILE_DIR}"
+PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\","
+PROFILER_CONFIG+="\"torch_profiler_with_stack\":false,\"ignore_frontend\":true}"
 
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 HCCL_DETERMINISTIC=strict \
@@ -47,7 +49,7 @@ vllm serve "${MODEL}" \
   --no-enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
   --profiler-config \
-    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\",\"torch_profiler_with_stack\":false}" \
+    "${PROFILER_CONFIG}" \
   --kv-transfer-config \
     '{"kv_connector":"LMCacheAscendConnectorV1Dynamic","kv_role":"kv_both","kv_connector_module_path":"lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"}' \
   2>&1 | tee "${LOG}"
@@ -74,7 +76,10 @@ The client sends one 4096-word prompt so its tokenized prompt should exceed
 `index_topk`. It profiles streamed chunks 5 through 16; the two numerical
 parity steps should therefore have completed before collection. Increase
 `--prompt-words` if the server reports that the prompt boundary is smaller than
-`index_topk`.
+`index_topk`. This proof only needs TP worker traces, so keep
+`ignore_frontend=true`; the smoke parses all raw rank directories from its
+non-daemon client process after `/stop_profile` returns. Override
+`--profile-analysis-timeout` if parsing the TP8 data needs more than 900 seconds.
 
 The automated gate requires all of the following:
 
@@ -139,4 +144,5 @@ does not replace the named-range proof.
 | TP checked count differs | At least one local layer/rank fell back; find the nearby `using the existing forward` reason. |
 | Trace has live-parity ranges | Start profiling later with `--profile-after-chunks 6` or more. |
 | Trace has named ranges but no ACL replay API | Verify the CANN API name and inspect whether `ACLGraphWrapper` replayed or eager code ran inside the range. |
+| Offline profiler analysis times out or fails | Keep the raw `*ascend_pt` directories, verify `torch_npu` is importable in terminal B, and rerun `analyse("${PROFILE_DIR}")` from a non-daemon process. |
 | Large gaps remain between graph ranges | Attribute the gap inside `lmcache_retrieve`; a single compute stream is normal, but host dispatch inside `pre` or `post` is not. |

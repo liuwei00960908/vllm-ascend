@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -50,6 +51,9 @@ _LIVE_SIGNATURE_VALIDATION = (
     "[SFA staged graph POC] verified pre/post startup capture and enabled "
     "always-on captured-input signature validation for live replay; LMCache "
     "retrieval remains eager."
+)
+_FRONTEND_PROFILER_ENABLED = (
+    "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
 )
 _PARITY_PASS = "[SFA staged graph POC] live eager-vs-graph parity passed"
 _FAILURE_MARKERS = (
@@ -112,6 +116,19 @@ def wait_until_ready(base_url: str, timeout: float) -> None:
     )
 
 
+def require_worker_only_profiling(server_log: Path) -> None:
+    """Reject frontend profiling before it can block the stop endpoint."""
+    if not server_log.is_file():
+        raise SmokeFailure(f"server log does not exist: {server_log}")
+    with server_log.open("r", encoding="utf-8", errors="replace") as log_file:
+        if any(_FRONTEND_PROFILER_ENABLED in line for line in log_file):
+            raise SmokeFailure(
+                "AsyncLLM frontend profiling is enabled; restart the server "
+                "with profiler config ignore_frontend=true so /stop_profile "
+                "only finalizes the TP worker traces"
+            )
+
+
 def profile_control(base_url: str, action: str, timeout: float) -> None:
     with _request(
         _url(base_url, f"/{action}_profile"),
@@ -123,6 +140,43 @@ def profile_control(base_url: str, action: str, timeout: float) -> None:
             raise SmokeFailure(
                 f"{action}_profile returned HTTP {response.status}: {body}"
             )
+
+
+def analyse_profile_data(
+    profile_dir: Path,
+    expected_ranks: int,
+    timeout: float,
+) -> None:
+    """Parse all raw rank traces from a non-daemon helper process."""
+    print(
+        f"offline parsing profiler data under {profile_dir} "
+        f"(timeout {timeout:g}s)...",
+        flush=True,
+    )
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from torch_npu.profiler.profiler import analyse; "
+            "import sys; analyse(sys.argv[1], "
+            "max_process_number=int(sys.argv[2]))"
+        ),
+        str(profile_dir),
+        str(expected_ranks),
+    ]
+    try:
+        subprocess.run(command, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise SmokeFailure(
+            f"offline profiler analysis did not finish within {timeout:g}s: "
+            f"{profile_dir}"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise SmokeFailure(
+            "offline profiler analysis failed with exit status "
+            f"{exc.returncode}: {profile_dir}"
+        ) from exc
+    print("offline profiler analysis completed", flush=True)
 
 
 def make_prompt(word_count: int) -> str:
@@ -166,6 +220,7 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
     content_chunks = 0
     profile_start_attempted = False
     profile_started = False
+    profile_stop_attempted = False
     profile_stopped = False
     try:
         with urllib.request.urlopen(
@@ -217,6 +272,10 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                     and content_chunks
                     >= args.profile_after_chunks + args.profile_chunks
                 ):
+                    # torch_npu profiler stop is not safely idempotent. Mark
+                    # the attempt before sending it so a lost response does
+                    # not cause finally to issue a second stop request.
+                    profile_stop_attempted = True
                     profile_control(
                         args.base_url,
                         "stop",
@@ -229,7 +288,11 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                         flush=True,
                     )
     finally:
-        if profile_start_attempted and not profile_stopped:
+        if (
+            profile_start_attempted
+            and not profile_stopped
+            and not profile_stop_attempted
+        ):
             try:
                 profile_control(
                     args.base_url,
@@ -494,6 +557,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-timeout", type=float, default=900)
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--profile-control-timeout", type=float, default=300)
+    parser.add_argument(
+        "--profile-analysis-timeout",
+        type=float,
+        default=900,
+        help="timeout for non-daemon offline torch_npu analysis",
+    )
     parser.add_argument("--trace-timeout", type=float, default=600)
     parser.add_argument(
         "--skip-profile",
@@ -510,6 +579,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("profile after at least three chunks to exclude parity steps")
     if args.profile_chunks <= 0:
         parser.error("--profile-chunks must be positive")
+    if args.profile_analysis_timeout <= 0:
+        parser.error("--profile-analysis-timeout must be positive")
     required_tokens = args.profile_after_chunks + args.profile_chunks + 2
     if not args.skip_profile and args.max_tokens < required_tokens:
         parser.error(
@@ -523,6 +594,8 @@ def main() -> int:
     before_traces = trace_snapshot(args.profile_dir)
     try:
         wait_until_ready(args.base_url, args.ready_timeout)
+        if not args.skip_profile:
+            require_worker_only_profiling(args.server_log)
         chunks = run_streaming_decode(args)
         print(f"streaming decode completed with {chunks} content chunks")
         expected_layers = check_server_log(args.server_log)
@@ -534,6 +607,11 @@ def main() -> int:
             )
             return 0
 
+        analyse_profile_data(
+            args.profile_dir,
+            expected_ranks=args.expected_ranks,
+            timeout=args.profile_analysis_timeout,
+        )
         traces = wait_for_new_traces(
             args.profile_dir,
             before_traces,

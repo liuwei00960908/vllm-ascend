@@ -429,9 +429,11 @@ class TestNPUWorker(TestBase):
 
                 worker._create_profiler("warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
 
-                mock_handler.assert_called_once()
-                call_kwargs = mock_handler.call_args[1] if mock_handler.call_args[1] else {}
-                self.assertEqual(call_kwargs.get("worker_name"), "warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
+                mock_handler.assert_called_once_with(
+                    "/path/to/traces",
+                    worker_name="warmup_dp0_pp0_tp0_dcp0_ep0_rank0",
+                    analyse_flag=False,
+                )
 
     @patch("vllm_ascend.worker.worker.envs_ascend")
     def test_profile_and_msmonitor_both_enabled_raises_error(
@@ -614,6 +616,7 @@ class TestNPUWorker(TestBase):
             mock_trace_handler.assert_called_once_with(
                 "/path/to/traces",
                 worker_name="warmup_dp0_pp0_tp0_dcp0_ep0_rank0",
+                analyse_flag=False,
             )
 
             mock_profile.assert_called_once()

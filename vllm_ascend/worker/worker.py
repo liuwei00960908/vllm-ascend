@@ -691,6 +691,7 @@ class NPUWorker(WorkerBase):
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                 profiler_config.torch_profiler_dir,
                 worker_name=trace_name,
+                analyse_flag=False,
             ),
         )
 
