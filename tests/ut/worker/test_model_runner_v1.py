@@ -579,7 +579,18 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         _staged_sfa_graph_configured,
     ):
         runner = self._build_runner()
-        impls = (self._make_captured_impl(), self._make_captured_impl())
+        with torch.inference_mode():
+            impls = (
+                self._make_captured_impl(),
+                self._make_captured_impl(),
+            )
+        self.assertTrue(
+            all(
+                torch.is_inference(canary)
+                for impl in impls
+                for canary in impl._staged_sfa_replay_canaries.values()
+            )
+        )
         runner._staged_sfa_impls = tuple(
             (f"layer-{index}", impl)
             for index, impl in enumerate(impls)
@@ -587,6 +598,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
 
         def ordered_dummy_replay(*args, **kwargs):
             self.assertEqual(args, (1,))
+            self.assertTrue(torch.is_inference_mode_enabled())
             self.assertEqual(
                 kwargs,
                 {
@@ -643,13 +655,21 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         _staged_sfa_graph_configured,
     ):
         runner = self._build_runner()
-        impl = self._make_captured_impl()
-        runner._staged_sfa_impls = (("layer-0", impl),)
-        runner._dummy_run = MagicMock(
-            side_effect=lambda *_args, **_kwargs: impl._staged_sfa_replay_canaries[
-                "pre"
-            ].fill_(1)
+        with torch.inference_mode():
+            impl = self._make_captured_impl()
+        self.assertTrue(
+            all(
+                torch.is_inference(canary)
+                for canary in impl._staged_sfa_replay_canaries.values()
+            )
         )
+        runner._staged_sfa_impls = (("layer-0", impl),)
+
+        def replay_pre_only(*_args, **_kwargs):
+            self.assertTrue(torch.is_inference_mode_enabled())
+            impl._staged_sfa_replay_canaries["pre"].fill_(1)
+
+        runner._dummy_run = MagicMock(side_effect=replay_pre_only)
         with (
             patch.object(torch.npu, "synchronize"),
             patch.object(
@@ -667,6 +687,8 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         consensus.assert_called_once_with(local_failed=True, local_count=1)
         self.assertFalse(runner._staged_sfa_startup_capture_complete)
         self.assertEqual(impl._staged_sfa_replay_proved, set())
+        self.assertEqual(impl._staged_sfa_replay_canaries["pre"].item(), 1)
+        self.assertEqual(impl._staged_sfa_replay_canaries["post"].item(), 0)
 
     def test_capture_model_preserves_result_and_orders_all_checks(self):
         runner = self._build_runner()

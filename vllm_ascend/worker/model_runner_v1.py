@@ -4415,6 +4415,7 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_impls = staged_impls
         self._staged_sfa_expected_layer_count = len(staged_impls)
 
+    @torch.inference_mode()
     def _prove_staged_sfa_ordered_startup_replay(self) -> None:
         """Replay the full model once and require every staged canary write."""
         if not staged_sfa_graph_configured(self.vllm_config):
