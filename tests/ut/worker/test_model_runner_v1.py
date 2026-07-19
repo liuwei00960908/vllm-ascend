@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import MTPProfileCollector, NPUModelRunner
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -87,6 +87,30 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
 
 class TestNPUModelRunnerSpecDecode(unittest.TestCase):
+
+    @patch("vllm_ascend.worker.model_runner_v1.logger.info")
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.synchronize")
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.Event")
+    def test_mtp_profile_flushes_after_configured_steps(
+        self,
+        mock_event,
+        mock_synchronize,
+        mock_logger_info,
+    ):
+        event = MagicMock()
+        event.elapsed_time.return_value = 2.5
+        mock_event.return_value = event
+        collector = MTPProfileCollector(enabled=True, max_steps=1, rank=0)
+
+        collector.begin_step()
+        with collector.section("target_forward"):
+            pass
+        collector.end_step()
+
+        self.assertTrue(collector.flushed)
+        mock_synchronize.assert_called_once()
+        mock_logger_info.assert_called_once()
+        self.assertIn("[MTP_PROFILE]", mock_logger_info.call_args.args[0])
 
     @patch("vllm_ascend.worker.model_runner_v1.RejectionSampler.parse_output")
     def test_sync_spec_decode_preserves_filtered_logprobs(self, mock_parse_output):

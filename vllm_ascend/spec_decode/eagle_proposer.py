@@ -171,6 +171,10 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
 
+    def _mtp_profile_section(self, name: str) -> AbstractContextManager[Any]:
+        profile = getattr(self.runner, "mtp_profile", None)
+        return profile.section(name) if profile is not None else nullcontext()
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -492,7 +496,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        with record_function_or_nullcontext("mtp_draft: set_inputs"):
+        with (
+            record_function_or_nullcontext("mtp_draft: set_inputs"),
+            self._mtp_profile_section("draft_set_inputs"),
+        ):
             num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
@@ -515,7 +522,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             num_input_tokens = num_tokens
 
-        with record_function_or_nullcontext("mtp_draft: sync_metadata_across_dp"):
+        with (
+            record_function_or_nullcontext("mtp_draft: sync_metadata_across_dp"),
+            self._mtp_profile_section("draft_sync_metadata_across_dp"),
+        ):
             (
                 num_input_tokens,
                 num_tokens_across_dp,
@@ -564,7 +574,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         # only tensor which will be used in current FIA.
         # Strictly speaking, `query_start_loc`, `seq_lens` should also have
         # their memory allocated separately for each step just like `slot_mapping`.
-        with record_function_or_nullcontext("mtp_draft: slot_mapping"):
+        with (
+            record_function_or_nullcontext("mtp_draft: slot_mapping"),
+            self._mtp_profile_section("draft_slot_mapping"),
+        ):
             slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
             self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
             self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
@@ -572,7 +585,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
-        with record_function_or_nullcontext("mtp_draft: attention_metadata"):
+        with (
+            record_function_or_nullcontext("mtp_draft: attention_metadata"),
+            self._mtp_profile_section("draft_attention_metadata"),
+        ):
             builder = self.draft_attn_groups[0].get_metadata_builder()
             attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
 
@@ -700,7 +716,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            with record_function_or_nullcontext("mtp_draft: runner"):
+            with (
+                record_function_or_nullcontext("mtp_draft: runner"),
+                self._mtp_profile_section("draft_runner"),
+            ):
                 draft_token_ids = self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=batch_size,
@@ -747,7 +766,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.method == "mtp":
                 model_kwargs["positions"] = model_positions
 
-        with record_function_or_nullcontext("mtp_draft: model"):
+        with (
+            record_function_or_nullcontext("mtp_draft: model"),
+            self._mtp_profile_section("draft_model"),
+        ):
             ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -755,7 +777,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             last_hidden_states, hidden_states = ret_hidden_states
 
-        with record_function_or_nullcontext("mtp_draft: hidden_state_postprocess"):
+        with (
+            record_function_or_nullcontext("mtp_draft: hidden_state_postprocess"),
+            self._mtp_profile_section("draft_hidden_state_postprocess"),
+        ):
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
                 last_hidden_states, model_positions, hidden_states
             )
@@ -788,7 +813,10 @@ class SpecDecodeBaseProposer(EagleProposer):
                 token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
             )
 
-        with record_function_or_nullcontext("mtp_draft: logits"):
+        with (
+            record_function_or_nullcontext("mtp_draft: logits"),
+            self._mtp_profile_section("draft_logits"),
+        ):
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             logits = self.model.compute_logits(sample_hidden_states)
 
@@ -796,7 +824,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
-        with record_function_or_nullcontext("mtp_draft: argmax"):
+        with (
+            record_function_or_nullcontext("mtp_draft: argmax"),
+            self._mtp_profile_section("draft_argmax"),
+        ):
             draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.

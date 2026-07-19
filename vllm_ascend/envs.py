@@ -214,6 +214,22 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(
         os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")
     ),
+    # Emit a one-shot per-phase MTP decode timing summary. The collector is disabled
+    # by default and only measures the first VLLM_ASCEND_MTP_PROFILE_STEPS MTP
+    # verification steps to keep profiling overhead bounded.
+    "VLLM_ASCEND_MTP_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_PROFILE", "0"))
+    ),
+    # Number of MTP verification steps sampled by VLLM_ASCEND_MTP_PROFILE. Default
+    # 16 gives a stable steady-state sample without retaining unbounded NPU events.
+    "VLLM_ASCEND_MTP_PROFILE_STEPS": lambda: int(
+        os.getenv("VLLM_ASCEND_MTP_PROFILE_STEPS", "16")
+    ),
+    # Emit MTP profile summaries from every TP rank. Default 0 restricts collection
+    # to TP0; enable when diagnosing rank skew or HCCL stragglers.
+    "VLLM_ASCEND_MTP_PROFILE_ALL_RANKS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_PROFILE_ALL_RANKS", "0"))
+    ),
 }
 
 # end-env-vars-definition

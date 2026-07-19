@@ -19,7 +19,9 @@
 
 import math
 import sys
+import time
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -223,6 +225,75 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+class MTPProfileCollector:
+    """Collect bounded CPU and NPU timings for MTP verification steps."""
+
+    def __init__(self, enabled: bool, max_steps: int, rank: int) -> None:
+        self.enabled = enabled and max_steps > 0
+        self.max_steps = max_steps
+        self.rank = rank
+        self.active = False
+        self.flushed = False
+        self.steps = 0
+        self.cpu_durations: dict[str, list[float]] = defaultdict(list)
+        self.npu_events: dict[
+            str, list[tuple[torch.npu.Event, torch.npu.Event]]
+        ] = defaultdict(list)
+
+    def begin_step(self) -> None:
+        if (
+            self.enabled
+            and not self.flushed
+            and not self.active
+            and self.steps < self.max_steps
+        ):
+            self.active = True
+
+    @contextmanager
+    def section(self, name: str) -> Iterator[None]:
+        if not self.active:
+            yield
+            return
+
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record()
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.cpu_durations[name].append((time.perf_counter() - start_time) * 1000)
+            end_event.record()
+            self.npu_events[name].append((start_event, end_event))
+
+    def end_step(self) -> None:
+        if not self.active:
+            return
+
+        self.active = False
+        self.steps += 1
+        if self.steps >= self.max_steps:
+            self._flush()
+
+    def _flush(self) -> None:
+        torch.npu.synchronize()
+        self.flushed = True
+        for name in sorted(self.cpu_durations):
+            cpu_durations = self.cpu_durations[name]
+            npu_durations = [
+                start.elapsed_time(end) for start, end in self.npu_events[name]
+            ]
+            logger.info(
+                "[MTP_PROFILE] rank=%d steps=%d phase=%s samples=%d cpu_avg_ms=%.3f npu_avg_ms=%.3f",
+                self.rank,
+                self.steps,
+                name,
+                len(cpu_durations),
+                sum(cpu_durations) / len(cpu_durations),
+                sum(npu_durations) / len(npu_durations),
+            )
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -382,6 +453,18 @@ class NPUModelRunner(GPUModelRunner):
             self.positions = self._make_buffer(max_buffer_num_tokens, dtype=torch.int64)
 
         self._set_up_drafter()
+        tp_rank = get_tp_group().rank
+        mtp_profile_enabled = bool(
+            self.speculative_config
+            and self.speculative_config.method == "mtp"
+            and envs_ascend.VLLM_ASCEND_MTP_PROFILE
+            and (envs_ascend.VLLM_ASCEND_MTP_PROFILE_ALL_RANKS or tp_rank == 0)
+        )
+        self.mtp_profile = MTPProfileCollector(
+            enabled=mtp_profile_enabled,
+            max_steps=envs_ascend.VLLM_ASCEND_MTP_PROFILE_STEPS,
+            rank=tp_rank,
+        )
 
         # kv role
         self.is_kv_producer = False
@@ -1079,7 +1162,10 @@ class NPUModelRunner(GPUModelRunner):
                     "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                 )
                 assert self.drafter is not None
-                with record_function_or_nullcontext("mtp_draft: prepare_next_tokens"):
+                with (
+                    record_function_or_nullcontext("mtp_draft: prepare_next_tokens"),
+                    self.mtp_profile.section("draft_prepare_next_tokens"),
+                ):
                     next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
                         common_attn_metadata,
                         sampled_token_ids,
@@ -1140,7 +1226,10 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
-                    with record_function_or_nullcontext("mtp_draft: prepare_inputs"):
+                    with (
+                        record_function_or_nullcontext("mtp_draft: prepare_inputs"),
+                        self.mtp_profile.section("draft_prepare_inputs"),
+                    ):
                         common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
                             self.drafter.prepare_inputs_padded(
                                 common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
@@ -1160,7 +1249,10 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            with record_function_or_nullcontext("mtp_draft: propose"):
+            with (
+                record_function_or_nullcontext("mtp_draft: propose"),
+                self.mtp_profile.section("draft_propose"),
+            ):
                 draft_token_ids = self.drafter._propose(
                     target_token_ids=target_token_ids,
                     target_positions=target_positions,
@@ -1430,8 +1522,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        if use_spec_decode:
+            self.mtp_profile.begin_step()
         with (
             record_function_or_nullcontext("forward"),
+            self.mtp_profile.section("target_forward"),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1708,6 +1803,7 @@ class NPUModelRunner(GPUModelRunner):
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
+        self.mtp_profile.end_step()
         if not self.use_async_scheduling:
             return model_runner_output
         return AsyncGPUModelRunnerOutput(
@@ -1733,7 +1829,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        with record_function_or_nullcontext("mtp: rejection_sampler"):
+        with (
+            record_function_or_nullcontext("mtp: rejection_sampler"),
+            self.mtp_profile.section("rejection_sampler"),
+        ):
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
