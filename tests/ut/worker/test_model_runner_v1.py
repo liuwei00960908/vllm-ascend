@@ -1,7 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
@@ -83,6 +84,60 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+
+class TestNPUModelRunnerSpecDecode(unittest.TestCase):
+
+    @patch("vllm_ascend.worker.model_runner_v1.RejectionSampler.parse_output")
+    def test_sync_spec_decode_preserves_filtered_logprobs(self, mock_parse_output):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_scheduling = False
+        runner.num_discarded_requests = 0
+        runner.discard_request_indices = SimpleNamespace(
+            np=np.empty(0, dtype=np.int64)
+        )
+        runner.max_model_len = 16
+        runner.input_batch = SimpleNamespace(
+            generators={},
+            req_ids=["request-0"],
+            req_id_to_index={"request-0": 0},
+            vocab_size=128,
+            num_tokens_no_spec=np.array([0]),
+            token_ids_cpu=np.zeros((1, 16), dtype=np.int64),
+            is_token_ids=np.zeros((1, 16), dtype=bool),
+            num_tokens=np.array([0]),
+        )
+        runner.requests = {"request-0": SimpleNamespace(output_token_ids=[])}
+        runner._get_prompt_logprobs_dict = MagicMock(return_value={})
+
+        filtered_logprobs = MagicMock(name="filtered_logprobs")
+        mock_parse_output.return_value = ([[1, 2]], filtered_logprobs)
+        logprobs_tensors = MagicMock(name="logprobs_tensors")
+        sampler_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[1, 2]]),
+            logprobs_tensors=logprobs_tensors,
+        )
+        scheduler_output = SimpleNamespace(num_scheduled_tokens={"request-0": 2})
+
+        (
+            logprobs_lists,
+            valid_sampled_token_ids,
+            _,
+            _,
+            _,
+            _,
+        ) = runner._bookkeeping_sync(
+            scheduler_output,
+            sampler_output,
+            logits=None,
+            hidden_states=torch.empty((2, 1)),
+            num_scheduled_tokens=2,
+            spec_decode_metadata=MagicMock(),
+        )
+
+        self.assertEqual(valid_sampled_token_ids, [[1, 2]])
+        self.assertIs(logprobs_lists, filtered_logprobs)
+        logprobs_tensors.tolists.assert_not_called()
 
 
 if __name__ == "__main__":
