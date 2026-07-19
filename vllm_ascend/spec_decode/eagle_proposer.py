@@ -37,6 +37,7 @@ from vllm.v1.spec_decode.utils import (
     compute_new_slot_mapping,
     extend_all_queries_by_N,
 )
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -491,19 +492,20 @@ class SpecDecodeBaseProposer(EagleProposer):
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=target_positions,
-            target_hidden_states=target_hidden_states,
-            token_indices_to_sample=token_indices_to_sample,
-            cad=common_attn_metadata,
-            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            req_scheduled_tokens=req_scheduled_tokens,
-            long_seq_metadata=long_seq_metadata,
-            num_prefill_reqs=num_prefill_reqs,
-            num_decode_reqs=num_decode_reqs,
-        )
+        with record_function_or_nullcontext("mtp_draft: set_inputs"):
+            num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                req_scheduled_tokens=req_scheduled_tokens,
+                long_seq_metadata=long_seq_metadata,
+                num_prefill_reqs=num_prefill_reqs,
+                num_decode_reqs=num_decode_reqs,
+            )
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -513,11 +515,12 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             num_input_tokens = num_tokens
 
-        (
-            num_input_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+        with record_function_or_nullcontext("mtp_draft: sync_metadata_across_dp"):
+            (
+                num_input_tokens,
+                num_tokens_across_dp,
+                _,
+            ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
 
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         if self.use_cuda_graph:
@@ -561,15 +564,17 @@ class SpecDecodeBaseProposer(EagleProposer):
         # only tensor which will be used in current FIA.
         # Strictly speaking, `query_start_loc`, `seq_lens` should also have
         # their memory allocated separately for each step just like `slot_mapping`.
-        slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-        self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
-        self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
-        common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
-        common_attn_metadata.num_input_tokens = num_input_tokens
+        with record_function_or_nullcontext("mtp_draft: slot_mapping"):
+            slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
+            self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
+            self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
+            common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+            common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
+        with record_function_or_nullcontext("mtp_draft: attention_metadata"):
+            builder = self.draft_attn_groups[0].get_metadata_builder()
+            attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
@@ -695,16 +700,17 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            draft_token_ids = self._runnable(
-                num_input_tokens=num_input_tokens,
-                batch_size=batch_size,
-                token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
-                target_positions=target_positions,
-                inputs_embeds=inputs_embeds,
-                multi_steps_attn_metadata=multi_steps_attn_metadata,
-                num_tokens=num_tokens,
-                is_prefill=attn_metadata_i.num_prefills,
-            )
+            with record_function_or_nullcontext("mtp_draft: runner"):
+                draft_token_ids = self._runnable(
+                    num_input_tokens=num_input_tokens,
+                    batch_size=batch_size,
+                    token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
+                    target_positions=target_positions,
+                    inputs_embeds=inputs_embeds,
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
+                    num_tokens=num_tokens,
+                    is_prefill=attn_metadata_i.num_prefills,
+                )
 
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -741,16 +747,18 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.method == "mtp":
                 model_kwargs["positions"] = model_positions
 
-        ret_hidden_states = self.model(**model_kwargs)
+        with record_function_or_nullcontext("mtp_draft: model"):
+            ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
         else:
             last_hidden_states, hidden_states = ret_hidden_states
 
-        last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
-            last_hidden_states, model_positions, hidden_states
-        )
+        with record_function_or_nullcontext("mtp_draft: hidden_state_postprocess"):
+            last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
+                last_hidden_states, model_positions, hidden_states
+            )
 
         num_indices = token_indices_to_sample.shape[0]
         if self.pcp_size > 1:
@@ -780,14 +788,16 @@ class SpecDecodeBaseProposer(EagleProposer):
                 token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
             )
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
+        with record_function_or_nullcontext("mtp_draft: logits"):
+            sample_hidden_states = last_hidden_states[token_indices_to_sample]
+            logits = self.model.compute_logits(sample_hidden_states)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
-        draft_token_ids = logits.argmax(dim=-1)
+        with record_function_or_nullcontext("mtp_draft: argmax"):
+            draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:

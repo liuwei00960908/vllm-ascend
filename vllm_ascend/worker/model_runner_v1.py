@@ -1079,14 +1079,15 @@ class NPUModelRunner(GPUModelRunner):
                     "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                 )
                 assert self.drafter is not None
-                next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_indices.gpu,
-                    self.num_discarded_requests,
-                )
+                with record_function_or_nullcontext("mtp_draft: prepare_next_tokens"):
+                    next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_indices.gpu,
+                        self.num_discarded_requests,
+                    )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -1139,11 +1140,12 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
-                    common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
-                        self.drafter.prepare_inputs_padded(
-                            common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+                    with record_function_or_nullcontext("mtp_draft: prepare_inputs"):
+                        common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
+                            self.drafter.prepare_inputs_padded(
+                                common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+                            )
                         )
-                    )
                 if self.pcp_size > 1:
                     target_token_ids = input_ids_pcp_full[token_indices]
                     target_positions = positions
@@ -1158,23 +1160,24 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            draft_token_ids = self.drafter._propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                common_attn_metadata=common_attn_metadata,
-                target_model_batch_desc=target_model_batch_desc,
-                sampling_metadata=sampling_metadata,
-                req_scheduled_tokens=req_scheduled_tokens,
-                long_seq_metadata=long_seq_metadata,
-                num_prefill_reqs=num_prefill_reqs,
-                num_decode_reqs=num_decode_reqs,
-                scheduler_output=scheduler_output,
-                num_scheduled_tokens=num_scheduled_tokens,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            )
+            with record_function_or_nullcontext("mtp_draft: propose"):
+                draft_token_ids = self.drafter._propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    common_attn_metadata=common_attn_metadata,
+                    target_model_batch_desc=target_model_batch_desc,
+                    sampling_metadata=sampling_metadata,
+                    req_scheduled_tokens=req_scheduled_tokens,
+                    long_seq_metadata=long_seq_metadata,
+                    num_prefill_reqs=num_prefill_reqs,
+                    num_decode_reqs=num_decode_reqs,
+                    scheduler_output=scheduler_output,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
@@ -1730,12 +1733,13 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        with record_function_or_nullcontext("mtp: rejection_sampler"):
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
