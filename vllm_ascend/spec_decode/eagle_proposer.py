@@ -53,6 +53,13 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
 
+def _is_tp_rank0() -> bool:
+    try:
+        return get_tp_group().rank == 0
+    except Exception:
+        return True
+
+
 # TODO: Remove it when the bug of fx-graph is solved
 # patch vllm_config to be in CompilationMode.NONE temporarily
 @contextmanager
@@ -157,6 +164,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self._runnable = self._run_merged_draft
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
+        self._mtp_graph_runtime_logged = False
         if self.uses_mrope:
             self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1), dtype=torch.int32, device=device)
         elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
@@ -331,6 +339,18 @@ class SpecDecodeBaseProposer(EagleProposer):
                 self._runnable = ACLGraphWrapper(
                     self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
+
+        if self.method == "mtp" and _is_tp_rank0():
+            logger.info(
+                "[MTP_GRAPH] configured async_scheduling=%s cudagraph_mode=%s "
+                "use_cuda_graph=%s disable_padded_drafter_batch=%s "
+                "model_wrapped=%s",
+                self.use_async_scheduling,
+                self.vllm_config.compilation_config.cudagraph_mode,
+                self.use_cuda_graph,
+                self.speculative_config.disable_padded_drafter_batch,
+                isinstance(self.model, ACLGraphWrapper),
+            )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -540,6 +560,18 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
+
+        if self.method == "mtp" and not self._mtp_graph_runtime_logged:
+            self._mtp_graph_runtime_logged = True
+            if _is_tp_rank0():
+                logger.info(
+                    "[MTP_GRAPH] runtime cudagraph_runtime_mode=%s "
+                    "num_tokens=%s num_input_tokens=%s batch_descriptor=%s",
+                    aclgraph_runtime_mode,
+                    num_tokens,
+                    num_input_tokens,
+                    batch_descriptor,
+                )
 
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding

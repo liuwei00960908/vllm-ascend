@@ -525,6 +525,8 @@ class NPUModelRunner(GPUModelRunner):
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self._mtp_k1_spec_metadata_cpu: torch.Tensor | None = None
+        self._mtp_k1_spec_metadata_gpu: torch.Tensor | None = None
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -1037,6 +1039,91 @@ class NPUModelRunner(GPUModelRunner):
         return attn_state
 
     def _calc_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        num_pcp_pads: np.ndarray | None,
+    ) -> SpecDecodeMetadata:
+        if self._can_use_mtp_k1_spec_metadata_fast_path(
+            num_draft_tokens,
+            num_pcp_pads,
+        ):
+            return self._calc_mtp_k1_spec_decode_metadata(cu_num_scheduled_tokens)
+
+        return self._calc_spec_decode_metadata_general(
+            num_draft_tokens,
+            cu_num_scheduled_tokens,
+            num_pcp_pads,
+        )
+
+    def _can_use_mtp_k1_spec_metadata_fast_path(
+        self,
+        num_draft_tokens: np.ndarray,
+        num_pcp_pads: np.ndarray | None,
+    ) -> bool:
+        speculative_config = getattr(self, "speculative_config", None)
+        return bool(
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and speculative_config.num_speculative_tokens == 1
+            and self.max_num_reqs == 1
+            and self.pcp_size == 1
+            and self.dcp_size == 1
+            and num_pcp_pads is None
+            and num_draft_tokens.shape == (1,)
+            and int(num_draft_tokens[0]) == 1
+        )
+
+    def _get_mtp_k1_spec_metadata_buffer(self) -> torch.Tensor:
+        if getattr(self, "_mtp_k1_spec_metadata_cpu", None) is None:
+            self._mtp_k1_spec_metadata_cpu = torch.empty(
+                6,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self._mtp_k1_spec_metadata_gpu = torch.empty_like(
+                self._mtp_k1_spec_metadata_cpu,
+                device=self.device,
+            )
+        assert self._mtp_k1_spec_metadata_cpu is not None
+        assert self._mtp_k1_spec_metadata_gpu is not None
+        return self._mtp_k1_spec_metadata_cpu
+
+    def _calc_mtp_k1_spec_decode_metadata(
+        self,
+        cu_num_scheduled_tokens: np.ndarray,
+    ) -> SpecDecodeMetadata:
+        # K=1, batch=1: sampled rows are [draft_verify, bonus]. Keep one
+        # contiguous CPU/NPU buffer to avoid per-step tensor construction.
+        metadata_cpu = self._get_mtp_k1_spec_metadata_buffer()
+        assert self._mtp_k1_spec_metadata_gpu is not None
+        logits_start = int(cu_num_scheduled_tokens[0]) - 2
+        metadata_cpu[0] = 1  # cu_num_draft_tokens
+        metadata_cpu[1] = 2  # cu_num_sampled_tokens
+        metadata_cpu[2] = logits_start
+        metadata_cpu[3] = logits_start + 1
+        metadata_cpu[4] = 0  # target_logits_indices
+        metadata_cpu[5] = 1  # bonus_logits_indices
+        metadata_gpu = self._mtp_k1_spec_metadata_gpu.copy_(
+            metadata_cpu,
+            non_blocking=True,
+        )
+        logits_indices = metadata_gpu[2:4]
+        target_logits_indices = metadata_gpu[4:5]
+        draft_token_ids = self.input_ids.gpu[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        return SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=[1],
+            cu_num_draft_tokens=metadata_gpu[0:1],
+            cu_num_sampled_tokens=metadata_gpu[1:2],
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=metadata_gpu[5:6],
+            logits_indices=logits_indices,
+        )
+
+    def _calc_spec_decode_metadata_general(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
@@ -1590,7 +1677,11 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with (
+                    record_function_or_nullcontext("mtp: target_logits"),
+                    self.mtp_profile.section("target_logits"),
+                ):
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1601,7 +1692,11 @@ class NPUModelRunner(GPUModelRunner):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with (
+                        record_function_or_nullcontext("mtp: target_logits"),
+                        self.mtp_profile.section("target_logits"),
+                    ):
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:

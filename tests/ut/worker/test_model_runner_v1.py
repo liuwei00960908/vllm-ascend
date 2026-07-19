@@ -88,6 +88,72 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
 class TestNPUModelRunnerSpecDecode(unittest.TestCase):
 
+    def test_mtp_k1_spec_decode_metadata_fast_path_reuses_buffer(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.pin_memory = False
+        runner.max_num_reqs = 1
+        runner.pcp_size = 1
+        runner.dcp_size = 1
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        runner.input_ids = SimpleNamespace(
+            gpu=torch.arange(32, dtype=torch.int32),
+        )
+
+        metadata = runner._calc_spec_decode_metadata(
+            np.array([1], dtype=np.int32),
+            np.array([10], dtype=np.int32),
+            num_pcp_pads=None,
+        )
+
+        self.assertEqual(metadata.num_draft_tokens, [1])
+        self.assertEqual(metadata.max_spec_len, 1)
+        self.assertEqual(metadata.cu_num_draft_tokens.tolist(), [1])
+        self.assertEqual(metadata.cu_num_sampled_tokens.tolist(), [2])
+        self.assertEqual(metadata.logits_indices.tolist(), [8, 9])
+        self.assertEqual(metadata.target_logits_indices.tolist(), [0])
+        self.assertEqual(metadata.bonus_logits_indices.tolist(), [1])
+        self.assertEqual(metadata.draft_token_ids.tolist(), [9])
+
+        logits_indices_data_ptr = metadata.logits_indices.data_ptr()
+        metadata = runner._calc_spec_decode_metadata(
+            np.array([1], dtype=np.int32),
+            np.array([12], dtype=np.int32),
+            num_pcp_pads=None,
+        )
+
+        self.assertEqual(metadata.logits_indices.tolist(), [10, 11])
+        self.assertEqual(metadata.draft_token_ids.tolist(), [11])
+        self.assertEqual(metadata.logits_indices.data_ptr(), logits_indices_data_ptr)
+
+    def test_mtp_k1_spec_decode_metadata_fast_path_is_gated(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.max_num_reqs = 1
+        runner.pcp_size = 1
+        runner.dcp_size = 1
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+
+        self.assertTrue(
+            runner._can_use_mtp_k1_spec_metadata_fast_path(
+                np.array([1], dtype=np.int32),
+                num_pcp_pads=None,
+            )
+        )
+
+        runner.max_num_reqs = 2
+        self.assertFalse(
+            runner._can_use_mtp_k1_spec_metadata_fast_path(
+                np.array([1], dtype=np.int32),
+                num_pcp_pads=None,
+            )
+        )
+
     @patch("vllm_ascend.worker.model_runner_v1.logger.info")
     @patch("vllm_ascend.worker.model_runner_v1.torch.npu.synchronize")
     @patch("vllm_ascend.worker.model_runner_v1.torch.npu.Event")
