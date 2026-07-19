@@ -17,7 +17,9 @@ from transformers import AutoTokenizer
 
 from load_dataset import load_locomo_dataset
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.append(project_root)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import parse_attn_args
 
 
