@@ -77,6 +77,23 @@ class TestLMCacheSparseWaitSync(TestBase):
         self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
 
 
+class TestDSASparsePadding(TestBase):
+    def test_trailing_graph_padding_is_zeroed_in_place(self):
+        topk = torch.arange(4 * 64, dtype=torch.int32).reshape(4, 1, 64)
+        original_actual = topk[:2].clone()
+        input_ptr = topk.data_ptr()
+
+        result, result_2d = sfa_v1._dsa_mask_padding_sparse_rows(
+            topk,
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+
+        self.assertEqual(result.data_ptr(), input_ptr)
+        self.assertEqual(result_2d.data_ptr(), input_ptr)
+        self.assertTrue(torch.equal(result[:2], original_actual))
+        self.assertEqual(torch.count_nonzero(result[2:]).item(), 0)
+
+
 class TestLMCacheSparseFrontier(TestBase):
     @staticmethod
     def _connector(metadata):
@@ -315,8 +332,14 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.need_sparse_lmcache_payload = True
         metadata.decode_valid_rows_all = True
-        metadata.decode_valid_row_indices = None
-        metadata.decode_scratch_base = None
+        metadata.decode_valid_row_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+        )
+        metadata.decode_scratch_base = torch.zeros(
+            batch_size,
+            dtype=torch.int32,
+        )
         metadata.decode_scratch_base_compact = None
         metadata.decode_scratch_base_cpu = [0] * batch_size
         metadata.decode_scratch_capacity = 128
@@ -561,6 +584,7 @@ class TestStagedSFAGraphPoc(TestBase):
         selected = torch.arange(12, dtype=torch.int32).view(3, 4)
         targets = torch.arange(12, dtype=torch.int64).view(3, 4) + 32
         metadata.decode_request_ids_compact = ["req-0", "req-0", "req-1"]
+        metadata.decode_valid_row_indices = torch.arange(3, dtype=torch.int32)
         metadata.decode_scratch_base_compact = torch.tensor([0, 4, 0])
         metadata.decode_target_slot_mapping = targets
 

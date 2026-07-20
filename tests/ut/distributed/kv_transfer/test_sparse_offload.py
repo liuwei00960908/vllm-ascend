@@ -88,7 +88,9 @@ def test_gather_plan_splits_prefill_and_decode():
 def test_gather_plan_all_invalid_row():
     plan = build_gather_plan(
         torch.tensor([[INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]]),
-        torch.tensor([5]), block_size=4, scratch_blocks_per_req=1,
+        torch.tensor([5]),
+        block_size=4,
+        scratch_blocks_per_req=1,
     )
     assert plan.seq_lens_kv.tolist() == [0]
     assert plan.dest_slot[0].tolist() == [INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]
@@ -103,8 +105,13 @@ def test_compute_reserved_bytes():
 # --------------------------------------------------------------- decode pool
 def test_decode_pool_append_gather_roundtrip():
     pool = GrowingDecodeLatentPool(
-        num_layers=2, block_size=4, kv_lora_rank=4, qk_rope_head_dim=2,
-        dtype=torch.float32, device="cpu", chunk_blocks=2,
+        num_layers=2,
+        block_size=4,
+        kv_lora_rank=4,
+        qk_rope_head_dim=2,
+        dtype=torch.float32,
+        device="cpu",
+        chunk_blocks=2,
     )
     latents = torch.randn(6, pool.latent_dim)
     for d in range(6):
@@ -116,8 +123,13 @@ def test_decode_pool_append_gather_roundtrip():
 
 def test_decode_pool_grows_on_demand_and_recycles():
     pool = GrowingDecodeLatentPool(
-        num_layers=1, block_size=2, kv_lora_rank=2, qk_rope_head_dim=2,
-        dtype=torch.float32, device="cpu", chunk_blocks=2,
+        num_layers=1,
+        block_size=2,
+        kv_lora_rank=2,
+        qk_rope_head_dim=2,
+        dtype=torch.float32,
+        device="cpu",
+        chunk_blocks=2,
     )
     assert pool.num_allocated_blocks == 0  # nothing pre-allocated
     one = torch.ones(pool.latent_dim)
@@ -136,9 +148,7 @@ def test_manager_gather_mixed_sources_roundtrip():
     mgr = _build(cfg)
 
     prompt_len = 5
-    k_nope = torch.arange(prompt_len * cfg.kv_lora_rank, dtype=torch.float32).reshape(
-        prompt_len, cfg.kv_lora_rank
-    )
+    k_nope = torch.arange(prompt_len * cfg.kv_lora_rank, dtype=torch.float32).reshape(prompt_len, cfg.kv_lora_rank)
     k_pe = torch.arange(prompt_len * cfg.qk_rope_head_dim, dtype=torch.float32).reshape(
         prompt_len, cfg.qk_rope_head_dim
     )
@@ -155,10 +165,10 @@ def test_manager_gather_mixed_sources_roundtrip():
 
     knope_flat = s_knope.view(-1, cfg.kv_lora_rank)
     kpe_flat = s_kpe.view(-1, cfg.qk_rope_head_dim)
-    assert torch.equal(knope_flat[0], k_nope[3])   # prefill 3 (backend)
-    assert torch.equal(knope_flat[1], dnope[0])    # decode 5 -> pool rel 0
+    assert torch.equal(knope_flat[0], k_nope[3])  # prefill 3 (backend)
+    assert torch.equal(knope_flat[1], dnope[0])  # decode 5 -> pool rel 0
     assert torch.equal(kpe_flat[1], dpe[0])
-    assert torch.equal(knope_flat[2], k_nope[1])   # prefill 1 (backend)
+    assert torch.equal(knope_flat[2], k_nope[1])  # prefill 1 (backend)
     assert sparse_indices[0].tolist() == [0, 1, 2, INVALID_TOKEN_INDEX]
 
 
@@ -192,9 +202,7 @@ def test_offload_path_attends_to_exactly_the_selected_tokens():
     plan = build_gather_plan(topk, torch.tensor([prompt_len]), cfg.block_size, cfg.scratch_blocks_per_req)
     s_knope, s_kpe, sparse_indices, block_tbl, seq_lens_kv = mgr.gather_decode_layer("L0", ["r0"], plan)
 
-    got_nope, got_pe = resolve_scratch_gather(
-        s_knope, s_kpe, sparse_indices, block_tbl, cfg.block_size, seq_lens_kv
-    )[0]
+    got_nope, got_pe = resolve_scratch_gather(s_knope, s_kpe, sparse_indices, block_tbl, cfg.block_size, seq_lens_kv)[0]
     valid_positions = torch.tensor([9, 13, 2, 12, 0])
     exp_nope = full_nope.index_select(0, valid_positions)
     exp_pe = full_pe.index_select(0, valid_positions)
@@ -211,8 +219,11 @@ def test_manager_free_request_delegates():
     cfg = _cpu_config()
     mgr = _build(cfg)
     mgr.store_prefill_layer(
-        "r0", "L0", torch.arange(3),
-        torch.randn(3, cfg.kv_lora_rank), torch.randn(3, cfg.qk_rope_head_dim),
+        "r0",
+        "L0",
+        torch.arange(3),
+        torch.randn(3, cfg.kv_lora_rank),
+        torch.randn(3, cfg.qk_rope_head_dim),
     )
     mgr.store_decode_token("r0", "L0", 0, torch.randn(1, cfg.kv_lora_rank), torch.randn(1, cfg.qk_rope_head_dim))
     mgr.free_request("r0")
@@ -227,8 +238,13 @@ def test_paged_latent_pool_write_read_and_free():
     )
 
     pool = PagedLatentPool(
-        num_layers=2, num_blocks=4, block_size=2, kv_lora_rank=3, qk_rope_head_dim=2,
-        dtype=torch.float32, device="cpu",
+        num_layers=2,
+        num_blocks=4,
+        block_size=2,
+        kv_lora_rank=3,
+        qk_rope_head_dim=2,
+        dtype=torch.float32,
+        device="cpu",
     )
     # reserve for 3 tokens -> 2 blocks (size 2).
     pool.reserve("r0", 3)
@@ -312,65 +328,194 @@ def test_hooks_gather_decode_full_step():
     cur_pe = torch.randn(1, cfg.qk_rope_head_dim)
     topk = torch.tensor([[[2, 6, INVALID_TOKEN_INDEX, INVALID_TOKEN_INDEX]]])  # 3-D
     sk, skp, si, bt, sl = gather_decode(
-        mgr, "L0", ["r0"], topk, torch.tensor([prompt_len]),
-        torch.tensor([6]), cfg.block_size, cur_nope, cur_pe,
+        mgr,
+        "L0",
+        ["r0"],
+        topk,
+        torch.tensor([prompt_len]),
+        torch.tensor([6]),
+        cfg.block_size,
+        cur_nope,
+        cur_pe,
     )
-    assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[0], kn[2])     # prefill 2 (backend)
+    assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[0], kn[2])  # prefill 2 (backend)
     assert torch.equal(sk.view(-1, cfg.kv_lora_rank)[1], cur_nope[0])  # decode 6 (pool)
     assert si[0].tolist()[:2] == [0, 1]
     assert sl[0] == 2
 
 
-class TestScratchRemap:
-    """Step B2: compact-scratch remap of decode top-k."""
+class TestPrepareSparseIndices:
+    """Step B2: prepare decode top-k for compact scratch and LMCache."""
 
     def test_remap_splits_prefill_compact_and_decode_absolute(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
 
         # req0: prompt 100; selected mixes prefill (5,7,99) and decode (100,103)
         # req1: prompt 200; all prefill
-        topk = torch.tensor(
-            [[[5, 100, 7, 103, 99]],
-             [[10, 11, 12, 13, 14]]], dtype=torch.int32)
+        topk = torch.tensor([[[5, 100, 7, 103, 99]], [[10, 11, 12, 13, 14]]], dtype=torch.int32)
         plen = torch.tensor([100, 200])
-        new_idx, packed = scratch_remap(topk, plen)
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            plen,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.arange(2, dtype=torch.int32),
+        )
 
         # prefill entries -> compact ranks in topk order; decode stay absolute
-        assert new_idx.tolist() == [[[0, 100, 1, 103, 2]],
-                                    [[0, 1, 2, 3, 4]]]
+        assert new_idx.tolist() == [[[0, 100, 1, 103, 2]], [[0, 1, 2, 3, 4]]]
         # packed rows: front-packed prefill positions (LMCache scatter order)
-        assert packed.tolist() == [[5, 7, 99, 0, 0],
-                                   [10, 11, 12, 13, 14]]
+        assert packed.tolist() == [[5, 7, 99, 0, 0], [10, 11, 12, 13, 14]]
         assert packed.dtype == torch.int32
         # the FA kernel requires int32 sparse indices — dtype must be preserved
         assert new_idx.dtype == topk.dtype
 
     def test_remap_padding_entries_untouched(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
 
         topk = torch.tensor([[[3, -1, 8, -1, 4]]], dtype=torch.int32)
         plen = torch.tensor([10])
-        new_idx, packed = scratch_remap(topk, plen)
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            plen,
+            scratch_base=torch.zeros(1, dtype=torch.int32),
+            valid_row_indices=torch.zeros(1, dtype=torch.int32),
+        )
         assert new_idx.tolist() == [[[0, -1, 1, -1, 2]]]
         assert packed.tolist() == [[3, 8, 4, 0, 0]]
 
     def test_remap_shape_2d_input(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
 
         topk = torch.tensor([[2, 50, 1]], dtype=torch.int32)
-        new_idx, packed = scratch_remap(topk, torch.tensor([40]))
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            torch.tensor([40]),
+            scratch_base=torch.zeros(1, dtype=torch.int32),
+            valid_row_indices=torch.zeros(1, dtype=torch.int32),
+        )
         assert new_idx.shape == topk.shape
         assert new_idx.tolist() == [[0, 50, 1]]
         assert packed.tolist() == [[2, 1, 0]]
 
     def test_remap_mixed_rows_plen_zero_untouched(self):
-        from vllm_ascend.distributed.kv_transfer.sparse_offload.scratch_remap import scratch_remap
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
 
         # row0: decode row (plen 100) -> remapped; row1: prefill row (plen 0) -> untouched
-        topk = torch.tensor([[[5, 100, 7]],
-                             [[5, 100, 7]]], dtype=torch.int32)
+        topk = torch.tensor([[[5, 100, 7]], [[5, 100, 7]]], dtype=torch.int32)
         plen = torch.tensor([100, 0])
-        new_idx, packed = scratch_remap(topk, plen)
-        assert new_idx.tolist() == [[[0, 100, 1]],
-                                    [[5, 100, 7]]]      # prefill row unchanged
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            plen,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.arange(2, dtype=torch.int32),
+        )
+        assert new_idx.tolist() == [[[0, 100, 1]], [[5, 100, 7]]]  # prefill row unchanged
         assert packed.tolist()[0] == [5, 7, 0]
+
+    def test_remap_compacts_only_explicit_decode_rows(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor(
+            [
+                [[5, 100, 7, -1]],
+                [[20, 21, 22, 23]],
+                [[3, 200, 4, 201]],
+            ],
+            dtype=torch.int32,
+        )
+        split_boundary = torch.tensor([100, 0, 200], dtype=torch.int32)
+        valid_rows = torch.tensor([0, 2], dtype=torch.int32)
+        scratch_base = torch.tensor([0, 0, 4], dtype=torch.int32)
+
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            split_boundary,
+            scratch_base=scratch_base,
+            valid_row_indices=valid_rows,
+        )
+
+        assert new_idx.tolist() == [
+            [[0, 100, 1, -1]],
+            [[20, 21, 22, 23]],
+            [[4, 200, 5, 201]],
+        ]
+        assert packed.tolist() == [[5, 7, 0, 0], [3, 4, 0, 0]]
+        assert packed.shape == (2, 4)
+
+    def test_remap_compact_without_payload(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor([[5, 100, 7], [10, 11, 12]], dtype=torch.int32)
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            torch.tensor([100, 0], dtype=torch.int32),
+            need_packed=False,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.tensor([0], dtype=torch.int32),
+        )
+
+        assert new_idx.tolist() == [[0, 100, 1], [10, 11, 12]]
+        assert packed is None
+
+    def test_prepare_zeroes_graph_padding_when_request_rows_are_provided(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.arange(4 * 64, dtype=torch.int32).reshape(4, 1, 64)
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            torch.tensor([128, 128, 0, 0], dtype=torch.int32),
+            scratch_base=torch.tensor([0, 64, 0, 0], dtype=torch.int32),
+            valid_row_indices=torch.tensor([0, 1], dtype=torch.int32),
+            row_req_indices=torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+
+        assert torch.count_nonzero(new_idx[2:]).item() == 0
+        assert packed.shape == (2, 64)
+
+    def test_prepare_keeps_mixed_prefill_row_without_request_rows(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor([[[5, 100, 7, -1]], [[20, 21, 22, 23]]], dtype=torch.int32)
+        prefill_row = topk[1].clone()
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            torch.tensor([100, 0], dtype=torch.int32),
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.tensor([0], dtype=torch.int32),
+            row_req_indices=None,
+        )
+
+        assert new_idx[0].tolist() == [[0, 100, 1, -1]]
+        assert torch.equal(new_idx[1], prefill_row)
+        assert packed.tolist() == [[5, 7, 0, 0]]
+
+    def test_public_prepare_does_not_fall_back_to_torch_on_cpu(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        with pytest.raises(RuntimeError, match="requires the NPU custom op"):
+            prepare_sparse_indices(
+                torch.zeros((1, 64), dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                scratch_base=torch.zeros(1, dtype=torch.int32),
+                valid_row_indices=torch.zeros(1, dtype=torch.int32),
+            )

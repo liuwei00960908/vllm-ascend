@@ -742,7 +742,7 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
 | `vllm_ascend/ascend_forward_context.py` | Pass a plan handle and layer cursor instead of loose dummy/key/parity attributes; carry cache epoch/virtual-engine identity |
 | `vllm_ascend/attention/sfa_v1.py` | Expose graph-safe logical pre/post kernels with explicit tensor contracts; keep nested wrappers and layer-local fallback out of the target path; add padded/MTP masks |
 | `vllm_ascend/attention/utils.py` | Keep current LMCache frontier/capability access localized and version-qualified; optionally replace the frontier source with vLLM-owned released-range state after R1 |
-| `vllm_ascend/distributed/kv_transfer/sparse_offload/scratch_remap.py` | Add explicit valid mask/count, safe padded rows, disjoint MTP ranges, and device-side bounds assertions where available |
+| `vllm_ascend/distributed/kv_transfer/sparse_offload/prepare_sparse_indices.py` | Extend the fused sparse-index preparation contract with disjoint MTP ranges and device-side bounds assertions where needed |
 | `vllm_ascend/ops/mla.py`, `vllm_ascend/platform.py` | Add the qualified staged decomposition and retrieve-only mutation-aware split; stop splitting at the whole `vllm::mla_forward` boundary only for that route; preserve existing non-staged MLA behavior |
 | `vllm_ascend/worker/worker.py` | Topology-aware measured memory reservation, local PP layer count, target/draft and lifecycle accounting |
 | `vllm_ascend/utils.py` | One compatibility fingerprint/reason system; rich capture keys; resource-driven bucket selection; actual stream accounting |
