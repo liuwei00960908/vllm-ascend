@@ -204,6 +204,7 @@ def test_report_displays_content_probe_status() -> None:
                     "stage": "deep",
                     "event": "content_store",
                     "kv_group": 0,
+                    "window_end": 256,
                     "chunk_fingerprints": [11, 12],
                 }
             ),
@@ -215,6 +216,7 @@ def test_report_displays_content_probe_status() -> None:
                     "stage": "deep",
                     "event": "content_transfer",
                     "kv_group": 0,
+                    "frontier": 256,
                     "source_chunk_fingerprints": [11, 12],
                     "content_probe": {"supported": True, "all_match": True},
                 }
@@ -225,7 +227,7 @@ def test_report_displays_content_probe_status() -> None:
     report = _format_report(summarize_events(parse_lines(lines)))
 
     assert (
-        "CONTENT group=0 store_cpu=yes retrieve_cpu=yes "
+        "CONTENT frontier=256 group=0 store_cpu=yes retrieve_cpu=yes "
         "store_retrieve_match=True scatter_supported=True scatter_match=True"
         in report
     )

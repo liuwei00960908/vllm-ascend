@@ -487,8 +487,8 @@ def _format_report(summary: dict[str, Any]) -> str:
     committed: set[tuple[int, int]] = set()
     retrieve_groups: set[int] = set()
     safety_events: list[dict[str, Any]] = []
-    store_content: dict[int, dict[str, Any]] = {}
-    transfer_content: dict[int, dict[str, Any]] = {}
+    store_content: dict[tuple[int, int], dict[str, Any]] = {}
+    transfer_content: dict[tuple[int, int], dict[str, Any]] = {}
     for event in events:
         window = (event.get("window_start"), event.get("window_end"))
         if (
@@ -517,14 +517,16 @@ def _format_report(summary: dict[str, Any]) -> str:
             event.get("stage") == "deep"
             and event.get("event") == "content_store"
             and isinstance(event.get("kv_group"), int)
+            and isinstance(event.get("window_end"), int)
         ):
-            store_content.setdefault(event["kv_group"], event)
+            store_content.setdefault((event["window_end"], event["kv_group"]), event)
         if (
             event.get("stage") == "deep"
             and event.get("event") == "content_transfer"
             and isinstance(event.get("kv_group"), int)
+            and isinstance(event.get("frontier"), int)
         ):
-            transfer_content.setdefault(event["kv_group"], event)
+            transfer_content.setdefault((event["frontier"], event["kv_group"]), event)
 
     windows = sorted(set(stores) | committed)
     for start, end in windows[:6]:
@@ -535,9 +537,9 @@ def _format_report(summary: dict[str, Any]) -> str:
         )
     groups = ",".join(str(group) for group in sorted(retrieve_groups)) or "-"
     lines.append(f"RETRIEVE groups={groups}")
-    for group in sorted(set(store_content) | set(transfer_content)):
-        store_event = store_content.get(group)
-        transfer_event = transfer_content.get(group)
+    for frontier, group in sorted(set(store_content) | set(transfer_content)):
+        store_event = store_content.get((frontier, group))
+        transfer_event = transfer_content.get((frontier, group))
         store_fingerprints = (
             store_event.get("chunk_fingerprints") if store_event is not None else None
         )
@@ -553,7 +555,8 @@ def _format_report(summary: dict[str, Any]) -> str:
         )
         probe = transfer_event.get("content_probe", {}) if transfer_event else {}
         lines.append(
-            f"CONTENT group={group} store_cpu={'yes' if store_event else 'no'} "
+            f"CONTENT frontier={frontier} group={group} "
+            f"store_cpu={'yes' if store_event else 'no'} "
             f"retrieve_cpu={'yes' if transfer_event else 'no'} "
             f"store_retrieve_match={source_match} "
             f"scatter_supported={probe.get('supported')} "
