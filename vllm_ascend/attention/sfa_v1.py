@@ -1861,6 +1861,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             _padding_row_req_indices = (
                 attn_metadata.decode_req_indices if _is_pure_decode else None
             )
+            _selected_token_counts = None
+            if _need_packed:
+                _topk_before_remap = topk_indices.reshape(_topk_rows, -1)
+                _boundary_before_remap = _split_boundary[:_topk_rows].reshape(
+                    -1, 1
+                ).to(dtype=_topk_before_remap.dtype)
+                _all_selected_counts = (
+                    (_topk_before_remap >= 0)
+                    & (_topk_before_remap < _boundary_before_remap)
+                ).sum(dim=1, dtype=torch.int32)
+                _selected_token_counts = _all_selected_counts.index_select(
+                    0, _valid_row_indices.to(dtype=torch.long)
+                )
             with _dsa_prof.section("prepare_sparse_indices"):
                 topk_indices, _sel_packed = prepare_sparse_indices(
                     topk_indices,
@@ -1964,6 +1977,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if _diag_deep_req_ids
                     else []
                 )
+                _diag_selected_counts = (
+                    _selected_token_counts.detach().cpu().tolist()
+                    if _diag_deep_req_ids and _selected_token_counts is not None
+                    else []
+                )
                 _diag_compact_row = (
                     {
                         source_row: compact_row
@@ -2051,7 +2069,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                             else 0
                         )
                         effective_scratch_base = scratch_base or 0
-                        selected_count = int(selected_absolute.numel())
+                        compact_row = _diag_compact_row.get(row)
+                        selected_count = (
+                            int(_diag_selected_counts[compact_row])
+                            if compact_row is not None
+                            and compact_row < len(_diag_selected_counts)
+                            else int(selected_absolute.numel())
+                        )
                         packed_values = packed_row.tolist()
                         absolute_values = absolute_row.tolist()
                         selected_absolute_values = selected_absolute.tolist()
@@ -2074,15 +2098,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 current_position,
                                 block_size,
                             )
-                            compact_row = _diag_compact_row.get(row)
                             target_slots = (
                                 [int(value) for value in _diag_target_slots[compact_row]]
                                 if compact_row is not None
                                 and compact_row < len(_diag_target_slots)
                                 else derived_target_slots
                             )
+                            consumed_target_slots = target_slots[:selected_count]
                             aliases = sorted(
-                                set(target_slots).intersection(live_slots)
+                                set(consumed_target_slots).intersection(live_slots)
                             )
                             if target_slots != derived_target_slots:
                                 _mtp_dw_event(
@@ -2178,10 +2202,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                             },
                         )
                         remaining = max(0, 32 - len(payload["selection"]))
-                        payload["selection"].extend(packed_values[:remaining])
-                        payload["slots"].extend(target_slots[:remaining])
-                        payload["payload_count"] += len(packed_values)
-                        payload["target_count"] += len(target_slots)
+                        consumed_packed_values = packed_values[:selected_count]
+                        payload["selection"].extend(
+                            consumed_packed_values[:remaining]
+                        )
+                        payload["slots"].extend(
+                            consumed_target_slots[:remaining]
+                        )
+                        payload["payload_count"] += len(consumed_packed_values)
+                        payload["target_count"] += len(consumed_target_slots)
                         payload["selected_count"] += selected_count
                         payload["aliases"].update(aliases)
                         payload["rows"].append(row)
@@ -2312,6 +2341,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         selected_tokens=_selected_for_wait,
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
+                        selected_token_counts=_selected_token_counts,
                     )
                 if (
                     _LMCACHE_SPARSE_WAIT_SYNC_ONCE

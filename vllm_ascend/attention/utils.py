@@ -358,6 +358,7 @@ def wait_for_kv_layer_from_connector(
     token_start_index=None,
     request_ids=None,
     target_slot_mapping=None,
+    selected_token_counts=None,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -378,6 +379,7 @@ def wait_for_kv_layer_from_connector(
                     token_start_index,
                     request_ids,
                     target_slot_mapping=target_slot_mapping,
+                    selected_token_counts=selected_token_counts,
                 )
         except Exception:
             logger.exception(
@@ -438,6 +440,7 @@ def wait_for_kv_layer_from_connector(
                     token_start_index,
                     request_ids,
                     target_slot_mapping=target_slot_mapping,
+                    selected_token_counts=selected_token_counts,
                 )
         else:
             connector.wait_for_layer_load(layer_name)
