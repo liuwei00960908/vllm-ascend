@@ -4165,6 +4165,7 @@ class NPUModelRunner(GPUModelRunner):
         for _layer_name, impl in self._collect_staged_sfa_impls():
             for attr in (
                 "_staged_sfa_cross_layer_producer_event",
+                "_staged_sfa_cross_layer_remap_boundary",
                 "_staged_sfa_cross_layer_runtime",
             ):
                 if hasattr(impl, attr):
@@ -4208,6 +4209,12 @@ class NPUModelRunner(GPUModelRunner):
                 for layer_name, impl in self._staged_sfa_impls
                 if getattr(
                     impl, "_staged_sfa_cross_layer_producer_event", None
+                )
+                is None
+                or getattr(
+                    impl,
+                    "_staged_sfa_cross_layer_remap_boundary",
+                    None,
                 )
                 is None
                 or getattr(impl, "_staged_sfa_cross_layer_runtime", None)

@@ -394,6 +394,67 @@ class TestStagedSFAGraphPoc(TestBase):
                 torch.empty(1, 4),
             )
 
+    def test_cross_layer_capture_reuses_eager_boundary_storage(self):
+        impl = self._make_eligible_impl()
+        kv_cache = self._make_eligible_kv_cache()
+        impl._staged_sfa_dummy_cache_initialized = True
+        impl._staged_sfa_cross_layer_producer_event = MagicMock()
+        impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
+        impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
+        impl._cross_layer_pre_compute = MagicMock(return_value=tuple(torch.empty(1) for _ in range(4)))
+        eager_metadata = self._make_decode_metadata()
+        capture_metadata = self._make_decode_metadata()
+        capture_metadata.decode_remap_boundary = eager_metadata.decode_remap_boundary
+        contexts = (
+            SimpleNamespace(
+                staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+                staged_sfa_graph_dummy_run=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ),
+            SimpleNamespace(
+                staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+                staged_sfa_graph_dummy_run=True,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ),
+        )
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                side_effect=contexts,
+            ),
+            patch.object(
+                sfa_v1,
+                "_prepare_sfa_remap_boundary",
+                return_value=eager_metadata.decode_remap_boundary,
+            ) as prepare_boundary,
+        ):
+            for metadata in (eager_metadata, capture_metadata):
+                impl.cross_layer_graph_pre(
+                    "layer-0",
+                    torch.empty(1, 4),
+                    kv_cache,
+                    metadata,
+                    False,
+                    torch.empty(1, 4),
+                )
+
+        prepare_boundary.assert_called_once_with(
+            eager_metadata,
+            eager_metadata.req_ids,
+            is_dummy_run=True,
+            index_topk=impl.index_topk,
+        )
+        self.assertIs(
+            impl._staged_sfa_cross_layer_remap_boundary,
+            eager_metadata.decode_remap_boundary,
+        )
+        self.assertIs(
+            impl._cross_layer_pre_compute.call_args_list[1].args[-3],
+            eager_metadata.decode_remap_boundary,
+        )
+
     def test_cross_layer_retrieve_prefetches_next_index(self):
         impl = self._make_eligible_impl()
         impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))

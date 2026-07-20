@@ -2133,12 +2133,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             for cache in kv_cache:
                 cache[: graph_key.request_capacity].zero_()
             self._staged_sfa_dummy_cache_initialized = True
-        remap_boundary = _prepare_sfa_remap_boundary(
-            attn_metadata,
-            attn_metadata.req_ids,
-            is_dummy_run=is_dummy,
-            index_topk=self.index_topk,
-        )
+        if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            # ACL capture cannot include the host copy in boundary preparation.
+            # The immediately preceding eager warmup filled this stable buffer.
+            capture_boundary = getattr(
+                self,
+                "_staged_sfa_cross_layer_remap_boundary",
+                None,
+            )
+            boundary = attn_metadata.decode_remap_boundary
+            if (
+                capture_boundary is None
+                or boundary is None
+                or capture_boundary.data_ptr() != boundary.data_ptr()
+                or capture_boundary.shape != boundary.shape
+            ):
+                raise RuntimeError(
+                    "[SFA cross-layer graph] remap boundary was not prepared in stable storage by eager warmup"
+                )
+            remap_boundary = capture_boundary
+        else:
+            remap_boundary = _prepare_sfa_remap_boundary(
+                attn_metadata,
+                attn_metadata.req_ids,
+                is_dummy_run=is_dummy,
+                index_topk=self.index_topk,
+            )
+            if is_dummy:
+                self._staged_sfa_cross_layer_remap_boundary = remap_boundary
         valid_row_indices = attn_metadata.decode_valid_row_indices
         scratch_base = attn_metadata.decode_scratch_base
         assert valid_row_indices is not None and scratch_base is not None
