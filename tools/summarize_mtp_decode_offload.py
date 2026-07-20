@@ -522,8 +522,35 @@ def _format_report(summary: dict[str, Any]) -> str:
     groups = ",".join(str(group) for group in sorted(retrieve_groups)) or "-"
     lines.append(f"RETRIEVE groups={groups}")
 
+    safety_by_row: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for event in safety_events:
+        key = (
+            int(event.get("boundary", -1) or -1),
+            int(event.get("committed_end", -1) or -1),
+            int(event.get("row", -1) or -1),
+        )
+        safety_by_row.setdefault(key, event)
+    unique_safety_events = [
+        safety_by_row[key] for key in sorted(safety_by_row)
+    ]
+
     findings: list[str] = []
-    for event in safety_events[:8]:
+    for event in unique_safety_events:
+        row = event.get("row")
+        within = event.get("target_within_committed")
+        beyond = event.get("target_beyond_current_sequence")
+        live_aliases = event.get("actual_target_live_intersection_count")
+        unmapped = event.get("target_unmapped_count")
+        if within is False:
+            findings.append(f"row{row}_target_outside_committed")
+        if beyond is True or (
+            isinstance(unmapped, int) and unmapped > 0
+        ):
+            findings.append(f"row{row}_target_unmapped")
+        if isinstance(live_aliases, int) and live_aliases > 0:
+            findings.append(f"row{row}_target_live_alias")
+
+    for event in unique_safety_events[:8]:
         row = event.get("row")
         start = event.get("target_logical_start")
         end = event.get("target_logical_end")
@@ -533,17 +560,12 @@ def _format_report(summary: dict[str, Any]) -> str:
         live_aliases = event.get("actual_target_live_intersection_count")
         unmapped = event.get("target_unmapped_count")
         lines.append(
-            f"SCRATCH row={row} dest=[{start},{end}) boundary={boundary} "
+            f"SCRATCH frontier={event.get('frontier')} row={row} "
+            f"dest=[{start},{end}) boundary={boundary} "
             f"within_committed={within} beyond_sequence={beyond} "
             f"unmapped={unmapped} live_aliases={live_aliases}"
         )
-        if within is False:
-            findings.append(f"row{row}_target_outside_committed")
-        if beyond is True or isinstance(unmapped, int) and unmapped > 0:
-            findings.append(f"row{row}_target_unmapped")
-        if isinstance(live_aliases, int) and live_aliases > 0:
-            findings.append(f"row{row}_target_live_alias")
-    if not safety_events:
+    if not unique_safety_events:
         findings.append("scratch_target_safety_missing")
     if findings:
         lines.append("FINDING " + ",".join(dict.fromkeys(findings)))

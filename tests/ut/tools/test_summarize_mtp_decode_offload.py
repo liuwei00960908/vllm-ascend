@@ -139,6 +139,29 @@ def test_pass_and_request_prefix() -> None:
 
 def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
     lines = _lines()
+    for tp_rank in range(8):
+        lines.append(
+            MARKER
+            + json.dumps(
+                {
+                    "schema": 1,
+                    "req": "chatcmpl-1-internal",
+                    "stage": "deep",
+                    "event": "scratch_target_safety",
+                    "frontier": 261,
+                    "committed_end": 256,
+                    "row": 0,
+                    "tp_rank": tp_rank,
+                    "target_logical_start": 0,
+                    "target_logical_end": 256,
+                    "boundary": 256,
+                    "target_within_committed": True,
+                    "target_beyond_current_sequence": False,
+                    "target_unmapped_count": 0,
+                    "actual_target_live_intersection_count": 0,
+                }
+            )
+        )
     lines.append(
         MARKER
         + json.dumps(
@@ -147,6 +170,8 @@ def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
                 "req": "chatcmpl-1-internal",
                 "stage": "deep",
                 "event": "scratch_target_safety",
+                "frontier": 262,
+                "committed_end": 256,
                 "row": 1,
                 "target_logical_start": 2048,
                 "target_logical_end": 2304,
@@ -162,7 +187,8 @@ def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
     report = _format_report(summarize_events(parse_lines(lines)))
 
     assert "WINDOW [0,256) store_groups=0,1 committed=yes" in report
-    assert "SCRATCH row=1 dest=[2048,2304) boundary=256" in report
+    assert report.count("SCRATCH frontier=261 row=0") == 1
+    assert "SCRATCH frontier=262 row=1 dest=[2048,2304) boundary=256" in report
     assert "FINDING row1_target_outside_committed,row1_target_live_alias" in report
 
 
