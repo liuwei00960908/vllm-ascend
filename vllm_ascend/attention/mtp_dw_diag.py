@@ -74,6 +74,66 @@ def scratch_live_slot_aliases(
     return target_slots, live_slots, aliases
 
 
+def scratch_target_safety(
+    block_table: Iterable[int],
+    scratch_start: int,
+    scratch_count: int,
+    committed_end: int,
+    current_position: int,
+    block_size: int,
+) -> dict[str, Any]:
+    """Describe whether an active scratch range is safe to overwrite.
+
+    Scratch target positions are resolved through the normal request block
+    table. This diagnostic is intentionally read-only: it reports the logical
+    range, block-table coverage, and physical overlap without changing remap
+    or transfer behavior.
+    """
+    if scratch_start < 0 or scratch_count < 0:
+        raise ValueError("scratch range must be non-negative")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    blocks = [int(block) for block in block_table]
+    target_end = scratch_start + scratch_count
+    valid_block_count = next(
+        (index for index, block in enumerate(blocks) if block < 0), len(blocks)
+    )
+    valid_logical_end = valid_block_count * block_size
+    target_block_start = scratch_start // block_size
+    target_block_end = (target_end + block_size - 1) // block_size
+    target_block_values = [
+        blocks[index] if index < len(blocks) else None
+        for index in range(target_block_start, target_block_end)
+    ]
+    mapped_end = min(target_end, valid_logical_end)
+    mapped_count = max(0, mapped_end - scratch_start)
+    mapped_positions = range(scratch_start, max(scratch_start, mapped_end))
+    target_slots = logical_to_physical_slots(blocks, mapped_positions, block_size)
+    live_start = min(max(committed_end, 0), valid_logical_end)
+    live_end = min(max(current_position + 1, live_start), valid_logical_end)
+    live_slots = logical_to_physical_slots(
+        blocks, range(live_start, live_end), block_size
+    )
+
+    return {
+        "target_logical_start": scratch_start,
+        "target_logical_end": target_end,
+        "target_block_start": target_block_start,
+        "target_block_end": target_block_end,
+        "target_block_values": target_block_values,
+        "valid_logical_end": valid_logical_end,
+        "target_within_committed": target_end <= committed_end,
+        "target_beyond_current_sequence": target_end > current_position + 1,
+        "target_unmapped_count": scratch_count - mapped_count,
+        "target_slots": target_slots,
+        "live_slots": live_slots,
+        "target_live_intersection": sorted(
+            set(target_slots).intersection(live_slots)
+        ),
+    }
+
+
 def first_post_commit_requests(
     previous_frontiers: dict[str, int],
     request_ids: Iterable[str],

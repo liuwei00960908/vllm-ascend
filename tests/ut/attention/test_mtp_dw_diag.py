@@ -10,6 +10,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     logical_to_physical_slots,
     post_commit_sample_requests,
     scratch_live_slot_aliases,
+    scratch_target_safety,
 )
 
 
@@ -105,3 +106,36 @@ def test_scratch_alias_check_accepts_one_shot_block_iterables() -> None:
     assert target == [28]
     assert live == [20]
     assert aliases == []
+
+
+def test_scratch_target_safety_reports_live_overlap() -> None:
+    safety = scratch_target_safety(
+        [7, 3, 5, 9],
+        scratch_start=8,
+        scratch_count=2,
+        committed_end=2,
+        current_position=9,
+        block_size=4,
+    )
+
+    assert safety["target_logical_start"] == 8
+    assert safety["target_logical_end"] == 10
+    assert safety["target_block_values"] == [5]
+    assert safety["target_within_committed"] is False
+    assert safety["target_beyond_current_sequence"] is False
+    assert safety["target_live_intersection"] == [20, 21]
+
+
+def test_scratch_target_safety_reports_unmapped_tail() -> None:
+    safety = scratch_target_safety(
+        [7, 3, -1, -1],
+        scratch_start=8,
+        scratch_count=2,
+        committed_end=2,
+        current_position=9,
+        block_size=4,
+    )
+
+    assert safety["target_block_values"] == [-1]
+    assert safety["target_unmapped_count"] == 2
+    assert safety["target_live_intersection"] == []

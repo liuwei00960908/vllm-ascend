@@ -473,6 +473,85 @@ def _format(summary: dict[str, Any], failures_only: bool, stage: str | None) -> 
     return "\n".join(lines)
 
 
+def _format_report(summary: dict[str, Any]) -> str:
+    """Render a compact, pasteable per-request diagnostic report."""
+    lines = [
+        f"REQ {summary['req'] or '-'} status={summary['status']} "
+        f"events={len(summary['events'])}"
+    ]
+    if summary["missing"]:
+        lines.append("MISSING " + ",".join(summary["missing"][:MAX_MISSING_ITEMS]))
+
+    events = summary["events"]
+    stores: dict[tuple[int, int], set[int]] = defaultdict(set)
+    committed: set[tuple[int, int]] = set()
+    retrieve_groups: set[int] = set()
+    safety_events: list[dict[str, Any]] = []
+    for event in events:
+        window = (event.get("window_start"), event.get("window_end"))
+        if (
+            event.get("stage") == "store"
+            and event.get("event") == "complete"
+            and all(isinstance(value, int) for value in window)
+            and isinstance(event.get("kv_group"), int)
+        ):
+            stores[window].add(event["kv_group"])
+        if (
+            event.get("stage") == "commit"
+            and event.get("event") == "publish_completed"
+            and all(isinstance(value, int) for value in window)
+        ):
+            committed.add(window)
+        if event.get("stage") == "retrieve" and isinstance(
+            event.get("kv_group"), int
+        ):
+            retrieve_groups.add(event["kv_group"])
+        if (
+            event.get("stage") == "deep"
+            and event.get("event") == "scratch_target_safety"
+        ):
+            safety_events.append(event)
+
+    windows = sorted(set(stores) | committed)
+    for start, end in windows[:6]:
+        groups = ",".join(str(group) for group in sorted(stores[(start, end)])) or "-"
+        lines.append(
+            f"WINDOW [{start},{end}) store_groups={groups} "
+            f"committed={'yes' if (start, end) in committed else 'no'}"
+        )
+    groups = ",".join(str(group) for group in sorted(retrieve_groups)) or "-"
+    lines.append(f"RETRIEVE groups={groups}")
+
+    findings: list[str] = []
+    for event in safety_events[:8]:
+        row = event.get("row")
+        start = event.get("target_logical_start")
+        end = event.get("target_logical_end")
+        boundary = event.get("boundary")
+        within = event.get("target_within_committed")
+        beyond = event.get("target_beyond_current_sequence")
+        live_aliases = event.get("actual_target_live_intersection_count")
+        unmapped = event.get("target_unmapped_count")
+        lines.append(
+            f"SCRATCH row={row} dest=[{start},{end}) boundary={boundary} "
+            f"within_committed={within} beyond_sequence={beyond} "
+            f"unmapped={unmapped} live_aliases={live_aliases}"
+        )
+        if within is False:
+            findings.append(f"row{row}_target_outside_committed")
+        if beyond is True or isinstance(unmapped, int) and unmapped > 0:
+            findings.append(f"row{row}_target_unmapped")
+        if isinstance(live_aliases, int) and live_aliases > 0:
+            findings.append(f"row{row}_target_live_alias")
+    if not safety_events:
+        findings.append("scratch_target_safety_missing")
+    if findings:
+        lines.append("FINDING " + ",".join(dict.fromkeys(findings)))
+    else:
+        lines.append("FINDING no_scratch_target_violation_reported")
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path)
@@ -483,6 +562,11 @@ def main() -> int:
     selection.add_argument("--request-prefix")
     parser.add_argument("--failures-only", action="store_true")
     parser.add_argument(
+        "--report",
+        action="store_true",
+        help="print a compact per-request lifecycle and scratch safety report",
+    )
+    parser.add_argument(
         "--stage", choices=sorted(REQUIRED_STAGES | {"deep", "fail"})
     )
     args = parser.parse_args()
@@ -490,7 +574,10 @@ def main() -> int:
     with args.log.open("r", encoding="utf-8", errors="replace") as log_file:
         events = parse_lines(log_file)
     summary = summarize_events(events, args.request_prefix)
-    print(_format(summary, args.failures_only, args.stage))
+    if args.report:
+        print(_format_report(summary))
+    else:
+        print(_format(summary, args.failures_only, args.stage))
     if summary["status"] == "FAIL":
         return 1
     if summary["status"] == "INCOMPLETE":

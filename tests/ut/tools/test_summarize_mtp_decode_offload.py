@@ -6,6 +6,7 @@ from tools.summarize_mtp_decode_offload import (
     MARKER,
     MAX_EVENT_CHARS,
     _format,
+    _format_report,
     parse_lines,
     summarize_events,
 )
@@ -134,6 +135,35 @@ def test_pass_and_request_prefix() -> None:
     summary = summarize_events(events, "chatcmpl-http")
     assert summary["status"] == "PASS"
     assert summary["req"] == "chatcmpl-http-worker"
+
+
+def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
+    lines = _lines()
+    lines.append(
+        MARKER
+        + json.dumps(
+            {
+                "schema": 1,
+                "req": "chatcmpl-1-internal",
+                "stage": "deep",
+                "event": "scratch_target_safety",
+                "row": 1,
+                "target_logical_start": 2048,
+                "target_logical_end": 2304,
+                "boundary": 256,
+                "target_within_committed": False,
+                "target_beyond_current_sequence": False,
+                "target_unmapped_count": 0,
+                "actual_target_live_intersection_count": 256,
+            }
+        )
+    )
+
+    report = _format_report(summarize_events(parse_lines(lines)))
+
+    assert "WINDOW [0,256) store_groups=0,1 committed=yes" in report
+    assert "SCRATCH row=1 dest=[2048,2304) boundary=256" in report
+    assert "FINDING row1_target_outside_committed,row1_target_live_alias" in report
 
 
 def test_failure_reports_first_invariant() -> None:

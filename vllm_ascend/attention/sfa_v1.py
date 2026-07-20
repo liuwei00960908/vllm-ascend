@@ -41,6 +41,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     diagnostic_int_checksum,
     diagnostic_values_to_list,
     scratch_live_slot_aliases,
+    scratch_target_safety,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -2089,6 +2090,30 @@ class AscendSFAImpl(MLAAttentionImpl):
                             .cpu()
                             .tolist()
                         )
+                        scratch_safety = scratch_target_safety(
+                            block_table_row,
+                            effective_scratch_base,
+                            selected_count,
+                            boundary,
+                            current_position,
+                            block_size,
+                        )
+                        actual_target_slots = (
+                            [int(value) for value in _diag_target_slots[compact_row]]
+                            if compact_row is not None
+                            and compact_row < len(_diag_target_slots)
+                            else None
+                        )
+                        if actual_target_slots is not None:
+                            consumed_target_slots = actual_target_slots[:selected_count]
+                            actual_aliases = sorted(
+                                set(consumed_target_slots).intersection(
+                                    scratch_safety["live_slots"]
+                                )
+                            )
+                        else:
+                            consumed_target_slots = []
+                            actual_aliases = []
                         try:
                             derived_target_slots, live_slots, _ = scratch_live_slot_aliases(
                                 block_table_row,
@@ -2100,12 +2125,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 current_position,
                                 block_size,
                             )
-                            target_slots = (
-                                [int(value) for value in _diag_target_slots[compact_row]]
-                                if compact_row is not None
-                                and compact_row < len(_diag_target_slots)
-                                else derived_target_slots
-                            )
+                            target_slots = actual_target_slots or derived_target_slots
                             consumed_target_slots = target_slots[:selected_count]
                             aliases = sorted(
                                 set(consumed_target_slots).intersection(live_slots)
@@ -2139,7 +2159,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 boundary=boundary,
                                 detail=str(error),
                             )
-                            target_slots, live_slots, aliases = [], [], []
+                            target_slots = actual_target_slots or []
+                            live_slots = scratch_safety["live_slots"]
+                            aliases = actual_aliases
                         deep_common = {
                             "tp_rank": self.tp_rank,
                             "tp_world": self.tp_size,
@@ -2173,6 +2195,44 @@ class AscendSFAImpl(MLAAttentionImpl):
                             live_physical_sample=live_slots[:8],
                             live_physical_checksum=diagnostic_int_checksum(live_slots),
                             checksum_scope="first32",
+                        )
+                        _mtp_dw_event(
+                            "deep",
+                            event="scratch_target_safety",
+                            **deep_common,
+                            selected_count=selected_count,
+                            target_logical_start=scratch_safety[
+                                "target_logical_start"
+                            ],
+                            target_logical_end=scratch_safety["target_logical_end"],
+                            target_block_start=scratch_safety["target_block_start"],
+                            target_block_end=scratch_safety["target_block_end"],
+                            target_block_values=scratch_safety[
+                                "target_block_values"
+                            ][:8],
+                            target_block_checksum=diagnostic_int_checksum(
+                                value
+                                for value in scratch_safety["target_block_values"]
+                                if value is not None
+                            ),
+                            valid_logical_end=scratch_safety["valid_logical_end"],
+                            target_within_committed=scratch_safety[
+                                "target_within_committed"
+                            ],
+                            target_beyond_current_sequence=scratch_safety[
+                                "target_beyond_current_sequence"
+                            ],
+                            target_unmapped_count=scratch_safety[
+                                "target_unmapped_count"
+                            ],
+                            target_live_intersection_count=len(
+                                scratch_safety["target_live_intersection"]
+                            ),
+                            target_live_intersection_sample=scratch_safety[
+                                "target_live_intersection"
+                            ][:8],
+                            actual_target_live_intersection_count=len(aliases),
+                            actual_target_live_intersection_sample=aliases[:8],
                         )
                         payload = _diag_deep_payloads.setdefault(
                             req_id,
