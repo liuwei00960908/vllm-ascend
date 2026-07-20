@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from threading import Lock
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import scipy  # type: ignore
