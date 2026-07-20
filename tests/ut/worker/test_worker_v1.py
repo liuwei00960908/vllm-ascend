@@ -707,6 +707,11 @@ class TestNPUWorker(TestBase):
             ):
                 reserves[capture_sizes] = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
 
+        index_head_state = worker_module._staged_sfa_key_state_reserved_bytes(
+            vllm_config,
+            32,
+        )
+
         with (
             patch.object(
                 worker_module,
@@ -722,21 +727,12 @@ class TestNPUWorker(TestBase):
             hf_text_config.topk_tokens = 4096
             larger_topk_reserve = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
 
-        with (
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_configured",
-                return_value=True,
-            ),
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_capture_sizes",
-                return_value=(1, 32),
-            ),
-        ):
-            hf_text_config.topk_tokens = 2048
-            hf_text_config.index_head_dim = 256
-            larger_index_head_reserve = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
+        hf_text_config.topk_tokens = 2048
+        hf_text_config.index_head_dim = 256
+        larger_index_head_state = worker_module._staged_sfa_key_state_reserved_bytes(
+            vllm_config,
+            32,
+        )
 
         self.assertEqual(disabled, 0)
         self.assertGreater(reserves[(1,)], 160 * (1 << 20))
@@ -749,8 +745,8 @@ class TestNPUWorker(TestBase):
             reserves[(1, 32)],
         )
         self.assertGreater(
-            larger_index_head_reserve,
-            reserves[(1, 32)],
+            larger_index_head_state,
+            index_head_state,
         )
 
     @staticmethod

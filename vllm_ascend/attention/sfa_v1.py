@@ -2923,7 +2923,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if runtime_mode != CUDAGraphMode.NONE:
                 raise RuntimeError(
                     "[SFA staged graph POC] the exact-Q1 dummy cache blocks "
-                    "were not initialized by eager warmup before capture."
+                    "were not initialized by the eager dummy warmup before capture."
                 )
             # Dummy row r maps to physical block r. Zero every block owned by
             # this exact key outside capture so requests cannot collide or

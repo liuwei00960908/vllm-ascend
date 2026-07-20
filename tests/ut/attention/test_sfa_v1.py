@@ -1647,6 +1647,11 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.is_kv_producer = True
         impl.dsa_offload_unbundle = True
         metadata = self._make_decode_metadata()
+        # A 256-token decode window starts at zero for the default synthetic
+        # sequence length 9, which correctly aliases the four scratch rows.
+        # Use the first valid window boundary for this ordering-only test.
+        metadata.seq_lens.fill_(257)
+        metadata.seq_lens_cpu.fill_(257)
         hidden_states = torch.empty(1, 4)
         output = torch.zeros_like(hidden_states)
         kv_cache = (
@@ -1732,7 +1737,7 @@ class TestStagedSFAGraphPoc(TestBase):
         forward_context.batch_descriptor = batch_descriptor
         parity_state = StagedSFALiveParityState(
             request_id="req-0",
-            seq_len=9,
+            seq_len=257,
             expected_layers=1,
         )
         forward_context.staged_sfa_live_parity_state = parity_state
