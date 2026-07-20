@@ -30,7 +30,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import vllm_ascend.envs as envs_ascend
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
@@ -90,12 +89,15 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+import vllm_ascend.envs as envs_ascend
+
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
+    staged_sfa_connector_supports_sparse_load,
     using_paged_attention,
 )
 
@@ -133,6 +135,8 @@ from vllm_ascend.utils import (
     is_moe_model,
     lmhead_tp_enable,
     set_weight_prefetch_method,
+    staged_sfa_graph_capture_sizes,
+    staged_sfa_graph_configuration_errors,
     staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
@@ -141,6 +145,8 @@ from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
+    STAGED_SFA_SINGLETON_GRAPH_KEY,
+    StagedSFAGraphKey,
     StagedSFALiveParityState,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
@@ -159,7 +165,6 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
 
@@ -169,6 +174,7 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+STAGED_SFA_LIVE_PARITY_CHECKS_PER_GRAPH_KEY = 1
 
 
 @dataclass
@@ -273,6 +279,8 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_live_parity_request_id: str | None = None
         self._staged_sfa_live_parity_validated_seq_lens: list[int] = []
         self._staged_sfa_live_parity_last_seq_len: int | None = None
+        self._staged_sfa_live_parity_histories = {}
+        self._staged_sfa_live_parity_last_batches = {}
         self._staged_sfa_startup_capture_attempted = False
         self._staged_sfa_startup_capture_complete = False
 
@@ -1437,12 +1445,26 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
+        staged_sfa_graph_key = self._staged_sfa_live_graph_key(
+            cudagraph_mode=cudagraph_mode,
+            batch_descriptor=batch_desc,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens_np,
+            num_tokens_across_dp=num_tokens_across_dp,
+            should_ubatch=should_ubatch,
+            has_cascade_attention=(
+                cascade_attn_prefix_lens is not None
+            ),
+        )
         staged_sfa_live_parity_state = self._prepare_staged_sfa_live_parity(
             cudagraph_mode=cudagraph_mode,
             batch_descriptor=batch_desc,
             num_tokens_unpadded=num_tokens_unpadded,
             num_reqs=num_reqs,
             request_ids=dsa_req_ids,
+            graph_key=staged_sfa_graph_key,
         )
 
         # Run forward pass
@@ -1464,6 +1486,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
+                staged_sfa_graph_key=staged_sfa_graph_key,
                 staged_sfa_live_parity_state=(
                     staged_sfa_live_parity_state
                 ),
@@ -2218,29 +2241,47 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
 
-        staged_dummy_prompt_len = None
+        staged_dummy_prompt_lens = None
         staged_dummy_computed_tokens = None
         staged_dummy_request_ids = None
         if staged_sfa_graph_dummy_run:
-            if num_tokens != 1 or num_reqs != 1:
+            scheduled = np.asarray(num_scheduled_tokens_np).reshape(-1)
+            if (
+                num_tokens != num_reqs
+                or num_tokens_padded != num_tokens
+                or num_reqs_padded != num_reqs
+                or scheduled.shape != (num_reqs,)
+                or not np.all(scheduled == 1)
+            ):
                 raise RuntimeError(
-                    "The staged SFA graph dummy metadata requires exactly "
-                    "one scheduled decode token."
+                    'The staged SFA graph dummy metadata requires one native '
+                    'Q=1 row per request without token or request padding.'
                 )
-            staged_dummy_prompt_len = int(self.seq_lens.np[0]) - 1
-            if staged_dummy_prompt_len < self.dsa_index_topk:
+            staged_dummy_prompt_lens = (
+                self.seq_lens.np[:num_reqs].astype(np.int32) - 1
+            )
+            if (
+                staged_dummy_prompt_lens.shape != (num_reqs,)
+                or np.any(staged_dummy_prompt_lens < self.dsa_index_topk)
+            ):
                 raise RuntimeError(
-                    "The staged SFA graph dummy prompt boundary must be at "
-                    f"least index_topk={self.dsa_index_topk}, got "
-                    f"{staged_dummy_prompt_len}."
+                    'Every staged SFA graph dummy prompt boundary must be at '
+                    f'least index_topk={self.dsa_index_topk}, got '
+                    f'{staged_dummy_prompt_lens.tolist()}.'
                 )
-            staged_dummy_computed_tokens = torch.full_like(
+            staged_dummy_computed_tokens = torch.empty_like(
                 self.input_batch.num_computed_tokens_cpu_tensor[
                     :num_reqs_padded
-                ],
-                staged_dummy_prompt_len,
+                ]
             )
-            staged_dummy_request_ids = ["staged-sfa-graph-dummy"]
+            staged_dummy_computed_tokens.copy_(
+                torch.from_numpy(staged_dummy_prompt_lens).to(
+                    dtype=staged_dummy_computed_tokens.dtype
+                )
+            )
+            staged_dummy_request_ids = self._staged_sfa_dummy_request_ids(
+                num_reqs
+            )
 
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
@@ -2368,12 +2409,8 @@ class NPUModelRunner(GPUModelRunner):
                     # values (decode rows -> plen, prefill/padding rows -> 0 =
                     # no remap) and ships them to device.
                     plens_np = (
-                        np.full(
-                            num_reqs,
-                            staged_dummy_prompt_len,
-                            dtype=np.int32,
-                        )
-                        if staged_dummy_prompt_len is not None
+                        staged_dummy_prompt_lens.copy()
+                        if staged_dummy_prompt_lens is not None
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
                     if (
@@ -2441,6 +2478,236 @@ class NPUModelRunner(GPUModelRunner):
         # it only happens for cudagraph_runtime_mode=FULL.
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
 
+    def _staged_sfa_dummy_batch_size(
+        self,
+        *,
+        is_profile: bool,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        uniform_decode: bool,
+        skip_eplb: bool,
+        remove_lora: bool,
+        num_active_loras: int,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_scheduled_tokens: np.ndarray,
+        batch_descriptor: BatchDescriptor,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> int | None:
+        '''Return an exact, unpadded Q=1 staged dummy batch size.'''
+        if (
+            not staged_sfa_graph_configured(self.vllm_config)
+            or is_profile
+            or cudagraph_runtime_mode
+            not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
+            or uniform_decode
+            or not skip_eplb
+            or remove_lora
+            or num_active_loras != 0
+            or self.speculative_config is not None
+            or getattr(self.parallel_config, 'data_parallel_size', 1) != 1
+            or num_tokens_across_dp is not None
+        ):
+            return None
+
+        batch_size = int(num_tokens_unpadded)
+        if (
+            batch_size not in staged_sfa_graph_capture_sizes(self.vllm_config)
+            or num_tokens_padded != batch_size
+            or num_reqs != batch_size
+            or num_reqs_padded != batch_size
+            or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
+        ):
+            return None
+
+        scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
+        if scheduled.shape != (batch_size,) or not np.all(scheduled == 1):
+            return None
+        return batch_size
+
+    def _staged_sfa_live_graph_key(
+        self,
+        *,
+        cudagraph_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        num_tokens_across_dp: torch.Tensor | None,
+        should_ubatch: bool,
+        has_cascade_attention: bool,
+    ) -> StagedSFAGraphKey | None:
+        """Authorize an exact-Q1 live key before model/SFA mutation."""
+        if (
+            not staged_sfa_graph_configured(self.vllm_config)
+            or cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or getattr(self.parallel_config, "data_parallel_size", 1)
+            != 1
+            or num_tokens_across_dp is not None
+            or self.speculative_config is not None
+            or getattr(self.vllm_config, "lora_config", None) is not None
+            or should_ubatch
+            or has_cascade_attention
+        ):
+            return None
+        batch_size = int(num_tokens_unpadded)
+        if (
+            batch_size <= 0
+            or batch_size
+            not in staged_sfa_graph_capture_sizes(self.vllm_config)
+            or num_tokens_padded != batch_size
+            or num_reqs != batch_size
+        ):
+            return None
+        scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
+        if scheduled.shape != (batch_size,) or not np.all(scheduled == 1):
+            return None
+        graph_key = StagedSFAGraphKey.exact_q1(batch_size)
+        if batch_descriptor != graph_key.to_legacy_batch_descriptor():
+            return None
+        return graph_key
+
+    @staticmethod
+    def _staged_sfa_q1_query_start_locs(
+        batch_size: int,
+        *,
+        dtype: np.dtype,
+    ) -> np.ndarray:
+        if batch_size <= 0:
+            raise ValueError('The staged SFA dummy batch size must be positive.')
+        return np.arange(batch_size + 1, dtype=dtype)
+
+    @staticmethod
+    def _staged_sfa_dummy_request_ids(batch_size: int) -> list[str]:
+        if batch_size <= 0:
+            raise ValueError('The staged SFA dummy batch size must be positive.')
+        return [
+            f'staged-sfa-graph-dummy-{request_index}'
+            for request_index in range(batch_size)
+        ]
+
+    def _prepare_staged_sfa_dummy_block_tables(
+        self,
+        *,
+        batch_size: int,
+        positions: np.ndarray,
+    ) -> None:
+        '''Give every staged dummy request a non-aliasing physical block.'''
+        positions = np.asarray(positions, dtype=np.int64).reshape(-1)
+        if positions.shape != (batch_size,) or np.any(positions < 0):
+            raise RuntimeError(
+                'Staged SFA dummy positions must contain one non-negative '
+                f'position per request, got shape={positions.shape}.'
+            )
+
+        block_tables = getattr(
+            self.input_batch.block_table,
+            'block_tables',
+            None,
+        )
+        if block_tables is None or len(block_tables) != 2:
+            raise RuntimeError(
+                'The staged SFA dummy batch requires exactly two KV block '
+                'tables (latent and indexer).'
+            )
+
+        configured_blocks_per_group = getattr(
+            self.kv_cache_config,
+            'num_blocks_per_group',
+            None,
+        )
+        if configured_blocks_per_group is None:
+            available_blocks_per_group = (
+                getattr(self.kv_cache_config, 'num_blocks', None),
+            ) * len(block_tables)
+        else:
+            try:
+                available_blocks_per_group = tuple(
+                    configured_blocks_per_group
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    'The staged SFA dummy batch requires one KV block count '
+                    'per group.'
+                ) from exc
+            if len(available_blocks_per_group) != len(block_tables):
+                raise RuntimeError(
+                    'The staged SFA dummy batch requires one KV block count '
+                    f'per group: groups={len(block_tables)}, '
+                    f'counts={len(available_blocks_per_group)}.'
+                )
+
+        req_indices = np.arange(batch_size, dtype=np.int32)
+        max_position = int(positions.max()) if positions.size else -1
+        for group_index, block_table in enumerate(block_tables):
+            available_blocks = available_blocks_per_group[group_index]
+            if (
+                not isinstance(available_blocks, (int, np.integer))
+                or int(available_blocks) < batch_size
+            ):
+                raise RuntimeError(
+                    'The staged SFA dummy batch requires one physical block '
+                    f'per request in KV group {group_index}: '
+                    f'batch_size={batch_size}, '
+                    f'available_blocks={available_blocks!r}.'
+                )
+            if (
+                int(block_table.max_num_reqs) < batch_size
+                or int(block_table.max_num_blocks_per_req) <= 0
+            ):
+                raise RuntimeError(
+                    'The staged SFA dummy block-table capacity is too small '
+                    f'for group {group_index}: batch_size={batch_size}, '
+                    f'max_num_reqs={block_table.max_num_reqs}, '
+                    'max_num_blocks_per_req='
+                    f'{block_table.max_num_blocks_per_req}.'
+                )
+
+            logical_table_width = int(
+                block_table.block_table.np.shape[1]
+            )
+            logical_block_size = int(block_table.block_size)
+            cp_world_size = max(
+                1,
+                int(getattr(block_table, 'dcp_world_size', 1))
+                * int(getattr(block_table, 'pcp_world_size', 1)),
+            )
+            logical_capacity = (
+                logical_table_width
+                * logical_block_size
+                * cp_world_size
+            )
+            if max_position >= logical_capacity:
+                raise RuntimeError(
+                    'The staged SFA dummy position exceeds the logical '
+                    f'block-table capacity for KV group {group_index}: '
+                    f'max_position={max_position}, '
+                    f'logical_capacity={logical_capacity}, '
+                    f'table_width={logical_table_width}, '
+                    f'logical_block_size={logical_block_size}, '
+                    f'cp_world_size={cp_world_size}.'
+                )
+
+            physical_blocks = np.arange(
+                batch_size,
+                dtype=block_table.block_table.np.dtype,
+            ).reshape(-1, 1)
+            block_table.block_table.np[:batch_size, :] = physical_blocks
+            block_table.num_blocks_per_row[:batch_size] = (
+                block_table.max_num_blocks_per_req
+            )
+            block_table.commit_block_table(batch_size)
+            block_table.compute_slot_mapping(req_indices, positions)
+            block_table.commit_slot_mapping(batch_size)
+
+            slots = block_table.slot_mapping.np[:batch_size]
+            if np.any(slots < 0) or np.unique(slots).size != batch_size:
+                raise RuntimeError(
+                    'The staged SFA dummy slot mapping aliases requests in '
+                    f'KV group {group_index}: slots={slots.tolist()}.'
+                )
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2545,20 +2812,22 @@ class NPUModelRunner(GPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
-        staged_sfa_graph_dummy_run = (
-            staged_sfa_graph_configured(self.vllm_config)
-            and not is_profile
-            and cudagraph_runtime_mode
-            in (
-                CUDAGraphMode.NONE,
-                CUDAGraphMode.PIECEWISE,
-            )
-            and skip_eplb
-            and not remove_lora
-            and num_tokens_unpadded == 1
-            and num_reqs == 1
-            and num_active_loras == 0
+        staged_sfa_dummy_batch_size = self._staged_sfa_dummy_batch_size(
+            is_profile=is_profile,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=uniform_decode,
+            skip_eplb=skip_eplb,
+            remove_lora=remove_lora,
+            num_active_loras=num_active_loras,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_scheduled_tokens=num_scheduled_tokens,
+            batch_descriptor=batch_desc,
+            num_tokens_across_dp=num_tokens_across_dp,
         )
+        staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
         # Build attention metadata for dummy_run
         if (
             self._should_build_dummy_attn_metadata(
@@ -2608,8 +2877,30 @@ class NPUModelRunner(GPUModelRunner):
             self.seq_lens.np[num_reqs_padded:] = 0
             self.seq_lens.copy_to_gpu()
 
-            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-            self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+            if staged_sfa_graph_dummy_run:
+                assert staged_sfa_dummy_batch_size is not None
+                self._prepare_staged_sfa_dummy_block_tables(
+                    batch_size=staged_sfa_dummy_batch_size,
+                    positions=(
+                        self.seq_lens.np[:staged_sfa_dummy_batch_size]
+                        .astype(np.int64)
+                        - 1
+                    ),
+                )
+                query_start_locs = self._staged_sfa_q1_query_start_locs(
+                    staged_sfa_dummy_batch_size,
+                    dtype=self.query_start_loc.np.dtype,
+                )
+                self.query_start_loc.np[
+                    : staged_sfa_dummy_batch_size + 1
+                ] = query_start_locs
+            else:
+                cum_num_tokens, _ = self._get_cumsum_and_arange(
+                    num_scheduled_tokens
+                )
+                self.query_start_loc.np[
+                    1 : num_reqs_padded + 1
+                ] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
             num_reqs_padded = self._pad_query_start_loc_for_fia(
                 num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
@@ -2620,7 +2911,9 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs=num_reqs_padded,
-                max_query_len=max_query_len,
+                max_query_len=(
+                    1 if staged_sfa_graph_dummy_run else max_query_len
+                ),
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
@@ -2705,6 +2998,13 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_offload_manager=getattr(self, "dsa_offload_manager", None),
                 dsa_adapter_cache=getattr(self, "dsa_adapter_cache", None),
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
+                staged_sfa_graph_key=(
+                    StagedSFAGraphKey.exact_q1(
+                        staged_sfa_dummy_batch_size
+                    )
+                    if staged_sfa_dummy_batch_size is not None
+                    else None
+                ),
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -2810,6 +3110,60 @@ class NPUModelRunner(GPUModelRunner):
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
+    def _validate_sfa_layerwise_connector_cudagraph_mode(self) -> None:
+        """Reject full-model replay that would bypass layerwise retrieval."""
+        staged_graph_configured = staged_sfa_graph_configured(
+            self.vllm_config
+        )
+        if (
+            envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
+            and not staged_graph_configured
+        ):
+            errors = staged_sfa_graph_configuration_errors(
+                self.vllm_config
+            )
+            details = "; ".join(errors) or "unknown incompatibility"
+            raise ValueError(
+                "VLLM_ASCEND_SFA_STAGED_GRAPH was explicitly requested, "
+                "but this configuration is unsupported: " + details
+            )
+        if (
+            staged_graph_configured
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "The staged SFA graph path does not yet support data "
+                "parallel replicas. Disable VLLM_ASCEND_SFA_STAGED_GRAPH "
+                "for native SFA fallback, or run with data_parallel_size=1."
+            )
+        if staged_graph_configured:
+            if not self.use_sparse:
+                raise ValueError(
+                    "The staged SFA graph path requires sparse attention."
+                )
+            if not staged_sfa_connector_supports_sparse_load():
+                raise ValueError(
+                    "The staged SFA graph path requires an LMCache connector "
+                    "that advertises layerwise batched sparse selective loads, "
+                    "reliable per-request frontier metadata, and a consumer "
+                    "role (kv_both or kv_consumer)."
+                )
+        mode = self.compilation_config.cudagraph_mode
+        if not self.use_sparse or not mode.has_full_cudagraphs():
+            return
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        if not bool(
+            getattr(connector, "uses_layerwise_model_callbacks", False)
+        ):
+            return
+        raise ValueError(
+            "SFA with a layerwise KV connector does not support FULL or "
+            "FULL_DECODE_ONLY graph mode: full-model replay bypasses the "
+            "Python per-layer retrieval callbacks. Use PIECEWISE graph mode."
+        )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -2817,6 +3171,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_copy_bufs = None
@@ -2936,8 +3291,8 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         from vllm_ascend.distributed.kv_transfer.sparse_offload.runner_integration import (
-            config_from_vllm,
             build_manager,
+            config_from_vllm,
         )
 
         mla_layers = get_layers_from_vllm_config(self.vllm_config, MLAAttention)
@@ -3794,85 +4149,129 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_unpadded: int,
         num_reqs: int,
         request_ids: Any,
+        graph_key: StagedSFAGraphKey | None = STAGED_SFA_SINGLETON_GRAPH_KEY,
     ) -> StagedSFALiveParityState | None:
-        """Select the first two distinct live staged-graph decode lengths."""
+        """Select one successful live parity check for each graph key."""
         expected_layers = getattr(
             self,
             "_staged_sfa_expected_layer_count",
             0,
         )
         if (
-            expected_layers <= 0
+            graph_key is None
+            or expected_layers <= 0
             or self.attn_state != AscendAttentionState.DecodeOnly
             or cudagraph_mode != CUDAGraphMode.PIECEWISE
-            or num_tokens_unpadded != 1
-            or num_reqs != 1
-            or batch_descriptor is None
-            or batch_descriptor.num_tokens != 1
-            or batch_descriptor.uniform
-            or batch_descriptor.has_lora
-            or batch_descriptor.num_reqs is not None
-            or batch_descriptor.num_active_loras != 0
+            or num_tokens_unpadded != graph_key.token_capacity
+            or num_reqs != graph_key.request_capacity
+            or batch_descriptor
+            != graph_key.to_legacy_batch_descriptor()
             or self.speculative_config is not None
             or self.vllm_config.lora_config is not None
             or getattr(self, "dsa_shrink_latent", 0) != 2
             or getattr(self, "dsa_offload_manager", None) is not None
             or getattr(self, "dsa_adapter_cache", None) is not None
             or request_ids is None
-            or len(request_ids) != 1
+            or len(request_ids) != graph_key.request_capacity
         ):
             return None
 
-        prompt_len = int(self.input_batch.num_prompt_tokens[0])
-        if prompt_len < self.dsa_index_topk:
+        batch_size = graph_key.request_capacity
+        request_id_tuple = tuple(
+            str(request_id) for request_id in request_ids
+        )
+        if len(set(request_id_tuple)) != batch_size:
             return None
-        # A full LMCache prefix hit can schedule one recalc-last prompt token
-        # while the runner is otherwise in the one-token DecodeOnly shape. The
-        # SFA metadata builder does not classify that row as decode until the
-        # computed-token count reaches the prompt boundary, so do not arm a
-        # parity state that no SFA layer can consume.
-        num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[0])
-        if num_computed_tokens < prompt_len:
+        prompt_lens = np.asarray(
+            self.input_batch.num_prompt_tokens[:batch_size],
+            dtype=np.int64,
+        ).reshape(-1)
+        computed_tokens = np.asarray(
+            self.input_batch.num_computed_tokens_cpu[:batch_size],
+            dtype=np.int64,
+        ).reshape(-1)
+        if (
+            prompt_lens.shape != (batch_size,)
+            or computed_tokens.shape != (batch_size,)
+            or np.any(prompt_lens < self.dsa_index_topk)
+            or np.any(computed_tokens < prompt_lens)
+        ):
+            # Full-prefix recalc-last and partially computed rows are not decode
+            # rows in the SFA metadata builder, so no layer could consume this
+            # parity state.
             return None
 
-        request_id = str(request_ids[0])
-        seq_len = int(self.seq_lens.np[0])
-        tracked_request_id = getattr(
+        seq_lens = tuple(
+            int(value) for value in self.seq_lens.np[:batch_size]
+        )
+        histories = getattr(
             self,
-            "_staged_sfa_live_parity_request_id",
+            "_staged_sfa_live_parity_histories",
             None,
         )
-        last_seq_len = getattr(
+        if not isinstance(histories, dict):
+            histories = {}
+            self._staged_sfa_live_parity_histories = histories
+        last_batches = getattr(
             self,
-            "_staged_sfa_live_parity_last_seq_len",
+            "_staged_sfa_live_parity_last_batches",
             None,
         )
-        if (
-            request_id != tracked_request_id
-            or (
-                last_seq_len is not None
-                and seq_len < last_seq_len
-            )
-        ):
-            self._staged_sfa_live_parity_request_id = request_id
-            self._staged_sfa_live_parity_validated_seq_lens = []
+        if not isinstance(last_batches, dict):
+            last_batches = {}
+            self._staged_sfa_live_parity_last_batches = last_batches
 
-        self._staged_sfa_live_parity_last_seq_len = seq_len
-        validated_seq_lens = getattr(
-            self,
-            "_staged_sfa_live_parity_validated_seq_lens",
-            [],
-        )
-        if (
-            seq_len in validated_seq_lens
-            or len(validated_seq_lens) >= 2
-        ):
+        # Migrate singleton-only test/runtime state once. This also keeps the
+        # old diagnostic attributes useful for downstream integrations.
+        if graph_key == STAGED_SFA_SINGLETON_GRAPH_KEY:
+            if graph_key not in histories:
+                histories[graph_key] = [
+                    (int(value),)
+                    for value in getattr(
+                        self,
+                        "_staged_sfa_live_parity_validated_seq_lens",
+                        [],
+                    )
+                ]
+            if graph_key not in last_batches:
+                legacy_request_id = getattr(
+                    self,
+                    "_staged_sfa_live_parity_request_id",
+                    None,
+                )
+                legacy_seq_len = getattr(
+                    self,
+                    "_staged_sfa_live_parity_last_seq_len",
+                    None,
+                )
+                if (
+                    legacy_request_id is not None
+                    and legacy_seq_len is not None
+                ):
+                    last_batches[graph_key] = (
+                        (str(legacy_request_id),),
+                        (int(legacy_seq_len),),
+                    )
+
+        validated_seq_lens = histories.setdefault(graph_key, [])
+        if len(validated_seq_lens) >= STAGED_SFA_LIVE_PARITY_CHECKS_PER_GRAPH_KEY:
             return None
+
+        last_batches[graph_key] = (request_id_tuple, seq_lens)
+        if graph_key == STAGED_SFA_SINGLETON_GRAPH_KEY:
+            self._staged_sfa_live_parity_request_id = request_id_tuple[0]
+            self._staged_sfa_live_parity_last_seq_len = seq_lens[0]
+            self._staged_sfa_live_parity_validated_seq_lens = [
+                values[0] for values in validated_seq_lens
+            ]
 
         return StagedSFALiveParityState(
-            request_id=request_id,
-            seq_len=seq_len,
+            request_id=request_id_tuple[0],
+            seq_len=seq_lens[0],
             expected_layers=expected_layers,
+            graph_key=graph_key,
+            request_ids=request_id_tuple,
+            seq_lens=seq_lens,
         )
 
     def _finalize_staged_sfa_live_parity(
@@ -3883,19 +4282,19 @@ class NPUModelRunner(GPUModelRunner):
         if parity_state is None:
             return
 
-        tracked_request_id = getattr(
+        last_batches = getattr(
             self,
-            "_staged_sfa_live_parity_request_id",
-            None,
+            "_staged_sfa_live_parity_last_batches",
+            {},
         )
-        last_seq_len = getattr(
-            self,
-            "_staged_sfa_live_parity_last_seq_len",
-            None,
+        tracked_batch = (
+            last_batches.get(parity_state.graph_key)
+            if isinstance(last_batches, dict)
+            else None
         )
-        if (
-            parity_state.request_id != tracked_request_id
-            or parity_state.seq_len != last_seq_len
+        if tracked_batch != (
+            parity_state.request_ids,
+            parity_state.seq_lens,
         ):
             parity_state.failures.append(
                 "runner parity tracking changed during model forward"
@@ -4010,8 +4409,9 @@ class NPUModelRunner(GPUModelRunner):
             )
             raise RuntimeError(
                 "[SFA staged graph POC] live eager-vs-graph parity failed "
-                f"(request_id={parity_state.request_id!r}, "
-                f"seq_len={parity_state.seq_len}, "
+                f"(graph_key={parity_state.graph_key!r}, "
+                f"request_ids={parity_state.request_ids!r}, "
+                f"seq_lens={parity_state.seq_lens!r}, "
                 f"local_checked={local_checked}, "
                 f"TP checked range={min_checked}..{max_checked}, "
                 f"expected={expected_layers}; "
@@ -4024,19 +4424,26 @@ class NPUModelRunner(GPUModelRunner):
                 kv_caches,
             )
 
-        validated_seq_lens = (
-            self._staged_sfa_live_parity_validated_seq_lens
+        histories = self._staged_sfa_live_parity_histories
+        validated_seq_lens = histories.setdefault(
+            parity_state.graph_key,
+            [],
         )
-        if parity_state.seq_len not in validated_seq_lens:
-            validated_seq_lens.append(parity_state.seq_len)
+        if parity_state.seq_lens not in validated_seq_lens:
+            validated_seq_lens.append(parity_state.seq_lens)
+        if parity_state.graph_key == STAGED_SFA_SINGLETON_GRAPH_KEY:
+            self._staged_sfa_live_parity_validated_seq_lens = [
+                values[0] for values in validated_seq_lens
+            ]
         logger.info(
             "[SFA staged graph POC] live eager-vs-graph parity passed "
-            "for request %r at sequence length %d (%d/%d live lengths, "
-            "%d local SFA layers).",
-            parity_state.request_id,
-            parity_state.seq_len,
+            "for key %r, requests %r at sequence lengths %r "
+            "(%d/%d live checks, %d local SFA layers).",
+            parity_state.graph_key,
+            parity_state.request_ids,
+            parity_state.seq_lens,
             len(validated_seq_lens),
-            2,
+            STAGED_SFA_LIVE_PARITY_CHECKS_PER_GRAPH_KEY,
             expected_layers,
         )
 
@@ -4063,28 +4470,44 @@ class NPUModelRunner(GPUModelRunner):
 
         Upstream graph-memory profiling clears upstream CUDAGraphWrapper
         instances, but the two inner ACLGraphWrapper instances are independent
-        and retain their size-one entries. Reusing those entries would turn the
+        and retain their per-key entries. Reusing those entries would turn the
         real startup capture into a replay of profiling-pool state.
         """
         self._staged_sfa_impls = ()
         self._staged_sfa_expected_layer_count = 0
+        self._staged_sfa_expected_graph_keys = ()
         self._staged_sfa_startup_capture_complete = False
         self._staged_sfa_live_parity_request_id = None
         self._staged_sfa_live_parity_validated_seq_lens = []
         self._staged_sfa_live_parity_last_seq_len = None
+        self._staged_sfa_live_parity_histories = {}
+        self._staged_sfa_live_parity_last_batches = {}
         for _layer_name, impl in self._collect_staged_sfa_impls():
-            impl._staged_sfa_capture_phases = set()
-            impl._staged_sfa_capture_records = set()
-            impl._staged_sfa_capture_failures = []
-            impl._staged_sfa_graph_input_signatures = {}
-            impl._staged_sfa_replay_proved = set()
-            impl._staged_sfa_pre_output_buffers = None
-            impl._staged_sfa_replay_canaries = {}
-            impl._staged_sfa_dummy_cache_initialized = False
-            impl._staged_sfa_live_capture_validated = False
-            impl._staged_sfa_live_validated_request_ids = None
-            impl._staged_sfa_parity_output = None
-            impl._staged_sfa_parity_latent_scratch = None
+            # This releases every key's profiling-pool tensors before wrapper
+            # entries are discarded. Resetting only legacy aliases would leave
+            # strong references in the registry and could rebind stale HBM.
+            reset_graph_states = getattr(
+                impl,
+                "_reset_staged_sfa_graph_states",
+                None,
+            )
+            if callable(reset_graph_states):
+                reset_graph_states()
+            else:
+                # Compatibility for test doubles and older downstream SFA
+                # implementations that have not adopted the registry yet.
+                impl._staged_sfa_capture_phases = set()
+                impl._staged_sfa_capture_records = set()
+                impl._staged_sfa_capture_failures = []
+                impl._staged_sfa_graph_input_signatures = {}
+                impl._staged_sfa_replay_proved = set()
+                impl._staged_sfa_pre_output_buffers = None
+                impl._staged_sfa_replay_canaries = {}
+                impl._staged_sfa_dummy_cache_initialized = False
+                impl._staged_sfa_live_capture_validated = False
+                impl._staged_sfa_live_validated_request_ids = None
+                impl._staged_sfa_parity_output = None
+                impl._staged_sfa_parity_latent_scratch = None
             for wrapper_attr in (
                 "_staged_sfa_pre_graph",
                 "_staged_sfa_post_graph",
@@ -4123,14 +4546,21 @@ class NPUModelRunner(GPUModelRunner):
         )
         return bool(failed_any), -negative_min_count, max_count
 
-    def _validate_staged_sfa_startup_capture(self) -> None:
-        """Validate every local staged graph after all startup capture work."""
-        if not staged_sfa_graph_configured(self.vllm_config):
-            self._staged_sfa_impls = ()
-            self._staged_sfa_expected_layer_count = 0
-            return
+    @staticmethod
+    def _validate_staged_sfa_capture_state(
+        *,
+        layer_name: str,
+        impl: Any,
+        graph_key: StagedSFAGraphKey,
+        state: Any,
+        legacy_state: bool,
+    ) -> str | None:
+        """Validate one layer/key pair without mutating its active state."""
+        def state_value(name: str, default: Any) -> Any:
+            if isinstance(state, dict):
+                return state.get(name, default)
+            return getattr(state, name, default)
 
-        staged_impls = self._collect_staged_sfa_impls()
         required_phases = {
             "pre:enter",
             "pre:exit",
@@ -4138,7 +4568,306 @@ class NPUModelRunner(GPUModelRunner):
             "post:exit",
         }
         required_regions = {"pre", "post"}
-        size_one_descriptor = BatchDescriptor(num_tokens=1)
+        observed_phases = set(
+            state_value("capture_phases", set()) or ()
+        )
+        missing_phases = required_phases - observed_phases
+        capture_records = set(
+            state_value("capture_records", set()) or ()
+        )
+        missing_records = required_regions - capture_records
+        unexpected_records = capture_records - required_regions
+        raw_capture_failures = state_value("capture_failures", [])
+        recorded_failures = (
+            list(raw_capture_failures)
+            if isinstance(raw_capture_failures, (list, tuple))
+            else [f"malformed failure record {raw_capture_failures!r}"]
+        )
+        premature_replays = set(
+            state_value("replay_proved", set()) or ()
+        )
+        descriptor = graph_key.to_legacy_batch_descriptor()
+
+        missing_entries: list[str] = []
+        missing_signatures: list[str] = []
+        signature_mismatches: list[str] = []
+        graph_entries: dict[str, Any] = {}
+        captured_signatures: dict[str, tuple] = {}
+        input_signatures = state_value("graph_input_signatures", {})
+        malformed_signature_map = not isinstance(input_signatures, dict)
+        if malformed_signature_map:
+            input_signatures = {}
+        for region_name, wrapper_attr in (
+            ("pre", "_staged_sfa_pre_graph"),
+            ("post", "_staged_sfa_post_graph"),
+        ):
+            wrapper = getattr(impl, wrapper_attr, None)
+            entries = getattr(
+                wrapper,
+                "concrete_aclgraph_entries",
+                {},
+            )
+            entry = (
+                entries.get(descriptor)
+                if isinstance(entries, dict)
+                else None
+            )
+            if entry is None or getattr(entry, "aclgraph", None) is None:
+                missing_entries.append(region_name)
+                continue
+            graph_entries[region_name] = entry
+            signatures = input_signatures.get(region_name)
+            if not isinstance(signatures, tuple) or not signatures:
+                missing_signatures.append(region_name)
+                continue
+            captured_signatures[region_name] = signatures
+            signature_addresses = [
+                signature[0]
+                for signature in signatures
+                if isinstance(signature, tuple)
+                and len(signature) == 6
+            ]
+            if (
+                len(signature_addresses) != len(signatures)
+                or getattr(entry, "input_addresses", None)
+                != signature_addresses
+            ):
+                signature_mismatches.append(region_name)
+
+        pre_outputs = state_value("pre_output_buffers", None)
+        missing_pre_outputs = not (
+            isinstance(pre_outputs, tuple)
+            and len(pre_outputs) == 4
+            and all(
+                isinstance(output, torch.Tensor)
+                for output in pre_outputs
+            )
+        )
+        pre_output_storage_alias = (
+            not missing_pre_outputs
+            and len(
+                {
+                    output.untyped_storage().data_ptr()
+                    for output in pre_outputs
+                }
+            )
+            != len(pre_outputs)
+        )
+        pre_output_binding_mismatch = False
+        if not missing_pre_outputs and "pre" in graph_entries:
+            entry_outputs = getattr(
+                graph_entries["pre"],
+                "output",
+                None,
+            )
+            if not isinstance(entry_outputs, tuple):
+                entry_outputs = (entry_outputs,)
+            pre_output_binding_mismatch = (
+                len(entry_outputs) != len(pre_outputs)
+                or any(
+                    not isinstance(entry_output, torch.Tensor)
+                    or entry_output.data_ptr()
+                    != strong_output.data_ptr()
+                    for entry_output, strong_output in zip(
+                        entry_outputs,
+                        pre_outputs,
+                    )
+                )
+            )
+
+        canaries = state_value("replay_canaries", {})
+        malformed_canary_map = not isinstance(canaries, dict)
+        if malformed_canary_map:
+            canaries = {}
+        missing_canaries = required_regions - set(canaries)
+        unexpected_canaries = set(canaries) - required_regions
+        malformed_canaries = [
+            region_name
+            for region_name in required_regions & set(canaries)
+            if not isinstance(canaries[region_name], torch.Tensor)
+            or canaries[region_name].shape != (1,)
+            or canaries[region_name].dtype != torch.int32
+            or (
+                not missing_pre_outputs
+                and canaries[region_name].device
+                != pre_outputs[0].device
+            )
+        ]
+        valid_canaries = [
+            canaries[region_name]
+            for region_name in sorted(required_regions)
+            if region_name in canaries
+            and isinstance(canaries[region_name], torch.Tensor)
+            and canaries[region_name].shape == (1,)
+            and canaries[region_name].dtype == torch.int32
+            and (
+                missing_pre_outputs
+                or canaries[region_name].device
+                == pre_outputs[0].device
+            )
+        ]
+        canary_storage_ptrs = [
+            canary.untyped_storage().data_ptr()
+            for canary in valid_canaries
+        ]
+        shared_canary_storage = (
+            len(valid_canaries) == 2
+            and len(set(canary_storage_ptrs)) != 2
+        )
+        output_storage_ptrs = (
+            {
+                output.untyped_storage().data_ptr()
+                for output in pre_outputs
+            }
+            if not missing_pre_outputs
+            else set()
+        )
+        post_entry_output = getattr(
+            graph_entries.get("post"),
+            "output",
+            None,
+        )
+        if isinstance(post_entry_output, torch.Tensor):
+            output_storage_ptrs.add(
+                post_entry_output.untyped_storage().data_ptr()
+            )
+        canary_output_storage_alias = bool(
+            output_storage_ptrs.intersection(canary_storage_ptrs)
+        )
+
+        pre_signature_tail_mismatch = True
+        pre_signatures = captured_signatures.get("pre")
+        if (
+            not missing_pre_outputs
+            and "pre" in canaries
+            and isinstance(canaries["pre"], torch.Tensor)
+            and isinstance(pre_signatures, tuple)
+            and len(pre_signatures) >= 5
+            and all(
+                isinstance(signature, tuple) and len(signature) == 6
+                for signature in pre_signatures[-5:]
+            )
+        ):
+            expected_tail = [
+                output.data_ptr() for output in pre_outputs
+            ] + [canaries["pre"].data_ptr()]
+            pre_signature_tail_mismatch = (
+                [signature[0] for signature in pre_signatures[-5:]]
+                != expected_tail
+            )
+
+        post_signature_tail_mismatch = True
+        post_output_binding_mismatch = True
+        post_signatures = captured_signatures.get("post")
+        post_entry = graph_entries.get("post")
+        if (
+            "post" in canaries
+            and isinstance(canaries["post"], torch.Tensor)
+            and isinstance(post_signatures, tuple)
+            and len(post_signatures) >= 2
+            and all(
+                isinstance(signature, tuple) and len(signature) == 6
+                for signature in post_signatures[-2:]
+            )
+        ):
+            post_signature_tail_mismatch = (
+                post_signatures[-1][0]
+                != canaries["post"].data_ptr()
+            )
+            if post_entry is not None:
+                post_entry_output = getattr(
+                    post_entry,
+                    "output",
+                    None,
+                )
+                post_output_binding_mismatch = (
+                    not isinstance(post_entry_output, torch.Tensor)
+                    or post_entry_output.data_ptr()
+                    != post_signatures[-2][0]
+                )
+
+        dummy_cache_missing = (
+            not legacy_state
+            and not bool(
+                state_value("dummy_cache_initialized", False)
+            )
+        )
+        failed = (
+            missing_phases
+            or missing_records
+            or unexpected_records
+            or recorded_failures
+            or premature_replays
+            or missing_entries
+            or missing_signatures
+            or signature_mismatches
+            or malformed_signature_map
+            or missing_pre_outputs
+            or pre_output_storage_alias
+            or pre_output_binding_mismatch
+            or malformed_canary_map
+            or missing_canaries
+            or unexpected_canaries
+            or malformed_canaries
+            or shared_canary_storage
+            or canary_output_storage_alias
+            or pre_signature_tail_mismatch
+            or post_signature_tail_mismatch
+            or post_output_binding_mismatch
+            or dummy_cache_missing
+        )
+        if not failed:
+            return None
+        return (
+            f"{layer_name}[key={graph_key!r}]: "
+            f"entries={missing_entries}, "
+            f"phases={sorted(missing_phases)}, "
+            f"records={sorted(missing_records)}, "
+            f"unexpected_records={sorted(unexpected_records)}, "
+            f"signatures={sorted(missing_signatures)}, "
+            f"signature_mismatches={sorted(signature_mismatches)}, "
+            f"malformed_signature_map={malformed_signature_map}, "
+            f"pre_outputs_missing={missing_pre_outputs}, "
+            f"pre_output_storage_alias={pre_output_storage_alias}, "
+            f"pre_output_binding_mismatch="
+            f"{pre_output_binding_mismatch}, "
+            f"malformed_canary_map={malformed_canary_map}, "
+            f"canaries={sorted(missing_canaries)}, "
+            f"unexpected_canaries={sorted(unexpected_canaries)}, "
+            f"malformed_canaries={sorted(malformed_canaries)}, "
+            f"shared_canary_storage={shared_canary_storage}, "
+            f"canary_output_storage_alias="
+            f"{canary_output_storage_alias}, "
+            f"pre_signature_tail_mismatch="
+            f"{pre_signature_tail_mismatch}, "
+            f"post_signature_tail_mismatch="
+            f"{post_signature_tail_mismatch}, "
+            f"post_output_binding_mismatch="
+            f"{post_output_binding_mismatch}, "
+            f"dummy_cache_missing={dummy_cache_missing}, "
+            f"premature_replays={sorted(premature_replays)}, "
+            f"capture_failures={recorded_failures}"
+        )
+
+    def _validate_staged_sfa_startup_capture(self) -> None:
+        """Validate every local layer/key pair after startup capture."""
+        if not staged_sfa_graph_configured(self.vllm_config):
+            self._staged_sfa_impls = ()
+            self._staged_sfa_expected_layer_count = 0
+            self._staged_sfa_expected_graph_keys = ()
+            return
+
+        expected_keys = tuple(
+            StagedSFAGraphKey.exact_q1(size)
+            for size in staged_sfa_graph_capture_sizes(
+                self.vllm_config
+            )
+        )
+        expected_key_set = set(expected_keys)
+        expected_descriptors = {
+            key.to_legacy_batch_descriptor() for key in expected_keys
+        }
+        staged_impls = self._collect_staged_sfa_impls()
         failures: list[str] = []
         if not staged_impls:
             failures.append(
@@ -4147,264 +4876,147 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         for layer_name, impl in staged_impls:
-            observed_phases = set(
-                getattr(impl, "_staged_sfa_capture_phases", set()) or ()
-            )
-            missing_phases = required_phases - observed_phases
-            capture_records = set(
-                getattr(impl, "_staged_sfa_capture_records", set()) or ()
-            )
-            missing_records = required_regions - capture_records
-            unexpected_records = capture_records - required_regions
-            raw_capture_failures = getattr(
+            iterator = getattr(
                 impl,
-                "_staged_sfa_capture_failures",
-                [],
+                "_iter_staged_sfa_graph_states",
+                None,
             )
-            recorded_failures = (
-                list(raw_capture_failures)
-                if isinstance(raw_capture_failures, (list, tuple))
-                else [f"malformed failure record {raw_capture_failures!r}"]
-            )
-            premature_replays = set(
-                getattr(impl, "_staged_sfa_replay_proved", set()) or ()
-            )
-            missing_entries = []
-            missing_signatures = []
-            signature_mismatches = []
-            graph_entries = {}
-            captured_signatures = {}
-            input_signatures = getattr(
-                impl,
-                "_staged_sfa_graph_input_signatures",
-                {},
-            )
-            malformed_signature_map = not isinstance(input_signatures, dict)
-            if malformed_signature_map:
-                input_signatures = {}
-            for region_name, wrapper_attr in (
-                ("pre", "_staged_sfa_pre_graph"),
-                ("post", "_staged_sfa_post_graph"),
+            legacy_state = not callable(iterator)
+            if legacy_state:
+                state_items = (
+                    (
+                        STAGED_SFA_SINGLETON_GRAPH_KEY,
+                        {
+                            "capture_phases": getattr(
+                                impl,
+                                "_staged_sfa_capture_phases",
+                                set(),
+                            ),
+                            "capture_records": getattr(
+                                impl,
+                                "_staged_sfa_capture_records",
+                                set(),
+                            ),
+                            "capture_failures": getattr(
+                                impl,
+                                "_staged_sfa_capture_failures",
+                                [],
+                            ),
+                            "graph_input_signatures": getattr(
+                                impl,
+                                "_staged_sfa_graph_input_signatures",
+                                {},
+                            ),
+                            "replay_proved": getattr(
+                                impl,
+                                "_staged_sfa_replay_proved",
+                                set(),
+                            ),
+                            "pre_output_buffers": getattr(
+                                impl,
+                                "_staged_sfa_pre_output_buffers",
+                                None,
+                            ),
+                            "replay_canaries": getattr(
+                                impl,
+                                "_staged_sfa_replay_canaries",
+                                {},
+                            ),
+                        },
+                    ),
+                )
+            else:
+                state_items = tuple(iterator())
+            state_map = dict(state_items)
+            missing_keys = expected_key_set - set(state_map)
+            unexpected_keys = set(state_map) - expected_key_set
+            if missing_keys or unexpected_keys:
+                failures.append(
+                    f"{layer_name}: missing_keys="
+                    f"{sorted(missing_keys, key=lambda key: key.token_capacity)}, "
+                    f"unexpected_keys="
+                    f"{sorted(unexpected_keys, key=lambda key: key.token_capacity)}"
+                )
+
+            for wrapper_attr in (
+                "_staged_sfa_pre_graph",
+                "_staged_sfa_post_graph",
             ):
-                wrapper = getattr(impl, wrapper_attr, None)
                 entries = getattr(
-                    wrapper,
+                    getattr(impl, wrapper_attr, None),
                     "concrete_aclgraph_entries",
                     {},
                 )
-                entry = (
-                    entries.get(size_one_descriptor)
-                    if isinstance(entries, dict)
-                    else None
-                )
-                if entry is None or getattr(entry, "aclgraph", None) is None:
-                    missing_entries.append(region_name)
-                    continue
-                graph_entries[region_name] = entry
-                signatures = input_signatures.get(region_name)
-                if not isinstance(signatures, tuple) or not signatures:
-                    missing_signatures.append(region_name)
-                    continue
-                captured_signatures[region_name] = signatures
-                signature_addresses = [
-                    signature[0]
-                    for signature in signatures
-                    if isinstance(signature, tuple)
-                    and len(signature) == 6
-                ]
-                if (
-                    len(signature_addresses) != len(signatures)
-                    or getattr(entry, "input_addresses", None)
-                    != signature_addresses
-                ):
-                    signature_mismatches.append(region_name)
-
-            pre_outputs = getattr(
-                impl,
-                "_staged_sfa_pre_output_buffers",
-                None,
-            )
-            missing_pre_outputs = not (
-                isinstance(pre_outputs, tuple)
-                and len(pre_outputs) == 4
-                and all(
-                    isinstance(output, torch.Tensor)
-                    for output in pre_outputs
-                )
-            )
-            pre_output_storage_alias = (
-                not missing_pre_outputs
-                and len(
-                    {
-                        output.untyped_storage().data_ptr()
-                        for output in pre_outputs
-                    }
-                )
-                != len(pre_outputs)
-            )
-            pre_output_binding_mismatch = False
-            if not missing_pre_outputs and "pre" in graph_entries:
-                entry_outputs = getattr(graph_entries["pre"], "output", None)
-                if not isinstance(entry_outputs, tuple):
-                    entry_outputs = (entry_outputs,)
-                pre_output_binding_mismatch = (
-                    len(entry_outputs) != len(pre_outputs)
-                    or any(
-                        not isinstance(entry_output, torch.Tensor)
-                        or entry_output.data_ptr() != strong_output.data_ptr()
-                        for entry_output, strong_output in zip(
-                            entry_outputs,
-                            pre_outputs,
+                if isinstance(entries, dict):
+                    unexpected_descriptors = (
+                        set(entries) - expected_descriptors
+                    )
+                    if unexpected_descriptors:
+                        failures.append(
+                            f"{layer_name}: {wrapper_attr} has unexpected "
+                            f"descriptors {unexpected_descriptors!r}"
                         )
+
+            owned_storage: dict[int, StagedSFAGraphKey] = {}
+            for graph_key in expected_keys:
+                state = state_map.get(graph_key)
+                if state is None:
+                    continue
+                failure = self._validate_staged_sfa_capture_state(
+                    layer_name=layer_name,
+                    impl=impl,
+                    graph_key=graph_key,
+                    state=state,
+                    legacy_state=legacy_state,
+                )
+                if failure is not None:
+                    failures.append(failure)
+
+                tensors: list[torch.Tensor] = []
+                if isinstance(state, dict):
+                    pre_outputs = state.get("pre_output_buffers")
+                    canaries = state.get("replay_canaries", {})
+                else:
+                    pre_outputs = getattr(state, "pre_output_buffers", None)
+                    canaries = getattr(state, "replay_canaries", {})
+                if isinstance(pre_outputs, tuple):
+                    tensors.extend(
+                        output
+                        for output in pre_outputs
+                        if isinstance(output, torch.Tensor)
                     )
-                )
-            canaries = getattr(
-                impl,
-                "_staged_sfa_replay_canaries",
-                {},
-            )
-            malformed_canary_map = not isinstance(canaries, dict)
-            if malformed_canary_map:
-                canaries = {}
-            missing_canaries = required_regions - set(canaries)
-            unexpected_canaries = set(canaries) - required_regions
-            malformed_canaries = [
-                region_name
-                for region_name in required_regions & set(canaries)
-                if not isinstance(canaries[region_name], torch.Tensor)
-                or canaries[region_name].shape != (1,)
-                or canaries[region_name].dtype != torch.int32
-                or (
-                    not missing_pre_outputs
-                    and canaries[region_name].device
-                    != pre_outputs[0].device
-                )
-            ]
-            valid_canaries = [
-                canaries[region_name]
-                for region_name in sorted(required_regions)
-                if region_name in canaries
-                and isinstance(canaries[region_name], torch.Tensor)
-                and canaries[region_name].shape == (1,)
-                and canaries[region_name].dtype == torch.int32
-                and (
-                    missing_pre_outputs
-                    or canaries[region_name].device
-                    == pre_outputs[0].device
-                )
-            ]
-            shared_canary_storage = (
-                len(valid_canaries) == 2
-                and valid_canaries[0].data_ptr()
-                == valid_canaries[1].data_ptr()
-            )
-
-            pre_signature_tail_mismatch = True
-            pre_signatures = captured_signatures.get("pre")
-            if (
-                not missing_pre_outputs
-                and "pre" in canaries
-                and isinstance(canaries["pre"], torch.Tensor)
-                and isinstance(pre_signatures, tuple)
-                and len(pre_signatures) >= 5
-                and all(
-                    isinstance(signature, tuple) and len(signature) == 6
-                    for signature in pre_signatures[-5:]
-                )
-            ):
-                expected_tail = [
-                    output.data_ptr() for output in pre_outputs
-                ] + [canaries["pre"].data_ptr()]
-                pre_signature_tail_mismatch = (
-                    [signature[0] for signature in pre_signatures[-5:]]
-                    != expected_tail
-                )
-
-            post_signature_tail_mismatch = True
-            post_output_binding_mismatch = True
-            post_signatures = captured_signatures.get("post")
-            post_entry = graph_entries.get("post")
-            if (
-                "post" in canaries
-                and isinstance(canaries["post"], torch.Tensor)
-                and isinstance(post_signatures, tuple)
-                and len(post_signatures) >= 2
-                and all(
-                    isinstance(signature, tuple) and len(signature) == 6
-                    for signature in post_signatures[-2:]
-                )
-            ):
-                post_signature_tail_mismatch = (
-                    post_signatures[-1][0]
-                    != canaries["post"].data_ptr()
-                )
-                if post_entry is not None:
-                    post_entry_output = getattr(post_entry, "output", None)
-                    post_output_binding_mismatch = (
-                        not isinstance(post_entry_output, torch.Tensor)
-                        or post_entry_output.data_ptr()
-                        != post_signatures[-2][0]
+                if isinstance(canaries, dict):
+                    tensors.extend(
+                        canary
+                        for canary in canaries.values()
+                        if isinstance(canary, torch.Tensor)
                     )
+                for tensor in tensors:
+                    storage_ptr = tensor.untyped_storage().data_ptr()
+                    previous_key = owned_storage.get(storage_ptr)
+                    if (
+                        previous_key is not None
+                        and previous_key != graph_key
+                    ):
+                        failures.append(
+                            f"{layer_name}: staged graph keys "
+                            f"{previous_key!r} and {graph_key!r} alias "
+                            "persistent storage"
+                        )
+                    else:
+                        owned_storage[storage_ptr] = graph_key
 
-            if (
-                missing_phases
-                or missing_records
-                or unexpected_records
-                or recorded_failures
-                or premature_replays
-                or missing_entries
-                or missing_signatures
-                or signature_mismatches
-                or malformed_signature_map
-                or missing_pre_outputs
-                or pre_output_storage_alias
-                or pre_output_binding_mismatch
-                or malformed_canary_map
-                or missing_canaries
-                or unexpected_canaries
-                or malformed_canaries
-                or shared_canary_storage
-                or pre_signature_tail_mismatch
-                or post_signature_tail_mismatch
-                or post_output_binding_mismatch
-            ):
-                failures.append(
-                    f"{layer_name}: entries={missing_entries}, "
-                    f"phases={sorted(missing_phases)}, "
-                    f"records={sorted(missing_records)}, "
-                    f"unexpected_records={sorted(unexpected_records)}, "
-                    f"signatures={sorted(missing_signatures)}, "
-                    f"signature_mismatches={sorted(signature_mismatches)}, "
-                    f"malformed_signature_map={malformed_signature_map}, "
-                    f"pre_outputs_missing={missing_pre_outputs}, "
-                    f"pre_output_storage_alias={pre_output_storage_alias}, "
-                    f"pre_output_binding_mismatch="
-                    f"{pre_output_binding_mismatch}, "
-                    f"malformed_canary_map={malformed_canary_map}, "
-                    f"canaries={sorted(missing_canaries)}, "
-                    f"unexpected_canaries={sorted(unexpected_canaries)}, "
-                    f"malformed_canaries={sorted(malformed_canaries)}, "
-                    f"shared_canary_storage={shared_canary_storage}, "
-                    f"pre_signature_tail_mismatch="
-                    f"{pre_signature_tail_mismatch}, "
-                    f"post_signature_tail_mismatch="
-                    f"{post_signature_tail_mismatch}, "
-                    f"post_output_binding_mismatch="
-                    f"{post_output_binding_mismatch}, "
-                    f"premature_replays={sorted(premature_replays)}, "
-                    f"capture_failures={recorded_failures}"
-                )
-
-        failed_any, min_layers, max_layers = (
+        expected_pairs = len(staged_impls) * len(expected_keys)
+        failed_any, min_pairs, max_pairs = (
             self._staged_sfa_tp_consensus(
                 local_failed=bool(failures),
-                local_count=len(staged_impls),
+                local_count=expected_pairs,
             )
         )
         global_failed = (
             failed_any
-            or min_layers != max_layers
-            or max_layers == 0
+            or min_pairs != max_pairs
+            or max_pairs == 0
         )
         if global_failed:
             local_details = (
@@ -4414,32 +5026,80 @@ class NPUModelRunner(GPUModelRunner):
             )
             raise RuntimeError(
                 "[SFA staged graph POC] startup capture is incomplete for "
-                "one or more local SFA layers "
+                "one or more local SFA layer/key pairs "
                 f"(local_layers={len(staged_impls)}, "
-                f"TP layer range={min_layers}..{max_layers}; "
+                f"local_pairs={expected_pairs}, "
+                f"TP pair range={min_pairs}..{max_pairs}; "
                 f"local failures: {local_details})."
             )
 
         self._staged_sfa_impls = staged_impls
         self._staged_sfa_expected_layer_count = len(staged_impls)
+        self._staged_sfa_expected_graph_keys = expected_keys
 
     @torch.inference_mode()
     def _prove_staged_sfa_ordered_startup_replay(self) -> None:
-        """Replay the full model once and require every staged canary write."""
+        """Replay every configured key and require every staged canary write."""
         if not staged_sfa_graph_configured(self.vllm_config):
             return
 
         staged_impls = self._staged_sfa_impls
+        expected_keys = getattr(
+            self,
+            "_staged_sfa_expected_graph_keys",
+            tuple(
+                StagedSFAGraphKey.exact_q1(size)
+                for size in staged_sfa_graph_capture_sizes(
+                    self.vllm_config
+                )
+            ),
+        )
         failures: list[str] = []
+
+        def state_map_for(impl: Any) -> tuple[dict, bool]:
+            iterator = getattr(
+                impl,
+                "_iter_staged_sfa_graph_states",
+                None,
+            )
+            if callable(iterator):
+                return dict(iterator()), False
+            return (
+                {
+                    STAGED_SFA_SINGLETON_GRAPH_KEY: {
+                        "replay_canaries": getattr(
+                            impl,
+                            "_staged_sfa_replay_canaries",
+                            {},
+                        ),
+                        "replay_proved": getattr(
+                            impl,
+                            "_staged_sfa_replay_proved",
+                            set(),
+                        ),
+                    }
+                },
+                True,
+            )
+
         for layer_name, impl in staged_impls:
-            for region_name in ("pre", "post"):
-                try:
-                    impl._staged_sfa_replay_canaries[region_name].zero_()
-                except Exception as exc:
-                    failures.append(
-                        f"{layer_name}: zeroing the {region_name} canary "
-                        f"raised {type(exc).__name__}: {exc}"
-                    )
+            states, _legacy = state_map_for(impl)
+            for graph_key in expected_keys:
+                state = states.get(graph_key)
+                canaries = (
+                    state.get("replay_canaries", {})
+                    if isinstance(state, dict)
+                    else getattr(state, "replay_canaries", {})
+                )
+                for region_name in ("pre", "post"):
+                    try:
+                        canaries[region_name].zero_()
+                    except Exception as exc:
+                        failures.append(
+                            f"{layer_name}[key={graph_key!r}]: zeroing "
+                            f"the {region_name} canary raised "
+                            f"{type(exc).__name__}: {exc}"
+                        )
         try:
             torch.npu.synchronize()
         except Exception as exc:
@@ -4448,21 +5108,23 @@ class NPUModelRunner(GPUModelRunner):
                 f"{type(exc).__name__}: {exc}"
             )
 
-        try:
-            self._dummy_run(
-                1,
-                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
-                uniform_decode=False,
-                allow_microbatching=False,
-                skip_eplb=True,
-                remove_lora=False,
-                num_active_loras=0,
-            )
-        except Exception as exc:
-            failures.append(
-                "ordered full-model dummy replay raised "
-                f"{type(exc).__name__}: {exc}"
-            )
+        for graph_key in expected_keys:
+            try:
+                self._dummy_run(
+                    graph_key.token_capacity,
+                    cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                    uniform_decode=False,
+                    allow_microbatching=False,
+                    skip_eplb=True,
+                    remove_lora=False,
+                    num_active_loras=0,
+                )
+            except Exception as exc:
+                failures.append(
+                    "ordered full-model dummy replay for "
+                    f"{graph_key!r} raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
         try:
             torch.npu.synchronize()
         except Exception as exc:
@@ -4474,26 +5136,39 @@ class NPUModelRunner(GPUModelRunner):
         # This is a startup-only check after a device-wide synchronize, not a
         # decode hot-path item() synchronization.
         passed_canaries = 0
+        final_states: dict[int, tuple[dict, bool]] = {}
         for layer_name, impl in staged_impls:
-            for region_name in ("pre", "post"):
-                canary = impl._staged_sfa_replay_canaries[region_name]
-                try:
-                    value = canary.item()
-                except Exception as exc:
-                    failures.append(
-                        f"{layer_name}: {region_name} canary read raised "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    continue
-                if value != 1:
-                    failures.append(
-                        f"{layer_name}: {region_name} replay canary is "
-                        f"{value!r}, expected 1"
-                    )
-                else:
-                    passed_canaries += 1
+            states, legacy = state_map_for(impl)
+            final_states[id(impl)] = (states, legacy)
+            for graph_key in expected_keys:
+                state = states.get(graph_key)
+                canaries = (
+                    state.get("replay_canaries", {})
+                    if isinstance(state, dict)
+                    else getattr(state, "replay_canaries", {})
+                )
+                for region_name in ("pre", "post"):
+                    try:
+                        value = canaries[region_name].item()
+                    except Exception as exc:
+                        failures.append(
+                            f"{layer_name}[key={graph_key!r}]: "
+                            f"{region_name} canary read raised "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    if value != 1:
+                        failures.append(
+                            f"{layer_name}[key={graph_key!r}]: "
+                            f"{region_name} replay canary is "
+                            f"{value!r}, expected 1"
+                        )
+                    else:
+                        passed_canaries += 1
 
-        expected_canaries = 2 * len(staged_impls)
+        expected_canaries = (
+            2 * len(staged_impls) * len(expected_keys)
+        )
         failed_any, min_passed, max_passed = (
             self._staged_sfa_tp_consensus(
                 local_failed=bool(failures),
@@ -4520,13 +5195,30 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         for _layer_name, impl in staged_impls:
-            impl._staged_sfa_replay_proved = {"pre", "post"}
+            states, legacy = final_states[id(impl)]
+            for graph_key in expected_keys:
+                state = states[graph_key]
+                replay_proved = (
+                    state.get("replay_proved", set())
+                    if isinstance(state, dict)
+                    else state.replay_proved
+                )
+                replay_proved.clear()
+                replay_proved.update(("pre", "post"))
+            if legacy:
+                impl._staged_sfa_replay_proved = {"pre", "post"}
+            else:
+                impl._activate_staged_sfa_graph_key(
+                    STAGED_SFA_SINGLETON_GRAPH_KEY
+                )
+
         self._staged_sfa_startup_capture_complete = True
         logger.info(
             "[SFA staged graph POC] startup capture and ordered replay-canary "
-            "completeness check passed for %d local SFA layers (%d staged "
-            "graphs).",
+            "completeness check passed for %d local SFA layers, %d keys "
+            "(%d staged graphs).",
             len(staged_impls),
+            len(expected_keys),
             expected_canaries,
         )
 

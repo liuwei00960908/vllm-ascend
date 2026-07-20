@@ -242,11 +242,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
-            request_ids=(
-                self.request_ids[:num_actual_reqs]
-                if self.request_ids is not None
-                else None
-            ),
+            request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
         )
 
 
@@ -320,36 +316,74 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
-    if request_ids is None:
-        return None
+def staged_sfa_connector_supports_sparse_load() -> bool:
+    """Whether the active v1 connector satisfies the staged SFA contract."""
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return None
+        return False
+    try:
+        connector = get_kv_transfer_group()
+        return bool(
+            getattr(connector, "supports_staged_sfa_sparse_load", False)
+            and getattr(connector, "uses_layerwise_model_callbacks", False)
+            and callable(getattr(connector, "wait_for_layer_load", None))
+            and callable(getattr(connector, "_get_connector_metadata", None))
+        )
+    except Exception:
+        return False
+
+
+def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
+    """Return a proven sparse frontier for every active request.
+
+    SHRINK_LATENT=2 has already released latent blocks beyond the compact
+    scratch reservation. Missing connector metadata is therefore a correctness
+    error, not permission to substitute the prompt length.
+    """
+    if request_ids is None:
+        raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
+    normalized_request_ids = [str(req_id) for req_id in list(request_ids)]
+    if len(set(normalized_request_ids)) != len(normalized_request_ids):
+        raise RuntimeError("[SFA sparse remap] frontier lookup requires unique native request IDs.")
+    if not normalized_request_ids:
+        return []
+    if not staged_sfa_connector_supports_sparse_load():
+        raise RuntimeError(
+            "[SFA sparse remap] the active connector does not advertise the "
+            "staged sparse selective-load/frontier contract."
+        )
 
     connector = get_kv_transfer_group()
     get_metadata = getattr(connector, "_get_connector_metadata", None)
-    if get_metadata is None:
-        return None
+    if not callable(get_metadata):
+        raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
     try:
         metadata = get_metadata()
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
 
     cached_by_req: dict[str, int] = {}
     for request in getattr(metadata, "requests", ()):
         if not getattr(request, "is_sparse_decode", False):
             continue
+        req_id = str(getattr(request, "req_id", ""))
+        if not req_id:
+            raise RuntimeError("[SFA sparse remap] sparse connector metadata has an empty request ID.")
+        if req_id in cached_by_req:
+            raise RuntimeError(
+                f"[SFA sparse remap] sparse connector metadata contains a duplicate request ID: {req_id!r}."
+            )
         load_spec = getattr(request, "load_spec", None)
         if load_spec is None or not getattr(load_spec, "can_load", False):
-            cached_by_req[getattr(request, "req_id", "")] = 0
+            cached_by_req[req_id] = 0
         else:
-            cached_by_req[getattr(request, "req_id", "")] = int(
-                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
-            )
+            cached_by_req[req_id] = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
 
-    if not cached_by_req:
-        return None
-    return [cached_by_req.get(str(req_id), 0) for req_id in list(request_ids)]
+    missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
+    if missing:
+        raise RuntimeError(
+            f"[SFA sparse remap] connector metadata has no proven sparse frontier for active requests: {missing!r}."
+        )
+    return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
 def wait_for_kv_layer_from_connector(
@@ -368,9 +402,7 @@ def wait_for_kv_layer_from_connector(
     if selected_tokens is not None and request_ids is not None and not should_log:
         try:
             if target_slot_mapping is None:
-                connector.wait_for_layer_load(
-                    layer_name, selected_tokens, token_start_index, request_ids
-                )
+                connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index, request_ids)
             else:
                 connector.wait_for_layer_load(
                     layer_name,
@@ -428,9 +460,7 @@ def wait_for_kv_layer_from_connector(
             if request_ids is None and dsa_req_ids is not None:
                 request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
             if target_slot_mapping is None:
-                connector.wait_for_layer_load(
-                    layer_name, selected_tokens, token_start_index, request_ids
-                )
+                connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index, request_ids)
             else:
                 connector.wait_for_layer_load(
                     layer_name,
@@ -481,8 +511,7 @@ def maybe_save_kv_layer_to_connector(
     should_log = _dsa_lmcache_log_layer(layer_name)
     if should_log:
         logger.info(
-            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s "
-            "connector=%s kv_cache_layer=%s attn_metadata=%s",
+            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
             layer_name,
             type(connector).__name__,
             _tensor_like_debug(kv_cache_layer),
@@ -492,8 +521,7 @@ def maybe_save_kv_layer_to_connector(
         connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
     except Exception:
         logger.exception(
-            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s "
-            "connector=%s kv_cache_layer=%s attn_metadata=%s",
+            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
             layer_name,
             type(connector).__name__,
             _tensor_like_debug(kv_cache_layer),

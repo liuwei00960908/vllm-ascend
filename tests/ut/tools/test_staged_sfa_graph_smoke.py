@@ -123,10 +123,51 @@ def test_offline_analysis_timeout_is_a_smoke_failure(
 def test_frontend_profiler_is_rejected_before_collection(tmp_path: Path):
     server_log = tmp_path / "server.log"
     server_log.write_text(
-        "Torch profiler enabled. AsyncLLM CPU traces will be collected under "
-        "/profiles\n",
+        "Torch profiler enabled. AsyncLLM CPU traces will be collected under /profiles\n",
         encoding="utf-8",
     )
 
     with pytest.raises(smoke.SmokeFailure, match="ignore_frontend=true"):
         smoke.require_worker_only_profiling(server_log)
+
+
+def _write_server_log(tmp_path: Path, *, expected_keys: int, keys: list[str]):
+    server_log = tmp_path / "server.log"
+    lines = [
+        smoke._STARTUP_REPLAY_CANARY_COMPLETE
+        + f" for 2 local SFA layers, {expected_keys} keys "
+        + f"({4 * expected_keys} staged graphs).",
+        smoke._LIVE_SIGNATURE_VALIDATION,
+    ]
+    lines.extend(
+        smoke._PARITY_PASS
+        + f" for key {key}, requests ('request-0',) at sequence lengths "
+        + "(4096,) (1/1 live checks, 2 local SFA layers)."
+        for key in keys
+    )
+    server_log.write_text("\n".join(lines), encoding="utf-8")
+    return server_log
+
+
+def test_server_log_accepts_one_parity_check_per_graph_key(tmp_path: Path):
+    server_log = _write_server_log(
+        tmp_path,
+        expected_keys=2,
+        keys=["exact-q1-1", "exact-q1-2"],
+    )
+
+    assert smoke.check_server_log(server_log) == 2
+
+
+def test_server_log_rejects_a_graph_key_without_parity(tmp_path: Path):
+    server_log = _write_server_log(
+        tmp_path,
+        expected_keys=2,
+        keys=["exact-q1-1"],
+    )
+
+    with pytest.raises(
+        smoke.SmokeFailure,
+        match="parity passed for 1 distinct graph keys; expected 2",
+    ):
+        smoke.check_server_log(server_log)

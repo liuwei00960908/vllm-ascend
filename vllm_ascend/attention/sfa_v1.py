@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -32,7 +32,10 @@ from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
+    STAGED_SFA_SINGLETON_GRAPH_KEY,
+    StagedSFAGraphKey,
     StagedSFALiveParityState,
+    StagedSFAQueryProfile,
 )
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -44,6 +47,7 @@ from vllm_ascend.attention.utils import (
     enable_cp,
     get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
+    staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -70,6 +74,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp_with_o_proj_tp,
     get_weight_prefetch_method,
     maybe_trans_nz,
+    staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -80,9 +85,12 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 # Fence the first sparse load once in each worker process by default.
-_LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv(
-    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1"
-).lower() in ("1", "true", "yes", "on")
+_LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
 
@@ -90,10 +98,7 @@ _lmcache_sparse_wait_sync_once_lock = Lock()
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
     global _lmcache_sparse_wait_sync_once_done
 
-    if (
-        not _LMCACHE_SPARSE_WAIT_SYNC_ONCE
-        or _lmcache_sparse_wait_sync_once_done
-    ):
+    if not _LMCACHE_SPARSE_WAIT_SYNC_ONCE or _lmcache_sparse_wait_sync_once_done:
         return
 
     with _lmcache_sparse_wait_sync_once_lock:
@@ -122,11 +127,12 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
-def _prepare_staged_sfa_remap_boundary(
+def _prepare_sfa_remap_boundary(
     attn_metadata: Any,
     request_ids: Any,
     *,
     is_dummy_run: bool,
+    index_topk: int,
 ) -> torch.Tensor:
     """Fill the stable Graph-A remap-boundary input once per step.
 
@@ -136,23 +142,15 @@ def _prepare_staged_sfa_remap_boundary(
     """
     boundary = attn_metadata.decode_remap_boundary
     if boundary is None:
-        raise RuntimeError(
-            "[SFA staged graph POC] remap-boundary storage is unavailable."
-        )
+        raise RuntimeError("[SFA sparse remap] boundary storage is unavailable.")
     if attn_metadata.decode_remap_boundary_ready:
         return boundary
 
     prompt_rows = attn_metadata.prompt_lens_cpu_rows
     row_req_indices = attn_metadata.decode_req_indices_cpu
     seq_lens_cpu = attn_metadata.seq_lens_cpu
-    if (
-        prompt_rows is None
-        or row_req_indices is None
-        or seq_lens_cpu is None
-    ):
-        raise RuntimeError(
-            "[SFA staged graph POC] CPU remap metadata is incomplete."
-        )
+    if prompt_rows is None or row_req_indices is None or seq_lens_cpu is None:
+        raise RuntimeError("[SFA sparse remap] CPU metadata is incomplete.")
 
     prompt_rows_np = np.asarray(prompt_rows, dtype=np.int32).reshape(-1)
     row_req_indices_np = np.asarray(
@@ -160,22 +158,15 @@ def _prepare_staged_sfa_remap_boundary(
         dtype=np.int64,
     ).reshape(-1)
     seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
-    if (
-        int(boundary.numel()) != int(prompt_rows_np.size)
-        or row_req_indices_np.size != prompt_rows_np.size
-    ):
+    if int(boundary.numel()) != int(prompt_rows_np.size) or row_req_indices_np.size != prompt_rows_np.size:
         raise RuntimeError(
-            "[SFA staged graph POC] remap-boundary shapes differ: "
+            "[SFA sparse remap] boundary shapes differ: "
             f"boundary={tuple(boundary.shape)}, "
             f"prompt_rows={tuple(prompt_rows_np.shape)}, "
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    cached_tokens = (
-        None
-        if is_dummy_run
-        else get_lmcache_sparse_cached_tokens(request_ids)
-    )
+    cached_tokens = None if is_dummy_run else get_lmcache_sparse_cached_tokens(request_ids)
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
     for row_index, request_index_value in enumerate(row_req_indices_np):
@@ -190,25 +181,167 @@ def _prepare_staged_sfa_remap_boundary(
             )
         cached_for_request = None
         if cached_tokens is not None:
-            cached_for_request = (
-                int(cached_tokens[request_index])
-                if request_index < len(cached_tokens)
-                else 0
-            )
+            cached_for_request = int(cached_tokens[request_index]) if request_index < len(cached_tokens) else 0
         if decode_window_size > 0:
             current_position = max(seq_lens[request_index] - 1, 0)
-            row_boundary = (
-                current_position // decode_window_size * decode_window_size
-            )
+            row_boundary = current_position // decode_window_size * decode_window_size
             if cached_for_request is not None:
                 row_boundary = min(row_boundary, cached_for_request)
             boundary_rows[row_index] = row_boundary
         elif cached_for_request is not None:
             boundary_rows[row_index] = cached_for_request
 
+    _validate_dsa_scratch_capacity(
+        boundary_rows,
+        row_req_indices_np,
+        getattr(attn_metadata, "decode_scratch_base_cpu", None),
+        index_topk,
+        getattr(attn_metadata, "decode_scratch_capacity", None),
+    )
+
     boundary.copy_(torch.from_numpy(boundary_rows))
     attn_metadata.decode_remap_boundary_ready = True
     return boundary
+
+
+def _validate_dsa_scratch_capacity(
+    boundary_rows: Any,
+    row_req_indices: Any,
+    scratch_base_rows: Any,
+    index_topk: int,
+    scratch_capacity: int | None = None,
+) -> None:
+    """Validate that compact DSA scratch cannot alias live KV positions."""
+    width = int(index_topk)
+    if width <= 0:
+        raise RuntimeError(f"DSA compact scratch requires a positive index_topk, got {width}.")
+
+    boundaries = np.asarray(boundary_rows, dtype=np.int64).reshape(-1)
+    request_rows = np.asarray(row_req_indices, dtype=np.int64).reshape(-1)
+    if scratch_base_rows is None:
+        scratch_bases = np.zeros_like(boundaries)
+    else:
+        scratch_bases = np.asarray(
+            scratch_base_rows,
+            dtype=np.int64,
+        ).reshape(-1)
+    if not (boundaries.size == request_rows.size == scratch_bases.size):
+        raise RuntimeError(
+            "DSA compact scratch metadata shapes differ: "
+            f"boundaries={boundaries.size}, request_rows={request_rows.size}, "
+            f"scratch_bases={scratch_bases.size}."
+        )
+
+    active_rows = np.flatnonzero(request_rows >= 0)
+    bases_by_request: dict[int, set[int]] = {}
+    for row_index_value in active_rows:
+        row_index = int(row_index_value)
+        request_index = int(request_rows[row_index])
+        scratch_base = int(scratch_bases[row_index])
+        boundary = int(boundaries[row_index])
+        if scratch_base < 0 or scratch_base % width != 0:
+            raise RuntimeError(
+                "DSA compact scratch base must be non-negative and "
+                f"index_topk-aligned: row={row_index}, "
+                f"request={request_index}, scratch_base={scratch_base}, "
+                f"index_topk={width}."
+            )
+        request_bases = bases_by_request.setdefault(request_index, set())
+        if scratch_base in request_bases:
+            raise RuntimeError(
+                "DSA compact scratch rows for one request overlap: "
+                f"row={row_index}, request={request_index}, "
+                f"scratch_base={scratch_base}."
+            )
+        request_bases.add(scratch_base)
+
+        required_boundary = scratch_base + width
+        if scratch_capacity is not None and required_boundary > int(scratch_capacity):
+            raise RuntimeError(
+                "DSA compact scratch row exceeds its physical reservation: "
+                f"row={row_index}, request={request_index}, "
+                f"scratch_base={scratch_base}, index_topk={width}, "
+                f"required_capacity={required_boundary}, "
+                f"reserved_capacity={int(scratch_capacity)}."
+            )
+        if boundary < required_boundary:
+            raise RuntimeError(
+                "DSA compact scratch would alias live KV positions: "
+                f"row={row_index}, request={request_index}, "
+                f"boundary={boundary}, scratch_base={scratch_base}, "
+                f"index_topk={width}, required_boundary="
+                f"{required_boundary}."
+            )
+
+
+def _prepare_dsa_sparse_lmcache_payload(
+    attn_metadata: Any,
+    selected_packed: torch.Tensor,
+    *,
+    index_topk: int,
+) -> tuple[torch.Tensor, list[str], torch.Tensor | None]:
+    """Build and validate the row-aligned sparse LMCache retrieve payload."""
+    if selected_packed.dim() != 2:
+        raise RuntimeError(
+            f"DSA sparse LMCache selected tokens must be rank 2, got shape={tuple(selected_packed.shape)}."
+        )
+    if int(selected_packed.shape[1]) != int(index_topk):
+        raise RuntimeError(
+            "DSA sparse LMCache selected-token width does not match "
+            f"index_topk: selected={tuple(selected_packed.shape)}, "
+            f"index_topk={int(index_topk)}."
+        )
+
+    valid_rows_all = bool(getattr(attn_metadata, "decode_valid_rows_all", False))
+    valid_row_indices = getattr(
+        attn_metadata,
+        "decode_valid_row_indices",
+        None,
+    )
+    if valid_rows_all:
+        selected_for_wait = selected_packed
+    elif valid_row_indices is not None:
+        selected_for_wait = selected_packed.index_select(
+            0,
+            valid_row_indices,
+        )
+    else:
+        raise RuntimeError("DSA sparse LMCache payload has no valid-row mapping.")
+
+    request_ids = getattr(
+        attn_metadata,
+        "decode_request_ids_compact",
+        None,
+    )
+    if request_ids is None:
+        raise RuntimeError("DSA sparse LMCache payload has no row-aligned request IDs.")
+    request_ids = list(request_ids)
+    num_rows = int(selected_for_wait.shape[0])
+    if len(request_ids) != num_rows:
+        raise RuntimeError(
+            "DSA sparse LMCache payload row count differs from request IDs: "
+            f"selected_rows={num_rows}, request_ids={len(request_ids)}."
+        )
+
+    target_slot_mapping = getattr(
+        attn_metadata,
+        "decode_target_slot_mapping",
+        None,
+    )
+    scratch_base_compact = getattr(
+        attn_metadata,
+        "decode_scratch_base_compact",
+        None,
+    )
+    if scratch_base_compact is not None and target_slot_mapping is None:
+        raise RuntimeError("Row-specific DSA scratch requires an explicit target-slot mapping.")
+    if target_slot_mapping is not None and tuple(target_slot_mapping.shape) != tuple(selected_for_wait.shape):
+        raise RuntimeError(
+            "DSA sparse LMCache target-slot shape differs from selected "
+            f"tokens: targets={tuple(target_slot_mapping.shape)}, "
+            f"selected={tuple(selected_for_wait.shape)}."
+        )
+    return selected_for_wait, request_ids, target_slot_mapping
 
 
 def _dsa_mask_padding_sparse_rows(
@@ -224,9 +357,7 @@ def _dsa_mask_padding_sparse_rows(
     if num_actual_rows is not None and num_rows <= int(num_actual_rows):
         return topk_indices, topk_2d
 
-    row_req_indices = row_req_indices[:num_rows].to(
-        device=topk_indices.device, dtype=torch.long
-    )
+    row_req_indices = row_req_indices[:num_rows].to(device=topk_indices.device, dtype=torch.long)
     if int(row_req_indices.numel()) < num_rows:
         pad = torch.full(
             (num_rows - int(row_req_indices.numel()),),
@@ -237,16 +368,12 @@ def _dsa_mask_padding_sparse_rows(
         row_req_indices = torch.cat((row_req_indices, pad), dim=0)
     padding_mask = row_req_indices < 0
     if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
-        topk_indices = topk_indices.masked_fill(
-            padding_mask.reshape(-1, 1, 1), 0
-        )
+        topk_indices = topk_indices.masked_fill(padding_mask.reshape(-1, 1, 1), 0)
     elif topk_indices.dim() == 2:
         topk_indices = topk_indices.masked_fill(padding_mask.reshape(-1, 1), 0)
     else:
         topk_indices = topk_indices.clone()
-        topk_indices.reshape(num_rows, -1).masked_fill_(
-            padding_mask.reshape(-1, 1), 0
-        )
+        topk_indices.reshape(num_rows, -1).masked_fill_(padding_mask.reshape(-1, 1), 0)
     return topk_indices, _dsa_topk_to_2d_indices(topk_indices)
 
 
@@ -256,6 +383,8 @@ def _dsa_build_target_slot_mapping(
     scratch_base: torch.Tensor,
     width: int,
     block_size: int,
+    *,
+    scratch_capacity: int,
 ) -> torch.Tensor:
     """Build per-row target slots for compact DSA scratch loads."""
     if width <= 0 or row_req_indices.numel() == 0:
@@ -265,17 +394,28 @@ def _dsa_build_target_slot_mapping(
             device=block_table.device,
         )
 
+    if block_size <= 0:
+        raise RuntimeError(f"DSA compact scratch block_size must be positive, got {block_size}.")
+    table_capacity = int(block_table.shape[1]) * int(block_size)
+    if scratch_capacity <= 0 or scratch_capacity > table_capacity:
+        raise RuntimeError(
+            "DSA compact scratch reservation exceeds the block-table "
+            f"capacity: reserved_capacity={scratch_capacity}, "
+            f"table_capacity={table_capacity}."
+        )
+
     row_req_indices = row_req_indices.to(device=block_table.device, dtype=torch.long)
     scratch_base = scratch_base.to(device=block_table.device, dtype=torch.long)
     block_table_rows = block_table.index_select(0, row_req_indices).to(torch.long)
-    positions = scratch_base.reshape(-1, 1) + torch.arange(
-        width, dtype=torch.long, device=block_table.device
-    ).reshape(1, -1)
+    positions = scratch_base.reshape(-1, 1) + torch.arange(width, dtype=torch.long, device=block_table.device).reshape(
+        1, -1
+    )
     logical_blocks = positions // block_size
     offsets = positions % block_size
-    max_logical_block = max(int(block_table_rows.shape[1]) - 1, 0)
-    safe_logical_blocks = torch.clamp(logical_blocks, min=0, max=max_logical_block)
-    physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+    # CPU metadata has already proved every logical block is inside both the
+    # scheduler reservation and this table. Do not clamp an invalid block into
+    # another row: gather must preserve the exact scratch destination.
+    physical_blocks = block_table_rows.gather(1, logical_blocks)
     return physical_blocks * block_size + offsets
 
 
@@ -399,11 +539,32 @@ class AscendSFAMetadata:
     decode_row_offsets: torch.Tensor | None = None
     decode_scratch_base: torch.Tensor | None = None
     decode_scratch_base_compact: torch.Tensor | None = None
+    decode_scratch_base_cpu: Any = None
+    decode_scratch_capacity: int | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
+
+
+@dataclass
+class _StagedSFAGraphState:
+    """Persistent host/device ownership for one structural staged graph key."""
+
+    key: StagedSFAGraphKey
+    capture_phases: set[str] = field(default_factory=set)
+    capture_records: set[str] = field(default_factory=set)
+    capture_failures: list[str] = field(default_factory=list)
+    graph_input_signatures: dict[str, tuple] = field(default_factory=dict)
+    replay_proved: set[str] = field(default_factory=set)
+    pre_output_buffers: tuple[torch.Tensor, ...] | None = None
+    replay_canaries: dict[str, torch.Tensor] = field(default_factory=dict)
+    live_capture_validated: bool = False
+    live_validated_request_ids: tuple[str, ...] | None = None
+    dummy_cache_initialized: bool = False
+    parity_output: torch.Tensor | None = None
+    parity_latent_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -450,11 +611,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
-        self.dsa_shrink_latent = (
-            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
-            if envs.VLLM_ASCEND_DSA_UNBUNDLE
-            else 0
-        )
+        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
         hf_config = self.model_config.hf_config
         hf_text_config = self.model_config.hf_text_config
         self.index_topk = int(
@@ -531,6 +688,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_row_offsets_rows = None
         decode_scratch_base_rows = None
         decode_scratch_base_compact = None
+        decode_scratch_capacity = (
+            (self.index_topk * self.decode_threshold + self.block_size - 1) // self.block_size * self.block_size
+        )
         decode_target_slot_mapping = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
@@ -561,51 +721,43 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # and explicit target-slot tensors.
             needs_row_scratch_base = bool(np.any(scratch_base_np))
             if needs_row_scratch_base:
-                decode_row_offsets_rows = torch.from_numpy(row_offsets).to(
-                    block_table.device
-                )
-                decode_scratch_base_rows = torch.from_numpy(scratch_base_np).to(
-                    block_table.device
-                )
-            need_sparse_lmcache_payload = (
-                self.dsa_shrink_latent != 3
-                and has_kv_transfer_group()
-                and is_v1_kv_transfer_group()
-            )
+                decode_row_offsets_rows = torch.from_numpy(row_offsets).to(block_table.device)
+                decode_scratch_base_rows = torch.from_numpy(scratch_base_np).to(block_table.device)
+            need_sparse_lmcache_payload = self.dsa_shrink_latent != 3 and staged_sfa_connector_supports_sparse_load()
             valid_row_indices_np = (
                 np.flatnonzero(req_rows >= 0).astype(np.int64)
                 if need_sparse_lmcache_payload
                 else np.empty(0, dtype=np.int64)
             )
             if valid_row_indices_np.size:
-                decode_valid_rows_all = int(valid_row_indices_np.size) == int(
-                    num_input_tokens
-                )
+                decode_valid_rows_all = int(valid_row_indices_np.size) == int(num_input_tokens)
                 valid_req_indices_np = req_rows[valid_row_indices_np].astype(np.int64)
                 valid_scratch_base_np = scratch_base_np[valid_row_indices_np]
                 decode_req_indices_compact_cpu = valid_req_indices_np
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
-                    decode_request_ids_compact = [
-                        req_ids[int(req_idx)] for req_idx in valid_req_indices_np
-                    ]
+                    decode_request_ids_compact = [req_ids[int(req_idx)] for req_idx in valid_req_indices_np]
                 if not decode_valid_rows_all:
-                    decode_valid_row_indices = torch.from_numpy(
-                        valid_row_indices_np
-                    ).to(block_table.device)
-                decode_req_indices_compact = torch.from_numpy(
-                    valid_req_indices_np
-                ).to(block_table.device)
+                    decode_valid_row_indices = torch.from_numpy(valid_row_indices_np).to(block_table.device)
+                decode_req_indices_compact = torch.from_numpy(valid_req_indices_np).to(block_table.device)
                 if needs_row_scratch_base:
-                    decode_scratch_base_compact = torch.from_numpy(
-                        valid_scratch_base_np
-                    ).to(block_table.device)
+                    required_capacity = int(valid_scratch_base_np.max()) + self.index_topk
+                    if required_capacity > decode_scratch_capacity:
+                        raise RuntimeError(
+                            "DSA compact scratch rows exceed the scheduler "
+                            "reservation: required_capacity="
+                            f"{required_capacity}, reserved_capacity="
+                            f"{decode_scratch_capacity}, "
+                            f"decode_threshold={self.decode_threshold}."
+                        )
+                    decode_scratch_base_compact = torch.from_numpy(valid_scratch_base_np).to(block_table.device)
                     decode_target_slot_mapping = _dsa_build_target_slot_mapping(
                         block_table,
                         decode_req_indices_compact,
                         decode_scratch_base_compact,
                         self.index_topk,
                         self.block_size,
+                        scratch_capacity=decode_scratch_capacity,
                     )
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
@@ -723,6 +875,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_row_offsets=decode_row_offsets_rows,
             decode_scratch_base=decode_scratch_base_rows,
             decode_scratch_base_compact=decode_scratch_base_compact,
+            decode_scratch_base_cpu=(scratch_base_np if plens_cpu is not None else None),
+            decode_scratch_capacity=decode_scratch_capacity,
             decode_target_slot_mapping=decode_target_slot_mapping,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
@@ -843,16 +997,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         # DSA latent offload Route-1 pragmatic (M-B): latent written to the
         # PagedLatentPool instead of the (shrunk) vLLM paged latent cache.
         self.dsa_offload_free_paged = bool(
-            envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
-            and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
+            envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
         # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
-        self.dsa_shrink_latent = (
-            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
-        )
-        self.enable_staged_sfa_graph = staged_sfa_graph_configured(
-            self.vllm_config
+        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
+        self._staged_sfa_graph_capture_sizes = (
+            staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
         )
         self._staged_sfa_pre_graph = None
         self._staged_sfa_post_graph = None
@@ -865,6 +1017,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_replay_canaries: dict[str, torch.Tensor] = {}
         self._staged_sfa_live_capture_validated = False
         self._staged_sfa_live_validated_request_ids = None
+        self._staged_sfa_active_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
+        self._staged_sfa_graph_states = {
+            STAGED_SFA_SINGLETON_GRAPH_KEY: (self._snapshot_active_staged_sfa_state(STAGED_SFA_SINGLETON_GRAPH_KEY))
+        }
         self._staged_sfa_dummy_cache_initialized = False
         self._staged_sfa_parity_output = None
         self._staged_sfa_parity_latent_scratch = None
@@ -1495,7 +1651,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata is not None
             and block_table is not None
             and attn_metadata.num_decode_tokens > 0
-            and attn_metadata.attn_state in (
+            and attn_metadata.attn_state
+            in (
                 AscendAttentionState.DecodeOnly,
                 AscendAttentionState.SpecDecoding,
             )
@@ -1519,10 +1676,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 decode_req_indices_sample = None
                 if decode_req_indices is not None:
                     decode_req_indices_sample = (
-                        decode_req_indices[: min(topk_rows, 8)]
-                        .detach()
-                        .to(device="cpu")
-                        .tolist()
+                        decode_req_indices[: min(topk_rows, 8)].detach().to(device="cpu").tolist()
                     )
                 raise RuntimeError(
                     "DSA sparse FA block_table batch dimension mismatch: "
@@ -1562,12 +1716,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M,
     ) -> str | None:
-        """Return why the conservative staged-graph POC cannot run.
+        """Return why this step cannot use an exact-Q1 staged graph key.
 
-        The first version deliberately targets the exact A/B measurement case:
-        one-token native compact-scratch decode (SHRINK_LATENT=2). Other live
-        batch shapes keep using the existing SFA forward; incompatible startup
-        configuration fails the explicit POC capture.
+        Only exact, unpadded one-token-per-request decode batches are admitted.
+        All structural checks happen before Graph A mutates cache state or the
+        layerwise connector advances.
         """
         forward_context = get_forward_context()
         runtime_mode = getattr(
@@ -1582,24 +1735,55 @@ class AscendSFAImpl(MLAAttentionImpl):
                 False,
             )
         )
-        if runtime_mode != CUDAGraphMode.PIECEWISE and not (
-            staged_dummy_run and runtime_mode == CUDAGraphMode.NONE
-        ):
+        if runtime_mode != CUDAGraphMode.PIECEWISE and not (staged_dummy_run and runtime_mode == CUDAGraphMode.NONE):
             return "the runtime graph mode is not PIECEWISE"
+
+        batch_size = int(hidden_states.shape[0])
+        capture_sizes = getattr(
+            self,
+            "_staged_sfa_graph_capture_sizes",
+            None,
+        )
+        if capture_sizes is None:
+            # Compatibility for lightweight test/downstream implementations.
+            capture_sizes = staged_sfa_graph_capture_sizes(self.vllm_config)
+        if batch_size not in capture_sizes:
+            return "the exact Q=1 batch size is not a configured staged SFA graph key"
+        graph_key = StagedSFAGraphKey(
+            token_capacity=batch_size,
+            request_capacity=batch_size,
+            query_profile=StagedSFAQueryProfile.DECODE_Q1,
+            max_query_len=1,
+        )
+        authorized_key = getattr(
+            forward_context,
+            "staged_sfa_graph_key",
+            None,
+        )
+        if authorized_key != graph_key:
+            return "the runner did not authorize this exact staged SFA graph key"
+
         batch_descriptor = getattr(
             forward_context,
             "batch_descriptor",
             None,
         )
         if (
-            batch_descriptor is None
-            or batch_descriptor.num_tokens != 1
+            batch_descriptor != graph_key.to_legacy_batch_descriptor()
             or batch_descriptor.uniform
             or batch_descriptor.has_lora
             or batch_descriptor.num_reqs is not None
             or batch_descriptor.num_active_loras != 0
         ):
-            return "the graph key is not the normalized PIECEWISE size 1 key"
+            return "the PIECEWISE descriptor does not match the exact Q=1 staged SFA graph key"
+
+        dp_size = getattr(
+            getattr(self.vllm_config, "parallel_config", None),
+            "data_parallel_size",
+            1,
+        )
+        if isinstance(dp_size, int) and dp_size != 1:
+            return "data parallel staged SFA graphs are unsupported"
         if self.vllm_config.speculative_config is not None:
             return "speculative decoding is enabled"
         if self.vllm_config.lora_config is not None:
@@ -1607,20 +1791,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
             return "only DecodeOnly is supported"
         if (
-            hidden_states.shape[0] != 1
-            or attn_metadata.num_input_tokens != 1
-            or attn_metadata.num_actual_tokens != 1
+            attn_metadata.num_input_tokens != batch_size
+            or attn_metadata.num_actual_tokens != batch_size
+            or attn_metadata.num_decode_tokens != batch_size
         ):
-            return "only a single, unpadded decode token is supported"
+            return "only exact, unpadded one-token-per-request decode batches are supported"
         if self.dsa_shrink_latent != 2:
             return "SHRINK_LATENT must be 2"
+        if not staged_sfa_connector_supports_sparse_load():
+            return "the active connector does not support staged sparse selective loads"
         if self.enable_mlapo:
             return "MLAPO is enabled"
         weight_prefetch_method = get_weight_prefetch_method()
-        if (
-            weight_prefetch_method is not None
-            and weight_prefetch_method.mla_sfa_prefetch_enable
-        ):
+        if weight_prefetch_method is not None and weight_prefetch_method.mla_sfa_prefetch_enable:
             return "weight prefetch is enabled"
         if self.enable_dsa_cp:
             return "DSA context parallelism is enabled"
@@ -1640,34 +1823,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the POC requires exactly three KV tensors"
         if any(cache.ndim != 4 for cache in kv_cache):
             return "the POC requires rank-4 PA_BSND KV tensors"
-        if self.num_kv_heads != 1 or any(
-            int(cache.shape[-2]) != 1 for cache in kv_cache
-        ):
+        if self.num_kv_heads != 1 or any(int(cache.shape[-2]) != 1 for cache in kv_cache):
             return "the POC requires one KV head in every cache tensor"
         expected_hidden_dims = (
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             self.head_dim,
         )
-        if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(
-            int(dim) for dim in expected_hidden_dims
-        ):
-            return (
-                "the staged KV cache hidden dimensions do not match SFA"
-            )
-        cache_block_sizes = {
-            int(cache.shape[1]) for cache in kv_cache
-        }
+        if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(int(dim) for dim in expected_hidden_dims):
+            return "the staged KV cache hidden dimensions do not match SFA"
+        cache_block_sizes = {int(cache.shape[1]) for cache in kv_cache}
         if len(cache_block_sizes) != 1:
             return "the staged KV cache block sizes do not agree"
-        configured_block_size = int(
-            self.vllm_config.cache_config.block_size
-        )
+        configured_block_size = int(self.vllm_config.cache_config.block_size)
         if next(iter(cache_block_sizes)) != configured_block_size:
-            return (
-                "the staged KV cache block size does not match the "
-                "configured block size"
-            )
+            return "the staged KV cache block size does not match the configured block size"
+        if any(int(cache.shape[0]) < batch_size for cache in kv_cache):
+            return "the staged KV caches do not have one safe dummy block per request"
         if len({cache.device for cache in kv_cache}) != 1:
             return "the staged KV caches are on different devices"
         cache_dtypes = {cache.dtype for cache in kv_cache}
@@ -1677,30 +1849,35 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.float16,
             torch.bfloat16,
         ):
-            return (
-                "the staged KV cache dtype must be float16 or bfloat16"
-            )
+            return "the staged KV cache dtype must be float16 or bfloat16"
         if self.q_lora_rank is None or self.fused_qkv_a_proj is None:
             return "the native Q-LoRA preprocessing path is unavailable"
         if self.q_a_layernorm is None:
             return "q_a_layernorm is unavailable"
-        if (
-            attn_metadata.cos is None
-            or attn_metadata.sin is None
-            or attn_metadata.slot_mapping is None
-            or attn_metadata.cum_query_lens is None
-            or attn_metadata.seq_lens is None
-            or attn_metadata.block_table is None
-            or attn_metadata.indexer_slot_mapping is None
-            or attn_metadata.indexer_block_table is None
-        ):
+
+        required_row_tensors = (
+            attn_metadata.cos,
+            attn_metadata.sin,
+            attn_metadata.slot_mapping,
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            attn_metadata.indexer_slot_mapping,
+        )
+        if any(tensor is None for tensor in required_row_tensors):
             return "required fixed-shape attention metadata is unavailable"
-        if attn_metadata.num_decode_tokens != 1:
-            return "the compact-scratch metadata does not contain one decode row"
+        if any(int(tensor.shape[0]) != batch_size for tensor in required_row_tensors):
+            return "the fixed-shape attention row count does not match the graph key"
+        if (
+            attn_metadata.block_table is None
+            or attn_metadata.indexer_block_table is None
+            or int(attn_metadata.block_table.shape[0]) != batch_size
+            or int(attn_metadata.indexer_block_table.shape[0]) != batch_size
+        ):
+            return "the native block-table row count does not match the graph key"
         if not attn_metadata.need_sparse_lmcache_payload:
             return "the v1 sparse LMCache payload path is unavailable"
         if not attn_metadata.decode_valid_rows_all:
-            return "the single decode row is not the complete compact payload"
+            return "not every exact-Q1 row is in the compact LMCache payload"
         if (
             attn_metadata.decode_valid_row_indices is not None
             or attn_metadata.decode_scratch_base is not None
@@ -1708,30 +1885,184 @@ class AscendSFAImpl(MLAAttentionImpl):
             or attn_metadata.decode_target_slot_mapping is not None
         ):
             return "row-specific MTP scratch placement is unsupported"
+
         request_ids = attn_metadata.decode_request_ids_compact
-        if request_ids is None or len(request_ids) != 1:
-            return "the compact LMCache request id is unavailable"
+        full_request_ids = attn_metadata.req_ids
+        if (
+            request_ids is None
+            or full_request_ids is None
+            or len(request_ids) != batch_size
+            or len(full_request_ids) != batch_size
+            or tuple(request_ids) != tuple(full_request_ids)
+            or len(set(request_ids)) != batch_size
+        ):
+            return "the compact LMCache request ids are not the unique native request order"
         if (
             attn_metadata.prompt_lens_cpu_rows is None
             or attn_metadata.decode_req_indices_cpu is None
             or attn_metadata.seq_lens_cpu is None
             or attn_metadata.decode_remap_boundary is None
+            or int(attn_metadata.decode_remap_boundary.shape[0]) != batch_size
         ):
             return "the persistent remap-boundary metadata is unavailable"
+
         prompt_rows = np.asarray(
             attn_metadata.prompt_lens_cpu_rows,
             dtype=np.int64,
         ).reshape(-1)
-        if prompt_rows.size != 1 or int(prompt_rows[0]) < self.index_topk:
-            return "the prompt boundary is smaller than index_topk"
+        request_rows = np.asarray(
+            attn_metadata.decode_req_indices_cpu,
+            dtype=np.int64,
+        ).reshape(-1)
+        scratch_bases = np.asarray(
+            attn_metadata.decode_scratch_base_cpu,
+            dtype=np.int64,
+        ).reshape(-1)
+        seq_lens_cpu = attn_metadata.seq_lens_cpu
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            if seq_lens_cpu.device.type != "cpu":
+                return "sequence-length validation metadata is not on CPU"
+            seq_rows = seq_lens_cpu.detach().numpy().reshape(-1)
+        else:
+            seq_rows = np.asarray(seq_lens_cpu).reshape(-1)
+        expected_request_rows = np.arange(batch_size, dtype=np.int64)
+        if (
+            prompt_rows.size != batch_size
+            or np.any(prompt_rows < self.index_topk)
+            or request_rows.size != batch_size
+            or not np.array_equal(request_rows, expected_request_rows)
+            or scratch_bases.size != batch_size
+            or np.any(scratch_bases != 0)
+            or seq_rows.size != batch_size
+            or np.any(seq_rows < prompt_rows)
+        ):
+            return "the exact-Q1 CPU row metadata does not match the graph key"
         return None
+
+    def _snapshot_active_staged_sfa_state(
+        self,
+        key: StagedSFAGraphKey,
+    ) -> _StagedSFAGraphState:
+        return _StagedSFAGraphState(
+            key=key,
+            capture_phases=self._staged_sfa_capture_phases,
+            capture_records=self._staged_sfa_capture_records,
+            capture_failures=self._staged_sfa_capture_failures,
+            graph_input_signatures=(self._staged_sfa_graph_input_signatures),
+            replay_proved=self._staged_sfa_replay_proved,
+            pre_output_buffers=self._staged_sfa_pre_output_buffers,
+            replay_canaries=self._staged_sfa_replay_canaries,
+            live_capture_validated=(self._staged_sfa_live_capture_validated),
+            live_validated_request_ids=(self._staged_sfa_live_validated_request_ids),
+            dummy_cache_initialized=bool(getattr(self, "_staged_sfa_dummy_cache_initialized", False)),
+            parity_output=getattr(self, "_staged_sfa_parity_output", None),
+            parity_latent_scratch=getattr(self, "_staged_sfa_parity_latent_scratch", None),
+        )
+
+    def _ensure_staged_sfa_state_registry(self) -> None:
+        if hasattr(self, "_staged_sfa_graph_states"):
+            return
+        active_key = STAGED_SFA_SINGLETON_GRAPH_KEY
+        self._staged_sfa_active_graph_key = active_key
+        self._staged_sfa_graph_states = {active_key: self._snapshot_active_staged_sfa_state(active_key)}
+
+    def _bind_staged_sfa_graph_state(
+        self,
+        state: _StagedSFAGraphState,
+    ) -> None:
+        """Bind legacy helper fields to one canonical key-owned state."""
+        self._staged_sfa_capture_phases = state.capture_phases
+        self._staged_sfa_capture_records = state.capture_records
+        self._staged_sfa_capture_failures = state.capture_failures
+        self._staged_sfa_graph_input_signatures = state.graph_input_signatures
+        self._staged_sfa_replay_proved = state.replay_proved
+        self._staged_sfa_pre_output_buffers = state.pre_output_buffers
+        self._staged_sfa_replay_canaries = state.replay_canaries
+        self._staged_sfa_live_capture_validated = state.live_capture_validated
+        self._staged_sfa_live_validated_request_ids = state.live_validated_request_ids
+        self._staged_sfa_dummy_cache_initialized = state.dummy_cache_initialized
+        self._staged_sfa_parity_output = state.parity_output
+        self._staged_sfa_parity_latent_scratch = state.parity_latent_scratch
+        self._staged_sfa_active_graph_key = state.key
+
+    def _flush_active_staged_sfa_graph_state(
+        self,
+    ) -> _StagedSFAGraphState:
+        self._ensure_staged_sfa_state_registry()
+        active_key = self._staged_sfa_active_graph_key
+        state = self._snapshot_active_staged_sfa_state(active_key)
+        self._staged_sfa_graph_states[active_key] = state
+        return state
+
+    def _activate_staged_sfa_graph_key(
+        self,
+        key: StagedSFAGraphKey,
+    ) -> _StagedSFAGraphState:
+        """Activate isolated state for one exact structural graph key.
+
+        The wrappers remain shared and dispatch by the equivalent
+        BatchDescriptor. vLLM-Ascend does not run concurrent ubatches, so an
+        explicit flush/bind at each boundary is sufficient.
+        """
+        self._ensure_staged_sfa_state_registry()
+        self._flush_active_staged_sfa_graph_state()
+        state = self._staged_sfa_graph_states.get(key)
+        if state is None:
+            state = _StagedSFAGraphState(key=key)
+            self._staged_sfa_graph_states[key] = state
+        self._bind_staged_sfa_graph_state(state)
+        return state
+
+    def _iter_staged_sfa_graph_states(
+        self,
+    ) -> tuple[tuple[StagedSFAGraphKey, _StagedSFAGraphState], ...]:
+        self._ensure_staged_sfa_state_registry()
+        active_key = self._staged_sfa_active_graph_key
+        self._staged_sfa_graph_states[active_key] = self._snapshot_active_staged_sfa_state(active_key)
+        return tuple(
+            sorted(
+                self._staged_sfa_graph_states.items(),
+                key=lambda item: (
+                    item[0].token_capacity,
+                    item[0].request_capacity,
+                    item[0].query_profile.value,
+                    item[0].max_query_len,
+                ),
+            )
+        )
+
+    def _reset_staged_sfa_graph_states(self) -> None:
+        self._staged_sfa_capture_phases = set()
+        self._staged_sfa_capture_records = set()
+        self._staged_sfa_capture_failures = []
+        self._staged_sfa_graph_input_signatures = {}
+        self._staged_sfa_replay_proved = set()
+        self._staged_sfa_pre_output_buffers = None
+        self._staged_sfa_replay_canaries = {}
+        self._staged_sfa_live_capture_validated = False
+        self._staged_sfa_live_validated_request_ids = None
+        self._staged_sfa_dummy_cache_initialized = False
+        self._staged_sfa_parity_output = None
+        self._staged_sfa_parity_latent_scratch = None
+        self._staged_sfa_active_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
+        self._staged_sfa_graph_states = {
+            STAGED_SFA_SINGLETON_GRAPH_KEY: (self._snapshot_active_staged_sfa_state(STAGED_SFA_SINGLETON_GRAPH_KEY))
+        }
+
+    @staticmethod
+    def _staged_sfa_q1_graph_key(
+        hidden_states: torch.Tensor,
+        attn_metadata: AscendSFAMetadata,
+    ) -> StagedSFAGraphKey:
+        token_capacity = int(hidden_states.shape[0])
+        request_capacity = len(attn_metadata.decode_request_ids_compact or ())
+        if request_capacity != token_capacity:
+            raise RuntimeError("[SFA staged graph POC] exact-Q1 token/request capacities diverged after admission.")
+        return StagedSFAGraphKey.exact_q1(token_capacity)
 
     def _get_staged_sfa_graph_wrappers(self):
         """Lazily construct the two inner PIECEWISE ACL graph wrappers."""
-        if (
-            self._staged_sfa_pre_graph is None
-            or self._staged_sfa_post_graph is None
-        ):
+        if self._staged_sfa_pre_graph is None or self._staged_sfa_post_graph is None:
             from vllm.compilation.cuda_graph import CUDAGraphOptions
 
             from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
@@ -1789,9 +2120,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     ):
         """Require a captured entry and optionally verify live input storage."""
         batch_descriptor = get_forward_context().batch_descriptor
-        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(
-            batch_descriptor
-        )
+        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(batch_descriptor)
         if graph_entry is None or graph_entry.aclgraph is None:
             raise RuntimeError(
                 "[SFA staged graph POC] the "
@@ -1802,22 +2131,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             return graph_entry
 
         captured_addresses = graph_entry.input_addresses
-        live_addresses = [
-            value.data_ptr()
-            for value in graph_inputs
-            if isinstance(value, torch.Tensor)
-        ]
+        live_addresses = [value.data_ptr() for value in graph_inputs if isinstance(value, torch.Tensor)]
         if captured_addresses is None:
-            raise RuntimeError(
-                "[SFA staged graph POC] the "
-                f"{region_name} graph did not record its input addresses."
-            )
+            raise RuntimeError(f"[SFA staged graph POC] the {region_name} graph did not record its input addresses.")
         if captured_addresses != live_addresses:
             mismatch_indices = [
                 index
-                for index, (captured, live) in enumerate(
-                    zip(captured_addresses, live_addresses)
-                )
+                for index, (captured, live) in enumerate(zip(captured_addresses, live_addresses))
                 if captured != live
             ]
             if len(captured_addresses) != len(live_addresses):
@@ -1839,22 +2159,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             {},
         ).get(region_name)
         live_signatures = tuple(
-            self._staged_sfa_tensor_signature(value)
-            for value in graph_inputs
-            if isinstance(value, torch.Tensor)
+            self._staged_sfa_tensor_signature(value) for value in graph_inputs if isinstance(value, torch.Tensor)
         )
         if captured_signatures is None:
             raise RuntimeError(
-                "[SFA staged graph POC] the "
-                f"{region_name} graph did not record its full input "
-                "signatures."
+                f"[SFA staged graph POC] the {region_name} graph did not record its full input signatures."
             )
         if captured_signatures != live_signatures:
             signature_mismatches = [
                 index
-                for index, (captured, live) in enumerate(
-                    zip(captured_signatures, live_signatures)
-                )
+                for index, (captured, live) in enumerate(zip(captured_signatures, live_signatures))
                 if captured != live
             ]
             if len(captured_signatures) != len(live_signatures):
@@ -1905,10 +2219,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if capture_failures is None:
                 capture_failures = []
                 self._staged_sfa_capture_failures = capture_failures
-            capture_failures.append(
-                f"{region_name}: runnable reached its {phase} phase outside "
-                "NPU stream capture"
-            )
+            capture_failures.append(f"{region_name}: runnable reached its {phase} phase outside NPU stream capture")
             return
         capture_phases = getattr(
             self,
@@ -1967,34 +2278,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         missing_phases = required_phases - observed_phases
         if missing_phases:
-            capture_failures.append(
-                f"{region_name}: missing capture phases "
-                f"{sorted(missing_phases)}"
-            )
+            capture_failures.append(f"{region_name}: missing capture phases {sorted(missing_phases)}")
 
         batch_descriptor = get_forward_context().batch_descriptor
-        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(
-            batch_descriptor
-        )
-        tensor_inputs = tuple(
-            value
-            for value in graph_inputs
-            if isinstance(value, torch.Tensor)
-        )
+        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(batch_descriptor)
+        tensor_inputs = tuple(value for value in graph_inputs if isinstance(value, torch.Tensor))
         live_addresses = [value.data_ptr() for value in tensor_inputs]
         if graph_entry is None or graph_entry.aclgraph is None:
-            capture_failures.append(
-                f"{region_name}: no captured graph entry for "
-                f"{batch_descriptor}"
-            )
+            capture_failures.append(f"{region_name}: no captured graph entry for {batch_descriptor}")
         elif graph_entry.input_addresses is None:
-            capture_failures.append(
-                f"{region_name}: captured graph entry has no input addresses"
-            )
+            capture_failures.append(f"{region_name}: captured graph entry has no input addresses")
         elif graph_entry.input_addresses != live_addresses:
             capture_failures.append(
-                f"{region_name}: captured input addresses do not match "
-                "the tensors returned from the capture call"
+                f"{region_name}: captured input addresses do not match the tensors returned from the capture call"
             )
 
         input_signatures = getattr(
@@ -2005,24 +2301,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if input_signatures is None:
             input_signatures = {}
             self._staged_sfa_graph_input_signatures = input_signatures
-        input_signatures[region_name] = tuple(
-            self._staged_sfa_tensor_signature(value)
-            for value in tensor_inputs
-        )
+        input_signatures[region_name] = tuple(self._staged_sfa_tensor_signature(value) for value in tensor_inputs)
 
         if not graph_outputs:
-            capture_failures.append(
-                f"{region_name}: capture returned no graph outputs"
-            )
+            capture_failures.append(f"{region_name}: capture returned no graph outputs")
         for output_index, graph_output in enumerate(graph_outputs):
             if not isinstance(graph_output, torch.Tensor):
-                capture_failures.append(
-                    f"{region_name}: output {output_index} is not a tensor"
-                )
+                capture_failures.append(f"{region_name}: output {output_index} is not a tensor")
             elif int(graph_output.numel()) == 0:
-                capture_failures.append(
-                    f"{region_name}: output {output_index} is empty"
-                )
+                capture_failures.append(f"{region_name}: output {output_index} is empty")
         capture_records.add(region_name)
 
     def _require_staged_sfa_startup_proof(self) -> None:
@@ -2058,11 +2345,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         exact: bool,
     ) -> torch.Tensor:
         """Return a device scalar without branching on a local TP result."""
-        if (
-            actual.shape != reference.shape
-            or actual.dtype != reference.dtype
-            or actual.device != reference.device
-        ):
+        if actual.shape != reference.shape or actual.dtype != reference.dtype or actual.device != reference.device:
             return actual.new_zeros((), dtype=torch.bool)
         if exact:
             return torch.eq(actual, reference).all()
@@ -2128,26 +2411,28 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_staged_sfa_parity_latent_scratch(
         self,
         kv_cache: tuple[torch.Tensor, ...],
+        num_rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return private one-block buffers for eager latent computation."""
+        """Return private buffers with one distinct slot per parity row."""
         live_caches = (kv_cache[0], kv_cache[1])
+        block_size = int(live_caches[0].shape[1])
+        required_blocks = (num_rows + block_size - 1) // block_size
+        if required_blocks <= 0 or any(int(live.shape[0]) < required_blocks for live in live_caches):
+            raise RuntimeError("[SFA staged graph POC] insufficient private cache capacity for batched live parity.")
         scratch = getattr(
             self,
             "_staged_sfa_parity_latent_scratch",
             None,
         )
-        if (
-            scratch is None
-            or any(
-                private.shape != live[:1].shape
-                or private.dtype != live.dtype
-                or private.device != live.device
-                for private, live in zip(scratch, live_caches)
-            )
+        if scratch is None or any(
+            private.shape != live[:required_blocks].shape
+            or private.dtype != live.dtype
+            or private.device != live.device
+            for private, live in zip(scratch, live_caches)
         ):
             scratch = (
-                torch.empty_like(live_caches[0][:1]),
-                torch.empty_like(live_caches[1][:1]),
+                torch.empty_like(live_caches[0][:required_blocks]),
+                torch.empty_like(live_caches[1][:required_blocks]),
             )
             self._staged_sfa_parity_latent_scratch = scratch
         return scratch
@@ -2192,28 +2477,33 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert k_li_scale is None
         k_li = self._get_full_kv(k_li, None)
 
-        private_nope, private_pe = (
-            self._get_staged_sfa_parity_latent_scratch(kv_cache)
+        num_rows = int(hidden_states.shape[0])
+        private_nope, private_pe = self._get_staged_sfa_parity_latent_scratch(
+            kv_cache,
+            num_rows,
         )
+        reference_slots = torch.arange(
+            num_rows,
+            dtype=torch.int64,
+            device=slot_mapping.device,
+        ).reshape(slot_mapping.shape)
         kv_input = kv_no_split.view(
             kv_no_split.shape[0],
             self.num_kv_heads,
             1,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
-        _, _, ref_k_pe, ref_k_nope = (
-            torch_npu.npu_kv_rmsnorm_rope_cache(
-                kv_input,
-                self.kv_a_layernorm.weight,
-                cos,
-                sin,
-                torch.zeros_like(slot_mapping).to(torch.int64),
-                private_pe,
-                private_nope,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA",
-                is_output_kv=True,
-            )
+        _, _, ref_k_pe, ref_k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+            kv_input,
+            self.kv_a_layernorm.weight,
+            cos,
+            sin,
+            reference_slots,
+            private_pe,
+            private_nope,
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA",
+            is_output_kv=True,
         )
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
@@ -2343,12 +2633,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         if any(value is not None for value in persistent_outputs):
             if not all(value is not None for value in persistent_outputs):
                 raise RuntimeError(
-                    "[SFA staged graph POC] Graph A requires either all four "
-                    "persistent output buffers or none of them."
+                    "[SFA staged graph POC] Graph A requires either all four persistent output buffers or none of them."
                 )
-            for output_index, (persistent, computed) in enumerate(
-                zip(persistent_outputs, computed_outputs)
-            ):
+            for output_index, (persistent, computed) in enumerate(zip(persistent_outputs, computed_outputs)):
                 assert persistent is not None
                 if (
                     persistent.shape != computed.shape
@@ -2497,19 +2784,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     or canary.device != device
                 ):
                     raise RuntimeError(
-                        "[SFA staged graph POC] the persistent "
-                        f"{region_name} replay canary has an invalid signature."
+                        f"[SFA staged graph POC] the persistent {region_name} replay canary has an invalid signature."
                     )
             if canaries["pre"].data_ptr() == canaries["post"].data_ptr():
-                raise RuntimeError(
-                    "[SFA staged graph POC] pre/post replay canaries alias."
-                )
+                raise RuntimeError("[SFA staged graph POC] pre/post replay canaries alias.")
             return canaries
         if canaries:
-            raise RuntimeError(
-                "[SFA staged graph POC] replay-canary initialization is "
-                f"partial: {sorted(canaries)}."
-            )
+            raise RuntimeError(f"[SFA staged graph POC] replay-canary initialization is partial: {sorted(canaries)}.")
         if runtime_mode != CUDAGraphMode.NONE:
             raise RuntimeError(
                 "[SFA staged graph POC] replay canaries were not allocated "
@@ -2538,14 +2819,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         is_dummy_run: bool,
         runtime_mode: CUDAGraphMode | None,
     ) -> tuple[torch.Tensor, ...]:
-        if len(graph_outputs) != 4 or not all(
-            isinstance(output, torch.Tensor)
-            for output in graph_outputs
-        ):
-            raise RuntimeError(
-                "[SFA staged graph POC] Graph A must return exactly four "
-                "tensor outputs."
-            )
+        if len(graph_outputs) != 4 or not all(isinstance(output, torch.Tensor) for output in graph_outputs):
+            raise RuntimeError("[SFA staged graph POC] Graph A must return exactly four tensor outputs.")
         persistent_outputs = getattr(
             self,
             "_staged_sfa_pre_output_buffers",
@@ -2557,9 +2832,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "[SFA staged graph POC] persistent Graph-A outputs were "
                     "not allocated by the eager dummy warmup before capture."
                 )
-            persistent_outputs = tuple(
-                torch.empty_like(output) for output in graph_outputs
-            )
+            persistent_outputs = tuple(torch.empty_like(output) for output in graph_outputs)
             for persistent, output in zip(
                 persistent_outputs,
                 graph_outputs,
@@ -2570,13 +2843,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         mismatches = [
             output_index
-            for output_index, (persistent, returned) in enumerate(
-                zip(persistent_outputs, graph_outputs)
-            )
-            if (
-                self._staged_sfa_tensor_signature(persistent)
-                != self._staged_sfa_tensor_signature(returned)
-            )
+            for output_index, (persistent, returned) in enumerate(zip(persistent_outputs, graph_outputs))
+            if (self._staged_sfa_tensor_signature(persistent) != self._staged_sfa_tensor_signature(returned))
         ]
         if len(persistent_outputs) != len(graph_outputs):
             mismatches.extend(
@@ -2586,10 +2854,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             )
         if mismatches:
-            message = (
-                "Graph A did not return its persistent output storage; "
-                f"differing output indices={mismatches}"
-            )
+            message = f"Graph A did not return its persistent output storage; differing output indices={mismatches}"
             if self._staged_sfa_capture_dummy_active():
                 failures = getattr(
                     self,
@@ -2615,6 +2880,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Run graph A -> eager LMCache retrieve -> graph B."""
+        graph_key = self._staged_sfa_q1_graph_key(
+            hidden_states,
+            attn_metadata,
+        )
+        self._activate_staged_sfa_graph_key(graph_key)
         pre_graph, post_graph = self._get_staged_sfa_graph_wrappers()
         forward_context = get_forward_context()
         parity_state = getattr(
@@ -2624,10 +2894,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if not isinstance(parity_state, StagedSFALiveParityState):
             parity_state = None
-        run_live_parity = (
-            parity_state is not None
-            and id(self) not in parity_state.checked_impl_ids
-        )
+        elif parity_state.graph_key != graph_key:
+            raise RuntimeError("[SFA staged graph POC] live parity key does not match the active graph key.")
+        run_live_parity = parity_state is not None and id(self) not in parity_state.checked_impl_ids
         parity_failures: list[str] = []
         is_dummy_run = bool(
             getattr(
@@ -2636,19 +2905,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 False,
             )
         )
-        live_request_ids = (
-            None
-            if is_dummy_run
-            else tuple(attn_metadata.decode_request_ids_compact or ())
-        )
+        live_request_ids = None if is_dummy_run else tuple(attn_metadata.decode_request_ids_compact or ())
         validate_live_inputs = not is_dummy_run
-        log_live_validation = (
-            validate_live_inputs
-            and (
-                not self._staged_sfa_live_capture_validated
-                or self._staged_sfa_live_validated_request_ids
-                != live_request_ids
-            )
+        log_live_validation = validate_live_inputs and (
+            not self._staged_sfa_live_capture_validated
+            or self._staged_sfa_live_validated_request_ids != live_request_ids
         )
         if validate_live_inputs:
             self._require_staged_sfa_startup_proof()
@@ -2661,18 +2922,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         if is_dummy_run and not self._staged_sfa_dummy_cache_initialized:
             if runtime_mode != CUDAGraphMode.NONE:
                 raise RuntimeError(
-                    "[SFA staged graph POC] cache block 0 was not initialized "
-                    "by the eager dummy warmup before graph capture."
+                    "[SFA staged graph POC] the exact-Q1 dummy cache blocks "
+                    "were not initialized by eager warmup before capture."
                 )
-            # The worker resets both dummy block tables to physical block 0.
-            # Initialize only that block outside capture so the later ordered
-            # replay smoke cannot inherit uninitialized cache data.
+            # Dummy row r maps to physical block r. Zero every block owned by
+            # this exact key outside capture so requests cannot collide or
+            # inherit uninitialized data during the ordered replay proof.
             for cache in kv_cache:
-                if cache.shape[0] == 0:
+                if int(cache.shape[0]) < graph_key.request_capacity:
                     raise RuntimeError(
-                        "[SFA staged graph POC] a dummy KV cache has no blocks."
+                        "[SFA staged graph POC] a dummy KV cache has fewer "
+                        "physical blocks than the exact-Q1 request capacity."
                     )
-                cache[0].zero_()
+                cache[: graph_key.request_capacity].zero_()
             self._staged_sfa_dummy_cache_initialized = True
 
         replay_canaries = self._ensure_staged_sfa_replay_canaries(
@@ -2684,21 +2946,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             "_staged_sfa_pre_output_buffers",
             None,
         )
-        pre_output_args = (
-            persistent_pre_outputs
-            if persistent_pre_outputs is not None
-            else (None, None, None, None)
-        )
+        pre_output_args = persistent_pre_outputs if persistent_pre_outputs is not None else (None, None, None, None)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
         indexer_slot_mapping = attn_metadata.indexer_slot_mapping
         indexer_block_table = attn_metadata.indexer_block_table
-        remap_boundary = _prepare_staged_sfa_remap_boundary(
+        remap_boundary = _prepare_sfa_remap_boundary(
             attn_metadata,
-            attn_metadata.decode_request_ids_compact,
+            attn_metadata.req_ids,
             is_dummy_run=is_dummy_run,
+            index_topk=self.index_topk,
         )
 
         # In two-group mode start_load only primes a cold index retriever. The
@@ -2706,9 +2965,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # on a warm/resident request this is an inexpensive connector no-op.
         if not is_dummy_run and index_lmcache_enabled:
             assert index_layer_name is not None
-            with torch.profiler.record_function(
-                "sfa_staged_graph_poc::lmcache_index_retrieve"
-            ):
+            with torch.profiler.record_function("sfa_staged_graph_poc::lmcache_index_retrieve"):
                 wait_for_kv_layer_from_connector(index_layer_name)
 
         pre_graph_inputs = (
@@ -2754,9 +3011,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if run_live_parity:
-            with torch.profiler.record_function(
-                "sfa_staged_graph_poc::live_parity_pre"
-            ):
+            with torch.profiler.record_function("sfa_staged_graph_poc::live_parity_pre"):
                 try:
                     (
                         ref_ql_nope,
@@ -2779,21 +3034,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                         remap_boundary,
                     )
                     latent_slots = slot_mapping.reshape(-1).to(torch.int64)
-                    index_slots = (
-                        indexer_slot_mapping.reshape(-1).to(torch.int64)
+                    index_slots = indexer_slot_mapping.reshape(-1).to(torch.int64)
+                    actual_cache_nope = (
+                        kv_cache[0]
+                        .reshape(
+                            -1,
+                            kv_cache[0].shape[-1],
+                        )
+                        .index_select(0, latent_slots)
                     )
-                    actual_cache_nope = kv_cache[0].reshape(
-                        -1,
-                        kv_cache[0].shape[-1],
-                    ).index_select(0, latent_slots)
-                    actual_cache_pe = kv_cache[1].reshape(
-                        -1,
-                        kv_cache[1].shape[-1],
-                    ).index_select(0, latent_slots)
-                    actual_cache_index = kv_cache[2].reshape(
-                        -1,
-                        kv_cache[2].shape[-1],
-                    ).index_select(0, index_slots)
+                    actual_cache_pe = (
+                        kv_cache[1]
+                        .reshape(
+                            -1,
+                            kv_cache[1].shape[-1],
+                        )
+                        .index_select(0, latent_slots)
+                    )
+                    actual_cache_index = (
+                        kv_cache[2]
+                        .reshape(
+                            -1,
+                            kv_cache[2].shape[-1],
+                        )
+                        .index_select(0, index_slots)
+                    )
                     parity_state.match_flags.extend(
                         (f"{layer_name}: pre.{name}", match_flag)
                         for name, match_flag in self._staged_sfa_parity_flags(
@@ -2839,10 +3104,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         )
                     )
                 except Exception as exc:
-                    parity_failures.append(
-                        "pre.exception="
-                        f"{type(exc).__name__}: {str(exc)[:256]}"
-                    )
+                    parity_failures.append(f"pre.exception={type(exc).__name__}: {str(exc)[:256]}")
 
         # Match the native producer fence: it follows current-token latent and
         # index writes, but precedes LMCache's scratch writes.
@@ -2872,35 +3134,35 @@ class AscendSFAImpl(MLAAttentionImpl):
         # This selective latent call intentionally stays outside both wrappers.
         # Its load stream waits for Graph A, scatters the selected prompt rows,
         # and makes the compute stream wait before Graph B consumes scratch.
-        with torch.profiler.record_function(
-            "sfa_staged_graph_poc::lmcache_retrieve"
-        ):
+        with torch.profiler.record_function("sfa_staged_graph_poc::lmcache_retrieve"):
             if not is_dummy_run:
+                (
+                    selected_for_wait,
+                    request_ids_for_wait,
+                    target_slot_mapping_for_wait,
+                ) = _prepare_dsa_sparse_lmcache_payload(
+                    attn_metadata,
+                    selected_packed,
+                    index_topk=self.index_topk,
+                )
                 wait_for_kv_layer_from_connector(
                     layer_name,
-                    selected_tokens=selected_packed,
+                    selected_tokens=selected_for_wait,
                     token_start_index=None,
-                    request_ids=attn_metadata.decode_request_ids_compact,
-                    target_slot_mapping=None,
+                    request_ids=request_ids_for_wait,
+                    target_slot_mapping=target_slot_mapping_for_wait,
                 )
-                if (
-                    _LMCACHE_SPARSE_WAIT_SYNC_ONCE
-                    and not _lmcache_sparse_wait_sync_once_done
-                ):
+                if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()
 
         with torch.profiler.record_function("sfa_staged_graph_poc::post"):
             post_graph_output = post_graph(*post_graph_inputs)
-        if (
-            not isinstance(post_graph_output, torch.Tensor)
-            or self._staged_sfa_tensor_signature(post_graph_output)
-            != self._staged_sfa_tensor_signature(output)
-        ):
+        if not isinstance(post_graph_output, torch.Tensor) or self._staged_sfa_tensor_signature(
+            post_graph_output
+        ) != self._staged_sfa_tensor_signature(output):
             message = "Graph B did not return its caller-owned output storage"
             if self._staged_sfa_capture_dummy_active():
-                self._staged_sfa_capture_failures.append(
-                    f"post: {message}"
-                )
+                self._staged_sfa_capture_failures.append(f"post: {message}")
             else:
                 raise RuntimeError(f"[SFA staged graph POC] {message}.")
         self._record_staged_sfa_graph_capture(
@@ -2910,9 +3172,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             (output,),
         )
         if run_live_parity:
-            with torch.profiler.record_function(
-                "sfa_staged_graph_poc::live_parity_post"
-            ):
+            with torch.profiler.record_function("sfa_staged_graph_poc::live_parity_post"):
                 try:
                     ref_output = self._staged_sfa_eager_post_reference_poc(
                         ql_nope,
@@ -2930,22 +3190,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                             f"{layer_name}: post.{name}",
                             match_flag,
                         )
-                        for name, match_flag in self._staged_sfa_parity_flags(
-                            (("output", output, ref_output, False),)
-                        )
+                        for name, match_flag in self._staged_sfa_parity_flags((("output", output, ref_output, False),))
                     )
                 except Exception as exc:
-                    parity_failures.append(
-                        "post.exception="
-                        f"{type(exc).__name__}: {str(exc)[:256]}"
-                    )
+                    parity_failures.append(f"post.exception={type(exc).__name__}: {str(exc)[:256]}")
 
             parity_state.checked_impl_ids.add(id(self))
             parity_state.checked_layer_names.append(layer_name)
-            parity_state.failures.extend(
-                f"{layer_name}: {failure}"
-                for failure in parity_failures
-            )
+            parity_state.failures.extend(f"{layer_name}: {failure}" for failure in parity_failures)
         if validate_live_inputs:
             self._staged_sfa_live_capture_validated = True
             self._staged_sfa_live_validated_request_ids = live_request_ids
@@ -2959,22 +3211,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Preserve the native pure-decode gate. Ordinary saves remain eager;
         # parity-token saves are queued until the model-boundary TP verdict.
         if not is_dummy_run:
-            skip_decode_save = (
-                bool(self.dsa_shrink_latent)
-                and _decode_window_save_window_size() == 0
-            )
-            save_operations: list[
-                tuple[str, list[torch.Tensor]]
-            ] = []
+            skip_decode_save = bool(self.dsa_shrink_latent) and _decode_window_save_window_size() == 0
+            save_operations: list[tuple[str, list[torch.Tensor]]] = []
             if not skip_decode_save:
                 if self.dsa_offload_unbundle:
-                    save_operations.append(
-                        (layer_name, [kv_cache[0], kv_cache[1]])
-                    )
+                    save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
                     if index_layer_name is not None and index_lmcache_enabled:
-                        save_operations.append(
-                            (index_layer_name, [kv_cache[2]])
-                        )
+                        save_operations.append((index_layer_name, [kv_cache[2]]))
                 else:
                     save_operations.append((layer_name, list(kv_cache)))
 
@@ -3001,23 +3244,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
-        _dsa_prof.set_step_kind(
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-        )
+        _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         _is_pure_decode = attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
-        index_layer_name = (
-            _dsa_indexer_layer_name(layer_name)
-            if self.dsa_offload_unbundle
-            else None
-        )
+        index_layer_name = _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
         index_lmcache_enabled = (
-            self.dsa_offload_unbundle
-            and index_layer_name is not None
-            and _dsa_index_lmcache_enabled()
+            self.dsa_offload_unbundle and index_layer_name is not None and _dsa_index_lmcache_enabled()
         )
         if self.dsa_offload_unbundle and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
@@ -3065,10 +3300,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     False,
                 )
             ):
-                raise RuntimeError(
-                    "[SFA staged graph POC] the one-token dummy pass "
-                    f"is ineligible: {staged_reason}."
-                )
+                raise RuntimeError(f"[SFA staged graph POC] the exact-Q1 dummy pass is ineligible: {staged_reason}.")
             if (
                 getattr(
                     get_forward_context(),
@@ -3077,10 +3309,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 == CUDAGraphMode.PIECEWISE
             ):
-                logger.warning_once(
-                    "[SFA staged graph POC] using the existing forward: "
-                    f"{staged_reason}."
-                )
+                logger.warning_once(f"[SFA staged graph POC] using the existing forward: {staged_reason}.")
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
@@ -3088,9 +3317,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # DSA two-group mode: the indexer cache write must use the indexer
         # group's own slots; falls back to the shared slots in single-group mode.
         idx_slot_mapping = (
-            attn_metadata.indexer_slot_mapping
-            if attn_metadata.indexer_slot_mapping is not None
-            else slot_mapping
+            attn_metadata.indexer_slot_mapping if attn_metadata.indexer_slot_mapping is not None else slot_mapping
         )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
@@ -3163,19 +3390,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # ckv_cache/k_cache at the pool's own slots. positions = arange(ctx,
                     # ctx+qlen) per request handles both prefill chunks and decode (qlen=1).
                     # HW-VERIFY: pool tensors are paged-layout for the op.
-                    _qsl = torch.cat(
-                        [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
-                    )
+                    _qsl = torch.cat([attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens])
                     _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
                     with _dsa_prof.section("exec_kv_slots"):
                         _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
-                            layer_name, _fc.dsa_req_ids, _qsl, _ctx,
+                            layer_name,
+                            _fc.dsa_req_ids,
+                            _qsl,
+                            _ctx,
                             decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
                         )
                     with _dsa_prof.section("exec_kv_op"):
-                        k_pe, k_nope = self.exec_kv(
-                            kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata
-                        )
+                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata)
                 else:
                     with _dsa_prof.section("exec_kv"):
                         k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
@@ -3304,11 +3530,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # block table. Decode-window mode uses current_window_start as the
         # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
-        if (
-            self.dsa_shrink_latent
-            and attn_metadata.prompt_lens is not None
-            and attn_metadata.num_decode_tokens > 0
-        ):
+        if self.dsa_shrink_latent and attn_metadata.prompt_lens is not None and attn_metadata.num_decode_tokens > 0:
             # _remap_boundary is per row. Decode rows carry prompt_len by
             # default; decode-window mode replaces it with current_window_start.
             # Prefill/padding rows carry 0 and stay untouched, so this also
@@ -3326,115 +3548,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             elif attn_metadata.decode_row_offsets is not None:
                 _topk_width = int(topk_indices.numel() // max(_topk_rows, 1))
                 _scratch_base = (
-                    attn_metadata.decode_row_offsets[:_topk_rows]
-                    .to(device=topk_indices.device)
-                    * _topk_width
+                    attn_metadata.decode_row_offsets[:_topk_rows].to(device=topk_indices.device) * _topk_width
                 )
-            _remap_boundary = attn_metadata.prompt_lens
-            _decode_window_size = _decode_window_save_window_size()
-            _cached_boundary = (
-                attn_metadata.decode_remap_boundary
-                if attn_metadata.decode_remap_boundary_ready
-                else None
+            _forward_context = get_forward_context()
+            _boundary_request_ids = attn_metadata.req_ids
+            if _boundary_request_ids is None:
+                _boundary_request_ids = getattr(
+                    _forward_context,
+                    "dsa_req_ids",
+                    None,
+                )
+            _remap_boundary = _prepare_sfa_remap_boundary(
+                attn_metadata,
+                _boundary_request_ids,
+                is_dummy_run=bool(
+                    getattr(
+                        _forward_context,
+                        "staged_sfa_graph_dummy_run",
+                        False,
+                    )
+                ),
+                index_topk=self.index_topk,
             )
-            if (
-                _cached_boundary is not None
-                and _cached_boundary.shape == _remap_boundary.shape
-                and _cached_boundary.device == _remap_boundary.device
-                and _cached_boundary.dtype == _remap_boundary.dtype
-            ):
-                _remap_boundary = _cached_boundary
-            else:
-                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
-                    getattr(get_forward_context(), "dsa_req_ids", None)
-                )
-                _lmcache_boundary = None
-                if _lmcache_cached_tokens is not None:
-                    _lmcache_boundary = torch.tensor(
-                        _lmcache_cached_tokens,
-                        device=_remap_boundary.device,
-                        dtype=_remap_boundary.dtype,
-                    )
-                _boundary_override = None
-                if _decode_window_size > 0:
-                    _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                    _window_start = (
-                        _cur_pos // _decode_window_size * _decode_window_size
-                    ).to(
-                        device=_remap_boundary.device,
-                        dtype=_remap_boundary.dtype,
-                    )
-                    if _lmcache_boundary is not None:
-                        if _lmcache_boundary.numel() < _window_start.numel():
-                            _lmcache_boundary = torch.nn.functional.pad(
-                                _lmcache_boundary,
-                                (
-                                    0,
-                                    _window_start.numel()
-                                    - _lmcache_boundary.numel(),
-                                ),
-                            )
-                        _committed_end = _lmcache_boundary[: _window_start.numel()]
-                        _window_start = torch.minimum(_window_start, _committed_end)
-                    _boundary_override = _window_start
-                elif _lmcache_boundary is not None:
-                    # No decode-window save, but LMCache still reports the prefix
-                    # that sparse direct can safely provide. Use that exact frontier
-                    # instead of prompt_len so the final partial prompt chunk stays
-                    # in the live vLLM tail.
-                    _boundary_override = _lmcache_boundary
-                if _boundary_override is not None:
-                    _row_req_indices = getattr(
-                        attn_metadata, "decode_req_indices", None
-                    )
-                    if _row_req_indices is not None:
-                        _row_req_indices = _row_req_indices[
-                            : _remap_boundary.shape[0]
-                        ].to(device=_remap_boundary.device, dtype=torch.long)
-                        _valid_decode_rows = _row_req_indices >= 0
-                        if _boundary_override.numel() == 0:
-                            raise RuntimeError(
-                                "LMCache sparse remap has decode rows but "
-                                "no request boundaries"
-                            )
-                        _safe_row_req_indices = _row_req_indices.clamp(
-                            min=0, max=int(_boundary_override.numel()) - 1
-                        )
-                        _boundary_rows = _boundary_override.index_select(
-                            0, _safe_row_req_indices
-                        ).to(dtype=_remap_boundary.dtype)
-                        _remap_boundary = torch.where(
-                            _valid_decode_rows,
-                            _boundary_rows,
-                            _remap_boundary,
-                        )
-                    else:
-                        if _boundary_override.shape[0] != _remap_boundary.shape[0]:
-                            raise RuntimeError(
-                                "LMCache sparse remap requires per-row "
-                                "decode_req_indices when request and row counts "
-                                "differ: "
-                                f"boundary_shape={tuple(_boundary_override.shape)} "
-                                f"remap_boundary_shape={tuple(_remap_boundary.shape)}"
-                            )
-                        _decode_rows = torch.arange(
-                            _remap_boundary.shape[0], device=_remap_boundary.device
-                        ) < int(attn_metadata.num_decode_tokens)
-                        _remap_boundary = torch.where(
-                            _decode_rows, _boundary_override, _remap_boundary
-                        )
-                _boundary_buffer = attn_metadata.decode_remap_boundary
-                if (
-                    _boundary_buffer is not None
-                    and _boundary_buffer.shape == _remap_boundary.shape
-                    and _boundary_buffer.device == _remap_boundary.device
-                    and _boundary_buffer.dtype == _remap_boundary.dtype
-                ):
-                    _boundary_buffer.copy_(_remap_boundary)
-                    _remap_boundary = _boundary_buffer
-                else:
-                    attn_metadata.decode_remap_boundary = _remap_boundary
-                attn_metadata.decode_remap_boundary_ready = True
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
@@ -3448,61 +3583,45 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
-                _valid_rows_all = getattr(
-                    attn_metadata, "decode_valid_rows_all", False
-                )
-                _valid_row_indices = getattr(
-                    attn_metadata, "decode_valid_row_indices", None
-                )
+                _valid_rows_all = getattr(attn_metadata, "decode_valid_rows_all", False)
+                _valid_row_indices = getattr(attn_metadata, "decode_valid_row_indices", None)
                 if _valid_rows_all or _valid_row_indices is not None:
-                    if _valid_rows_all:
-                        _selected_for_wait = _sel_packed
-                    else:
-                        _selected_for_wait = _sel_packed.index_select(
-                            0, _valid_row_indices
-                        )
-                    _target_slot_mapping_for_wait = getattr(
-                        attn_metadata, "decode_target_slot_mapping", None
-                    )
-                    _request_ids_for_wait = getattr(
-                        attn_metadata, "decode_request_ids_compact", None
+                    (
+                        _selected_for_wait,
+                        _request_ids_for_wait,
+                        _target_slot_mapping_for_wait,
+                    ) = _prepare_dsa_sparse_lmcache_payload(
+                        attn_metadata,
+                        _sel_packed,
+                        index_topk=self.index_topk,
                     )
                 elif attn_metadata.decode_req_indices is not None and _scratch_base is not None:
-                    _decode_req_indices = attn_metadata.decode_req_indices[
-                        : _sel_packed.shape[0]
-                    ]
+                    _decode_req_indices = attn_metadata.decode_req_indices[: _sel_packed.shape[0]]
                     _decode_row_mask = _decode_req_indices >= 0
                     _selected_for_wait = _sel_packed[_decode_row_mask]
                     _row_req_indices = _decode_req_indices[_decode_row_mask]
-                    _row_scratch_base = _scratch_base[: _sel_packed.shape[0]][
-                        _decode_row_mask
-                    ]
+                    _row_scratch_base = _scratch_base[: _sel_packed.shape[0]][_decode_row_mask]
                     _target_slot_mapping_for_wait = _dsa_build_target_slot_mapping(
                         attn_metadata.block_table,
                         _row_req_indices,
                         _row_scratch_base,
                         int(_selected_for_wait.shape[1]),
                         int(kv_cache[0].shape[1]),
+                        scratch_capacity=int(attn_metadata.decode_scratch_capacity or 0),
                     )
                     _dsa_req_ids = getattr(get_forward_context(), "dsa_req_ids", None)
                     if _dsa_req_ids is not None:
-                        _decode_req_indices_cpu = getattr(
-                            attn_metadata, "decode_req_indices_cpu", None
-                        )
+                        _decode_req_indices_cpu = getattr(attn_metadata, "decode_req_indices_cpu", None)
                         if _decode_req_indices_cpu is not None:
                             _request_ids_for_wait = [
                                 _dsa_req_ids[int(req_idx)]
-                                for req_idx in _decode_req_indices_cpu[
-                                    : int(_sel_packed.shape[0])
-                                ]
+                                for req_idx in _decode_req_indices_cpu[: int(_sel_packed.shape[0])]
                                 if int(req_idx) >= 0
                             ]
                         else:
                             _request_ids_for_wait = [
                                 _dsa_req_ids[int(req_idx)]
-                                for req_idx in _row_req_indices.detach()
-                                .to(device="cpu")
-                                .tolist()
+                                for req_idx in _row_req_indices.detach().to(device="cpu").tolist()
                             ]
                 else:
                     # Compatibility fallback for metadata built before row-level DSA
@@ -3516,10 +3635,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
-                if (
-                    _LMCACHE_SPARSE_WAIT_SYNC_ONCE
-                    and not _lmcache_sparse_wait_sync_once_done
-                ):
+                if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
@@ -3532,14 +3648,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_fc = get_forward_context()
         _dsa_mgr = getattr(_dsa_fc, "dsa_offload_manager", None)
         _dsa_adapter = getattr(_dsa_fc, "dsa_adapter_cache", None)
-        _dsa_on_native_path = not (
-            self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
-        )
+        _dsa_on_native_path = not (self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS)
         _dsa_supported = (
-            _dsa_mgr is not None
-            and not self.enable_dsa_cp
-            and not self.use_sparse_c8_indexer
-            and _dsa_on_native_path
+            _dsa_mgr is not None and not self.enable_dsa_cp and not self.use_sparse_c8_indexer and _dsa_on_native_path
         )
         # Adapter latent cache (separate flag). Needs per-request ids in the forward
         # context (absent in dummy/profile runs -> skip -> native).
@@ -3615,8 +3726,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
                     native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="adapter_parity_native",
                     )
@@ -3629,9 +3745,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # prefill: store this layer's prompt latent into the adapter backend so
                 # decode-time retrieve can fetch prefill-selected blocks; attention
                 # itself uses the native prefill path (attn_output stays None).
-                _qsl_a = torch.cat(
-                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
-                )
+                _qsl_a = torch.cat([attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens])
                 _ctx_a = attn_metadata.seq_lens - (_qsl_a[1:] - _qsl_a[:-1])
                 _ac.store_prefill(layer_name, _req_ids_a, _qsl_a, _ctx_a, _kn_a, _kp_a)
 
@@ -3680,8 +3794,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="lmcache_parity_native",
                     )
@@ -3695,30 +3814,36 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # the self-managed PagedLatentPool and run prefill attention from the pool
                 # (Route 1 / R1b). The vLLM paged latent is still written by the op, so
                 # the parity path can compare pool-attn vs native-paged-attn.
-                _qsl = torch.cat(
-                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
-                )
+                _qsl = torch.cat([attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens])
                 _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
-                _dsa_hooks.store_prefill(
-                    _dsa_mgr, layer_name, _dsa_fc.dsa_req_ids, _qsl, _ctx, _kn, _kp
-                )
-                _dsa_mgr.populate_pool_layer(
-                    _dsa_fc.dsa_req_ids, layer_name, _qsl, _ctx, _kn, _kp
-                )
+                _dsa_hooks.store_prefill(_dsa_mgr, layer_name, _dsa_fc.dsa_req_ids, _qsl, _ctx, _kn, _kp)
+                _dsa_mgr.populate_pool_layer(_dsa_fc.dsa_req_ids, layer_name, _qsl, _ctx, _kn, _kp)
                 _p_knope, _p_kpe, _p_bt = _dsa_mgr.pool_attn_args(
                     layer_name, _dsa_fc.dsa_req_ids, attn_metadata.block_table.shape[1]
                 )
                 pool_out = self._execute_sparse_flash_attention_process(
-                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                    actual_seq_lengths_query, actual_seq_lengths_key,
-                    kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key,
+                    kv_override=_p_knope,
+                    key_rope_override=_p_kpe,
+                    block_table_override=_p_bt,
                     layer_name=layer_name,
                     trace_label="pool_prefill",
                 )
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
                     native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
                         layer_name=layer_name,
                         trace_label="pool_prefill_parity_native",
                     )
@@ -3731,8 +3856,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_output is None:
             with _dsa_prof.section("fa"):
                 attn_output = self._execute_sparse_flash_attention_process(
-                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                    actual_seq_lengths_query, actual_seq_lengths_key,
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key,
                     layer_name=layer_name,
                     trace_label="native",
                 )
@@ -3790,27 +3920,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
         _decode_window_save_enabled = _decode_window_save_window_size() > 0
-        _skip_decode_save = (
-            bool(self.dsa_shrink_latent)
-            and _is_pure_decode
-            and not _decode_window_save_enabled
-        )
-        save_operations: list[
-            tuple[str, list[torch.Tensor]]
-        ] = []
+        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
+        save_operations: list[tuple[str, list[torch.Tensor]]] = []
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                save_operations.append(
-                    (layer_name, [kv_cache[0], kv_cache[1]])
-                )
-                if (
-                    len(kv_cache) >= 3
-                    and index_layer_name is not None
-                    and index_lmcache_enabled
-                ):
-                    save_operations.append(
-                        (index_layer_name, [kv_cache[2]])
-                    )
+                save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
+                if len(kv_cache) >= 3 and index_layer_name is not None and index_lmcache_enabled:
+                    save_operations.append((index_layer_name, [kv_cache[2]]))
             else:
                 save_operations.append((layer_name, list(kv_cache)))
 

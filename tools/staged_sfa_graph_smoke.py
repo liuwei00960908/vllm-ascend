@@ -4,15 +4,15 @@
 The server must already be running with TP=8, no speculative decoding,
 SHRINK_LATENT=2, PIECEWISE graph mode, and the staged-SFA POC enabled.  This
 client sends one long, streaming completion.  It starts the online Ascend
-PyTorch profiler only after the first four streamed token chunks so the first
-two eager-vs-graph parity steps are normally outside the steady-state trace.
+PyTorch profiler only after the first four streamed token chunks so the live
+eager-vs-graph parity check is normally outside the steady-state trace.
 
 Automated checks require the model-level startup capture and ordered
-replay-canary completeness check and two live numerical parity steps to pass.
-They also require at least eight new staged worker traces to contain all three
-ranges plus an ACL model-replay API. They do not prove timeline nesting or
-device execution density; finish the checklist below in MindStudio Insight
-before calling the hardware proof successful.
+replay-canary completeness check and one live numerical parity check per graph
+key to pass. They also require at least eight new staged worker traces to
+contain all three ranges plus an ACL model-replay API. They do not prove
+timeline nesting or device execution density; finish the checklist below in
+MindStudio Insight before calling the hardware proof successful.
 """
 
 from __future__ import annotations
@@ -25,9 +25,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
-
 
 _TRACE_MARKERS = (
     "sfa_staged_graph_poc::pre",
@@ -44,24 +43,21 @@ _ACL_REPLAY_APIS = (
     "aclmdlExecuteAsyncV2",
 )
 _STARTUP_REPLAY_CANARY_COMPLETE = (
-    "[SFA staged graph POC] startup capture and ordered replay-canary "
-    "completeness check passed"
+    "[SFA staged graph POC] startup capture and ordered replay-canary completeness check passed"
 )
 _LIVE_SIGNATURE_VALIDATION = (
     "[SFA staged graph POC] verified pre/post startup capture and enabled "
     "always-on captured-input signature validation for live replay; LMCache "
     "retrieval remains eager."
 )
-_FRONTEND_PROFILER_ENABLED = (
-    "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
-)
+_FRONTEND_PROFILER_ENABLED = "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
 _PARITY_PASS = "[SFA staged graph POC] live eager-vs-graph parity passed"
 _FAILURE_MARKERS = (
     "[SFA staged graph POC] live eager-vs-graph parity failed",
     "[SFA staged graph POC] startup capture is incomplete",
     "[SFA staged graph POC] startup ordered replay-canary check failed",
     "[SFA staged graph POC] startup ordered replay-canary check is incomplete",
-    "[SFA staged graph POC] the one-token dummy pass is ineligible",
+    "[SFA staged graph POC] the exact-Q1 dummy pass is ineligible",
     "positional tensor storage for the pre graph changed",
     "positional tensor storage for the post graph changed",
     "full tensor signature for the",
@@ -111,9 +107,7 @@ def wait_until_ready(base_url: str, timeout: float) -> None:
         except (OSError, urllib.error.URLError) as exc:
             last_error = exc
         time.sleep(1.0)
-    raise SmokeFailure(
-        f"server did not become healthy within {timeout:g}s: {last_error}"
-    )
+    raise SmokeFailure(f"server did not become healthy within {timeout:g}s: {last_error}")
 
 
 def require_worker_only_profiling(server_log: Path) -> None:
@@ -137,9 +131,7 @@ def profile_control(base_url: str, action: str, timeout: float) -> None:
     ) as response:
         body = response.read().decode("utf-8", errors="replace")
         if not 200 <= response.status < 300:
-            raise SmokeFailure(
-                f"{action}_profile returned HTTP {response.status}: {body}"
-            )
+            raise SmokeFailure(f"{action}_profile returned HTTP {response.status}: {body}")
 
 
 def analyse_profile_data(
@@ -149,8 +141,7 @@ def analyse_profile_data(
 ) -> None:
     """Parse all raw rank traces from a non-daemon helper process."""
     print(
-        f"offline parsing profiler data under {profile_dir} "
-        f"(timeout {timeout:g}s)...",
+        f"offline parsing profiler data under {profile_dir} (timeout {timeout:g}s)...",
         flush=True,
     )
     command = [
@@ -167,14 +158,10 @@ def analyse_profile_data(
     try:
         subprocess.run(command, check=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise SmokeFailure(
-            f"offline profiler analysis did not finish within {timeout:g}s: "
-            f"{profile_dir}"
-        ) from exc
+        raise SmokeFailure(f"offline profiler analysis did not finish within {timeout:g}s: {profile_dir}") from exc
     except subprocess.CalledProcessError as exc:
         raise SmokeFailure(
-            "offline profiler analysis failed with exit status "
-            f"{exc.returncode}: {profile_dir}"
+            f"offline profiler analysis failed with exit status {exc.returncode}: {profile_dir}"
         ) from exc
     print("offline profiler analysis completed", flush=True)
 
@@ -237,19 +224,13 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                 try:
                     event = json.loads(data)
                 except json.JSONDecodeError as exc:
-                    raise SmokeFailure(
-                        f"invalid completion stream event: {data[:200]!r}"
-                    ) from exc
+                    raise SmokeFailure(f"invalid completion stream event: {data[:200]!r}") from exc
                 choices = event.get("choices", [])
                 if not any(choice.get("text") for choice in choices):
                     continue
                 content_chunks += 1
 
-                if (
-                    not args.skip_profile
-                    and not profile_started
-                    and content_chunks >= args.profile_after_chunks
-                ):
+                if not args.skip_profile and not profile_started and content_chunks >= args.profile_after_chunks:
                     # A lost HTTP response can hide a successful server-side
                     # start. Remember the attempt first so finally always sends
                     # a best-effort stop in that case.
@@ -261,16 +242,14 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                     )
                     profile_started = True
                     print(
-                        "profiler started after "
-                        f"{content_chunks} streamed content chunks",
+                        f"profiler started after {content_chunks} streamed content chunks",
                         flush=True,
                     )
 
                 if (
                     profile_started
                     and not profile_stopped
-                    and content_chunks
-                    >= args.profile_after_chunks + args.profile_chunks
+                    and content_chunks >= args.profile_after_chunks + args.profile_chunks
                 ):
                     # torch_npu profiler stop is not safely idempotent. Mark
                     # the attempt before sending it so a lost response does
@@ -283,16 +262,11 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                     )
                     profile_stopped = True
                     print(
-                        "profiler stopped after "
-                        f"{content_chunks} streamed content chunks",
+                        f"profiler stopped after {content_chunks} streamed content chunks",
                         flush=True,
                     )
     finally:
-        if (
-            profile_start_attempted
-            and not profile_stopped
-            and not profile_stop_attempted
-        ):
+        if profile_start_attempted and not profile_stopped and not profile_stop_attempted:
             try:
                 profile_control(
                     args.base_url,
@@ -302,16 +276,9 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
             except Exception as exc:  # best-effort cleanup after a primary failure
                 print(f"warning: failed to stop profiler: {exc}", file=sys.stderr)
 
-    minimum_chunks = (
-        args.profile_after_chunks + args.profile_chunks
-        if not args.skip_profile
-        else 2
-    )
+    minimum_chunks = args.profile_after_chunks + args.profile_chunks if not args.skip_profile else 2
     if content_chunks < minimum_chunks:
-        raise SmokeFailure(
-            f"completion produced only {content_chunks} content chunks; "
-            f"need at least {minimum_chunks}"
-        )
+        raise SmokeFailure(f"completion produced only {content_chunks} content chunks; need at least {minimum_chunks}")
     if not args.skip_profile and not profile_stopped:
         raise SmokeFailure("profile interval did not complete")
     return content_chunks
@@ -323,42 +290,57 @@ def check_server_log(path: Path) -> int:
 
     replay_canary_complete_seen = False
     signature_seen = False
-    first_parity_seen = False
-    second_parity_seen = False
     parity_passes = 0
+    parity_keys: set[str] = set()
+    parity_layer_counts: set[int] = set()
     expected_layers: int | None = None
+    expected_keys: int | None = None
     expected_graphs: int | None = None
     failures: list[str] = []
     completeness_pattern = re.compile(
         re.escape(_STARTUP_REPLAY_CANARY_COMPLETE)
-        + r" for (\d+) local SFA layers \((\d+) staged graphs\)\."
+        + r" for (\d+) local SFA layers, (\d+) keys "
+        + r"\((\d+) staged graphs\)\."
     )
+    parity_count_pattern = re.compile(r"\(1/1 live checks, (\d+) local SFA layers\)\.")
 
     with path.open("r", encoding="utf-8", errors="replace") as log_file:
         for line_number, line in enumerate(log_file, start=1):
             signature_seen |= _LIVE_SIGNATURE_VALIDATION in line
             if _PARITY_PASS in line:
                 parity_passes += 1
-                first_parity_seen |= "(1/2 live lengths" in line
-                second_parity_seen |= "(2/2 live lengths" in line
+                key_prefix = _PARITY_PASS + " for key "
+                key_and_details = line.partition(key_prefix)[2]
+                key, separator, details = key_and_details.partition(", requests ")
+                parity_match = parity_count_pattern.search(details)
+                if not separator or not key or parity_match is None:
+                    failures.append(f"line {line_number}: malformed parity pass marker")
+                else:
+                    parity_keys.add(key)
+                    parity_layer_counts.add(int(parity_match.group(1)))
             match = completeness_pattern.search(line)
             if match is not None:
                 replay_canary_complete_seen = True
                 layer_count = int(match.group(1))
-                graph_count = int(match.group(2))
+                key_count = int(match.group(2))
+                graph_count = int(match.group(3))
                 if expected_layers is None:
                     expected_layers = layer_count
                 elif expected_layers != layer_count:
                     failures.append(
-                        "startup logs disagree on local SFA layer count: "
-                        f"{expected_layers} versus {layer_count}"
+                        f"startup logs disagree on local SFA layer count: {expected_layers} versus {layer_count}"
+                    )
+                if expected_keys is None:
+                    expected_keys = key_count
+                elif expected_keys != key_count:
+                    failures.append(
+                        f"startup logs disagree on staged graph key count: {expected_keys} versus {key_count}"
                     )
                 if expected_graphs is None:
                     expected_graphs = graph_count
                 elif expected_graphs != graph_count:
                     failures.append(
-                        "startup logs disagree on staged graph count: "
-                        f"{expected_graphs} versus {graph_count}"
+                        f"startup logs disagree on staged graph count: {expected_graphs} versus {graph_count}"
                     )
             for marker in _FAILURE_MARKERS:
                 if marker in line:
@@ -366,25 +348,34 @@ def check_server_log(path: Path) -> int:
 
     missing = []
     if not replay_canary_complete_seen:
-        missing.append(
-            "model-level startup capture and ordered replay-canary "
-            "completeness check"
-        )
+        missing.append("model-level startup capture and ordered replay-canary completeness check")
     if not signature_seen:
         missing.append("always-on live captured-input signature validation")
-    if not first_parity_seen:
-        missing.append("first live eager-vs-graph parity pass")
-    if not second_parity_seen:
-        missing.append("second distinct-length eager-vs-graph parity pass")
+    if not parity_keys:
+        missing.append("one live eager-vs-graph parity pass per graph key")
     if expected_layers is None or expected_layers <= 0:
         missing.append("positive local staged-SFA layer count")
+    if expected_keys is None or expected_keys <= 0:
+        missing.append("positive staged graph key count")
     if expected_graphs is None or expected_graphs <= 0:
         missing.append("positive staged graph count")
-    elif expected_layers is not None and expected_graphs != 2 * expected_layers:
+    elif (
+        expected_layers is not None
+        and expected_keys is not None
+        and expected_graphs != 2 * expected_layers * expected_keys
+    ):
         failures.append(
             "startup completeness marker reported "
             f"{expected_graphs} staged graphs for {expected_layers} local SFA "
-            "layers; expected exactly one pre and one post graph per layer"
+            f"layers and {expected_keys} keys; expected exactly one pre and "
+            "one post graph per layer/key pair"
+        )
+    if expected_keys is not None and len(parity_keys) != expected_keys:
+        failures.append(f"parity passed for {len(parity_keys)} distinct graph keys; expected {expected_keys}")
+    if parity_layer_counts and expected_layers is not None and parity_layer_counts != {expected_layers}:
+        failures.append(
+            "parity markers reported local SFA layer counts "
+            f"{sorted(parity_layer_counts)}; expected only {expected_layers}"
         )
     if missing:
         failures.append("missing log gates: " + ", ".join(missing))
@@ -394,8 +385,9 @@ def check_server_log(path: Path) -> int:
     print(
         "server-log gates passed: model-level startup capture and ordered "
         "replay-canary completeness, "
-        "always-on live input-signature validation, and two parity lengths "
-        f"({expected_layers} local layers; {expected_graphs} staged graphs; "
+        "always-on live input-signature validation, and one parity check per "
+        f"graph key ({expected_layers} local layers; {expected_keys} keys; "
+        f"{expected_graphs} staged graphs; "
         f"{parity_passes} rank-visible "
         "parity messages)"
     )
@@ -428,11 +420,7 @@ def wait_for_new_traces(
     staged_count = 0
     while time.monotonic() < deadline:
         current = trace_snapshot(root)
-        newest = sorted(
-            path
-            for path, state in current.items()
-            if path not in before or before[path] != state
-        )
+        newest = sorted(path for path, state in current.items() if path not in before or before[path] != state)
         states = {path: current[path] for path in newest}
         if len(newest) >= expected_ranks and states == last_states:
             stable_polls += 1
@@ -442,10 +430,7 @@ def wait_for_new_traces(
                     cache_key = (path, current[path])
                     if cache_key not in staged_cache:
                         marker_counts = scan_binary(path, _TRACE_MARKERS)
-                        staged_cache[cache_key] = all(
-                            marker_counts[marker] > 0
-                            for marker in _TRACE_MARKERS
-                        )
+                        staged_cache[cache_key] = all(marker_counts[marker] > 0 for marker in _TRACE_MARKERS)
                     staged_count += int(staged_cache[cache_key])
                 if staged_count >= expected_ranks:
                     return newest
@@ -484,9 +469,7 @@ def check_traces(paths: list[Path], expected_ranks: int) -> None:
     ignored_traces: list[tuple[Path, list[str]]] = []
     for path in paths:
         counts = scan_binary(path, needles)
-        missing_ranges = [
-            marker for marker in _TRACE_MARKERS if counts[marker] == 0
-        ]
+        missing_ranges = [marker for marker in _TRACE_MARKERS if counts[marker] == 0]
         if missing_ranges:
             ignored_traces.append((path, missing_ranges))
             continue
@@ -499,10 +482,7 @@ def check_traces(paths: list[Path], expected_ranks: int) -> None:
         )
 
     for path, missing_ranges in ignored_traces:
-        print(
-            f"ignoring non-staged trace {path}: missing ranges "
-            f"{missing_ranges}"
-        )
+        print(f"ignoring non-staged trace {path}: missing ranges {missing_ranges}")
 
     for path, counts in staged_traces:
         replay_count = sum(counts[name] for name in _ACL_REPLAY_APIS)
@@ -511,24 +491,17 @@ def check_traces(paths: list[Path], expected_ranks: int) -> None:
             failures.append(f"{path}: no known ACL model-replay API was recorded")
         if parity_count:
             failures.append(
-                f"{path}: steady-state profile contains {parity_count} live-parity "
-                "ranges; start profiling later"
+                f"{path}: steady-state profile contains {parity_count} live-parity ranges; start profiling later"
             )
         print(
             f"trace {path}: "
-            + ", ".join(
-                f"{marker.rsplit('::', 1)[-1]}={counts[marker]}"
-                for marker in _TRACE_MARKERS
-            )
+            + ", ".join(f"{marker.rsplit('::', 1)[-1]}={counts[marker]}" for marker in _TRACE_MARKERS)
             + f", ACL replay APIs={replay_count}"
         )
     if failures:
         raise SmokeFailure("trace inventory failed:\n  " + "\n  ".join(failures))
 
-    print(
-        f"validated {len(staged_traces)} staged worker traces; "
-        f"ignored {len(ignored_traces)} extra non-staged traces"
-    )
+    print(f"validated {len(staged_traces)} staged worker traces; ignored {len(ignored_traces)} extra non-staged traces")
 
 
 def parse_args() -> argparse.Namespace:
@@ -583,9 +556,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--profile-analysis-timeout must be positive")
     required_tokens = args.profile_after_chunks + args.profile_chunks + 2
     if not args.skip_profile and args.max_tokens < required_tokens:
-        parser.error(
-            f"--max-tokens must be at least {required_tokens} for this profile interval"
-        )
+        parser.error(f"--max-tokens must be at least {required_tokens} for this profile interval")
     return args
 
 
@@ -601,10 +572,7 @@ def main() -> int:
         expected_layers = check_server_log(args.server_log)
 
         if args.skip_profile:
-            print(
-                "LOG GATES PASSED. Trace proof was skipped; capture success is "
-                "not yet established."
-            )
+            print("LOG GATES PASSED. Trace proof was skipped; capture success is not yet established.")
             return 0
 
         analyse_profile_data(

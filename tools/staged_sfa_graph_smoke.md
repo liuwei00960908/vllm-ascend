@@ -73,8 +73,8 @@ python3 tools/staged_sfa_graph_smoke.py \
 ```
 
 The client sends one 4096-word prompt so its tokenized prompt should exceed
-`index_topk`. It profiles streamed chunks 5 through 16; the two numerical
-parity steps should therefore have completed before collection. Increase
+`index_topk`. It profiles streamed chunks 5 through 16; the numerical parity
+check should therefore have completed before collection. Increase
 `--prompt-words` if the server reports that the prompt boundary is smaller than
 `index_topk`. This proof only needs TP worker traces, so keep
 `ignore_frontend=true`; the smoke parses all raw rank directories from its
@@ -85,11 +85,12 @@ The automated gate requires all of the following:
 
 1. every local staged SFA implementation has both captured entries and fixed,
    strongly owned Graph-A handoff buffers;
-2. one size-one full-model replay, run only after all captures finish, writes
-   the dedicated pre/post canary for every local SFA layer;
+2. one full-model replay per configured exact-Q1 key, run only after all
+   captures finish, writes the dedicated pre/post canary for every local SFA
+   layer;
 3. always-on captured-input signature validation (pointer, shape, stride,
    storage offset, dtype, and device) is enabled for live replay;
-4. eager and graph results pass at two distinct sequence lengths on all TP
+4. eager and graph results pass once for every captured graph key on all TP
    ranks;
 5. at least eight new worker/rank traces contain `pre`, `lmcache_retrieve`, and
    `post`, plus an ACL model-replay API; extra coordinator traces without those

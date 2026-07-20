@@ -27,8 +27,9 @@ def scratch_remap(
             by the indexer; negative entries are padding.
         prompt_lens: [bs] cache boundary per decode request. In the original
             mode this is the prompt length; decode-window mode passes the
-            current window start. Callers must ensure boundary >= k for every
-            row (else scratch rows would alias live-cache positions).
+            current window start. Callers must ensure
+            boundary >= scratch_base + k for every active row (else scratch
+            rows would alias live-cache positions).
         need_packed: whether to build the LMCache selected-token payload.
         scratch_base: optional [bs] compact scratch base per row. This lets MTP
             rows for the same request use disjoint compact scratch ranges.

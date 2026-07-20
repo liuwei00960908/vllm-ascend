@@ -17,7 +17,6 @@ init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
 
 
 class TestNPUWorker(TestBase):
-
     def setUp(self):
         """Setup test environment"""
         # Create configuration mocks
@@ -30,8 +29,8 @@ class TestNPUWorker(TestBase):
 
         self.hf_config_mock = MagicMock()
         self.hf_config_mock.model_type = "test_model"
-        if hasattr(self.hf_config_mock, 'index_topk'):
-            delattr(self.hf_config_mock, 'index_topk')
+        if hasattr(self.hf_config_mock, "index_topk"):
+            delattr(self.hf_config_mock, "index_topk")
 
         self.model_config_mock.hf_config = self.hf_config_mock
 
@@ -182,8 +181,7 @@ class TestNPUWorker(TestBase):
         # Create NPUWorker instance
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch("vllm.utils.torch_utils.STR_DTYPE_TO_TORCH_DTYPE",
-                   {"float32": torch.float32}):
+        with patch("vllm.utils.torch_utils.STR_DTYPE_TO_TORCH_DTYPE", {"float32": torch.float32}):
             worker = NPUWorker(
                 vllm_config=self.vllm_config_mock,
                 local_rank=self.local_rank,
@@ -243,9 +241,7 @@ class TestNPUWorker(TestBase):
 
             mock_allocator.wake_up.assert_called_once_with(tags=["test_tag"])
 
-    @patch(
-        "vllm_ascend.worker.worker.NPUWorker._init_worker_distributed_environment"
-    )
+    @patch("vllm_ascend.worker.worker.NPUWorker._init_worker_distributed_environment")
     @patch("vllm_ascend.worker.worker.init_device_properties_triton")
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.MemorySnapshot")
@@ -276,9 +272,7 @@ class TestNPUWorker(TestBase):
             worker.parallel_config.local_world_size = 0
             worker.parallel_config.data_parallel_size = 1
             worker.model_config.seed = 42
-            worker.cache_config = SimpleNamespace(
-                gpu_memory_utilization=0.4
-            )
+            worker.cache_config = SimpleNamespace(gpu_memory_utilization=0.4)
 
             # Test _init_device
             result = worker._init_device()
@@ -349,11 +343,20 @@ class TestNPUWorker(TestBase):
             worker.profiler = None
             worker.rank = 0
 
-        with patch("vllm.distributed.utils.get_worker_rank_suffix", return_value="dp0_pp0_tp0_dcp0_ep0_rank0"):
-            with patch.object(NPUWorker, "_create_profiler", return_value=MagicMock()) as mock_create:
-                worker.profile(is_start=True, profile_prefix="warmup")
+        with (
+            patch(
+                "vllm.distributed.utils.get_worker_rank_suffix",
+                return_value="dp0_pp0_tp0_dcp0_ep0_rank0",
+            ),
+            patch.object(
+                NPUWorker,
+                "_create_profiler",
+                return_value=MagicMock(),
+            ) as mock_create,
+        ):
+            worker.profile(is_start=True, profile_prefix="warmup")
 
-                mock_create.assert_called_once_with("warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
+            mock_create.assert_called_once_with("warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
 
     def test_profile_lazy_init(self):
         """[RFC #6954] Profiler is lazily created on first profile(is_start=True) call"""
@@ -383,7 +386,7 @@ class TestNPUWorker(TestBase):
             self.assertIsNotNone(worker.profiler)
 
     def test_profile_restart_reuses_existing_profiler(self):
-        """[RFC #6954] Restarting profile (stop then start) reuses existing profiler, does not call _create_profiler again"""
+        """[RFC #6954] Restarting profiling reuses the existing profiler."""
         from vllm_ascend.worker.worker import NPUWorker
 
         profiler_config = ProfilerConfig(
@@ -398,15 +401,24 @@ class TestNPUWorker(TestBase):
             worker.profiler = None
             worker.rank = 0
 
-        with patch("vllm.distributed.utils.get_worker_rank_suffix", return_value="dp0_pp0_tp0_dcp0_ep0_rank0"):
-            with patch.object(NPUWorker, "_create_profiler", return_value=mock_profiler) as mock_create:
-                worker.profile(is_start=True, profile_prefix="session1")
-                mock_create.assert_called_once_with("session1_dp0_pp0_tp0_dcp0_ep0_rank0")
+        with (
+            patch(
+                "vllm.distributed.utils.get_worker_rank_suffix",
+                return_value="dp0_pp0_tp0_dcp0_ep0_rank0",
+            ),
+            patch.object(
+                NPUWorker,
+                "_create_profiler",
+                return_value=mock_profiler,
+            ) as mock_create,
+        ):
+            worker.profile(is_start=True, profile_prefix="session1")
+            mock_create.assert_called_once_with("session1_dp0_pp0_tp0_dcp0_ep0_rank0")
 
-                worker.profile(is_start=False)
-                worker.profile(is_start=True)  # Restart without new prefix
-                # Should NOT create new profiler, just restart existing
-                mock_create.assert_called_once()
+            worker.profile(is_start=False)
+            worker.profile(is_start=True)  # Restart without new prefix
+            # Should NOT create new profiler, just restart existing
+            mock_create.assert_called_once()
 
     def test_trace_handler_uses_worker_name(self):
         """[RFC #6954] _create_profiler passes worker_name to tensorboard_trace_handler"""
@@ -436,17 +448,13 @@ class TestNPUWorker(TestBase):
                 )
 
     @patch("vllm_ascend.worker.worker.envs_ascend")
-    def test_profile_and_msmonitor_both_enabled_raises_error(
-            self, mock_envs_ascend):
+    def test_profile_and_msmonitor_both_enabled_raises_error(self, mock_envs_ascend):
         """Test _create_profiler raises when both profiler and msmonitor are enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
         mock_envs_ascend.MSMONITOR_USE_DAEMON = 1
 
-        profiler_config = ProfilerConfig(
-            profiler="torch",
-            torch_profiler_dir="/path/to/traces"
-        )
+        profiler_config = ProfilerConfig(profiler="torch", torch_profiler_dir="/path/to/traces")
         vllm_config_mock = MagicMock()
         vllm_config_mock.profiler_config = profiler_config
 
@@ -459,8 +467,8 @@ class TestNPUWorker(TestBase):
                 _ = worker._create_profiler("test_trace")
 
             self.assertIn(
-                "MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.",
-                str(cm.exception))
+                "MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.", str(cm.exception)
+            )
 
     def test_lora_methods(self):
         """Test LoRA related methods"""
@@ -510,17 +518,14 @@ class TestNPUWorker(TestBase):
 
             mock_model_runner.get_model.return_value = mock_model
             mock_model_runner.get_kv_cache_spec.return_value = mock_kv_cache_spec
-            mock_model_runner.get_supported_pooling_tasks.return_value = (
-                mock_pooling_tasks)
+            mock_model_runner.get_supported_pooling_tasks.return_value = mock_pooling_tasks
             mock_model_runner.get_supported_tasks.return_value = mock_supported_tasks
 
             # Test each get method
             self.assertEqual(worker.get_model(), mock_model)
             self.assertEqual(worker.get_kv_cache_spec(), mock_kv_cache_spec)
-            self.assertEqual(worker.get_supported_pooling_tasks(),
-                             mock_pooling_tasks)
-            self.assertEqual(worker.get_supported_tasks(),
-                             mock_supported_tasks)
+            self.assertEqual(worker.get_supported_pooling_tasks(), mock_pooling_tasks)
+            self.assertEqual(worker.get_supported_tasks(), mock_supported_tasks)
 
     def test_execute_dummy_batch(self):
         """Test execute_dummy_batch method"""
@@ -540,7 +545,8 @@ class TestNPUWorker(TestBase):
 
             # Verify call
             mock_model_runner._dummy_run.assert_called_once_with(
-                num_tokens=mock_decode_token_per_req, uniform_decode=True)
+                num_tokens=mock_decode_token_per_req, uniform_decode=True
+            )
 
     @patch("vllm_ascend.worker.worker.envs_ascend")
     @patch("torch_npu.profiler._ExperimentalConfig")
@@ -570,7 +576,7 @@ class TestNPUWorker(TestBase):
             profiler="torch",
             torch_profiler_dir="/path/to/traces",
             torch_profiler_with_stack=True,
-            torch_profiler_with_memory=True
+            torch_profiler_with_memory=True,
         )
         vllm_config_mock = MagicMock()
         vllm_config_mock.profiler_config = profiler_config
@@ -631,10 +637,7 @@ class TestNPUWorker(TestBase):
         """Test _create_profiler raises when profiler disabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
-        profiler_config = ProfilerConfig(
-            profiler=None,
-            torch_profiler_dir=""
-        )
+        profiler_config = ProfilerConfig(profiler=None, torch_profiler_dir="")
 
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
@@ -665,28 +668,90 @@ class TestNPUWorker(TestBase):
         import vllm_ascend.worker.worker as worker_module
 
         vllm_config = MagicMock()
-        vllm_config.model_config.hf_text_config.num_hidden_layers = 80
+        hf_text_config = vllm_config.model_config.hf_text_config
+        hf_text_config.num_hidden_layers = 80
+        hf_text_config.kv_lora_rank = 512
+        hf_text_config.qk_rope_head_dim = 64
+        hf_text_config.index_head_dim = 128
+        hf_text_config.topk_tokens = 2048
+        vllm_config.model_config.dtype = torch.bfloat16
+        vllm_config.model_config.get_hidden_size.return_value = 6144
+        vllm_config.model_config.get_num_attention_heads.return_value = 8
+        vllm_config.model_config.get_head_size.return_value = 64
+        vllm_config.parallel_config = SimpleNamespace(
+            tensor_parallel_size=8,
+        )
+        vllm_config.cache_config.block_size = 128
 
         with patch.object(
             worker_module,
             "staged_sfa_graph_configured",
             return_value=False,
         ):
-            disabled = worker_module._staged_sfa_graph_reserved_bytes(
-                vllm_config
-            )
+            disabled = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
 
-        with patch.object(
-            worker_module,
-            "staged_sfa_graph_configured",
-            return_value=True,
+        reserves = {}
+        for capture_sizes in ((1,), (1, 32)):
+            with (
+                self.subTest(capture_sizes=capture_sizes),
+                patch.object(
+                    worker_module,
+                    "staged_sfa_graph_configured",
+                    return_value=True,
+                ),
+                patch.object(
+                    worker_module,
+                    "staged_sfa_graph_capture_sizes",
+                    return_value=capture_sizes,
+                ),
+            ):
+                reserves[capture_sizes] = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
+
+        with (
+            patch.object(
+                worker_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                worker_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 32),
+            ),
         ):
-            reserved = worker_module._staged_sfa_graph_reserved_bytes(
-                vllm_config
-            )
+            hf_text_config.topk_tokens = 4096
+            larger_topk_reserve = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
+
+        with (
+            patch.object(
+                worker_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                worker_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 32),
+            ),
+        ):
+            hf_text_config.topk_tokens = 2048
+            hf_text_config.index_head_dim = 256
+            larger_index_head_reserve = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
 
         self.assertEqual(disabled, 0)
-        self.assertEqual(reserved, 160 * (1 << 20))
+        self.assertGreater(reserves[(1,)], 160 * (1 << 20))
+        self.assertGreater(
+            reserves[(1, 32)],
+            2 * reserves[(1,)],
+        )
+        self.assertGreater(
+            larger_topk_reserve,
+            reserves[(1, 32)],
+        )
+        self.assertGreater(
+            larger_index_head_reserve,
+            reserves[(1, 32)],
+        )
 
     @staticmethod
     def _build_memory_profile_worker(
@@ -696,9 +761,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         worker = NPUWorker.__new__(NPUWorker)
-        worker.init_snapshot = SimpleNamespace(
-            free_memory=initial_free_memory
-        )
+        worker.init_snapshot = SimpleNamespace(free_memory=initial_free_memory)
         worker.requested_memory = requested_memory
         worker.model_runner = MagicMock()
         worker.model_runner.model_memory_usage = 1000
@@ -723,9 +786,7 @@ class TestNPUWorker(TestBase):
         """Test the current memory-profiling result is used for KV capacity."""
         import vllm_ascend.worker.worker as worker_module
 
-        worker = self._build_memory_profile_worker(
-            requested_memory=8000
-        )
+        worker = self._build_memory_profile_worker(requested_memory=8000)
         profile_result = self._memory_profile_result(
             free_memory=6000,
             non_kv_cache_memory=3000,
@@ -748,9 +809,7 @@ class TestNPUWorker(TestBase):
             ),
             patch.object(worker_module, "logger") as mock_logger,
         ):
-            mock_memory_profiling.return_value.__enter__.return_value = (
-                profile_result
-            )
+            mock_memory_profiling.return_value.__enter__.return_value = profile_result
             result = worker.determine_available_memory()
 
         mock_memory_profiling.assert_called_once_with(
@@ -766,9 +825,7 @@ class TestNPUWorker(TestBase):
         """Test non-torch usage folded into non_kv_cache_memory."""
         import vllm_ascend.worker.worker as worker_module
 
-        worker = self._build_memory_profile_worker(
-            requested_memory=9000
-        )
+        worker = self._build_memory_profile_worker(requested_memory=9000)
         profile_result = self._memory_profile_result(
             free_memory=5000,
             non_kv_cache_memory=5500,
@@ -790,9 +847,7 @@ class TestNPUWorker(TestBase):
                 self._memory_profile_envs_without_optional_reserves(),
             ),
         ):
-            mock_memory_profiling.return_value.__enter__.return_value = (
-                profile_result
-            )
+            mock_memory_profiling.return_value.__enter__.return_value = profile_result
             result = worker.determine_available_memory()
 
         worker.model_runner.profile_run.assert_called_once_with()
@@ -802,9 +857,7 @@ class TestNPUWorker(TestBase):
         """Test an increase in free memory during profiling is rejected."""
         import vllm_ascend.worker.worker as worker_module
 
-        worker = self._build_memory_profile_worker(
-            requested_memory=8000
-        )
+        worker = self._build_memory_profile_worker(requested_memory=8000)
         profile_result = self._memory_profile_result(
             free_memory=9000,
             non_kv_cache_memory=1000,
@@ -814,9 +867,7 @@ class TestNPUWorker(TestBase):
             worker_module,
             "memory_profiling",
         ) as mock_memory_profiling:
-            mock_memory_profiling.return_value.__enter__.return_value = (
-                profile_result
-            )
+            mock_memory_profiling.return_value.__enter__.return_value = profile_result
             with self.assertRaises(AssertionError) as cm:
                 worker.determine_available_memory()
 
@@ -827,9 +878,7 @@ class TestNPUWorker(TestBase):
         """A negative budget is propagated for downstream validation."""
         import vllm_ascend.worker.worker as worker_module
 
-        worker = self._build_memory_profile_worker(
-            requested_memory=8000
-        )
+        worker = self._build_memory_profile_worker(requested_memory=8000)
         profile_result = self._memory_profile_result(
             free_memory=2000,
             non_kv_cache_memory=10000,
@@ -851,9 +900,7 @@ class TestNPUWorker(TestBase):
                 self._memory_profile_envs_without_optional_reserves(),
             ),
         ):
-            mock_memory_profiling.return_value.__enter__.return_value = (
-                profile_result
-            )
+            mock_memory_profiling.return_value.__enter__.return_value = profile_result
             result = worker.determine_available_memory()
 
         worker.model_runner.profile_run.assert_called_once_with()
@@ -872,17 +919,13 @@ class TestNPUWorker(TestBase):
                 "__init__",
                 lambda x, **kwargs: None,
             ),
-            patch(
-                "vllm_ascend.worker.worker.get_pp_group"
-            ) as mock_get_pp_group,
+            patch("vllm_ascend.worker.worker.get_pp_group") as mock_get_pp_group,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
-            worker.vllm_config.parallel_config.distributed_executor_backend = (
-                "ray"
-            )
+            worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
             worker._pp_send_work = []
 
             mock_pp_group = MagicMock()
@@ -893,9 +936,7 @@ class TestNPUWorker(TestBase):
             mock_scheduler_output = MagicMock()
             mock_scheduler_output.total_num_scheduled_tokens = 1
             mock_model_output = MagicMock(spec=ModelRunnerOutput)
-            worker.model_runner.execute_model.return_value = (
-                mock_model_output
-            )
+            worker.model_runner.execute_model.return_value = mock_model_output
 
             result = worker.execute_model(mock_scheduler_output)
 
@@ -931,9 +972,7 @@ class TestNPUWorker(TestBase):
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
-            worker.vllm_config.parallel_config.distributed_executor_backend = (
-                "ray"
-            )
+            worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
             worker._pp_send_work = []
 
             mock_pp_group = MagicMock()
@@ -946,25 +985,17 @@ class TestNPUWorker(TestBase):
             )
             mock_get_pp_group.return_value = mock_pp_group
 
-            mock_intermediate_output = MagicMock(
-                spec=IntermediateTensors
-            )
-            mock_intermediate_output.tensors = {
-                "output_tensor": "data"
-            }
+            mock_intermediate_output = MagicMock(spec=IntermediateTensors)
+            mock_intermediate_output.tensors = {"output_tensor": "data"}
             mock_intermediate_output.kv_connector_output = None
-            worker.model_runner.execute_model.return_value = (
-                mock_intermediate_output
-            )
+            worker.model_runner.execute_model.return_value = mock_intermediate_output
 
             mock_scheduler_output = MagicMock()
             mock_scheduler_output.total_num_scheduled_tokens = 1
 
             result = worker.execute_model(mock_scheduler_output)
 
-            mock_pp_group.irecv_tensor_dict.assert_called_once_with(
-                all_gather_group=mock_get_tp_group.return_value
-            )
+            mock_pp_group.irecv_tensor_dict.assert_called_once_with(all_gather_group=mock_get_tp_group.return_value)
             worker.model_runner.execute_model.assert_called_once()
             args, kwargs = worker.model_runner.execute_model.call_args
             self.assertEqual(args[0], mock_scheduler_output)
@@ -988,17 +1019,13 @@ class TestNPUWorker(TestBase):
                 "__init__",
                 lambda x, **kwargs: None,
             ),
-            patch(
-                "vllm_ascend.worker.worker.get_pp_group"
-            ) as mock_get_pp_group,
+            patch("vllm_ascend.worker.worker.get_pp_group") as mock_get_pp_group,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
-            worker.vllm_config.parallel_config.distributed_executor_backend = (
-                "external_launcher"
-            )
+            worker.vllm_config.parallel_config.distributed_executor_backend = "external_launcher"
             worker._pp_send_work = []
 
             mock_pp_group = MagicMock()
@@ -1009,9 +1036,7 @@ class TestNPUWorker(TestBase):
             mock_scheduler_output = MagicMock()
             mock_scheduler_output.total_num_scheduled_tokens = 1
             mock_model_output = MagicMock(spec=ModelRunnerOutput)
-            worker.model_runner.execute_model.return_value = (
-                mock_model_output
-            )
+            worker.model_runner.execute_model.return_value = mock_model_output
 
             result = worker.execute_model(mock_scheduler_output)
 
@@ -1043,8 +1068,7 @@ class TestNPUWorker(TestBase):
             # Verify calls
             mock_allocator_class.get_instance.assert_called_once()
             mock_allocator.get_current_usage.assert_called_once()
-            mock_allocator.use_memory_pool.assert_called_once_with(
-                tag="weights")
+            mock_allocator.use_memory_pool.assert_called_once_with(tag="weights")
             worker.model_runner.load_model.assert_called_once()
 
     def test_load_model_without_sleep_mode(self):
@@ -1091,8 +1115,7 @@ class TestNPUWorker(TestBase):
 
     @patch("vllm_ascend.worker.worker.logger")
     @patch("vllm_ascend.worker.worker.NPUWorker._warm_up_atb")
-    def test_compile_or_warm_up_model_with_eager_mode(self, mock_warm_up_atb,
-                                                      mock_logger):
+    def test_compile_or_warm_up_model_with_eager_mode(self, mock_warm_up_atb, mock_logger):
         """Test compile_or_warm_up_model method - eager mode"""
         from vllm_ascend.worker.worker import NPUWorker
 
@@ -1108,9 +1131,7 @@ class TestNPUWorker(TestBase):
             # Setup compilation config
             worker.vllm_config.compilation_config = MagicMock()
             worker.vllm_config.compilation_config.compile_sizes = [1, 4, 8, 16]
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes = [
-                4, 8
-            ]
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes = [4, 8]
 
             # Test compile_or_warm_up_model
             worker.compile_or_warm_up_model()
@@ -1135,8 +1156,7 @@ class TestNPUWorker(TestBase):
 
     @patch("vllm_ascend.worker.worker.logger")
     @patch("vllm_ascend.worker.worker.NPUWorker._warm_up_atb")
-    def test_compile_or_warm_up_model_with_graph_capture(
-            self, mock_warm_up_atb, mock_logger):
+    def test_compile_or_warm_up_model_with_graph_capture(self, mock_warm_up_atb, mock_logger):
         """Test compile_or_warm_up_model method - with graph capture enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
@@ -1152,9 +1172,7 @@ class TestNPUWorker(TestBase):
             # Setup compilation config
             worker.vllm_config.compilation_config = MagicMock()
             worker.vllm_config.compilation_config.compile_sizes = [1, 4, 8, 16]
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes = [
-                4, 8
-            ]
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes = [4, 8]
 
             # Test compile_or_warm_up_model
             worker.compile_or_warm_up_model()
@@ -1183,10 +1201,7 @@ class TestNPUWorker(TestBase):
                 "__init__",
                 lambda x, **kwargs: None,
             ),
-            patch(
-                "vllm_ascend.worker.worker."
-                "ensure_kv_transfer_initialized"
-            ) as mock_ensure_kv_transfer_initialized,
+            patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized") as mock_ensure_kv_transfer_initialized,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
@@ -1197,9 +1212,7 @@ class TestNPUWorker(TestBase):
             mock_allocator = MagicMock()
             mock_context = MagicMock()
             mock_allocator.use_memory_pool.return_value = mock_context
-            mock_allocator_class.get_instance.return_value = (
-                mock_allocator
-            )
+            mock_allocator_class.get_instance.return_value = mock_allocator
             mock_kv_cache_config = MagicMock()
 
             worker.initialize_from_config(mock_kv_cache_config)
@@ -1209,12 +1222,8 @@ class TestNPUWorker(TestBase):
                 mock_kv_cache_config,
             )
             mock_allocator_class.get_instance.assert_called_once_with()
-            mock_allocator.use_memory_pool.assert_called_once_with(
-                tag="kv_cache"
-            )
-            worker.model_runner.initialize_kv_cache.assert_called_once_with(
-                mock_kv_cache_config
-            )
+            mock_allocator.use_memory_pool.assert_called_once_with(tag="kv_cache")
+            worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
     def test_initialize_from_config_without_sleep_mode(self):
         """Test initialize_from_config method - without sleep mode enabled"""
@@ -1226,10 +1235,7 @@ class TestNPUWorker(TestBase):
                 "__init__",
                 lambda x, **kwargs: None,
             ),
-            patch(
-                "vllm_ascend.worker.worker."
-                "ensure_kv_transfer_initialized"
-            ) as mock_ensure_kv_transfer_initialized,
+            patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized") as mock_ensure_kv_transfer_initialized,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
@@ -1244,9 +1250,7 @@ class TestNPUWorker(TestBase):
                 worker.vllm_config,
                 mock_kv_cache_config,
             )
-            worker.model_runner.initialize_kv_cache.assert_called_once_with(
-                mock_kv_cache_config
-            )
+            worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
     @patch(
         "vllm_ascend.worker.worker.enable_sp",
@@ -1276,9 +1280,7 @@ class TestNPUWorker(TestBase):
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
-            worker.vllm_config.parallel_config.distributed_executor_backend = (
-                "ray"
-            )
+            worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
             worker._pp_send_work = []
 
             mock_pp_group = MagicMock()
@@ -1295,27 +1297,17 @@ class TestNPUWorker(TestBase):
             mock_kv_connector_output.finished_sending = False
             mock_kv_connector_output.finished_recving = False
 
-            mock_intermediate_output = MagicMock(
-                spec=IntermediateTensors
-            )
-            mock_intermediate_output.tensors = {
-                "output_tensor": "data"
-            }
-            mock_intermediate_output.kv_connector_output = (
-                mock_kv_connector_output
-            )
-            worker.model_runner.execute_model.return_value = (
-                mock_intermediate_output
-            )
+            mock_intermediate_output = MagicMock(spec=IntermediateTensors)
+            mock_intermediate_output.tensors = {"output_tensor": "data"}
+            mock_intermediate_output.kv_connector_output = mock_kv_connector_output
+            worker.model_runner.execute_model.return_value = mock_intermediate_output
 
             mock_scheduler_output = MagicMock()
             mock_scheduler_output.total_num_scheduled_tokens = 1
 
             result = worker.execute_model(mock_scheduler_output)
 
-            mock_pp_group.irecv_tensor_dict.assert_called_once_with(
-                all_gather_group=mock_get_tp_group.return_value
-            )
+            mock_pp_group.irecv_tensor_dict.assert_called_once_with(all_gather_group=mock_get_tp_group.return_value)
             mock_pp_group.isend_tensor_dict.assert_called_once_with(
                 {"output_tensor": "data"},
                 all_gather_group=mock_get_tp_group.return_value,

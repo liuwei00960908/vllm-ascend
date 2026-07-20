@@ -31,6 +31,57 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
+class StagedSFAQueryProfile(str, Enum):
+    """Structural query layouts that require distinct staged SFA graphs."""
+
+    DECODE_Q1 = "decode_q1"
+    SPEC_FIXED = "spec_fixed"
+
+
+@dataclass(frozen=True)
+class StagedSFAGraphKey:
+    """Shape/topology key for a staged SFA graph pair.
+
+    Actual token/request counts and sequence lengths are dynamic buffer
+    contents. Capacities and query topology are structural and must never
+    collapse onto the same inner graph entry.
+    """
+
+    token_capacity: int
+    request_capacity: int
+    query_profile: StagedSFAQueryProfile
+    max_query_len: int
+
+    def __post_init__(self) -> None:
+        if self.token_capacity <= 0 or self.request_capacity <= 0 or self.max_query_len <= 0:
+            raise ValueError("Staged SFA graph capacities must be positive.")
+
+    @classmethod
+    def exact_q1(cls, size: int) -> "StagedSFAGraphKey":
+        """Construct an exact, unpadded one-token-per-request key."""
+        return cls(
+            token_capacity=size,
+            request_capacity=size,
+            query_profile=StagedSFAQueryProfile.DECODE_Q1,
+            max_query_len=1,
+        )
+
+    def to_legacy_batch_descriptor(self) -> BatchDescriptor:
+        """Adapt exact Q=1 capacities to normalized PIECEWISE dispatch."""
+        if (
+            self.query_profile != StagedSFAQueryProfile.DECODE_Q1
+            or self.token_capacity != self.request_capacity
+            or self.max_query_len != 1
+        ):
+            raise NotImplementedError(
+                "Only exact, unpadded Q=1 staged SFA keys can use legacy BatchDescriptor dispatch."
+            )
+        return BatchDescriptor(num_tokens=self.token_capacity)
+
+
+STAGED_SFA_SINGLETON_GRAPH_KEY = StagedSFAGraphKey.exact_q1(1)
+
+
 @dataclass
 class StagedSFALiveParityState:
     """Forward-scoped eager-vs-graph validation for the staged SFA POC."""
@@ -38,13 +89,25 @@ class StagedSFALiveParityState:
     request_id: str
     seq_len: int
     expected_layers: int
+    graph_key: StagedSFAGraphKey = STAGED_SFA_SINGLETON_GRAPH_KEY
+    request_ids: tuple[str, ...] | None = None
+    seq_lens: tuple[int, ...] | None = None
     checked_impl_ids: set[int] = field(default_factory=set)
     checked_layer_names: list[str] = field(default_factory=list)
     match_flags: list[tuple[str, torch.Tensor]] = field(default_factory=list)
-    pending_saves: list[
-        tuple[str, list[torch.Tensor]]
-    ] = field(default_factory=list)
+    pending_saves: list[tuple[str, list[torch.Tensor]]] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.request_ids is None:
+            self.request_ids = (self.request_id,)
+        if self.seq_lens is None:
+            self.seq_lens = (self.seq_len,)
+        if (
+            len(self.request_ids) != self.graph_key.request_capacity
+            or len(self.seq_lens) != self.graph_key.request_capacity
+        ):
+            raise ValueError("Live parity request/sequence rows must match the staged SFA graph key.")
 
 
 @contextmanager
@@ -68,6 +131,7 @@ def set_ascend_forward_context(
     dsa_prompt_lens=None,
     dsa_adapter_cache=None,
     staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_graph_key: StagedSFAGraphKey | None = None,
     staged_sfa_live_parity_state: StagedSFALiveParityState | None = None,
 ):
     """A context manager that stores the current forward context,
@@ -101,9 +165,8 @@ def set_ascend_forward_context(
         # passes used by the staged SFA proof of concept. Connector generators
         # and save hooks must not advance during either dummy pass.
         forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
-        forward_context.staged_sfa_live_parity_state = (
-            staged_sfa_live_parity_state
-        )
+        forward_context.staged_sfa_graph_key = staged_sfa_graph_key
+        forward_context.staged_sfa_live_parity_state = staged_sfa_live_parity_state
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
