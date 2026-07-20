@@ -1,9 +1,11 @@
-from unittest.mock import MagicMock, patch
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 from vllm.config import CacheConfig, CompilationMode, CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.forward_context import BatchDescriptor
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
@@ -339,6 +341,63 @@ class TestEagleProposerDummyRun(TestBase):
         self.mock_dp_group.stop()
         # Clear the current vllm config
         set_current_vllm_config(None)
+
+    def test_pad_draft_num_tokens_for_cudagraph(self):
+        self.proposer.use_cuda_graph = True
+        self.runner.cudagraph_batch_sizes = [2, 4, 8]
+
+        for num_tokens, expected in ((1, 2), (2, 2), (3, 4), (8, 8), (9, 9)):
+            with self.subTest(num_tokens=num_tokens):
+                self.assertEqual(
+                    self.proposer._pad_draft_num_tokens_for_cudagraph(num_tokens),
+                    expected,
+                )
+
+    def test_pad_draft_num_tokens_preserves_non_graph_paths(self):
+        for use_cuda_graph, batch_sizes in ((False, [1, 2]), (True, [])):
+            with self.subTest(use_cuda_graph=use_cuda_graph, batch_sizes=batch_sizes):
+                self.proposer.use_cuda_graph = use_cuda_graph
+                self.runner.cudagraph_batch_sizes = batch_sizes
+                self.assertEqual(
+                    self.proposer._pad_draft_num_tokens_for_cudagraph(1),
+                    1,
+                )
+
+    def test_propose_does_not_require_dispatcher_private_padding_map(self):
+        self.proposer.method = "mtp"
+        self.proposer.use_cuda_graph = True
+        self.runner.cudagraph_batch_sizes = [1, 2]
+        self.runner.cudagraph_dispatcher = SimpleNamespace(dispatch=MagicMock())
+        self.runner.mtp_profile = None
+        common_attn_metadata = MagicMock()
+        common_attn_metadata.batch_size.return_value = 1
+        self.proposer.set_inputs_first_pass = MagicMock(
+            return_value=(
+                1,
+                torch.tensor([0], dtype=torch.int32),
+                common_attn_metadata,
+                None,
+            )
+        )
+        self.runner._sync_metadata_across_dp.side_effect = RuntimeError(
+            "stop after graph padding"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stop after graph padding"):
+            self.proposer._propose(
+                target_token_ids=torch.tensor([1], dtype=torch.int32),
+                target_positions=torch.tensor([0], dtype=torch.int64),
+                target_hidden_states=torch.zeros((1, 1)),
+                next_token_ids=torch.tensor([2], dtype=torch.int32),
+                token_indices_to_sample=torch.tensor([0], dtype=torch.int32),
+                common_attn_metadata=common_attn_metadata,
+                target_model_batch_desc=BatchDescriptor(
+                    num_tokens=1,
+                    num_reqs=1,
+                    uniform=True,
+                ),
+                sampling_metadata=MagicMock(),
+            )
 
     # cpu does not support parallel-group, let alone `sp`
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')

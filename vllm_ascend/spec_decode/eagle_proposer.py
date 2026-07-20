@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+from bisect import bisect_left
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
@@ -182,6 +183,19 @@ class SpecDecodeBaseProposer(EagleProposer):
     def _mtp_profile_section(self, name: str) -> AbstractContextManager[Any]:
         profile = getattr(self.runner, "mtp_profile", None)
         return profile.section(name) if profile is not None else nullcontext()
+
+    def _pad_draft_num_tokens_for_cudagraph(
+        self,
+        num_tokens: int,
+    ) -> int:
+        graph_sizes = self.runner.cudagraph_batch_sizes
+        if (
+            not self.use_cuda_graph
+            or not graph_sizes
+            or num_tokens > graph_sizes[-1]
+        ):
+            return num_tokens
+        return graph_sizes[bisect_left(graph_sizes, num_tokens)]
 
     def _get_model(self) -> nn.Module:
         """
@@ -537,10 +551,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
         assert self.runner is not None
-        if self.use_cuda_graph and num_tokens <= self.runner.cudagraph_batch_sizes[-1]:
-            num_input_tokens = self.runner.cudagraph_dispatcher._bs_to_padded_graph_size[num_tokens]
-        else:
-            num_input_tokens = num_tokens
+        num_input_tokens = self._pad_draft_num_tokens_for_cudagraph(num_tokens)
 
         with (
             record_function_or_nullcontext("mtp_draft: sync_metadata_across_dp"),
