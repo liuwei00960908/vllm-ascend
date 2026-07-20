@@ -516,7 +516,7 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
-    """Return the bounded exact Q=1 batch capacities for staged SFA."""
+    """Return the single-request exact-Q1 cross-layer graph key."""
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
@@ -529,12 +529,8 @@ def staged_sfa_graph_capture_sizes(
         ) from exc
     if not sizes or any(size <= 0 for size in sizes):
         raise ValueError("VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain positive integers.")
-    if 1 not in sizes:
-        raise ValueError("Staged SFA capture sizes must include 1 for startup/live sequence-length parity validation.")
-    if len(sizes) > 2:
-        raise ValueError(
-            "At most two staged SFA capture sizes are supported because each size owns two graphs per SFA layer."
-        )
+    if sizes != (1,):
+        raise ValueError("Cross-layer staged SFA currently supports only capture size 1.")
 
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     limits = (
@@ -568,7 +564,6 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     # Store original configuration and temporarily clear it
     compilation_config = vllm_config.compilation_config
     original_sizes, compilation_config.cudagraph_capture_sizes = compilation_config.cudagraph_capture_sizes, None
-    original_max_capture_size = max(original_sizes) if original_sizes else None
 
     # Calculate parallel configuration factor
     if not vllm_config.model_config:
@@ -606,23 +601,15 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
     staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
     if staged_sfa_graph_active:
-        # The size-1 SFA POC owns two extra persistent graphs per layer.
-        # Conservatively charge both staged graphs the same communication
-        # stream expansion as an ordinary per-layer graph. Reserve those
-        # resources before sampling regular capture sizes so the one-flag POC
-        # does not push TP jobs past the empirical ACL/HCCL stream ceiling.
-        staged_sfa_resources = len(staged_sfa_sizes) * 2 * num_hidden_layers * (1 + 2 * num_comm_groups)
-        if staged_sfa_resources >= MAX_CAPTURE_SIZE:
-            raise ValueError(
-                "Insufficient ACL graph resources for the staged SFA graph "
-                f"POC: required reservation={staged_sfa_resources}, "
-                f"available={MAX_CAPTURE_SIZE}."
-            )
-        MAX_CAPTURE_SIZE -= staged_sfa_resources
-        logger.info(
-            "Reserved %d ACL graph resources for staged SFA capture",
-            staged_sfa_resources,
+        update_cudagraph_capture_sizes(
+            vllm_config,
+            list(staged_sfa_sizes),
         )
+        logger.info(
+            "Restricted ACL graph batch sizes to cross-layer staged SFA keys %s",
+            list(staged_sfa_sizes),
+        )
+        return
 
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
         # TODO: Find out whether we need to take into account the pp_size
@@ -677,31 +664,6 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
 
     arch_name = vllm_config.model_config.architecture
 
-    if staged_sfa_graph_active and max_num_batch_sizes < 1:
-        raise ValueError("The staged SFA graph POC has no ACL graph capture slots left after resource budgeting.")
-    if staged_sfa_graph_active:
-        original_sizes = sorted({*staged_sfa_sizes, *original_sizes})
-
-    if staged_sfa_graph_active and max_num_batch_sizes < len(staged_sfa_sizes):
-        raise ValueError(
-            "The requested staged SFA keys exceed the remaining ACL graph "
-            f"batch-size slots: keys={list(staged_sfa_sizes)}, "
-            f"slots={max_num_batch_sizes}."
-        )
-    if (
-        staged_sfa_graph_active
-        and max_num_batch_sizes == len(staged_sfa_sizes)
-        and len(original_sizes) > len(staged_sfa_sizes)
-    ):
-        update_cudagraph_capture_sizes(
-            vllm_config,
-            list(staged_sfa_sizes),
-        )
-        logger.info(
-            "Adjusted ACL graph batch sizes to staged SFA keys %s",
-            list(staged_sfa_sizes),
-        )
-        return
     # If original sizes exceed maximum, sample a representative subset
     if max_num_batch_sizes < len(original_sizes):
         # Sample uniformly from original sizes
@@ -712,25 +674,6 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         indices[0], indices[-1] = 0, len(original_sizes) - 1
 
         sampled_sizes = [original_sizes[i] for i in indices]
-        if staged_sfa_graph_active:
-            remaining_slots = max_num_batch_sizes - len(staged_sfa_sizes)
-            non_staged_candidates = [
-                size for size in sampled_sizes if size not in staged_sfa_sizes and size != original_max_capture_size
-            ]
-            if (
-                remaining_slots > 0
-                and original_max_capture_size is not None
-                and original_max_capture_size not in staged_sfa_sizes
-            ):
-                # Injecting staged keys must not discard the largest native
-                # bucket whenever at least one non-staged slot remains.
-                non_staged_sizes = [
-                    *non_staged_candidates[: remaining_slots - 1],
-                    original_max_capture_size,
-                ]
-            else:
-                non_staged_sizes = non_staged_candidates[:remaining_slots]
-            sampled_sizes = sorted({*staged_sfa_sizes, *non_staged_sizes})
         update_cudagraph_capture_sizes(vllm_config, sampled_sizes)
         logger.info(
             "Adjusted ACL graph batch sizes for %s model (layers: %d): %d → %d sizes",
@@ -742,8 +685,7 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             ),
         )
     else:
-        # No adjustment needed, but staged-key injection can still change the
-        # derived maximum and normalized dispatcher state.
+        # No adjustment needed.
         update_cudagraph_capture_sizes(vllm_config, original_sizes)
         logger.info(
             "No adjustment needed for ACL graph batch sizes: %s model (layers: %d) with %d sizes",

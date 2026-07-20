@@ -58,10 +58,7 @@ from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_sp,
     get_ascend_device_type,
-    get_max_hidden_layers,
     register_ascend_customop,
-    staged_sfa_graph_capture_sizes,
-    staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -75,110 +72,6 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
-
-
-def _staged_sfa_required_positive_int(value, name: str) -> int:
-    if not isinstance(value, int) or value <= 0:
-        raise ValueError(f"Staged SFA graph memory accounting requires a positive {name}, got {value!r}.")
-    return value
-
-
-def _staged_sfa_dtype_size(model_config) -> int:
-    dtype = getattr(model_config, "dtype", None)
-    if isinstance(dtype, str):
-        dtype = STR_DTYPE_TO_TORCH_DTYPE.get(dtype)
-    if dtype is None:
-        raise ValueError("Staged SFA graph memory accounting requires a resolved model dtype.")
-    try:
-        return torch.empty((), dtype=dtype, device="cpu").element_size()
-    except (TypeError, RuntimeError) as exc:
-        raise ValueError(f"Staged SFA graph memory accounting could not resolve the model dtype {dtype!r}.") from exc
-
-
-def _staged_sfa_key_state_reserved_bytes(
-    vllm_config: VllmConfig,
-    token_capacity: int,
-) -> int:
-    """Conservative owned-state and first-parity peak for one layer/key."""
-    model_config = vllm_config.model_config
-    hf_text_config = model_config.hf_text_config
-    parallel_config = vllm_config.parallel_config
-    cache_config = vllm_config.cache_config
-    token_capacity = _staged_sfa_required_positive_int(token_capacity, "token capacity")
-    hidden_size = _staged_sfa_required_positive_int(model_config.get_hidden_size(), "hidden size")
-    local_num_heads = _staged_sfa_required_positive_int(
-        model_config.get_num_attention_heads(parallel_config),
-        "local attention-head count",
-    )
-    index_head_dim = _staged_sfa_required_positive_int(
-        getattr(hf_text_config, "index_head_dim", None),
-        "index_head_dim",
-    )
-    kv_lora_rank = _staged_sfa_required_positive_int(
-        getattr(hf_text_config, "kv_lora_rank", None),
-        "kv_lora_rank",
-    )
-    rope_head_dim = _staged_sfa_required_positive_int(
-        getattr(hf_text_config, "qk_rope_head_dim", None),
-        "qk_rope_head_dim",
-    )
-    index_topk = _staged_sfa_required_positive_int(
-        getattr(
-            hf_text_config,
-            "topk_tokens",
-            getattr(hf_text_config, "index_topk", None),
-        ),
-        "index_topk",
-    )
-    block_size = _staged_sfa_required_positive_int(getattr(cache_config, "block_size", None), "KV block size")
-    dtype_size = _staged_sfa_dtype_size(model_config)
-
-    # Persistent Graph-A outputs: ql_nope, q_pe, remapped top-k and the
-    # row-aligned selected-token payload. The first live parity check also holds
-    # one eager reference of those values while the graph-owned copy is live,
-    # so reserve two copies of their peak.
-    q_bytes = token_capacity * local_num_heads * (kv_lora_rank + rope_head_dim) * dtype_size
-    sparse_index_bytes = 2 * token_capacity * index_topk * 4
-    graph_a_and_reference_bytes = 2 * (q_bytes + sparse_index_bytes)
-
-    # Per-key parity state persists after first use. The private latent scratch
-    # is block rounded; the eager cache-write reference also returns one row of
-    # latent, rope, and indexer data for each token.
-    parity_output_bytes = token_capacity * hidden_size * dtype_size
-    scratch_rows = (token_capacity + block_size - 1) // block_size * block_size
-    parity_latent_scratch_bytes = scratch_rows * (kv_lora_rank + rope_head_dim) * dtype_size
-    eager_cache_reference_bytes = token_capacity * (kv_lora_rank + rope_head_dim + index_head_dim) * dtype_size
-    return (
-        graph_a_and_reference_bytes
-        + parity_output_bytes
-        + parity_latent_scratch_bytes
-        + eager_cache_reference_bytes
-        + 2 * 4  # Two int32 replay canaries.
-    )
-
-
-def _staged_sfa_graph_reserved_bytes(vllm_config: VllmConfig) -> int:
-    if not staged_sfa_graph_configured(vllm_config):
-        return 0
-    hf_text_config = vllm_config.model_config.hf_text_config
-    num_hidden_layers = getattr(
-        hf_text_config,
-        "num_hidden_layers",
-        None,
-    )
-    if not isinstance(num_hidden_layers, int):
-        num_hidden_layers = get_max_hidden_layers(hf_text_config)
-    num_hidden_layers = _staged_sfa_required_positive_int(num_hidden_layers, "hidden-layer count")
-
-    # Keep the historical 1 MiB driver floor for each of the two inner graphs,
-    # then add every known strong/per-key allocation above it. Round each
-    # layer/key independently so allocator granularity cannot erase the bound.
-    mib = 1 << 20
-    per_layer_bytes = 0
-    for token_capacity in staged_sfa_graph_capture_sizes(vllm_config):
-        key_bytes = 2 * mib + _staged_sfa_key_state_reserved_bytes(vllm_config, token_capacity)
-        per_layer_bytes += (key_bytes + mib - 1) // mib * mib
-    return num_hidden_layers * per_layer_bytes
 
 
 class NPUWorker(WorkerBase):
@@ -460,15 +353,6 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
-
-        staged_graph_reserved_bytes = _staged_sfa_graph_reserved_bytes(self.vllm_config)
-        if staged_graph_reserved_bytes:
-            self.available_kv_cache_memory_bytes -= staged_graph_reserved_bytes
-            logger.info_once(
-                "Reserved a %.2f MiB staged SFA graph/state minimum",
-                staged_graph_reserved_bytes / (1 << 20),
-                scope="local",
-            )
 
         # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
         # buffers out of the KV budget *before* the scheduler splits it into blocks,

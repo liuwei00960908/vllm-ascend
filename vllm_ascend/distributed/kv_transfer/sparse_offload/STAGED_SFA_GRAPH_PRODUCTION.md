@@ -2,42 +2,63 @@
 
 ## Executive decision
 
-The production feature is a **model-step executor**, not a conditional branch
-inside `AscendSFAImpl.forward`. `sfa_v1.py` should own two replayable kernels and
-their layer-local tensor contract. The model runner must own admission, graph
-selection, stable buffers, TP agreement, connector progress, failure handling,
-and step finalization.
+The production target is a **cross-layer piecewise model-step executor** in
+which LMCache retrieval is the only staged-SFA FX split. The outer vLLM
+piecewise compiler owns the ACL graph islands. `sfa_v1.py` owns graph-safe
+pre-retrieval and post-retrieval operator bodies and their explicit tensor
+contract, but it does not own nested per-layer graph wrappers in the target
+path. The model runner owns admission, island selection, stable buffers, TP
+agreement, connector progress, failure handling, and step finalization.
 
-The required per-layer order is:
+The required ordered schedule is:
 
 ```text
-Static preflight -> connector frontier/source-domain lease -> final TP admission
-                  (preparation is reversible; no cache/cursor side effect)
+Static preflight -> validate current remap/callback assumptions -> final TP admission
+                  (no cache/cursor side effect)
                                   |
                                   v
-Eager 0: wait/materialize the LMCache index group for this layer,
+Bootstrap: wait/materialize the LMCache index group for layer 0,
          then obtain a rank-consistent success/failure verdict
                                   |
                                   v
-Graph A: Q/K preprocessing, current-token KV/index writes, indexer/top-k,
-         inactive-row mask, scratch remap, fixed-capacity selection output
+Island 0: Graph A(0): Q/K preprocessing, current-token KV/index writes,
+          indexer/top-k, inactive-row mask, scratch remap, selection output
                                   |
                                   v
-Eager 1: selective LMCache latent load into target scratch slots,
-         Graph-A producer event -> load stream -> rank-consistent verdict
+Split 0: selective latent load(0) and index load(1), using the existing
+         connector callbacks, with a rank-consistent verdict
                                   |
                                   v
-Graph B: scratch-backed sparse attention, value projection, output projection
-         completion event defers layer finish, lease release, and slot reuse
+Island 1: Graph B(0) -> layer tail(0) -> Graph A(1)
+          producer/load/consumer events close every cross-stream dependency
                                   |
                                   v
-Layer/step connector commit and deferred saves
+... repeat one retrieve split per participating layer ...
+                                  |
+                                  v
+Island N: Graph B(N-1) -> layer tail(N-1)
+          completion ordering prevents early resource and slot reuse
+                                  |
+                                  v
+Existing connector finalization and deferred saves
 ```
 
-The eager index wait is before Graph A because Graph A reads the indexer cache.
-The selective latent load is after Graph A because it consumes Graph A's top-k
-selection. A single full-model ACL graph is not a valid target until LMCache
-offers device-driven, graph-safe retrieval.
+This architecture fits the current compiler model. Ascend already wraps the
+whole model in one ACL graph for `FULL`/`FULL_DECODE_ONLY` when there are no
+layerwise host callbacks. In PIECEWISE mode, vLLM isolates every configured
+split op and merges all ordinary FX nodes between adjacent splits into one
+compiled subgraph. Therefore a retrieve-only split naturally yields islands
+that cross transformer-layer boundaries.
+
+It is not available through configuration alone. Today
+`torch.ops.vllm.mla_forward` is an opaque custom op and `platform.py` forces the
+whole op to be a split in PIECEWISE mode. Its Python body obtains attention
+metadata/KV cache through `ForwardContext` and invokes both SFA computation and
+LMCache callbacks. The target must decompose this staged path into graph-safe
+pre/post ops with explicit tensors plus one mutation-aware eager retrieve op.
+Non-staged MLA keeps its existing route. A single uninterrupted full-model ACL
+graph remains invalid until retrieval itself becomes device-driven and
+capture-safe.
 
 Production-ready does not mean every vLLM mode must be captured in the first
 release. It means the enabled envelope is correct, bounded, observable, and
@@ -49,7 +70,7 @@ removing an eligibility guard is never support.
 
 | Release | Graph envelope | Required non-graph behavior |
 | --- | --- | --- |
-| R1: safe exact Q1 | Two-group unbundled LMCache, `SHRINK_LATENT=2`, exact configured Q=1 decode sizes, fp16/bf16, target model, TP, one DP replica, one virtual engine | All unsupported steps are classified before model forward as safe native, recompute, or fatal |
+| R1: cross-layer exact Q1 | Retrieve-only outer FX splits, nominally `N + 1` ACL islands for `N` local SFA layers, two-group unbundled LMCache, `SHRINK_LATENT=2`, exact configured Q=1 decode sizes, fp16/bf16, target model, TP, one DP replica, one virtual engine | All unsupported steps are classified before model forward as safe native, recompute, or fatal |
 | R2: general Q1 | Fixed-capacity padded Q=1 buckets through `max_num_seqs` | Inactive rows are invisible to LMCache and cannot touch live cache state |
 | R3: MTP | Fixed `SPEC_FIXED` candidate-width buckets for the target model | Unsupported widths/acceptance layouts use a proven route selected before mutation |
 | R4: serving parallelism | DP padding, empty ranks, PP/virtual-engine isolation, multi-engine lifecycle expansion | Rank decisions cannot diverge or reuse stale graph/cache addresses; base cache-epoch invalidation/rejection already ships in R1 |
@@ -58,41 +79,47 @@ removing an eligibility guard is never support.
 R1 can be released as a bounded production feature. R2-R5 expand coverage; they
 must not weaken the R1 safety contract.
 
-## Current implementation: useful foundation, not yet a release boundary
+## Current implementation checkpoint: first cross-layer milestone
 
-The current worktree already implements a substantial exact-Q1 proof:
+The worktree now contains the narrow single-request implementation that must be
+qualified before broader production work continues:
 
-- a structural `StagedSFAGraphKey` and per-key layer capture state;
-- two `ACLGraphWrapper` instances per SFA layer, with SFA-owned persistent
-  buffers providing the required strong output lifetime;
-- persistent Graph-A outputs, input signatures, capture records, canaries, and
-  ordered full-model startup replay proof;
-- exact configured unpadded batch sizes, long-generation sequence changes,
-  true multi-request dummy cache rows, and TP-wide startup/parity verdicts;
-- Graph-A current-token KV/index writes, indexer selection, scratch remap, and
-  Graph-B sparse attention/projections;
-- eager selective LMCache retrieval between the graphs with row-aligned
-  selected tokens and exact-Q1 request rows; native helpers/connector code have
-  groundwork for duplicate MTP IDs and row-specific target slots, but current
-  staged eligibility rejects them;
-- eager-versus-graph checks for the first live sequence-length tuple per key;
-- a conservative estimate for known persistent tensors and graph count.
+- `vllm::sfa_lmcache_retrieve` is the only staged-SFA FX split;
+- Graph A and Graph B reuse the already-validated SFA math but are captured by
+  the outer PIECEWISE executor, producing nominally `N + 1` islands for `N`
+  local SFA layers;
+- the runner performs the layer-zero index/bootstrap wait before model forward,
+  then each retrieve split loads the current latent group, prepares the next
+  layer's remap boundary, and waits for its index group;
+- a persistent event recorded inside Graph A is forwarded through LMCache's
+  existing optional `payload_event` argument; the adapter waits it on the
+  compute stream and LMCache's load stream waits that stream before packing and
+  transfer, so selective-load payloads cannot race captured top-k/remap
+  production;
+- decode saves are submitted at the model boundary because per-layer Python
+  save callbacks cannot remain inside the cross-layer islands;
+- capture is intentionally restricted to exact unpadded Q=1 with one request;
+  unsupported steps run the existing native SFA path with graph replay disabled;
+- startup rejects missing SFA layers, producer events, or stable save state.
 
-Those pieces should be retained. The production change is to move authority
-out of the layer and formalize the contracts around them.
+This is not yet a release boundary. It has static checks and focused tests, but
+still requires NPU startup, deterministic-output, LMCache-hit, trace-ordering,
+and no-profiler TPOT proof against the two-wrapper commit. The nested-wrapper
+implementation and its parity/canary state have been removed from this branch;
+the earlier commit is the external comparison and rollback point.
 
 ### Current support and rejection matrix
 
 | Mode | Current behavior | Production requirement |
 | --- | --- | --- |
-| Exact unpadded Q=1 | Staged for configured sizes | Finish P0 safety work and NPU qualification |
-| Long generation | Reuses a shape key with dynamic sequence contents | Prove every block/window/maximum-length boundary |
-| Unconfigured or padded Q=1 | Layer-local native fallback | Plan once at runner; add padded buckets in R2 |
+| Exact unpadded Q=1 | Cross-layer capture for one request; not NPU-qualified | Finish the first numerical/TPOT checkpoint, then P0 safety work |
+| Long generation | Intended to reuse the single shape key with live metadata tensors | Prove every block/window/maximum-length boundary |
+| Unconfigured or padded Q=1 | Runner disables replay before model forward; native SFA executes | Add planned padded buckets in R2 |
 | MTP/speculative target | Startup/runtime rejection | Fixed candidate-width keys, row masks, disjoint scratch in R3 |
 | Mixed prefill/decode | Rejected | Decode-row compaction plus native prefill design in R5 |
 | Compact-scratch LMCache native path | Available for many rows | Classify precisely when it is safe; never assume it is always a fallback |
-| Legacy manager/free-paged/adapter | Rejected by staged path | Stay eager until they implement the same transaction/event contract |
-| TP | Startup proof and sampled live parity | Per-step TP admission consensus and TP1/2/8 gates |
+| Legacy manager/free-paged/adapter | Rejected by staged path | Stay eager until their existing connector lifecycle and event behavior are independently qualified |
+| TP | Local startup completeness checks only in the new path | Restore rank-consistent startup/admission verdicts and TP1/2/8 gates |
 | DP | Staged configuration rejected | Common structural bucket, rank-local masks, empty-rank handling in R4 |
 | PP/multiple virtual engines | No capture namespace/lifecycle contract | Isolate cache epochs and in-flight slots or reject in R1-R3 |
 | LoRA, CP/o-proj TP, C8, MLAPO, prefetch | Rejected in layer eligibility | Centralize the rejection before capture and enable individually in R5 |
@@ -101,27 +128,31 @@ out of the layer and formalize the contracts around them.
 
 ## Blocking gap ledger
 
-The first ten items are release blockers even for exact Q1. Feature breadth
-work begins only after they are closed.
+The P0 items are release blockers even for exact Q1. Feature breadth work
+begins only after they are closed. P2 items are optional cleanup; they do not
+block R1 and may not change the existing connector API without a demonstrated
+correctness need.
 
 | ID | Current evidence | Risk | Required outcome |
 | --- | --- | --- | --- |
-| P0.1 atomic dispatch | Runner proposes a key in `_staged_sfa_live_graph_key`, but every layer re-runs `_staged_sfa_graph_ineligible_reason`; Graph A can mutate before a later layer rejects | One model step can mix graph/native execution or fail after partial KV mutation | One immutable all-layer plan, final TP admission, and TP phase verdicts around rank-local connector gaps; no layer-local fallback |
-| P0.2 fallback safety | `sfa_v1.py` can warn and enter native after graph rejection; `model_runner_v1.py` already warns that `prompt_len < index_topk` can alias live positions under `SHRINK_LATENT=2` | A path labelled "fallback" can knowingly return wrong output | Classify `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`; admission must prove the selected route has all required latent data |
-| P0.3 pre-mutation validation | The index wait occurs before full replay validation; Graph B's complete signature is checked only after Graph A writes cache | Pointer drift or connector failure can be detected too late | Validate both graph entries, all layers, frontiers, buffers, and rank agreement before the first wait/write |
-| P0.4 store-before-free | The stage-2 latent manager frees middle prompt blocks after prompt computation, but the scheduler has no per-request/group LMCache store-commit acknowledgement; sparse frontier can be inferred from prompt length | The only resident copy can be freed although some chunks were never committed | Free only coverage acknowledged by a versioned store commit; derive retrieval frontier from committed coverage, never prompt length |
-| P0.5 retrieval readiness | Strict misses and incomplete transfer masks can surface only when a layer generator resumes; exact top-k rows do not exist until Graph A | A post-selection load can fail after index/cache side effects | Before admission, lease the complete selectable committed source domain and validate every possible destination; a short post-A subset load is a protocol failure handled by coordinated abort |
-| P0.6 connector transaction | Frontier discovery uses private `_get_connector_metadata`; progress is an implicit `current_layer` cursor | Exceptions, retry, cancellation, or version skew can double-advance or strand the connector | Public versioned begin/layer/commit/abort protocol with step and layer IDs and idempotency |
-| P0.7 stream contract | Wrapper replay synchronization is disabled; correctness relies on connector internals and an optional one-time global NPU synchronize | Race between Graph A, load stream, and Graph B; early lease/slot release; hidden first-request latency | Explicit producer/load/Graph-B-completion event contract; zero hot-path device/global synchronization |
-| P0.8 stable ownership | Signatures cover explicit tensor arguments, but graph namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Capture registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
-| P0.9 bounded resources | Memory uses known-tensor estimates plus a fixed graph floor; stream count is empirical and PP is not included | KV sizing can overcommit HBM/streams despite passing startup arithmetic | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
-| P0.10 qualification evidence | Startup canaries prove graph tails ran; live parity samples one length tuple per graph key; smoke validates per-key parity and `2 * layers * keys` startup graph cardinality | One live tuple per key does not prove the full semantic boundary matrix | Automate NPU numerical, trace, lifecycle, and failure matrices |
-| P1.1 padded rows | Only remap boundary is persistent; builder allocates per-step CPU/NumPy/device metadata | Exact keys cause graph explosion/fallbacks and cannot safely pad | Stable fixed-capacity row arena, safe pad block/slots, masks through both graphs and connector filtering |
+| P0.0 cross-layer compiler contract | The worktree decomposes staged SFA into pre/retrieve/post custom ops, registers only retrieve as the staged split, and a mock FX test proves the intended middle partition | Source structure can still differ from the ACL graphs produced by the Ascend runtime | Prove on NPU that an island contains `Graph B(i) -> layer tail(i) -> Graph A(i+1)`, with no nested SFA wrappers and lower TPOT than the two-wrapper baseline |
+| P0.1 atomic dispatch | The runner authorizes one exact-Q1 key and disables replay before model forward for every other step; captured layer bodies do not make live fallback decisions | Admission is not yet one immutable all-layer/TP plan, so dynamic metadata or rank drift after runner admission is not collectively rejected | One immutable all-layer plan, final TP admission, and TP phase verdicts around rank-local connector gaps; no layer-local fallback |
+| P0.2 fallback safety | Unsupported steps now enter native execution with outer replay disabled before model forward; the native compact-scratch constraints, including `prompt_len < index_topk`, are still not represented by a typed route decision | A path labelled native can lack all latent data required by its selected compact-scratch mode | Classify `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`; admission must prove the selected route has all required latent data |
+| P0.3 pre-mutation validation | Startup checks that every local SFA layer created an event and stable save binding, but live cache/frontier/pointer identity is not validated as one plan before bootstrap | Pointer drift or connector failure can be detected only after the first index wait or captured write | Validate the complete island/split plan, frontiers, buffers, and rank agreement before the first wait/write |
+| P0.4 store-before-free | Decode-window release already waits for `completed_decode_window_saves`, but required latent/index groups and TP-owner aggregation are not yet fault-qualified | The only resident copy could be freed after an incomplete or rank-asymmetric save | Prove the existing completion path covers every required group/owner and frees only acknowledged aligned bundles; strengthen its implementation only where a failing test demonstrates a gap |
+| P0.5 retrieval readiness | Strict misses and incomplete transfer masks can surface only when a layer generator resumes; exact top-k rows do not exist until Graph A | A post-selection load can fail after index/cache side effects | Fault-test the current `start_load_kv`/`wait_for_layer_load` path before mutation and after Graph A; use coordinated recovery for post-mutation failure, and extend the connector contract only if the existing lifecycle cannot express a correct result |
+| P0.6 connector lifecycle failures | The production connector lifecycle and implicit `current_layer` cursor work on the qualified success path; exception, retry, cancellation, preemption, and rank-asymmetric behavior are not yet fully exercised | An unhandled failure could double-advance or strand connector state | Prove exactly-once callback progress and cleanup through the existing connector contract; prefer local guards/finalization, and require a reproduced correctness failure before proposing any shared API change |
+| P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | The event chain is not NPU-trace-qualified, while retaining generic fences can cap TPOT and jitter | Prove producer/load/following-island ordering, then remove only synchronization demonstrated redundant by the closed event chain |
+| P0.8 stable ownership | Outer PIECEWISE wrappers own the cross-layer graph storage, and startup retains per-layer cache/event bindings, but the namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Island registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
+| P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
+| P0.10 qualification evidence | Static schemas, retrieve-only FX partitioning, focused smoke parsing, and startup completeness checks pass; no Ascend result exists yet for the new path | Source/static evidence cannot prove device capture, numerical correctness, or the TPOT improvement | Automate NPU numerical, partition, trace, lifecycle, and failure matrices; assert the compiled island plan and zero nested staged wrappers |
+| P1.1 padded rows | Only remap boundary is persistent; builder allocates per-step CPU/NumPy/device metadata | Exact keys cause graph explosion/fallbacks and cannot safely pad | Stable fixed-capacity row arena, safe pad block/slots, masks through both logical SFA phases and connector filtering |
 | P1.2 rich ACL dispatch | `StagedSFAGraphKey` collapses to legacy `BatchDescriptor(num_tokens)` | Padded Q1 and `SPEC_FIXED` entries can collide at equal token counts | Carry the full structural key through `ACLGraphWrapper` dispatch |
 | P1.3 MTP scratch | Native metadata has row-specific groundwork; staged eligibility rejects it | Candidate rows can alias scratch or lose request-row order | Fixed-width profile, unique-request frontier expansion, disjoint scratch/targets, valid-row mask |
 | P1.4 scheduler ownership | Input rows can be condensed/swapped after scheduler output is formed; scratch is configured through scattered environment reads | Request IDs, block rows, selected rows, and targets can describe different generations | Build plan after row condensation; use generation/step identity and typed KV scratch configuration |
 | P1.5 DP/PP/concurrency | DP/ubatch are rejected and active-key aliases are mutable without locking | Rank deadlock, cross-request state reuse, stale virtual-engine cache addresses | DP-wide bucket agreement, per-VE/cache namespace, and either isolated in-flight slots or enforced no overlap |
 | P1.6 compatibility | Layer eligibility, startup config, memory budgeting, and connector checks encode different support subsets | Service can reserve/capture before discovering an unsupported operator combination | One capability fingerprint and reason enum used by every stage |
+| P2.2 vLLM-owned remap frontier | The current path obtains the committed frontier from bound LMCache metadata through `_get_connector_metadata` | This is connector-specific coupling and may complicate upstream review, but no runtime defect has been demonstrated for the pinned version pair | Optional cleanup: retain the remap boundary but derive it from the latent range vLLM actually released. Do not add a connector API solely for encapsulation or refactor resistance |
 
 ## Target ownership model
 
@@ -133,8 +164,8 @@ levels:
 ```text
 CaptureNamespace(
     model_instance_id, target_or_draft, device_rank,
-    virtual_engine, kv_cache_epoch, layer_id,
-    operator_fingerprint, connector_protocol_major,
+    virtual_engine, kv_cache_epoch, island_id_or_layer_span,
+    operator_fingerprint, connector_compatibility_id,
     in_flight_slot,
 )
 
@@ -150,7 +181,8 @@ model/SFA implementation, torch-npu and CANN support tier, dtypes, KV layout,
 block size, top-k, head dimensions, q-LoRA path, quantization/operator variant,
 TP/CP sharding, projection mode, and relevant connector capabilities. Most of
 these do not need to enlarge every dictionary key if the registry is already
-scoped to a layer, but they must be recorded and checked for invalidation.
+scoped to a compiled island plan, but they must be recorded and checked for
+invalidation.
 
 Dynamic contents include request IDs, row order, actual row count, sequence and
 prompt lengths, cache frontiers, block IDs, slot mappings, active masks, and
@@ -168,12 +200,13 @@ forward. It should contain at least:
 - capture namespace, structural key, actual token/request counts, and profile;
 - the single authoritative full-request and token-row mapping;
 - stable row-buffer arena and active-row slices;
-- every participating SFA layer and its prevalidated graph entries;
-- connector transaction handle, immutable committed-frontier snapshot, and
-  source/destination coverage lease;
+- the ordered outer-island/retrieve-split plan and every participating SFA
+  layer's position in it;
+- the remap frontier used by the qualified current path and the existing
+  connector-callback sequence expected for every participating layer;
 - scratch reservation and target-slot ownership;
 - TP consensus result and a typed fallback/rejection reason;
-- phase, mutation bit, connector-progress ledger, and finalization state.
+- phase, mutation bit, callback-progress ledger, and finalization state.
 
 All SFA implementations consume this plan. They may assert their layer entry,
 but they may not independently choose graph versus native. If a model has one
@@ -192,7 +225,8 @@ Allocate per namespace/key/in-flight slot, not ad hoc inside metadata build:
 - latent/index block tables, slot mappings, and safe padded rows;
 - scratch base, selected-token output, valid counts/masks, compact request IDs,
   and physical target slots;
-- strong Graph-A outputs and graph input tuples;
+- strong bridge tensors from Graph A to its retrieve split and following
+  island, plus graph input tuples per island;
 - reusable events for Graph-A producer and load completion;
 - optional debug canaries/parity buffers kept outside the release arena.
 
@@ -203,12 +237,12 @@ with a runtime guard rather than relying on today's scheduler behavior.
 
 ### 4. Capture registry
 
-The registry owns both wrappers, the graph-pool entry, startup proof, resource
-measurements, and state for every namespace/key. Required states are:
+The registry owns the compiled outer islands, graph-pool entries, startup proof,
+resource measurements, and state for every namespace/key. Required states are:
 
 ```text
-UNALLOCATED -> ALLOCATED -> CAPTURING_A -> CAPTURING_B
-            -> PROVING_ORDERED_REPLAY -> READY
+UNALLOCATED -> ALLOCATED -> CAPTURING_ISLANDS
+            -> PROVING_PARTITION_AND_ORDERED_REPLAY -> READY
 READY -> QUARANTINED | INVALIDATING -> RELEASED
 ```
 
@@ -216,191 +250,137 @@ Capture every enabled key before the worker reports ready. Retry is allowed only
 after the failed namespace has been fully invalidated and all graph/pool/arena
 objects have been rebuilt. Sleep/wake, model/weight reload, KV cache
 reinitialization, virtual-engine recreation, operator workspace relocation, or
-connector protocol-major change creates a new cache epoch and invalidates old
+supported connector software/configuration change creates a new cache epoch and invalidates old
 entries.
 
 ## Step and failure state machine
 
-The step transaction must make the mutation boundary explicit:
+The runner plan must make the mutation boundary explicit without replacing the
+existing vLLM connector lifecycle:
 
 ```text
 CREATED
   -> STATIC_PREFLIGHTED
-  -> CONNECTOR_PREPARED           # reversible source pin/handle acquisition
-  -> SOURCE_DOMAIN_LEASED         # all rows top-k is allowed to select
-  -> FINAL_ADMITTED               # TP verdict after connector preparation
-  -> LAYER_i_INDEX_WAIT_STARTED   # first connector/cache side effect
-  -> LAYER_i_INDEX_READY
-  -> LAYER_i_INDEX_PHASE_AGREED
-  -> LAYER_i_GRAPH_A_DONE
-  -> LAYER_i_LATENT_LOAD_STARTED
-  -> LAYER_i_LATENT_READY
-  -> LAYER_i_LATENT_PHASE_AGREED
-  -> LAYER_i_GRAPH_B_ENQUEUED
-  -> LAYER_i_GRAPH_B_DONE_EVENT
-  -> LAYER_i_FINISHED
-  -> ... next layer ...
+  -> FINAL_ADMITTED               # TP verdict before connector/cache mutation
+  -> BOOTSTRAP_INDEX_WAIT_STARTED  # first connector/cache side effect
+  -> BOOTSTRAP_INDEX_READY_AND_AGREED
+  -> ISLAND_0_ENQUEUED              # contains Graph A(0)
+  -> SPLIT_i_STARTED                # latent-load(i) + index-load(i+1)
+  -> SPLIT_i_READY_AND_TP_AGREED
+  -> ISLAND_i_PLUS_1_ENQUEUED       # B(i) + tail(i) + A(i+1)
+  -> ISLAND_i_PLUS_1_DONE_EVENT
+  -> ... next retrieve split ...
+  -> FINAL_ISLAND_ENQUEUED          # contains B(N-1) + tail(N-1)
+  -> FINAL_ISLAND_DONE_EVENT
   -> MODEL_DONE
   -> SAVES_DONE
-  -> COMMITTED
+  -> FINISHED
 
-Before INDEX_WAIT_STARTED, a route change may abort the reversible prepared
-transaction. At/after INDEX_WAIT_STARTED, no implicit native fallback is
-allowed; coordinated abort/recovery only.
+Before BOOTSTRAP_INDEX_WAIT_STARTED, a route change may use a proven safe route.
+At/after BOOTSTRAP_INDEX_WAIT_STARTED, no implicit native fallback is allowed; coordinated
+recovery only.
 ```
 
 Required rules:
 
-1. Static preflight validates both Graph A and Graph B entries for every layer,
-   the arena, scratch/destination capacity, connector capabilities, and static
-   rank compatibility.
-2. Connector preparation then snapshots committed frontiers and leases the
-   complete source interval from which top-k may select. Final TP admission runs
-   after that preparation; disagreement aborts every prepared handle before the
-   index wait.
+1. Static preflight validates every outer island and retrieve split in the
+   compiled plan, the arena, scratch/destination capacity, connector
+   capabilities, and static rank compatibility.
+2. Final TP admission runs before the index wait. The current remap frontier and
+   connector metadata/callback assumptions are validated for the pinned
+   software/configuration fingerprint; disagreement rejects the staged route.
 3. The index wait does not begin until final admission succeeds. Its cache write
    and connector progress are the first side-effect boundary.
-4. A rank-local index/latent operation must expose a connector-guaranteed
-   rank-consistent result or be followed by a TP phase verdict before any rank
-   enters Graph A/Graph B collective work.
-5. A layer transition is identified by `(step_id, layer_id, group)` and is
-   idempotent. Duplicate calls return the previous result or a typed error; they
-   never silently increment a cursor.
+4. The bootstrap index operation and every rank-local retrieve split must
+   expose a connector-guaranteed rank-consistent result or be followed by a TP
+   phase verdict before any rank enters the following collective-bearing
+   island.
+5. The runner calls each required index/latent layer callback exactly once,
+   including the combined `latent(i) + index(i+1)` transition, and verifies
+   with injected retry/error tests that no path silently increments the
+   existing connector cursor twice.
 6. Cancellation/preemption before the side-effect boundary may switch to
-   scheduler recovery after aborting preparation. After the boundary it invokes
-   connector abort, marks the request/cache epoch as
-   needing recovery, and cannot reuse partially written state as if committed.
+   scheduler recovery. After the boundary it marks the request/cache epoch as
+   needing recovery and cannot reuse partially written state as successful.
 7. A connector timeout is not automatically a native fallback. It is
    `SAFE_NATIVE` only if admission proved the necessary latent remains resident;
    otherwise schedule recomputation or fail the request.
-8. Graph B records a completion event. `finish_layer`, lease release, arena-slot
-   reuse, and save release are event-deferred; enqueueing Graph B is not
-   completion.
+8. Completion of the island containing Graph B must precede arena-slot reuse
+   and any connector resource release that could invalidate its inputs;
+   enqueueing the island is not proof of completion. Use the existing
+   stream/event behavior unless testing proves it insufficient.
 9. Exceptions at every phase run exactly one finalizer. Saves are released only
    after the graph result is accepted. No empty/no-forward/recalc-last path may
-   leak or double-finish the connector transaction.
+   leak or double-finish the existing connector lifecycle.
 10. A bad key is quarantined for future steps after a replay error. The current
    mutated step follows abort/recovery; future steps may use safe native mode.
 
-## Public LMCache staged-SFA protocol
+## Existing connector contract and API-change threshold
 
-Private metadata access and monkey-patched capability attributes are not a
-production API. LMCache-NPU and LMCache-Ascend need one versioned protocol. The
-names below are illustrative; the semantics are normative:
+R1 preserves the production vLLM connector lifecycle:
 
-```python
-caps = connector.staged_sfa_capabilities(protocol_major=1)
-txn = connector.prepare_staged_sparse_step(
-    step_id, unique_requests, required_coverage, role
-)
-snapshot, coverage_lease = txn.get_committed_frontiers(unique_request_order)
-
-txn.wait_index_layer(layer_id, target_cache, consumer_stream)
-txn.load_latent_layer(
-    layer_id,
-    selected_tokens,
-    compact_request_ids,
-    target_slot_mapping,
-    valid_row_mask,
-    producer_event,
-    consumer_stream,
-)
-graph_b_done_event = replay_graph_b_and_record_event()
-txn.finish_layer(layer_id, graph_b_done_event)
-txn.commit_step()
-# or txn.abort_step(reason, recovery_policy)
+```text
+bind_connector_metadata
+  -> start_load_kv
+  -> wait_for_layer_load for each index/latent layer
+  -> save_kv_layer
+  -> wait_for_save
+  -> clear_connector_metadata
 ```
 
-The producer side also needs an explicit path; load-step `commit_step()` is not
-a persistence acknowledgement:
+The staged executor inserts Graph A and Graph B around the existing selective
+layer load; it does not by itself justify a new LMCache-vLLM transaction API.
+The current LMCache/LMCache-Ascend implementation, including its established
+selected-row, target-slot, and event handling, remains the reference behavior.
 
-```python
-store = connector.begin_staged_sparse_store(prefill_step_id, requests, groups)
-store.enqueue_layers(layer_payloads, producer_events)
-local_commit = store.await_store_commit()
-global_commit = tp_broadcast_and_intersect_required_coverage(local_commit)
-worker.report_store_commit_to_scheduler(global_commit)
-# scheduler releases only aligned whole block bundles in global_commit
-```
+Changing the shared connector API is not recommended for encapsulation,
+cleanliness, or possible future refactors. It requires a reproduced correctness
+failure showing that the existing lifecycle cannot express the required
+ordering, completion, failure, or ownership semantics. Before proposing an API
+change, fault injection must first rule out a local runner guard, finalizer,
+event hand-off, or connector-internal fix. Any unavoidable extension should be
+general enough for upstream vLLM connector review rather than staged-SFA- or
+LMCache-specific plumbing.
 
-Capabilities must describe, rather than imply:
+The current `_get_connector_metadata` frontier lookup is a narrow, pinned-version
+integration dependency, not an R1 blocker by itself. Removing that dependency
+is useful optional cleanup: retain the remap boundary, but derive it from the
+latent range vLLM actually released. Do not add a frontier getter to the shared
+connector API unless a correctness test demonstrates that no vLLM-owned source
+can represent the needed value.
 
-- protocol major/minor and compatible vLLM metadata version;
-- producer/consumer/both roles and layerwise callback ownership;
-- two-group index/latent behavior and which group advances progress;
-- selective row load, duplicate MTP request rows, direct physical target slots,
-  padded-row masks, and maximum row/token capacities;
-- maximum in-flight transactions, stream-pool ownership, and whether overlapping
-  forward/load/store calls are serialized or forward-scoped;
-- frontier meaning, decode-window interaction, partial/miss outcomes, and
-  snapshot/coverage-lease lifetime;
-- store-commit acknowledgements by request, group, layer range, token interval,
-  and cache generation;
-- Graph-A producer-event ownership, load-stream/compute-stream hand-off, and
-  Graph-B completion-event-deferred finish/release;
-- idempotency, retry, abort, timeout, and cancellation semantics;
-- tensor lifetime: when selected/ID/target buffers may be reused, with complete
-  destination `data_ptr`/shape/stride/storage-offset and source lease identity;
-- TP save/load ownership, `save_only_first_rank`, shared CPU cache, and rank
-  failure behavior;
-- async store/load backpressure and completion semantics.
+The final selective payload must preserve candidate-row order and may contain
+duplicate request IDs. For every valid row, `selected_tokens[i]`,
+`request_ids[i]`, `target_slot_mapping[i]`, and the valid mask describe the same
+row. A short transfer or source disappearance after Graph A is a failure that
+requires coordinated recovery; it is not a native fallback.
 
-Frontier lookup always uses the unique full-request order. Preparation leases
-the whole committed interval that the qualified top-k operator is allowed to
-select, not the still-unknown exact top-k subset. The snapshot is then
-expanded through the plan's token-row map. The final selective payload preserves
-candidate-row order and may contain duplicate request IDs. For every valid row,
-`selected_tokens[i]`, `request_ids[i]`, `target_slot_mapping[i]`, and the valid
-mask describe the same row.
+### Store-before-free and retrieval readiness
 
-After Graph A, loading the exact selected subset must be guaranteed by that
-lease. A short transfer mask or source disappearance is a protocol/health
-failure after the side-effect boundary and triggers TP-coordinated abort and
-request/cache recovery; it is not a native fallback.
-
-The connector returns typed outcomes such as `READY`, `PARTIAL`, `MISS`,
-`TIMEOUT`, `CANCELLED`, and `PROTOCOL_ERROR`. The runner decides recomputation or
-fatal handling before mutation where possible. Broad exception-to-`False`
-capability checks and silent no-ops are forbidden in staged mode.
-
-### Store-before-free and retrieval leases
-
-Stage-2 memory saving is correct only if persistence, scheduler release, and
-later retrieval share one committed-coverage contract:
+Stage-2 memory saving is correct only if the existing completion signal,
+scheduler release, and later retrieval describe the same covered range:
 
 ```text
 prefill KV produced
-  -> LMCache stores required latent/index groups and waits for durable/usable ack
-  -> StoreCommit(request, cache_generation, layers, groups, committed_intervals)
-  -> worker intersects required layer/group coverage and propagates the TP
-     result (including rank-0 broadcast for save_only_first_rank)
-  -> scheduler marks only those intervals releasable
+  -> LMCache stores the required data and wait_for_save reaches completion
+  -> worker reports completed_decode_window_saves through the existing output
+  -> scheduler accepts the completion and marks that range releasable
   -> aligned whole latent block bundles are freed
-  -> decode acquires a lease over the same generation/coverage
-  -> staged/native compact-scratch execution consumes that lease
-  -> lease releases after Graph B and connector completion
+  -> staged/native compact-scratch execution retrieves the released range
 ```
 
 Prompt length or chunk rounding is not evidence of persistence. Missing
 metadata, cache mapping, indexer registration, a short transfer mask, or an
-empty source is a typed incomplete-coverage result, never a silent save/load
-success. A failed store keeps the resident blocks, triggers recomputation before
-free, or fails the request according to policy. It cannot advance the committed
-frontier.
+empty source may not be treated as silent save/load success. A failed store
+keeps the resident blocks, triggers recomputation before free, or fails the
+request according to policy. Fault tests must prove that TP ownership and
+`save_only_first_rank` cannot report completion prematurely.
 
-The decode preparation call must validate and lease every source interval that
-the captured top-k is allowed to select before final staged admission. The token binds
-request generation, committed intervals, source object/pin generation, and
-destination cache epoch. Forced unpin, cache health change, connector restart,
-or pointer re-registration invalidates the lease and prevents Graph A. A lease
-cannot expire while its asynchronous load or Graph B is still using it; the
-Graph-B completion event, not enqueue return, releases it.
-
-If LMCache cannot provide an efficient guarantee for the full selectable
-domain, the alternative is to split selection into a read-only graph before the
-mutation boundary, validate/lease its exact result, and capture cache writes in
-a later graph. That is a different three-island design and must be benchmarked;
-R1 may not pretend exact selected rows were known before current Graph A.
+R1 first validates source lifetime and transfer completion through the existing
+connector callbacks and stream/event behavior. If a forced-unpin, restart,
+timeout, or post-Graph-A failure exposes a correctness gap that cannot be fixed
+inside the current implementation, that evidence defines the minimum API
+extension to propose. A speculative lease/transaction API is not a prerequisite.
 
 ## Graph A and Graph B contracts
 
@@ -437,6 +417,85 @@ primary hot-path safety mechanism. Release mode relies on registry/arena epochs
 and validates the entire plan before mutation. Sampled signature/canary checks
 quarantine a key on drift. Startup proof must include numerical reference data,
 not only terminal canaries.
+
+## Target cross-layer retrieve-split architecture
+
+The target is supported by the current compiler architecture, with one required
+decomposition:
+
+- Ascend `FULL`/`FULL_DECODE_ONLY` already sets `splitting_ops=[]` and wraps the
+  whole model with `ACLGraphWrapper`. Existing e2e coverage uses this path.
+  `model_runner_v1.py` rejects it specifically when a connector advertises
+  layerwise callbacks, because replay would bypass their Python execution.
+- In PIECEWISE mode, `split_graph` isolates configured split nodes and compiles
+  each maximal run of ordinary FX nodes between them. With retrieval as the
+  only staged-SFA split, this directly creates cross-layer graph islands.
+- Today `AscendMultiHeadLatentAttention.forward` emits only
+  `vllm::mla_forward`, and `platform.py` forcibly adds that whole opaque op to
+  `splitting_ops`. The SFA pre phase, LMCache callback, and post phase therefore
+  cannot be partitioned independently.
+- The model-facing MLA call normally supplies positions and hidden states, not
+  populated KV-cache/attention-metadata arguments. The current custom-op body
+  deliberately resolves those from `ForwardContext`. The staged decomposition
+  must not broaden every upstream model call. For R1's single virtual engine,
+  bind model-owned KV tensors and stable runner arena metadata to the Ascend MLA
+  layer/plan before capture, then expose mutations and cross-split tensor
+  dependencies in the custom-op operands. Any remaining prebound implicit
+  tensor must be covered by the namespace, address, and update-event contract.
+
+Consequently this is feasible, but not as a configuration-only change. For the
+qualified staged route, expose three logical custom ops: graph-safe SFA pre,
+eager LMCache retrieve, and graph-safe SFA post. Only the retrieve op is a
+split. The pre/post ops use explicit tensor operands and contain no dynamic
+Python/connector decisions, so the surrounding outer ACL wrapper captures their
+NPU execution. The existing `vllm::mla_forward` route remains unchanged for
+configurations that do not enable this target and as the temporary reference
+executor. Within an enabled process, prefill and any pre-admitted native step
+still execute with graph runtime `NONE`; the decomposed op sequence must route
+that eager invocation through the existing native MLA implementation exactly
+once and make retrieve/post no-ops as appropriate. Cross-layer decode support
+may not regress dense prefix retrieval, prefill, or safe native behavior.
+
+For layer `i`, use the following nominal island schedule:
+
+```text
+bootstrap: index-load(0)
+
+Graph(0): Graph A(0)
+Split(0): latent-load(0) + index-load(1)
+Graph(1): Graph B(0) + layer-tail(0) + Graph A(1)
+Split(1): latent-load(1) + index-load(2)
+...
+Graph(N): Graph B(N-1) + layer-tail(N-1)
+```
+
+Combining `latent-load(i)` with `index-load(i+1)` is required to obtain one
+connector split per layer. This does not require a new connector API: the split
+may invoke the existing layer callbacks sequentially with static current/next
+layer identities. The feasibility spike must prove that the current two-group
+cursor does not advance on the index-group wait and advances exactly once on
+the latent-group wait. If that cannot be proved, the target becomes two splits
+per layer and loses the nominal `N + 1` cardinality; it must not hide the extra
+boundary.
+
+The retrieve split op must accept selected rows, destination slots, affected
+cache tensors, and a dependency token as real operands. Its schema must declare
+cache mutation/aliasing so FX cannot remove or reorder it. Static layer identity
+and request IDs may be resolved by the eager body from the runner-owned plan;
+the tensor dataflow and ordering may not depend only on hidden
+`ForwardContext` side effects. The preceding island publishes a producer event,
+the connector load stream waits and scatters, and the following island waits on
+a load-completion event. Generic piecewise replay synchronization must be
+disabled only for these event-closed islands after their stable input ownership
+is proved; the generic wrapper default remains unchanged.
+
+This design produces graphs that cross layer boundaries; it does not produce
+one uninterrupted full-model graph. The current full-graph support proves that
+ordinary device execution can span all transformer layers, but it does not make
+LMCache's request-specific Python/CPU callback capturable. The earlier
+two-wrapper commit remains the reference and rollback route until the
+cross-layer target has its own numerical, lifecycle, trace, and performance
+qualification; production registry/resource work is built for outer islands.
 
 ## Padded Q1 design
 
@@ -607,10 +666,9 @@ gates pass, but must continue reporting its exact support tier.
 The budget must be computed per device before KV-cache sizing:
 
 ```text
-R_total = sum(namespaces, keys, local_SFA_layers, in_flight_slots)(
-              graph_A_pool + graph_B_pool
-            + graph_A_workspace + graph_B_workspace
-            + persistent_inputs + strong_A_outputs + owned_output
+R_total = sum(namespaces, keys, compiled_islands, in_flight_slots)(
+              island_graph_pool + island_workspace
+            + persistent_inputs + strong_bridge_outputs + owned_output
             + safe_padding_storage + events)
           + connector_staging_and_scratch
           + optional_verify_or_parity_storage
@@ -656,19 +714,21 @@ Expose low-cardinality metrics with reason enums:
 - capture attempts/success/failure/duration by structural key;
 - registry state, ready/quarantined keys, cache epoch, and recapture count;
 - step admission counts for staged/safe-native/recompute/fatal;
-- per-layer Graph-A replay, index wait, latent load, Graph-B replay, and save
-  timing;
-- connector transaction starts/layer transitions/commits/aborts/timeouts and
-  duplicate-transition detection;
+- per-island replay, per-layer logical Graph-A/Graph-B timing, index/latent
+  callback timing, and save timing;
+- connector callback starts/layer transitions/completions/failures/timeouts and
+  duplicate-callback detection;
 - active/padded/selected rows and cache hit/partial/miss outcome;
 - reserved/measured graph, arena, scratch, and connector memory;
 - sampled parity/top-k/cache-write mismatch counts;
 - TP/DP decision disagreement and lifecycle invalidation reason.
 
-Profiler traces must show the expected index wait, one Graph A replay, one
-selective load, and one Graph B replay per participating layer, with explicit
-events and no hot-path global synchronize. A health endpoint/log summary should
-state enabled keys, protocol version, qualification fingerprint, resource
+Profiler traces must show the bootstrap index wait, exactly one retrieve split
+per participating layer, the compiled outer-island plan, explicit
+producer/load/consumer events, and no hot-path global synchronize. They must
+also show that each middle island contains `Graph B(i)`, the transformer tail,
+and `Graph A(i+1)`. A health endpoint/log summary should state enabled keys,
+connector compatibility fingerprint, qualification fingerprint, resource
 budget, and fallback/recompute policy.
 
 Use a runtime kill switch that prevents new staged plans. It may route future
@@ -680,97 +740,131 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
 | --- | --- |
 | `vllm_ascend/worker/model_runner_v1.py` | Build/finalize the immutable execution plan; enumerate all local SFA layers; do TP consensus; own arenas/registry; handle lifecycle and parity sampling |
 | `vllm_ascend/ascend_forward_context.py` | Pass a plan handle and layer cursor instead of loose dummy/key/parity attributes; carry cache epoch/virtual-engine identity |
-| `vllm_ascend/attention/sfa_v1.py` | Reduce to graph kernels plus a plan-driven layer executor; remove layer-local mode choice/private connector discovery; add padded/MTP masks; remove POC sync and hot signature dependence |
-| `vllm_ascend/attention/utils.py` | Replace private metadata/capability probes with the public connector transaction adapter and typed outcomes |
+| `vllm_ascend/attention/sfa_v1.py` | Expose graph-safe logical pre/post kernels with explicit tensor contracts; keep nested wrappers and layer-local fallback out of the target path; add padded/MTP masks |
+| `vllm_ascend/attention/utils.py` | Keep current LMCache frontier/capability access localized and version-qualified; optionally replace the frontier source with vLLM-owned released-range state after R1 |
 | `vllm_ascend/distributed/kv_transfer/sparse_offload/scratch_remap.py` | Add explicit valid mask/count, safe padded rows, disjoint MTP ranges, and device-side bounds assertions where available |
+| `vllm_ascend/ops/mla.py`, `vllm_ascend/platform.py` | Add the qualified staged decomposition and retrieve-only mutation-aware split; stop splitting at the whole `vllm::mla_forward` boundary only for that route; preserve existing non-staged MLA behavior |
 | `vllm_ascend/worker/worker.py` | Topology-aware measured memory reservation, local PP layer count, target/draft and lifecycle accounting |
 | `vllm_ascend/utils.py` | One compatibility fingerprint/reason system; rich capture keys; resource-driven bucket selection; actual stream accounting |
 | `vllm_ascend/envs.py` | Typed operational mode/buckets/debug sampling; centralize all staged-SFA environment reads |
-| `vllm_ascend/compilation/acl_graph.py` | Accept full structural dispatch key, expose bounded invalidation/destruction and resource measurements |
-| vLLM scheduler/input batch/KV managers | Final row-generation plan, typed scratch/window config, capacity enforcement, store-commit-gated latent release, idempotent lifecycle/recompute ownership |
-| LMCache-NPU vLLM adapter | Versioned step/layer transaction, public committed-frontier/readiness lease, idempotent progress, abort/finalize, event and tensor-lifetime contract |
-| LMCache-Ascend connector | Advertise the full negotiated capability object without monkeypatches; implement two-group/rank-specific semantics and failure outcomes |
+| `vllm_ascend/compilation/acl_graph.py` | Accept full structural dispatch keys, expose bounded invalidation/destruction and resource measurements, and add an opt-in event-closed replay policy without changing the generic synchronization default |
+| vLLM scheduler/input batch/KV managers | Final row-generation plan, typed scratch/window config, capacity enforcement, completion-gated latent release, and lifecycle/recompute ownership; optional vLLM-owned released frontier |
+| LMCache-NPU vLLM adapter | Preserve the existing connector API; fix only reproduced store/retrieve/finalization failures and add fault tests around current callbacks |
+| LMCache-Ascend connector | Preserve existing two-group/rank-specific and stream/event behavior; expose a new shared API only if a correctness gap cannot be fixed internally |
 | smoke/unit/NPU test tools | Multi-key graph-count parsing, plan/failure injection, lifecycle/parallel matrices, automated trace assertions |
 
 ## Delivery route and dependencies
 
-### W0: freeze the support contract and repair evidence tooling
+### W0: prove the cross-layer partition and capture contract
+
+- Add a narrowly gated staged decomposition in `ops/mla.py`: graph-safe pre,
+  eager retrieve, and graph-safe post. Make selected rows, destinations,
+  affected caches, and a dependency token explicit operands.
+- Add an Ascend-owned per-layer binding for model-owned KV tensors and stable
+  plan/arena metadata; do not change the model-facing MLA or shared connector
+  API. Assert binding identity before capture and replay.
+- Register only the retrieve op as a staged-SFA splitting op. Stop using
+  `vllm::mla_forward` as the boundary only for this qualified route; preserve
+  the existing path for all other MLA modes.
+- In the enabled process, preserve prefill and pre-admitted native execution
+  under runtime mode `NONE` by calling the existing MLA implementation exactly
+  once; add regression tests that retrieve/post do not duplicate its effects.
+- Reuse the current exact-Q1 Graph-A/Graph-B bodies without nested
+  `ACLGraphWrapper` instances in the new route.
+- Add a CPU/mock FX partition test proving that two adjacent layers produce
+  `pre(0) | retrieve(0) | post(0)+tail(0)+pre(1) | retrieve(1) | post(1)` and
+  that retrieval remains eager and mutation-ordered.
+- On NPU, start with the current eight-layer test model and one exact-Q1 key.
+  Assert nominal `local_sfa_layers + 1` outer graph islands, zero nested staged
+  entries, one retrieve call per layer, stable addresses, and a middle island
+  containing `Graph B(i)`, the layer tail, and `Graph A(i+1)`.
+- Invoke `latent-load(i)` and `index-load(i+1)` through the existing connector
+  callbacks in one split and prove exact cursor progression. Do not change the
+  connector API for this spike.
+
+Exit: deterministic token/logit/KV/top-k parity matches the current executor;
+the partition and profiler trace match the intended islands on TP2; warm replay
+does not execute connector callbacks inside a graph or recapture; prefill,
+dense prefix hit/TTFT behavior, decode save, and pre-admitted native fallback
+remain unchanged. If any exit condition fails, stop and document the concrete
+compiler/operator/connector constraint before doing production ownership work.
+
+### W1: freeze support behavior and qualify the existing connector lifecycle
 
 - Convert the compatibility table into typed capability/reason data shared by
   startup, resource planning, runner, and layer assertions.
 - Document `SAFE_NATIVE` versus `RECOMPUTE` versus `FATAL` for every current
   rejection, especially `prompt_len < index_topk` and missing/partial cache.
-- Update `tools/staged_sfa_graph_smoke.py` for the current startup message and
-  `graph_count == 2 * local_sfa_layers * keys`.
-- Repair the reported profiler-smoke contract: when AsyncLLM frontend profiling
-  is enabled, launch with profiler config `ignore_frontend=true` so
-  `/stop_profile` finalizes only TP-worker traces. Generalize the client's
-  intentional TP8-only parser/trace assertions; for the supplied TP2 launch,
-  pass or derive `--expected-ranks 2` instead of its current enforced value 8.
-- Add metrics/log schema and qualification fingerprint.
+- Keep the existing vLLM/LMCache connector API and callback order unchanged.
+- Fault-test store completion across every required layer/group and TP owner,
+  including `save_only_first_rank`, and verify that only acknowledged aligned
+  block bundles are released.
+- Inject sparse source miss/partial transfer, timeout, exception, cancel,
+  preemption, retry, and rank-asymmetric failure around bootstrap, each
+  combined retrieve split, and each following island.
+- Prove exactly-once use and cleanup of the existing layerwise cursor/generators;
+  add local runner/finalizer guards or connector-internal fixes only for
+  reproduced defects.
+- Prove producer, load-stream completion, and following-island consumer ordering
+  with automated NPU trace assertions.
+- Move scratch/window capacity into typed vLLM-owned configuration where
+  practical and record the pinned connector/software/configuration fingerprint.
+- Repair profiler smoke (`ignore_frontend=true`, configurable TP rank count),
+  update graph-count assertions to the compiled island plan, and add the
+  metrics/log qualification schema.
 
-Exit: every rejection has a tested action and the smoke gate matches multi-key
-capture. This work can start in parallel with W1.
+API-change gate: propose a shared connector extension only if a fault test
+demonstrates a correctness failure that cannot be fixed through the existing
+lifecycle. Removing `_get_connector_metadata` and deriving the remap frontier
+from vLLM-owned released-range state is optional P2.2 cleanup, not W1 exit work.
 
-### W1: public LMCache transaction and typed scratch configuration
+Exit: every rejection has a tested action; mocked and NPU fault injection prove
+store-before-free, island event ordering, and exactly-once existing-callback
+behavior for success, timeout, exception, cancel, preempt, and retry.
 
-- Land the capability/snapshot/begin/layer/commit/abort protocol across
-  LMCache-NPU and LMCache-Ascend.
-- Add per-request/group/generation store-commit acknowledgement; derive sparse
-  frontier from committed coverage and gate scheduler latent release on it.
-- Aggregate the intersection across every required layer/group and TP owner,
-  broadcast `save_only_first_rank` results, and free only aligned whole block
-  bundles acknowledged to the scheduler.
-- Lease the full selectable committed source domain in step preparation and
-  validate every possible destination. Guarantee any later top-k subset; treat
-  a short post-A transfer mask as a coordinated protocol failure.
-- Make progress idempotent by step/layer/group ID; remove private metadata reads
-  and monkey-patched capabilities from staged admission.
-- Add explicit Graph-A producer event and load-completion contract.
-- Move scratch/window capacity into typed KV configuration and enforce it.
+### W2: island registry, prebound arena, invalidation, and resource budget
 
-Exit: mocked and NPU fault-injection tests prove store-before-free, selectable-
-domain lease guarantees, Graph-B-event-deferred release, and exactly-once
-progress for success, timeout, exception, cancel, preempt, and retry. Blocks W3
-release.
-
-### W2: capture registry, prebound arena, invalidation, and resource budget
-
-- Add namespace/key/in-flight ownership and full structural ACL dispatch.
-- Allocate stable per-key tensors, including Graph-A outputs and prebound
-  Graph-B inputs, so both graph entries can be validated before index wait.
+- Add namespace/key/in-flight ownership and full structural ACL dispatch for
+  the compiled island plan.
+- Allocate stable per-key bridge tensors from Graph A through retrieval into the
+  following island so every island/split binding can be validated before the
+  bootstrap wait.
 - Implement cache epochs, quiesce/invalidate/rebuild, quarantine, and bounded
   graph destruction. Reject unsupported lifecycle operations before state
   changes.
 - Implement the offline-bound or two-pass resource strategy and feed the result
   into KV sizing without circular measurement.
+- Add an opt-in event-closed replay policy for these islands and remove
+  per-island host synchronization only after the event and ownership proof.
 - Remove release-mode hot signature scans after arena/epoch proof.
 
-Exit: both graph bindings are known before side effects; exact Q1 survives
+Exit: all island/split bindings are known before side effects; exact Q1 survives
 `1 -> B -> 1` and every allowed/rejected R1 lifecycle transition with bounded
-memory and no stale-address replay. Can proceed in parallel with W1, but event
-and connector resource accounting finish with W1.
+memory, no stale-address replay, and no hot-path stream/device synchronize.
 
-### W3: runner-owned transaction for existing exact Q1 kernels
+### W3: runner-owned cross-layer step plan
 
-- Introduce the execution plan and the static-preflight -> connector-prepare ->
-  source-lease -> final-admission state machine.
-- Validate every local layer and both graph entries before index wait; do final
-  per-step TP admission and phase verdicts after rank-local connector gaps.
-- Forbid layer-local fallback after planning and any fallback after index wait.
-- Implement one RAII finalizer plus Graph-B completion-event hand-off for
-  success/error/cancel/no-forward paths.
-- Keep current exact-Q1 math kernels unchanged except for consuming the plan.
-- Remove the first-use global synchronization after event proof passes.
+- Introduce the execution plan and the static-preflight -> final-admission ->
+  bootstrap -> alternating island/split state machine.
+- Validate every island, split, and participating layer before bootstrap; do
+  final per-step TP admission and phase verdicts after rank-local connector
+  gaps.
+- Forbid layer-local fallback after planning and any fallback after bootstrap.
+- Implement one runner finalizer around the existing connector lifecycle plus
+  final-island completion hand-off for success/error/cancel/no-forward paths.
+- Keep current exact-Q1 math unchanged except for consuming the plan and
+  explicit bridge tensors.
 
 Exit: injected local/rank-asymmetric failure at every layer/phase cannot cause
 mixed graph/native execution, collective divergence, double cursor movement,
-early lease/slot release, or reuse of partial state. Depends on W1 and W2.
+early slot/resource release, or reuse of partial state. Depends on W1 and W2.
 
-### W4: R1 exact-Q1 NPU qualification and rollout
+### W4: R1 cross-layer exact-Q1 NPU qualification and rollout
 
-- Run the complete numerical/boundary/cache/TP/lifecycle matrix.
-- Automate profiler/operator/event assertions and performance gates.
+- Run the complete numerical/boundary/cache/TP/lifecycle matrix against both
+  the archived two-wrapper commit and the valid native LMCache route.
+- Automate partition/operator/event assertions and performance gates, including
+  graph-island cardinality and zero nested staged wrappers.
 - Run verify/canary soak, release parity-only storage, and validate kill switch.
 - Publish the qualified hardware/software/operator fingerprint.
 
@@ -833,14 +927,17 @@ additional prefix-cache configurations. Each work item supplies:
 - all-layer plan failure and TP mismatch before mutation;
 - one-rank-only index/latent failure prevents every rank from entering the next
   graph island;
-- connector exactly-once ledger under an exception injected at every state;
+- existing connector callback counts and cursor progress under an exception
+  injected at every state;
 - store failure/short save cannot advance frontier or free resident blocks;
-- readiness miss/short transfer/lease invalidation is visible before Graph A;
+- readiness miss/short transfer is handled according to the pre/post-mutation
+  recovery policy;
 - connector destination pointer rebind/allocator reuse rebuilds native plans;
-- source pin timeout cannot invalidate an active coverage lease;
-- delayed Graph-B completion prevents early lease, scratch, or arena-slot reuse;
-- missing indexer registration and connector import-order variants fail the
-  public handshake rather than silently changing capabilities;
+- source pin timeout cannot invalidate data still consumed by the current step;
+- delayed completion of an island containing Graph B prevents early
+  connector-resource, scratch, or arena-slot reuse;
+- missing indexer registration and connector import-order variants fail staged
+  admission rather than silently changing capabilities;
 - cancel/preempt/recompute/recalc-last/empty-step/late-save finalization;
 - cache-epoch invalidation and bounded entry release;
 - resource formula for local PP layers, target/draft, every key and slot;
@@ -876,15 +973,20 @@ Axes include:
 
 ### Capture and trace assertions
 
-- exactly two ready graph entries per local SFA layer and structural key;
+- target executor cardinality equals the compiled island plan: nominally local
+  SFA layers plus one per structural key when retrieval is the only split, with
+  no nested Graph-A/Graph-B entries;
+- no nested two-wrapper executor is present in the production R1 branch or
+  included in target resource/cardinality accounting;
 - no unbounded recapture after readiness;
-- every intended operator is inside the correct replay island;
-- index wait precedes Graph A; producer event precedes selective load; load
-  completion precedes Graph B;
+- every intended operator is inside the correct replay island, including
+  `Graph B(i) -> layer tail(i) -> Graph A(i+1)` in every middle island;
+- bootstrap index wait precedes Graph A(0); producer event precedes each
+  selective load; load completion precedes the island containing Graph B;
 - no hot-path `.item()`, global stream/device synchronize, or tensor allocation
-  in either replay path;
-- graph output aliases the documented owned output and all strong outputs live
-  for the required slot lifetime.
+  in any target replay island;
+- island outputs alias documented owned storage and all bridge tensors live for
+  the required slot lifetime.
 
 ### Reliability and performance gates
 
@@ -896,7 +998,8 @@ Axes include:
 - throughput and TPOT improve for the workload/buckets that justify the feature;
 - TTFT/TPOT p50 and p99 have no unapproved regression from index waits, event
   hand-off, plan building, or first-use synchronization;
-- host launch count and eager gap between Graph A/B match the trace budget.
+- host launch count, outer-island count, and eager retrieve gaps match the trace
+  budget.
 
 Numeric performance thresholds, model mix, prompt/decode distribution, and soak
 duration must be fixed before W4 begins and stored with the evidence. A claim of
@@ -913,7 +1016,7 @@ duration must be fixed before W4 begins and stored with the evidence. A claim of
 4. Increase key/traffic coverage only when fallback/recompute, abort, memory,
    TPOT, and parity metrics remain within the signed thresholds.
 5. Quarantine a bad key automatically; use the kill switch for future steps.
-   Mutated in-flight steps still follow transaction recovery.
+   Mutated in-flight steps still follow the qualified recovery policy.
 6. Make R1 generally available only with the evidence bundle and rollback
    procedure; keep R2+ features separately gated.
 
@@ -927,15 +1030,16 @@ true:
    rank-local connector operation.
 2. Every graph input/output and implicit dependency has stable owned lifetime
    under a versioned namespace and cache epoch.
-3. Connector progress and store commitment are public, versioned,
-   event-ordered, idempotent, and exactly once on
-   success/error/cancel/recompute paths.
+3. Existing connector progress, store completion, and stream/event ordering are
+   proven exactly once on success/error/cancel/recompute paths. A new shared API
+   is required only if this cannot be achieved through the existing contract.
 4. Unsupported values have a proven `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`
    action; no unsafe fallback exists after mutation.
 5. Startup capture and ordered replay succeed on every participating rank and
    numerical parity covers the signed boundary/topology matrix.
 6. Padding/MTP rows, when enabled, have masks and disjoint cache/scratch/target
-   ownership through both graphs and LMCache.
+   ownership through both logical SFA phases, every retrieve split, and
+   LMCache.
 7. Graph, workspace, arena, scratch, stream, and connector resources are bounded
    before KV sizing and agree with measured high-water.
 8. Supported lifecycle invalidation and explicit pre-change rejection of

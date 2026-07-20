@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -32,9 +32,7 @@ from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
-    STAGED_SFA_SINGLETON_GRAPH_KEY,
     StagedSFAGraphKey,
-    StagedSFALiveParityState,
     StagedSFAQueryProfile,
 )
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -548,25 +546,6 @@ class AscendSFAMetadata:
     decode_remap_boundary_ready: bool = False
 
 
-@dataclass
-class _StagedSFAGraphState:
-    """Persistent host/device ownership for one structural staged graph key."""
-
-    key: StagedSFAGraphKey
-    capture_phases: set[str] = field(default_factory=set)
-    capture_records: set[str] = field(default_factory=set)
-    capture_failures: list[str] = field(default_factory=list)
-    graph_input_signatures: dict[str, tuple] = field(default_factory=dict)
-    replay_proved: set[str] = field(default_factory=set)
-    pre_output_buffers: tuple[torch.Tensor, ...] | None = None
-    replay_canaries: dict[str, torch.Tensor] = field(default_factory=dict)
-    live_capture_validated: bool = False
-    live_validated_request_ids: tuple[str, ...] | None = None
-    dummy_cache_initialized: bool = False
-    parity_output: torch.Tensor | None = None
-    parity_latent_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
-
-
 M = TypeVar("M", bound=AscendSFAMetadata)
 
 
@@ -1006,24 +985,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
         )
-        self._staged_sfa_pre_graph = None
-        self._staged_sfa_post_graph = None
-        self._staged_sfa_capture_phases: set[str] = set()
-        self._staged_sfa_capture_records: set[str] = set()
-        self._staged_sfa_capture_failures: list[str] = []
-        self._staged_sfa_graph_input_signatures: dict[str, tuple] = {}
-        self._staged_sfa_replay_proved: set[str] = set()
-        self._staged_sfa_pre_output_buffers = None
-        self._staged_sfa_replay_canaries: dict[str, torch.Tensor] = {}
-        self._staged_sfa_live_capture_validated = False
-        self._staged_sfa_live_validated_request_ids = None
-        self._staged_sfa_active_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        self._staged_sfa_graph_states = {
-            STAGED_SFA_SINGLETON_GRAPH_KEY: (self._snapshot_active_staged_sfa_state(STAGED_SFA_SINGLETON_GRAPH_KEY))
-        }
         self._staged_sfa_dummy_cache_initialized = False
-        self._staged_sfa_parity_output = None
-        self._staged_sfa_parity_latent_scratch = None
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1710,7 +1672,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return attn_output
 
-    def _staged_sfa_graph_ineligible_reason(
+    def _cross_layer_ineligible_reason(
         self,
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
@@ -1939,602 +1901,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the exact-Q1 CPU row metadata does not match the graph key"
         return None
 
-    def _snapshot_active_staged_sfa_state(
-        self,
-        key: StagedSFAGraphKey,
-    ) -> _StagedSFAGraphState:
-        return _StagedSFAGraphState(
-            key=key,
-            capture_phases=self._staged_sfa_capture_phases,
-            capture_records=self._staged_sfa_capture_records,
-            capture_failures=self._staged_sfa_capture_failures,
-            graph_input_signatures=(self._staged_sfa_graph_input_signatures),
-            replay_proved=self._staged_sfa_replay_proved,
-            pre_output_buffers=self._staged_sfa_pre_output_buffers,
-            replay_canaries=self._staged_sfa_replay_canaries,
-            live_capture_validated=(self._staged_sfa_live_capture_validated),
-            live_validated_request_ids=(self._staged_sfa_live_validated_request_ids),
-            dummy_cache_initialized=bool(getattr(self, "_staged_sfa_dummy_cache_initialized", False)),
-            parity_output=getattr(self, "_staged_sfa_parity_output", None),
-            parity_latent_scratch=getattr(self, "_staged_sfa_parity_latent_scratch", None),
-        )
-
-    def _ensure_staged_sfa_state_registry(self) -> None:
-        if hasattr(self, "_staged_sfa_graph_states"):
-            return
-        active_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        self._staged_sfa_active_graph_key = active_key
-        self._staged_sfa_graph_states = {active_key: self._snapshot_active_staged_sfa_state(active_key)}
-
-    def _bind_staged_sfa_graph_state(
-        self,
-        state: _StagedSFAGraphState,
-    ) -> None:
-        """Bind legacy helper fields to one canonical key-owned state."""
-        self._staged_sfa_capture_phases = state.capture_phases
-        self._staged_sfa_capture_records = state.capture_records
-        self._staged_sfa_capture_failures = state.capture_failures
-        self._staged_sfa_graph_input_signatures = state.graph_input_signatures
-        self._staged_sfa_replay_proved = state.replay_proved
-        self._staged_sfa_pre_output_buffers = state.pre_output_buffers
-        self._staged_sfa_replay_canaries = state.replay_canaries
-        self._staged_sfa_live_capture_validated = state.live_capture_validated
-        self._staged_sfa_live_validated_request_ids = state.live_validated_request_ids
-        self._staged_sfa_dummy_cache_initialized = state.dummy_cache_initialized
-        self._staged_sfa_parity_output = state.parity_output
-        self._staged_sfa_parity_latent_scratch = state.parity_latent_scratch
-        self._staged_sfa_active_graph_key = state.key
-
-    def _flush_active_staged_sfa_graph_state(
-        self,
-    ) -> _StagedSFAGraphState:
-        self._ensure_staged_sfa_state_registry()
-        active_key = self._staged_sfa_active_graph_key
-        state = self._snapshot_active_staged_sfa_state(active_key)
-        self._staged_sfa_graph_states[active_key] = state
-        return state
-
-    def _activate_staged_sfa_graph_key(
-        self,
-        key: StagedSFAGraphKey,
-    ) -> _StagedSFAGraphState:
-        """Activate isolated state for one exact structural graph key.
-
-        The wrappers remain shared and dispatch by the equivalent
-        BatchDescriptor. vLLM-Ascend does not run concurrent ubatches, so an
-        explicit flush/bind at each boundary is sufficient.
-        """
-        self._ensure_staged_sfa_state_registry()
-        self._flush_active_staged_sfa_graph_state()
-        state = self._staged_sfa_graph_states.get(key)
-        if state is None:
-            state = _StagedSFAGraphState(key=key)
-            self._staged_sfa_graph_states[key] = state
-        self._bind_staged_sfa_graph_state(state)
-        return state
-
-    def _iter_staged_sfa_graph_states(
-        self,
-    ) -> tuple[tuple[StagedSFAGraphKey, _StagedSFAGraphState], ...]:
-        self._ensure_staged_sfa_state_registry()
-        active_key = self._staged_sfa_active_graph_key
-        self._staged_sfa_graph_states[active_key] = self._snapshot_active_staged_sfa_state(active_key)
-        return tuple(
-            sorted(
-                self._staged_sfa_graph_states.items(),
-                key=lambda item: (
-                    item[0].token_capacity,
-                    item[0].request_capacity,
-                    item[0].query_profile.value,
-                    item[0].max_query_len,
-                ),
-            )
-        )
-
-    def _reset_staged_sfa_graph_states(self) -> None:
-        self._staged_sfa_capture_phases = set()
-        self._staged_sfa_capture_records = set()
-        self._staged_sfa_capture_failures = []
-        self._staged_sfa_graph_input_signatures = {}
-        self._staged_sfa_replay_proved = set()
-        self._staged_sfa_pre_output_buffers = None
-        self._staged_sfa_replay_canaries = {}
-        self._staged_sfa_live_capture_validated = False
-        self._staged_sfa_live_validated_request_ids = None
-        self._staged_sfa_dummy_cache_initialized = False
-        self._staged_sfa_parity_output = None
-        self._staged_sfa_parity_latent_scratch = None
-        self._staged_sfa_active_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        self._staged_sfa_graph_states = {
-            STAGED_SFA_SINGLETON_GRAPH_KEY: (self._snapshot_active_staged_sfa_state(STAGED_SFA_SINGLETON_GRAPH_KEY))
-        }
-
-    @staticmethod
-    def _staged_sfa_q1_graph_key(
-        hidden_states: torch.Tensor,
-        attn_metadata: AscendSFAMetadata,
-    ) -> StagedSFAGraphKey:
-        token_capacity = int(hidden_states.shape[0])
-        request_capacity = len(attn_metadata.decode_request_ids_compact or ())
-        if request_capacity != token_capacity:
-            raise RuntimeError("[SFA staged graph POC] exact-Q1 token/request capacities diverged after admission.")
-        return StagedSFAGraphKey.exact_q1(token_capacity)
-
-    def _get_staged_sfa_graph_wrappers(self):
-        """Lazily construct the two inner PIECEWISE ACL graph wrappers."""
-        if self._staged_sfa_pre_graph is None or self._staged_sfa_post_graph is None:
-            from vllm.compilation.cuda_graph import CUDAGraphOptions
-
-            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
-
-            options = CUDAGraphOptions(
-                debug_log_enable=False,
-                gc_disable=True,
-                weak_ref_output=False,
-            )
-            self._staged_sfa_pre_graph = ACLGraphWrapper(
-                runnable=self._staged_sfa_graph_pre_poc,
-                vllm_config=self.vllm_config,
-                runtime_mode=CUDAGraphMode.PIECEWISE,
-                cudagraph_options=options,
-                synchronize_before_replay=False,
-            )
-            self._staged_sfa_post_graph = ACLGraphWrapper(
-                runnable=self._staged_sfa_graph_post_poc,
-                vllm_config=self.vllm_config,
-                runtime_mode=CUDAGraphMode.PIECEWISE,
-                cudagraph_options=CUDAGraphOptions(
-                    debug_log_enable=False,
-                    gc_disable=True,
-                    weak_ref_output=False,
-                ),
-                synchronize_before_replay=False,
-            )
-            logger.warning_once(
-                "[SFA staged graph POC] active: compact-scratch decode "
-                "compute is captured before and after an eager LMCache layer "
-                "retrieve. Staged replay uses stream/event ordering without "
-                "per-graph host synchronization. Dynamic sequence-length "
-                "replay of the torch_npu lightning indexer remains "
-                "experimental and requires live numerical parity."
-            )
-        return self._staged_sfa_pre_graph, self._staged_sfa_post_graph
-
-    @staticmethod
-    def _staged_sfa_tensor_signature(tensor: torch.Tensor) -> tuple:
-        """Describe every tensor property that must stay fixed for replay."""
-        return (
-            tensor.data_ptr(),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.storage_offset(),
-            tensor.dtype,
-            tensor.device,
-        )
-
-    def _validate_staged_sfa_graph_entry(
-        self,
-        region_name: str,
-        graph_wrapper,
-        graph_inputs: tuple[torch.Tensor, ...] | None = None,
-    ):
-        """Require a captured entry and optionally verify live input storage."""
-        batch_descriptor = get_forward_context().batch_descriptor
-        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(batch_descriptor)
-        if graph_entry is None or graph_entry.aclgraph is None:
-            raise RuntimeError(
-                "[SFA staged graph POC] the "
-                f"{region_name} region was not captured during startup "
-                f"for {batch_descriptor}."
-            )
-        if graph_inputs is None:
-            return graph_entry
-
-        captured_addresses = graph_entry.input_addresses
-        live_addresses = [value.data_ptr() for value in graph_inputs if isinstance(value, torch.Tensor)]
-        if captured_addresses is None:
-            raise RuntimeError(f"[SFA staged graph POC] the {region_name} graph did not record its input addresses.")
-        if captured_addresses != live_addresses:
-            mismatch_indices = [
-                index
-                for index, (captured, live) in enumerate(zip(captured_addresses, live_addresses))
-                if captured != live
-            ]
-            if len(captured_addresses) != len(live_addresses):
-                mismatch_indices.extend(
-                    range(
-                        min(len(captured_addresses), len(live_addresses)),
-                        max(len(captured_addresses), len(live_addresses)),
-                    )
-                )
-            raise RuntimeError(
-                "[SFA staged graph POC] the positional tensor storage for "
-                f"the {region_name} graph changed before live replay; "
-                f"differing input indices={mismatch_indices}."
-            )
-
-        captured_signatures = getattr(
-            self,
-            "_staged_sfa_graph_input_signatures",
-            {},
-        ).get(region_name)
-        live_signatures = tuple(
-            self._staged_sfa_tensor_signature(value) for value in graph_inputs if isinstance(value, torch.Tensor)
-        )
-        if captured_signatures is None:
-            raise RuntimeError(
-                f"[SFA staged graph POC] the {region_name} graph did not record its full input signatures."
-            )
-        if captured_signatures != live_signatures:
-            signature_mismatches = [
-                index
-                for index, (captured, live) in enumerate(zip(captured_signatures, live_signatures))
-                if captured != live
-            ]
-            if len(captured_signatures) != len(live_signatures):
-                signature_mismatches.extend(
-                    range(
-                        min(len(captured_signatures), len(live_signatures)),
-                        max(len(captured_signatures), len(live_signatures)),
-                    )
-                )
-            raise RuntimeError(
-                "[SFA staged graph POC] the full tensor signature for the "
-                f"{region_name} graph changed before live replay; differing "
-                f"input indices={signature_mismatches}."
-            )
-        return graph_entry
-
-    @staticmethod
-    def _staged_sfa_capture_dummy_active() -> bool:
-        forward_context = get_forward_context()
-        return bool(
-            getattr(
-                forward_context,
-                "staged_sfa_graph_dummy_run",
-                False,
-            )
-            and getattr(
-                forward_context,
-                "cudagraph_runtime_mode",
-                None,
-            )
-            == CUDAGraphMode.PIECEWISE
-        )
-
-    def _observe_staged_sfa_capture_phase(
-        self,
-        region_name: str,
-        phase: str,
-    ) -> None:
-        """Record that a staged runnable executed inside NPU stream capture."""
-        if not self._staged_sfa_capture_dummy_active():
-            return
-        if not torch.npu.is_current_stream_capturing():
-            capture_failures = getattr(
-                self,
-                "_staged_sfa_capture_failures",
-                None,
-            )
-            if capture_failures is None:
-                capture_failures = []
-                self._staged_sfa_capture_failures = capture_failures
-            capture_failures.append(f"{region_name}: runnable reached its {phase} phase outside NPU stream capture")
-            return
-        capture_phases = getattr(
-            self,
-            "_staged_sfa_capture_phases",
-            None,
-        )
-        if capture_phases is None:
-            capture_phases = set()
-            self._staged_sfa_capture_phases = capture_phases
-        capture_phases.add(f"{region_name}:{phase}")
-
-    def _record_staged_sfa_graph_capture(
-        self,
-        region_name: str,
-        graph_wrapper,
-        graph_inputs: tuple,
-        graph_outputs: tuple[torch.Tensor, ...],
-    ) -> None:
-        """Record capture structure without replaying or mutating graph data.
-
-        All staged graphs share the process-global graph pool. Replaying an
-        inner graph while later graphs are still being captured violates the
-        pool's capture/replay ordering contract, so startup replay is deferred
-        to one ordered, full-model dummy pass after capture_model completes.
-        """
-        if not self._staged_sfa_capture_dummy_active():
-            return
-        capture_records = getattr(
-            self,
-            "_staged_sfa_capture_records",
-            None,
-        )
-        if capture_records is None:
-            capture_records = set()
-            self._staged_sfa_capture_records = capture_records
-        if region_name in capture_records:
-            return
-
-        capture_failures = getattr(
-            self,
-            "_staged_sfa_capture_failures",
-            None,
-        )
-        if capture_failures is None:
-            capture_failures = []
-            self._staged_sfa_capture_failures = capture_failures
-
-        required_phases = {
-            f"{region_name}:enter",
-            f"{region_name}:exit",
-        }
-        observed_phases = getattr(
-            self,
-            "_staged_sfa_capture_phases",
-            set(),
-        )
-        missing_phases = required_phases - observed_phases
-        if missing_phases:
-            capture_failures.append(f"{region_name}: missing capture phases {sorted(missing_phases)}")
-
-        batch_descriptor = get_forward_context().batch_descriptor
-        graph_entry = graph_wrapper.concrete_aclgraph_entries.get(batch_descriptor)
-        tensor_inputs = tuple(value for value in graph_inputs if isinstance(value, torch.Tensor))
-        live_addresses = [value.data_ptr() for value in tensor_inputs]
-        if graph_entry is None or graph_entry.aclgraph is None:
-            capture_failures.append(f"{region_name}: no captured graph entry for {batch_descriptor}")
-        elif graph_entry.input_addresses is None:
-            capture_failures.append(f"{region_name}: captured graph entry has no input addresses")
-        elif graph_entry.input_addresses != live_addresses:
-            capture_failures.append(
-                f"{region_name}: captured input addresses do not match the tensors returned from the capture call"
-            )
-
-        input_signatures = getattr(
-            self,
-            "_staged_sfa_graph_input_signatures",
-            None,
-        )
-        if input_signatures is None:
-            input_signatures = {}
-            self._staged_sfa_graph_input_signatures = input_signatures
-        input_signatures[region_name] = tuple(self._staged_sfa_tensor_signature(value) for value in tensor_inputs)
-
-        if not graph_outputs:
-            capture_failures.append(f"{region_name}: capture returned no graph outputs")
-        for output_index, graph_output in enumerate(graph_outputs):
-            if not isinstance(graph_output, torch.Tensor):
-                capture_failures.append(f"{region_name}: output {output_index} is not a tensor")
-            elif int(graph_output.numel()) == 0:
-                capture_failures.append(f"{region_name}: output {output_index} is empty")
-        capture_records.add(region_name)
-
-    def _require_staged_sfa_startup_proof(self) -> None:
-        required_phases = {
-            "pre:enter",
-            "pre:exit",
-            "post:enter",
-            "post:exit",
-        }
-        missing_phases = required_phases - getattr(
-            self,
-            "_staged_sfa_capture_phases",
-            set(),
-        )
-        missing_replays = {"pre", "post"} - getattr(
-            self,
-            "_staged_sfa_replay_proved",
-            set(),
-        )
-        if missing_phases or missing_replays:
-            raise RuntimeError(
-                "[SFA staged graph POC] startup ordered replay-canary check is "
-                "incomplete: "
-                f"missing capture phases={sorted(missing_phases)}, "
-                f"missing replay canaries={sorted(missing_replays)}."
-            )
-
-    @staticmethod
-    def _staged_sfa_parity_match_tensor(
-        actual: torch.Tensor,
-        reference: torch.Tensor,
-        *,
-        exact: bool,
-    ) -> torch.Tensor:
-        """Return a device scalar without branching on a local TP result."""
-        if actual.shape != reference.shape or actual.dtype != reference.dtype or actual.device != reference.device:
-            return actual.new_zeros((), dtype=torch.bool)
-        if exact:
-            return torch.eq(actual, reference).all()
-        if not actual.is_floating_point():
-            return actual.new_zeros((), dtype=torch.bool)
-        if actual.dtype in (torch.float16, torch.bfloat16):
-            rtol, atol = 1e-2, 1e-3
-        else:
-            rtol, atol = 1e-4, 1e-5
-        finite = torch.logical_and(
-            torch.isfinite(actual).all(),
-            torch.isfinite(reference).all(),
-        )
-        close = torch.isclose(
-            actual,
-            reference,
-            rtol=rtol,
-            atol=atol,
-            equal_nan=False,
-        ).all()
-        return torch.logical_and(finite, close)
-
-    @classmethod
-    def _staged_sfa_parity_flags(
-        cls,
-        comparisons: tuple[
-            tuple[str, torch.Tensor, torch.Tensor, bool],
-            ...,
-        ],
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Build device flags; the runner materializes all layers at once."""
-        return [
-            (
-                label,
-                cls._staged_sfa_parity_match_tensor(
-                    actual,
-                    reference,
-                    exact=exact,
-                ),
-            )
-            for label, actual, reference, exact in comparisons
-        ]
-
     def _submit_sfa_save_operations(
         self,
         save_operations: list[tuple[str, list[torch.Tensor]]],
     ) -> None:
-        """Publish saves normally, but hold parity-token saves for consensus."""
-        parity_state = getattr(
-            get_forward_context(),
-            "staged_sfa_live_parity_state",
-            None,
-        )
-        if isinstance(parity_state, StagedSFALiveParityState):
-            parity_state.pending_saves.extend(save_operations)
-            return
         for layer_name, kv_caches in save_operations:
             maybe_save_kv_layer_to_connector(
                 layer_name,
                 kv_caches,
             )
 
-    def _get_staged_sfa_parity_latent_scratch(
-        self,
-        kv_cache: tuple[torch.Tensor, ...],
-        num_rows: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return private buffers with one distinct slot per parity row."""
-        live_caches = (kv_cache[0], kv_cache[1])
-        block_size = int(live_caches[0].shape[1])
-        required_blocks = (num_rows + block_size - 1) // block_size
-        if required_blocks <= 0 or any(int(live.shape[0]) < required_blocks for live in live_caches):
-            raise RuntimeError("[SFA staged graph POC] insufficient private cache capacity for batched live parity.")
-        scratch = getattr(
-            self,
-            "_staged_sfa_parity_latent_scratch",
-            None,
-        )
-        if scratch is None or any(
-            private.shape != live[:required_blocks].shape
-            or private.dtype != live.dtype
-            or private.device != live.device
-            for private, live in zip(scratch, live_caches)
-        ):
-            scratch = (
-                torch.empty_like(live_caches[0][:required_blocks]),
-                torch.empty_like(live_caches[1][:required_blocks]),
-            )
-            self._staged_sfa_parity_latent_scratch = scratch
-        return scratch
-
-    def _staged_sfa_eager_pre_reference_poc(
-        self,
-        hidden_states: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, ...],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        indexer_slot_mapping: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        indexer_block_table: torch.Tensor,
-        remap_boundary: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """Graph-A reference with no live-cache write or connector call."""
-        assert self.fused_qkv_a_proj is not None
-        assert self.q_lora_rank is not None
-        assert self.q_a_layernorm is not None
-        assert self.kv_a_layernorm is not None
-        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-        q_c, kv_no_split = qkv_lora.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            dim=-1,
-        )
-        q_c = self.q_a_layernorm(q_c)
-        k_li, k_li_scale = self.indexer_select_pre_process(
-            hidden_states,
-            cos,
-            sin,
-        )
-        assert k_li_scale is None
-        k_li = self._get_full_kv(k_li, None)
-
-        num_rows = int(hidden_states.shape[0])
-        private_nope, private_pe = self._get_staged_sfa_parity_latent_scratch(
-            kv_cache,
-            num_rows,
-        )
-        reference_slots = torch.arange(
-            num_rows,
-            dtype=torch.int64,
-            device=slot_mapping.device,
-        ).reshape(slot_mapping.shape)
-        kv_input = kv_no_split.view(
-            kv_no_split.shape[0],
-            self.num_kv_heads,
-            1,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-        )
-        _, _, ref_k_pe, ref_k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv_input,
-            self.kv_a_layernorm.weight,
-            cos,
-            sin,
-            reference_slots,
-            private_pe,
-            private_nope,
-            epsilon=self.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA",
-            is_output_kv=True,
-        )
-        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-        q_pe = self.rope_single(q_pe, cos, sin)
-        topk_indices = self.indexer_select_post_process(
-            x=hidden_states,
-            q_c=q_c,
-            kv_cache=kv_cache,
-            attn_metadata=None,
-            cos=cos,
-            sin=sin,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            indexer_block_table_override=indexer_block_table,
-        )
-        topk_indices, selected_packed = scratch_remap(
-            topk_indices,
-            remap_boundary,
-            need_packed=True,
-        )
-        assert selected_packed is not None
-        return (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            selected_packed,
-            ref_k_nope.reshape(-1, kv_cache[0].shape[-1]),
-            ref_k_pe.reshape(-1, kv_cache[1].shape[-1]),
-            k_li.reshape(-1, kv_cache[2].shape[-1]),
-        )
-
-    def _staged_sfa_graph_pre_poc(
+    def _cross_layer_pre_compute(
         self,
         hidden_states: torch.Tensor,
         kv_cache_nope: torch.Tensor,
@@ -2548,22 +1925,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table: torch.Tensor,
         remap_boundary: torch.Tensor,
-        ql_nope_output: torch.Tensor | None = None,
-        q_pe_output: torch.Tensor | None = None,
-        topk_indices_output: torch.Tensor | None = None,
-        selected_packed_output: torch.Tensor | None = None,
-        replay_canary: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Graph A: preprocess, cache writes, top-k and scratch remap."""
+        """Pre-retrieval compute captured by the outer PIECEWISE graph."""
         assert self.fused_qkv_a_proj is not None
         assert self.q_lora_rank is not None
         assert self.q_a_layernorm is not None
-        self._observe_staged_sfa_capture_phase("pre", "enter")
 
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -2618,51 +1989,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_packed=True,
         )
         assert selected_packed is not None
-        computed_outputs = (
+        return (
             ql_nope,
             q_pe,
             topk_indices,
             selected_packed,
         )
-        persistent_outputs = (
-            ql_nope_output,
-            q_pe_output,
-            topk_indices_output,
-            selected_packed_output,
-        )
-        if any(value is not None for value in persistent_outputs):
-            if not all(value is not None for value in persistent_outputs):
-                raise RuntimeError(
-                    "[SFA staged graph POC] Graph A requires either all four persistent output buffers or none of them."
-                )
-            for output_index, (persistent, computed) in enumerate(zip(persistent_outputs, computed_outputs)):
-                assert persistent is not None
-                if (
-                    persistent.shape != computed.shape
-                    or persistent.dtype != computed.dtype
-                    or persistent.device != computed.device
-                ):
-                    raise RuntimeError(
-                        "[SFA staged graph POC] persistent Graph-A output "
-                        f"{output_index} does not match the computed tensor."
-                    )
-                persistent.copy_(computed)
-            assert ql_nope_output is not None
-            assert q_pe_output is not None
-            assert topk_indices_output is not None
-            assert selected_packed_output is not None
-            computed_outputs = (
-                ql_nope_output,
-                q_pe_output,
-                topk_indices_output,
-                selected_packed_output,
-            )
-        if replay_canary is not None:
-            replay_canary.fill_(1)
-        self._observe_staged_sfa_capture_phase("pre", "exit")
-        return computed_outputs
 
-    def _staged_sfa_post_compute_poc(
+    def _cross_layer_post_compute(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -2699,420 +2033,199 @@ class AscendSFAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(attn_output)[0]
         return output
 
-    def _staged_sfa_graph_post_poc(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        topk_indices: torch.Tensor,
-        kv_cache_nope: torch.Tensor,
-        kv_cache_pe: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        block_table: torch.Tensor,
-        output: torch.Tensor,
-        replay_canary: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Graph B: scratch-backed SFA, value-up and output projection."""
-        self._observe_staged_sfa_capture_phase("post", "enter")
-        output = self._staged_sfa_post_compute_poc(
-            ql_nope,
-            q_pe,
-            topk_indices,
-            kv_cache_nope,
-            kv_cache_pe,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table,
-            output,
-            trace_label="staged_graph_poc",
-        )
-        if replay_canary is not None:
-            replay_canary.fill_(1)
-        self._observe_staged_sfa_capture_phase("post", "exit")
-        return output
-
-    def _staged_sfa_eager_post_reference_poc(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        topk_indices: torch.Tensor,
-        kv_cache_nope: torch.Tensor,
-        kv_cache_pe: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        block_table: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pure Graph-B reference using one private persistent output."""
-        reference_output = self._staged_sfa_parity_output
-        if (
-            reference_output is None
-            or reference_output.shape != output.shape
-            or reference_output.dtype != output.dtype
-            or reference_output.device != output.device
-        ):
-            reference_output = torch.empty_like(output)
-            self._staged_sfa_parity_output = reference_output
-        return self._staged_sfa_post_compute_poc(
-            ql_nope,
-            q_pe,
-            topk_indices,
-            kv_cache_nope,
-            kv_cache_pe,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table,
-            reference_output,
-            trace_label="staged_graph_live_reference",
-        )
-
-    def _ensure_staged_sfa_replay_canaries(
-        self,
-        device: torch.device,
-        runtime_mode: CUDAGraphMode | None,
-    ) -> dict[str, torch.Tensor]:
-        canaries = getattr(self, "_staged_sfa_replay_canaries", None)
-        if canaries is None:
-            canaries = {}
-            self._staged_sfa_replay_canaries = canaries
-        if set(canaries) == {"pre", "post"}:
-            for region_name, canary in canaries.items():
-                if (
-                    not isinstance(canary, torch.Tensor)
-                    or canary.shape != (1,)
-                    or canary.dtype != torch.int32
-                    or canary.device != device
-                ):
-                    raise RuntimeError(
-                        f"[SFA staged graph POC] the persistent {region_name} replay canary has an invalid signature."
-                    )
-            if canaries["pre"].data_ptr() == canaries["post"].data_ptr():
-                raise RuntimeError("[SFA staged graph POC] pre/post replay canaries alias.")
-            return canaries
-        if canaries:
-            raise RuntimeError(f"[SFA staged graph POC] replay-canary initialization is partial: {sorted(canaries)}.")
-        if runtime_mode != CUDAGraphMode.NONE:
-            raise RuntimeError(
-                "[SFA staged graph POC] replay canaries were not allocated "
-                "by the eager dummy warmup before graph capture."
-            )
-        canaries.update(
-            {
-                "pre": torch.zeros(
-                    1,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                "post": torch.zeros(
-                    1,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-            }
-        )
-        return canaries
-
-    def _bind_staged_sfa_pre_output_buffers(
-        self,
-        graph_outputs: tuple[torch.Tensor, ...],
-        *,
-        is_dummy_run: bool,
-        runtime_mode: CUDAGraphMode | None,
-    ) -> tuple[torch.Tensor, ...]:
-        if len(graph_outputs) != 4 or not all(isinstance(output, torch.Tensor) for output in graph_outputs):
-            raise RuntimeError("[SFA staged graph POC] Graph A must return exactly four tensor outputs.")
-        persistent_outputs = getattr(
-            self,
-            "_staged_sfa_pre_output_buffers",
-            None,
-        )
-        if persistent_outputs is None:
-            if not is_dummy_run or runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError(
-                    "[SFA staged graph POC] persistent Graph-A outputs were "
-                    "not allocated by the eager dummy warmup before capture."
-                )
-            persistent_outputs = tuple(torch.empty_like(output) for output in graph_outputs)
-            for persistent, output in zip(
-                persistent_outputs,
-                graph_outputs,
-            ):
-                persistent.copy_(output)
-            self._staged_sfa_pre_output_buffers = persistent_outputs
-            return persistent_outputs
-
-        mismatches = [
-            output_index
-            for output_index, (persistent, returned) in enumerate(zip(persistent_outputs, graph_outputs))
-            if (self._staged_sfa_tensor_signature(persistent) != self._staged_sfa_tensor_signature(returned))
-        ]
-        if len(persistent_outputs) != len(graph_outputs):
-            mismatches.extend(
-                range(
-                    min(len(persistent_outputs), len(graph_outputs)),
-                    max(len(persistent_outputs), len(graph_outputs)),
-                )
-            )
-        if mismatches:
-            message = f"Graph A did not return its persistent output storage; differing output indices={mismatches}"
-            if self._staged_sfa_capture_dummy_active():
-                failures = getattr(
-                    self,
-                    "_staged_sfa_capture_failures",
-                    None,
-                )
-                if failures is None:
-                    failures = []
-                    self._staged_sfa_capture_failures = failures
-                failures.append(f"pre: {message}")
-            else:
-                raise RuntimeError(f"[SFA staged graph POC] {message}.")
-        return persistent_outputs
-
-    def _forward_staged_sfa_graph_poc(
+    def _cross_layer_kv_cache(
         self,
         layer_name: str,
-        index_layer_name: str | None,
-        index_lmcache_enabled: bool,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> tuple[tuple[torch.Tensor, ...], str | None, bool]:
+        index_layer_name = _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
+        index_enabled = bool(index_layer_name is not None and _dsa_index_lmcache_enabled())
+        if self.dsa_offload_unbundle and len(kv_cache) < 3:
+            index_cache = getattr(self, "_dsa_idx_cache_t", None)
+            if index_cache is None:
+                context = get_forward_context()
+                assert index_layer_name is not None
+                registered = context.no_compile_layers[index_layer_name].kv_cache[context.virtual_engine]
+                index_cache = registered[0] if isinstance(registered, (tuple, list)) else registered
+                self._dsa_idx_cache_t = index_cache
+            kv_cache = (*kv_cache, index_cache)
+        return kv_cache, index_layer_name, index_enabled
+
+    def _cross_layer_empty_outputs(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The bridge has a fixed one-row contract in the first milestone. The
+        # native path ignores these tensors, so do not scale them with prefill.
+        num_tokens = 1
+        return (
+            hidden_states.new_empty((num_tokens, self.local_num_heads, self.kv_lora_rank)),
+            hidden_states.new_empty((num_tokens, self.local_num_heads, self.qk_rope_head_dim)),
+            torch.empty(
+                (num_tokens, 1, self.index_topk),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            ),
+            torch.empty(
+                (num_tokens, self.index_topk),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            ),
+        )
+
+    def cross_layer_graph_pre(
+        self,
+        layer_name: str,
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: M,
+        attn_metadata: M | None,
+        need_gather_q_kv: bool,
         output: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run graph A -> eager LMCache retrieve -> graph B."""
-        graph_key = self._staged_sfa_q1_graph_key(
-            hidden_states,
-            attn_metadata,
-        )
-        self._activate_staged_sfa_graph_key(graph_key)
-        pre_graph, post_graph = self._get_staged_sfa_graph_wrappers()
-        forward_context = get_forward_context()
-        parity_state = getattr(
-            forward_context,
-            "staged_sfa_live_parity_state",
-            None,
-        )
-        if not isinstance(parity_state, StagedSFALiveParityState):
-            parity_state = None
-        elif parity_state.graph_key != graph_key:
-            raise RuntimeError("[SFA staged graph POC] live parity key does not match the active graph key.")
-        run_live_parity = parity_state is not None and id(self) not in parity_state.checked_impl_ids
-        parity_failures: list[str] = []
-        is_dummy_run = bool(
-            getattr(
-                forward_context,
-                "staged_sfa_graph_dummy_run",
-                False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run graph A, or the complete native path outside staged replay."""
+        context = get_forward_context()
+        if attn_metadata is None:
+            self.forward(
+                layer_name,
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+                need_gather_q_kv,
+                output,
             )
-        )
-        live_request_ids = None if is_dummy_run else tuple(attn_metadata.decode_request_ids_compact or ())
-        validate_live_inputs = not is_dummy_run
-        log_live_validation = validate_live_inputs and (
-            not self._staged_sfa_live_capture_validated
-            or self._staged_sfa_live_validated_request_ids != live_request_ids
-        )
-        if validate_live_inputs:
-            self._require_staged_sfa_startup_proof()
+            return self._cross_layer_empty_outputs(hidden_states)
+        kv_cache, index_layer_name, index_enabled = self._cross_layer_kv_cache(layer_name, kv_cache)
+        graph_key = getattr(context, "staged_sfa_graph_key", None)
+        if graph_key is None:
+            self.forward(
+                layer_name,
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+                need_gather_q_kv,
+                output,
+            )
+            return self._cross_layer_empty_outputs(hidden_states)
+        reason = self._cross_layer_ineligible_reason(hidden_states, kv_cache, attn_metadata)
+        if reason is not None:
+            raise RuntimeError(
+                f"[SFA cross-layer graph] runner-authorized key became ineligible in {layer_name}: {reason}"
+            )
 
-        runtime_mode = getattr(
-            forward_context,
-            "cudagraph_runtime_mode",
-            None,
-        )
-        if is_dummy_run and not self._staged_sfa_dummy_cache_initialized:
-            if runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError(
-                    "[SFA staged graph POC] the exact-Q1 dummy cache blocks "
-                    "were not initialized by the eager dummy warmup before capture."
-                )
-            # Dummy row r maps to physical block r. Zero every block owned by
-            # this exact key outside capture so requests cannot collide or
-            # inherit uninitialized data during the ordered replay proof.
+        is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
+        if is_dummy and not self._staged_sfa_dummy_cache_initialized:
             for cache in kv_cache:
-                if int(cache.shape[0]) < graph_key.request_capacity:
-                    raise RuntimeError(
-                        "[SFA staged graph POC] a dummy KV cache has fewer "
-                        "physical blocks than the exact-Q1 request capacity."
-                    )
                 cache[: graph_key.request_capacity].zero_()
             self._staged_sfa_dummy_cache_initialized = True
-
-        replay_canaries = self._ensure_staged_sfa_replay_canaries(
-            hidden_states.device,
-            runtime_mode,
-        )
-        persistent_pre_outputs = getattr(
-            self,
-            "_staged_sfa_pre_output_buffers",
-            None,
-        )
-        pre_output_args = persistent_pre_outputs if persistent_pre_outputs is not None else (None, None, None, None)
-
-        cos = attn_metadata.cos
-        sin = attn_metadata.sin
-        slot_mapping = attn_metadata.slot_mapping
-        indexer_slot_mapping = attn_metadata.indexer_slot_mapping
-        indexer_block_table = attn_metadata.indexer_block_table
         remap_boundary = _prepare_sfa_remap_boundary(
             attn_metadata,
             attn_metadata.req_ids,
-            is_dummy_run=is_dummy_run,
+            is_dummy_run=is_dummy,
             index_topk=self.index_topk,
         )
-
-        # In two-group mode start_load only primes a cold index retriever. The
-        # group-1 wait materializes it without advancing the latent-layer cursor;
-        # on a warm/resident request this is an inexpensive connector no-op.
-        if not is_dummy_run and index_lmcache_enabled:
-            assert index_layer_name is not None
-            with torch.profiler.record_function("sfa_staged_graph_poc::lmcache_index_retrieve"):
-                wait_for_kv_layer_from_connector(index_layer_name)
-
-        pre_graph_inputs = (
+        outputs = self._cross_layer_pre_compute(
             hidden_states,
             kv_cache[0],
             kv_cache[1],
             kv_cache[2],
-            cos,
-            sin,
-            slot_mapping,
-            indexer_slot_mapping,
+            attn_metadata.cos,
+            attn_metadata.sin,
+            attn_metadata.slot_mapping,
+            attn_metadata.indexer_slot_mapping,
             attn_metadata.cum_query_lens,
             attn_metadata.seq_lens,
-            indexer_block_table,
+            attn_metadata.indexer_block_table,
             remap_boundary,
-            *pre_output_args,
-            replay_canaries["pre"],
         )
-        if validate_live_inputs:
-            self._validate_staged_sfa_graph_entry(
-                "pre",
-                pre_graph,
-                pre_graph_inputs,
+        producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
+        if producer_event is None:
+            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError("staged SFA producer event was not created by eager warmup")
+            producer_event = torch.npu.Event()
+            self._staged_sfa_cross_layer_producer_event = producer_event
+        attn_metadata.reshape_cache_event = producer_event
+        producer_event.record()
+        self._staged_sfa_cross_layer_runtime = (
+            layer_name,
+            kv_cache,
+            index_layer_name,
+            index_enabled,
+        )
+        return outputs
+
+    def cross_layer_lmcache_retrieve(
+        self,
+        layer_name: str,
+        next_layer_name: str,
+        selected_packed: torch.Tensor,
+        attn_metadata: M | None,
+    ) -> None:
+        with torch.profiler.record_function("sfa_cross_layer::lmcache_retrieve"):
+            context = get_forward_context()
+            if (
+                attn_metadata is None
+                or getattr(context, "staged_sfa_graph_key", None) is None
+                or getattr(context, "staged_sfa_graph_dummy_run", False)
+            ):
+                return
+            index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
+            producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
+            if producer_event is not None:
+                attn_metadata.reshape_cache_event = producer_event
+            selected, request_ids, target_slots = _prepare_dsa_sparse_lmcache_payload(
+                attn_metadata,
+                selected_packed,
+                index_topk=self.index_topk,
             )
-            self._validate_staged_sfa_graph_entry("post", post_graph)
-        with torch.profiler.record_function("sfa_staged_graph_poc::pre"):
-            captured_pre_outputs = tuple(pre_graph(*pre_graph_inputs))
-        (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            selected_packed,
-        ) = self._bind_staged_sfa_pre_output_buffers(
-            captured_pre_outputs,
-            is_dummy_run=is_dummy_run,
-            runtime_mode=runtime_mode,
-        )
-        self._record_staged_sfa_graph_capture(
-            "pre",
-            pre_graph,
-            pre_graph_inputs,
-            (ql_nope, q_pe, topk_indices, selected_packed),
-        )
+            wait_for_kv_layer_from_connector(
+                layer_name,
+                selected_tokens=selected,
+                token_start_index=None,
+                request_ids=request_ids,
+                target_slot_mapping=target_slots,
+                payload_event=producer_event,
+            )
+            if _LMCACHE_SPARSE_WAIT_SYNC_ONCE:
+                _sync_compute_stream_after_lmcache_sparse_wait()
+            if next_layer_name:
+                next_metadata = context.attn_metadata[next_layer_name]
+                _prepare_sfa_remap_boundary(
+                    next_metadata,
+                    next_metadata.req_ids,
+                    is_dummy_run=False,
+                    index_topk=self.index_topk,
+                )
+                if index_enabled:
+                    wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(next_layer_name))
 
-        if run_live_parity:
-            with torch.profiler.record_function("sfa_staged_graph_poc::live_parity_pre"):
-                try:
-                    (
-                        ref_ql_nope,
-                        ref_q_pe,
-                        ref_topk_indices,
-                        ref_selected_packed,
-                        ref_cache_nope,
-                        ref_cache_pe,
-                        ref_cache_index,
-                    ) = self._staged_sfa_eager_pre_reference_poc(
-                        hidden_states,
-                        kv_cache,
-                        cos,
-                        sin,
-                        slot_mapping,
-                        indexer_slot_mapping,
-                        attn_metadata.cum_query_lens,
-                        attn_metadata.seq_lens,
-                        indexer_block_table,
-                        remap_boundary,
-                    )
-                    latent_slots = slot_mapping.reshape(-1).to(torch.int64)
-                    index_slots = indexer_slot_mapping.reshape(-1).to(torch.int64)
-                    actual_cache_nope = (
-                        kv_cache[0]
-                        .reshape(
-                            -1,
-                            kv_cache[0].shape[-1],
-                        )
-                        .index_select(0, latent_slots)
-                    )
-                    actual_cache_pe = (
-                        kv_cache[1]
-                        .reshape(
-                            -1,
-                            kv_cache[1].shape[-1],
-                        )
-                        .index_select(0, latent_slots)
-                    )
-                    actual_cache_index = (
-                        kv_cache[2]
-                        .reshape(
-                            -1,
-                            kv_cache[2].shape[-1],
-                        )
-                        .index_select(0, index_slots)
-                    )
-                    parity_state.match_flags.extend(
-                        (f"{layer_name}: pre.{name}", match_flag)
-                        for name, match_flag in self._staged_sfa_parity_flags(
-                            (
-                                (
-                                    "ql_nope",
-                                    ql_nope,
-                                    ref_ql_nope,
-                                    False,
-                                ),
-                                ("q_pe", q_pe, ref_q_pe, False),
-                                (
-                                    "topk_indices",
-                                    topk_indices,
-                                    ref_topk_indices,
-                                    True,
-                                ),
-                                (
-                                    "selected_packed",
-                                    selected_packed,
-                                    ref_selected_packed,
-                                    True,
-                                ),
-                                (
-                                    "cache_nope",
-                                    actual_cache_nope,
-                                    ref_cache_nope,
-                                    False,
-                                ),
-                                (
-                                    "cache_pe",
-                                    actual_cache_pe,
-                                    ref_cache_pe,
-                                    False,
-                                ),
-                                (
-                                    "cache_index",
-                                    actual_cache_index,
-                                    ref_cache_index,
-                                    False,
-                                ),
-                            )
-                        )
-                    )
-                except Exception as exc:
-                    parity_failures.append(f"pre.exception={type(exc).__name__}: {str(exc)[:256]}")
+    def bootstrap_cross_layer(self, layer_name: str) -> None:
+        """Prepare layer zero before the first captured island is launched."""
+        with torch.profiler.record_function("sfa_cross_layer::bootstrap"):
+            context = get_forward_context()
+            metadata = context.attn_metadata[layer_name]
+            _prepare_sfa_remap_boundary(
+                metadata,
+                metadata.req_ids,
+                is_dummy_run=False,
+                index_topk=self.index_topk,
+            )
+            if _dsa_index_lmcache_enabled():
+                wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(layer_name))
 
-        # Match the native producer fence: it follows current-token latent and
-        # index writes, but precedes LMCache's scratch writes.
-        if not is_dummy_run and self.is_kv_producer:
-            attn_metadata.reshape_cache_event = torch.npu.Event()
-            attn_metadata.reshape_cache_event.record()
-
-        post_graph_inputs = (
+    def cross_layer_graph_post(
+        self,
+        layer_name: str,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M | None,
+        output: torch.Tensor,
+    ) -> None:
+        if attn_metadata is None or getattr(get_forward_context(), "staged_sfa_graph_key", None) is None:
+            return
+        kv_cache, _, _ = self._cross_layer_kv_cache(layer_name, kv_cache)
+        self._cross_layer_post_compute(
             ql_nope,
             q_pe,
             topk_indices,
@@ -3122,109 +2235,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.seq_lens,
             attn_metadata.block_table,
             output,
-            replay_canaries["post"],
+            trace_label="cross_layer",
         )
-        if validate_live_inputs:
-            self._validate_staged_sfa_graph_entry(
-                "post",
-                post_graph,
-                post_graph_inputs,
-            )
 
-        # This selective latent call intentionally stays outside both wrappers.
-        # Its load stream waits for Graph A, scatters the selected prompt rows,
-        # and makes the compute stream wait before Graph B consumes scratch.
-        with torch.profiler.record_function("sfa_staged_graph_poc::lmcache_retrieve"):
-            if not is_dummy_run:
-                (
-                    selected_for_wait,
-                    request_ids_for_wait,
-                    target_slot_mapping_for_wait,
-                ) = _prepare_dsa_sparse_lmcache_payload(
-                    attn_metadata,
-                    selected_packed,
-                    index_topk=self.index_topk,
-                )
-                wait_for_kv_layer_from_connector(
-                    layer_name,
-                    selected_tokens=selected_for_wait,
-                    token_start_index=None,
-                    request_ids=request_ids_for_wait,
-                    target_slot_mapping=target_slot_mapping_for_wait,
-                )
-                if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
-                    _sync_compute_stream_after_lmcache_sparse_wait()
-
-        with torch.profiler.record_function("sfa_staged_graph_poc::post"):
-            post_graph_output = post_graph(*post_graph_inputs)
-        if not isinstance(post_graph_output, torch.Tensor) or self._staged_sfa_tensor_signature(
-            post_graph_output
-        ) != self._staged_sfa_tensor_signature(output):
-            message = "Graph B did not return its caller-owned output storage"
-            if self._staged_sfa_capture_dummy_active():
-                self._staged_sfa_capture_failures.append(f"post: {message}")
-            else:
-                raise RuntimeError(f"[SFA staged graph POC] {message}.")
-        self._record_staged_sfa_graph_capture(
-            "post",
-            post_graph,
-            post_graph_inputs,
-            (output,),
-        )
-        if run_live_parity:
-            with torch.profiler.record_function("sfa_staged_graph_poc::live_parity_post"):
-                try:
-                    ref_output = self._staged_sfa_eager_post_reference_poc(
-                        ql_nope,
-                        q_pe,
-                        topk_indices,
-                        kv_cache[0],
-                        kv_cache[1],
-                        attn_metadata.cum_query_lens,
-                        attn_metadata.seq_lens,
-                        attn_metadata.block_table,
-                        output,
-                    )
-                    parity_state.match_flags.extend(
-                        (
-                            f"{layer_name}: post.{name}",
-                            match_flag,
-                        )
-                        for name, match_flag in self._staged_sfa_parity_flags((("output", output, ref_output, False),))
-                    )
-                except Exception as exc:
-                    parity_failures.append(f"post.exception={type(exc).__name__}: {str(exc)[:256]}")
-
-            parity_state.checked_impl_ids.add(id(self))
-            parity_state.checked_layer_names.append(layer_name)
-            parity_state.failures.extend(f"{layer_name}: {failure}" for failure in parity_failures)
-        if validate_live_inputs:
-            self._staged_sfa_live_capture_validated = True
-            self._staged_sfa_live_validated_request_ids = live_request_ids
-        if log_live_validation:
-            logger.info_once(
-                "[SFA staged graph POC] verified pre/post startup capture "
-                "and enabled always-on captured-input signature validation for "
-                "live replay; LMCache retrieval remains eager."
-            )
-
-        # Preserve the native pure-decode gate. Ordinary saves remain eager;
-        # parity-token saves are queued until the model-boundary TP verdict.
-        if not is_dummy_run:
-            skip_decode_save = bool(self.dsa_shrink_latent) and _decode_window_save_window_size() == 0
-            save_operations: list[tuple[str, list[torch.Tensor]]] = []
-            if not skip_decode_save:
-                if self.dsa_offload_unbundle:
-                    save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
-                    if index_layer_name is not None and index_lmcache_enabled:
-                        save_operations.append((index_layer_name, [kv_cache[2]]))
-                else:
-                    save_operations.append((layer_name, list(kv_cache)))
-
-            self._submit_sfa_save_operations(save_operations)
-
-            _dsa_prof.step()
-        return output
+    def submit_cross_layer_save(self) -> None:
+        runtime = getattr(self, "_staged_sfa_cross_layer_runtime", None)
+        if runtime is None:
+            return
+        layer_name, kv_cache, index_layer_name, index_enabled = runtime
+        if bool(self.dsa_shrink_latent) and _decode_window_save_window_size() == 0:
+            return
+        operations = [(layer_name, [kv_cache[0], kv_cache[1]])]
+        if index_layer_name is not None and index_enabled:
+            operations.append((index_layer_name, [kv_cache[2]]))
+        self._submit_sfa_save_operations(operations)
+        _dsa_prof.step()
 
     def forward(
         self,
@@ -3273,43 +2298,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
                 self._dsa_idx_cache_t = _idx_t
             kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
-
-        if self.enable_staged_sfa_graph:
-            staged_reason = self._staged_sfa_graph_ineligible_reason(
-                hidden_states,
-                kv_cache,
-                attn_metadata,
-            )
-            if staged_reason is None:
-                staged_output = self._forward_staged_sfa_graph_poc(
-                    layer_name=layer_name,
-                    index_layer_name=index_layer_name,
-                    index_lmcache_enabled=index_lmcache_enabled,
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    output=output,
-                )
-                _dsa_prof.end(_sfa_t)
-                return staged_output
-            staged_forward_context = get_forward_context()
-            if bool(
-                getattr(
-                    staged_forward_context,
-                    "staged_sfa_graph_dummy_run",
-                    False,
-                )
-            ):
-                raise RuntimeError(f"[SFA staged graph POC] the exact-Q1 dummy pass is ineligible: {staged_reason}.")
-            if (
-                getattr(
-                    get_forward_context(),
-                    "cudagraph_runtime_mode",
-                    None,
-                )
-                == CUDAGraphMode.PIECEWISE
-            ):
-                logger.warning_once(f"[SFA staged graph POC] using the existing forward: {staged_reason}.")
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin

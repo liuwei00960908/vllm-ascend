@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Drive and check the narrow TP8 staged-SFA graph proof of concept.
+"""Drive and check the single-request cross-layer SFA graph milestone.
 
-The server must already be running with TP=8, no speculative decoding,
+The server must already be running with the requested TP size, no speculative decoding,
 SHRINK_LATENT=2, PIECEWISE graph mode, and the staged-SFA POC enabled.  This
-client sends one long, streaming completion.  It starts the online Ascend
-PyTorch profiler only after the first four streamed token chunks so the live
-eager-vs-graph parity check is normally outside the steady-state trace.
+client sends one long, streaming completion and profiles its steady-state
+decode.
 
-Automated checks require the model-level startup capture and ordered
-replay-canary completeness check and one live numerical parity check per graph
-key to pass. They also require at least eight new staged worker traces to
-contain all three ranges plus an ACL model-replay API. They do not prove
-timeline nesting or device execution density; finish the checklist below in
-MindStudio Insight before calling the hardware proof successful.
+Automated checks require successful cross-layer startup capture and worker
+traces containing eager LMCache retrieval plus ACL model replay. They do not
+prove output parity, timeline nesting, or device execution density; run the
+deterministic output/TPOT comparison and finish the MindStudio checklist.
 """
 
 from __future__ import annotations
@@ -29,38 +26,24 @@ from collections.abc import Iterable
 from pathlib import Path
 
 _TRACE_MARKERS = (
-    "sfa_staged_graph_poc::pre",
-    "sfa_staged_graph_poc::lmcache_retrieve",
-    "sfa_staged_graph_poc::post",
+    "sfa_cross_layer::bootstrap",
+    "sfa_cross_layer::lmcache_retrieve",
 )
-_PARITY_MARKERS = (
-    "sfa_staged_graph_poc::live_parity_pre",
-    "sfa_staged_graph_poc::live_parity_post",
+_LEGACY_GRAPH_MARKERS = (
+    "sfa_staged_graph_poc::pre",
+    "sfa_staged_graph_poc::post",
 )
 _ACL_REPLAY_APIS = (
     "aclmdlRIExecuteAsync",
     "aclmdlExecuteAsync",
     "aclmdlExecuteAsyncV2",
 )
-_STARTUP_REPLAY_CANARY_COMPLETE = (
-    "[SFA staged graph POC] startup capture and ordered replay-canary completeness check passed"
-)
-_LIVE_SIGNATURE_VALIDATION = (
-    "[SFA staged graph POC] verified pre/post startup capture and enabled "
-    "always-on captured-input signature validation for live replay; LMCache "
-    "retrieval remains eager."
-)
+_STARTUP_CROSS_LAYER_COMPLETE = "[SFA cross-layer graph] captured retrieve-split outer graphs"
 _FRONTEND_PROFILER_ENABLED = "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
-_PARITY_PASS = "[SFA staged graph POC] live eager-vs-graph parity passed"
 _FAILURE_MARKERS = (
-    "[SFA staged graph POC] live eager-vs-graph parity failed",
-    "[SFA staged graph POC] startup capture is incomplete",
-    "[SFA staged graph POC] startup ordered replay-canary check failed",
-    "[SFA staged graph POC] startup ordered replay-canary check is incomplete",
-    "[SFA staged graph POC] the exact-Q1 dummy pass is ineligible",
-    "positional tensor storage for the pre graph changed",
-    "positional tensor storage for the post graph changed",
-    "full tensor signature for the",
+    "[SFA cross-layer graph] no local SFA layers were captured",
+    "[SFA cross-layer graph] eager warmup/capture was incomplete",
+    "[SFA cross-layer graph] runner-authorized key became ineligible",
 )
 
 
@@ -288,42 +271,21 @@ def check_server_log(path: Path) -> int:
     if not path.is_file():
         raise SmokeFailure(f"server log does not exist: {path}")
 
-    replay_canary_complete_seen = False
-    signature_seen = False
-    parity_passes = 0
-    parity_keys: set[str] = set()
-    parity_layer_counts: set[int] = set()
+    capture_complete_seen = False
     expected_layers: int | None = None
     expected_keys: int | None = None
-    expected_graphs: int | None = None
     failures: list[str] = []
     completeness_pattern = re.compile(
-        re.escape(_STARTUP_REPLAY_CANARY_COMPLETE)
-        + r" for (\d+) local SFA layers, (\d+) keys "
-        + r"\((\d+) staged graphs\)\."
+        re.escape(_STARTUP_CROSS_LAYER_COMPLETE) + r" for (\d+) local SFA layers and (\d+) keys"
     )
-    parity_count_pattern = re.compile(r"\(1/1 live checks, (\d+) local SFA layers\)\.")
 
     with path.open("r", encoding="utf-8", errors="replace") as log_file:
         for line_number, line in enumerate(log_file, start=1):
-            signature_seen |= _LIVE_SIGNATURE_VALIDATION in line
-            if _PARITY_PASS in line:
-                parity_passes += 1
-                key_prefix = _PARITY_PASS + " for key "
-                key_and_details = line.partition(key_prefix)[2]
-                key, separator, details = key_and_details.partition(", requests ")
-                parity_match = parity_count_pattern.search(details)
-                if not separator or not key or parity_match is None:
-                    failures.append(f"line {line_number}: malformed parity pass marker")
-                else:
-                    parity_keys.add(key)
-                    parity_layer_counts.add(int(parity_match.group(1)))
             match = completeness_pattern.search(line)
             if match is not None:
-                replay_canary_complete_seen = True
+                capture_complete_seen = True
                 layer_count = int(match.group(1))
                 key_count = int(match.group(2))
-                graph_count = int(match.group(3))
                 if expected_layers is None:
                     expected_layers = layer_count
                 elif expected_layers != layer_count:
@@ -336,60 +298,25 @@ def check_server_log(path: Path) -> int:
                     failures.append(
                         f"startup logs disagree on staged graph key count: {expected_keys} versus {key_count}"
                     )
-                if expected_graphs is None:
-                    expected_graphs = graph_count
-                elif expected_graphs != graph_count:
-                    failures.append(
-                        f"startup logs disagree on staged graph count: {expected_graphs} versus {graph_count}"
-                    )
             for marker in _FAILURE_MARKERS:
                 if marker in line:
                     failures.append(f"line {line_number}: {line.strip()}")
 
     missing = []
-    if not replay_canary_complete_seen:
-        missing.append("model-level startup capture and ordered replay-canary completeness check")
-    if not signature_seen:
-        missing.append("always-on live captured-input signature validation")
-    if not parity_keys:
-        missing.append("one live eager-vs-graph parity pass per graph key")
+    if not capture_complete_seen:
+        missing.append("cross-layer retrieve-split startup capture")
     if expected_layers is None or expected_layers <= 0:
         missing.append("positive local staged-SFA layer count")
     if expected_keys is None or expected_keys <= 0:
         missing.append("positive staged graph key count")
-    if expected_graphs is None or expected_graphs <= 0:
-        missing.append("positive staged graph count")
-    elif (
-        expected_layers is not None
-        and expected_keys is not None
-        and expected_graphs != 2 * expected_layers * expected_keys
-    ):
-        failures.append(
-            "startup completeness marker reported "
-            f"{expected_graphs} staged graphs for {expected_layers} local SFA "
-            f"layers and {expected_keys} keys; expected exactly one pre and "
-            "one post graph per layer/key pair"
-        )
-    if expected_keys is not None and len(parity_keys) != expected_keys:
-        failures.append(f"parity passed for {len(parity_keys)} distinct graph keys; expected {expected_keys}")
-    if parity_layer_counts and expected_layers is not None and parity_layer_counts != {expected_layers}:
-        failures.append(
-            "parity markers reported local SFA layer counts "
-            f"{sorted(parity_layer_counts)}; expected only {expected_layers}"
-        )
     if missing:
         failures.append("missing log gates: " + ", ".join(missing))
     if failures:
         raise SmokeFailure("server-log validation failed:\n  " + "\n  ".join(failures))
 
     print(
-        "server-log gates passed: model-level startup capture and ordered "
-        "replay-canary completeness, "
-        "always-on live input-signature validation, and one parity check per "
-        f"graph key ({expected_layers} local layers; {expected_keys} keys; "
-        f"{expected_graphs} staged graphs; "
-        f"{parity_passes} rank-visible "
-        "parity messages)"
+        "server-log gates passed: cross-layer retrieve-split capture "
+        f"({expected_layers} local layers; {expected_keys} keys)"
     )
     assert expected_layers is not None
     return expected_layers
@@ -464,7 +391,7 @@ def scan_binary(path: Path, needles: Iterable[str]) -> dict[str, int]:
 
 def check_traces(paths: list[Path], expected_ranks: int) -> None:
     failures = []
-    needles = _TRACE_MARKERS + _PARITY_MARKERS + _ACL_REPLAY_APIS
+    needles = _TRACE_MARKERS + _LEGACY_GRAPH_MARKERS + _ACL_REPLAY_APIS
     staged_traces: list[tuple[Path, dict[str, int]]] = []
     ignored_traces: list[tuple[Path, list[str]]] = []
     for path in paths:
@@ -486,13 +413,11 @@ def check_traces(paths: list[Path], expected_ranks: int) -> None:
 
     for path, counts in staged_traces:
         replay_count = sum(counts[name] for name in _ACL_REPLAY_APIS)
-        parity_count = sum(counts[name] for name in _PARITY_MARKERS)
         if replay_count == 0:
             failures.append(f"{path}: no known ACL model-replay API was recorded")
-        if parity_count:
-            failures.append(
-                f"{path}: steady-state profile contains {parity_count} live-parity ranges; start profiling later"
-            )
+        legacy_count = sum(counts[name] for name in _LEGACY_GRAPH_MARKERS)
+        if legacy_count:
+            failures.append(f"{path}: found {legacy_count} legacy per-layer graph ranges")
         print(
             f"trace {path}: "
             + ", ".join(f"{marker.rsplit('::', 1)[-1]}={counts[marker]}" for marker in _TRACE_MARKERS)
@@ -517,7 +442,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--profile-dir", type=Path, required=True)
-    parser.add_argument("--expected-ranks", type=int, default=8)
+    parser.add_argument("--expected-ranks", type=int, default=2)
     parser.add_argument(
         "--prompt-words",
         type=int,
@@ -540,16 +465,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-profile",
         action="store_true",
-        help="run only startup/live-parity log gates",
+        help="run only startup and request log gates",
     )
     args = parser.parse_args()
 
-    if args.expected_ranks != 8:
-        parser.error("this POC smoke is intentionally restricted to TP8")
+    if args.expected_ranks <= 0:
+        parser.error("--expected-ranks must be positive")
     if args.prompt_words <= 0:
         parser.error("--prompt-words must be positive")
     if args.profile_after_chunks < 3:
-        parser.error("profile after at least three chunks to exclude parity steps")
+        parser.error("profile after at least three chunks to exclude decode warmup")
     if args.profile_chunks <= 0:
         parser.error("--profile-chunks must be positive")
     if args.profile_analysis_timeout <= 0:
@@ -572,7 +497,7 @@ def main() -> int:
         expected_layers = check_server_log(args.server_log)
 
         if args.skip_profile:
-            print("LOG GATES PASSED. Trace proof was skipped; capture success is not yet established.")
+            print("LOG GATES PASSED. Trace and output/TPOT proof were skipped.")
             return 0
 
         analyse_profile_data(
@@ -593,17 +518,16 @@ def main() -> int:
 
     print(
         "\nAUTOMATED GATES PASSED; FINAL MINDSTUDIO INSPECTION IS REQUIRED.\n"
-        "On one rank and one steady decode step, verify for every SFA layer:\n"
-        "  1. sfa_staged_graph_poc::pre contains one aclmdlRIExecuteAsync "
-        "(or version-equivalent ACL model replay), not individual eager op launches.\n"
-        "  2. sfa_staged_graph_poc::lmcache_retrieve is outside both graph ranges.\n"
-        "  3. sfa_staged_graph_poc::post contains a second ACL model replay.\n"
-        "  4. The two replay calls each drive their corresponding NPU compute "
-        "island, with LMCache stream/event work between them.\n"
-        f"  5. pre and post each occur about {expected_layers} times per decoded "
-        "token on that rank; no live_parity ranges occur in the measured interval.\n"
-        "Only after those timeline relationships are visible is the TP8 hardware "
-        "capture/replay proof complete."
+        "On one rank and one steady decode step, verify:\n"
+        f"  1. sfa_cross_layer::lmcache_retrieve occurs {expected_layers} times "
+        "for latent loads, and sfa_cross_layer::bootstrap occurs once.\n"
+        "  2. Every retrieval is outside aclmdlRIExecuteAsync graph ranges.\n"
+        "  3. An outer graph spans post(layer N), the intervening model ops, "
+        "and pre(layer N+1).\n"
+        "  4. The captured producer event orders each LMCache load, and the "
+        "next-index wait orders the following cross-layer graph.\n"
+        "Then compare deterministic tokens and no-profiler TPOT against the "
+        "two-graph baseline before accepting the milestone."
     )
     return 0
 

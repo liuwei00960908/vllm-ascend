@@ -152,15 +152,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
-    # Experimental SFA graph-capture proof of concept. When enabled, the
-    # one-token DecodeOnly / SHRINK_LATENT=2 path is executed as two piecewise
-    # ACL graphs with selective LMCache retrieval left eager between them.
+    # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
+    # decode is captured across layers, with selective LMCache retrieval as
+    # the eager split operation.
     # Unsupported live batch shapes keep using the existing eager SFA forward;
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
-    # Comma-separated exact, unpadded Q=1 batch sizes for staged SFA. Keep this
-    # bounded because every size owns two graphs per SFA layer.
+    # Exact, unpadded Q=1 batch size for staged SFA. The first cross-layer
+    # milestone intentionally supports only one concurrent request.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
         "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
         "1",

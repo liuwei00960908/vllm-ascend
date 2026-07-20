@@ -392,25 +392,28 @@ def wait_for_kv_layer_from_connector(
     token_start_index=None,
     request_ids=None,
     target_slot_mapping=None,
+    payload_event=None,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
     connector = get_kv_transfer_group()
     should_log = _dsa_lmcache_log_layer(layer_name)
+    wait_kwargs = {}
+    if target_slot_mapping is not None:
+        wait_kwargs["target_slot_mapping"] = target_slot_mapping
+    if payload_event is not None:
+        wait_kwargs["payload_event"] = payload_event
 
     if selected_tokens is not None and request_ids is not None and not should_log:
         try:
-            if target_slot_mapping is None:
-                connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index, request_ids)
-            else:
-                connector.wait_for_layer_load(
-                    layer_name,
-                    selected_tokens,
-                    token_start_index,
-                    request_ids,
-                    target_slot_mapping=target_slot_mapping,
-                )
+            connector.wait_for_layer_load(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                **wait_kwargs,
+            )
         except Exception:
             logger.exception(
                 "[DSA_INDEX_LMCACHE] connector_wait_error layer=%s "
@@ -459,16 +462,13 @@ def wait_for_kv_layer_from_connector(
             dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
             if request_ids is None and dsa_req_ids is not None:
                 request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
-            if target_slot_mapping is None:
-                connector.wait_for_layer_load(layer_name, selected_tokens, token_start_index, request_ids)
-            else:
-                connector.wait_for_layer_load(
-                    layer_name,
-                    selected_tokens,
-                    token_start_index,
-                    request_ids,
-                    target_slot_mapping=target_slot_mapping,
-                )
+            connector.wait_for_layer_load(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                **wait_kwargs,
+            )
         else:
             connector.wait_for_layer_load(layer_name)
     except Exception:

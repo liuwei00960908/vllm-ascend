@@ -214,7 +214,7 @@ class TestUtils(TestBase):
 
         self.assertEqual(0, len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
 
-    def test_staged_sfa_graph_capture_sizes_normalizes_values(self):
+    def test_staged_sfa_graph_capture_sizes_accepts_single_request(self):
         vllm_config = mock.MagicMock()
         vllm_config.scheduler_config.max_num_seqs = 64
         vllm_config.scheduler_config.max_num_batched_tokens = 128
@@ -227,12 +227,12 @@ class TestUtils(TestBase):
             ),
             mock.patch.dict(
                 os.environ,
-                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 32, 1,32 "},
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 1,1 "},
             ),
         ):
             capture_sizes = utils.staged_sfa_graph_capture_sizes(vllm_config)
 
-        self.assertEqual(capture_sizes, (1, 32))
+        self.assertEqual(capture_sizes, (1,))
 
     def test_staged_sfa_graph_capture_sizes_ignored_when_disabled(self):
         with (
@@ -258,8 +258,8 @@ class TestUtils(TestBase):
             ("", "must contain positive integers"),
             ("1,not-an-integer", "comma-separated list"),
             ("0,1", "must contain positive integers"),
-            ("2", "must include 1"),
-            ("1,2,3", "At most two"),
+            ("2", "only capture size 1"),
+            ("1,2", "only capture size 1"),
         )
 
         with mock.patch.object(
@@ -296,16 +296,16 @@ class TestUtils(TestBase):
                 ),
                 mock.patch.dict(
                     os.environ,
-                    {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,32"},
+                    {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "32"},
                 ),
                 self.assertRaisesRegex(
                     ValueError,
-                    "exact Q=1 scheduler capacity 16",
+                    "only capture size 1",
                 ),
             ):
                 utils.staged_sfa_graph_capture_sizes(vllm_config)
 
-    def test_update_aclgraph_sizes_reserves_staged_sfa_resources(self):
+    def test_update_aclgraph_sizes_restricts_cross_layer_capture(self):
         compilation_config = mock.MagicMock()
         compilation_config.cudagraph_capture_sizes = list(range(1, 101))
         compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -350,9 +350,7 @@ class TestUtils(TestBase):
             utils.update_aclgraph_sizes(vllm_config)
 
         sampled_sizes = update_sizes.call_args.args[1]
-        self.assertEqual(len(sampled_sizes), 5)
-        self.assertEqual(sampled_sizes[0], 1)
-        self.assertEqual(sampled_sizes[-1], 100)
+        self.assertEqual(sampled_sizes, [1])
 
     def test_staged_sfa_resource_budget_keeps_size_one(self):
         compilation_config = mock.MagicMock()
@@ -400,7 +398,7 @@ class TestUtils(TestBase):
         update_sizes.assert_called_once()
         self.assertEqual(update_sizes.call_args.args[1], [1])
 
-    def test_staged_sfa_resource_budget_keeps_all_requested_keys(self):
+    def test_staged_sfa_cross_layer_capture_uses_requested_key(self):
         compilation_config = mock.MagicMock()
         compilation_config.cudagraph_capture_sizes = list(range(1, 101))
         compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -451,7 +449,7 @@ class TestUtils(TestBase):
         update_sizes.assert_called_once()
         self.assertEqual(update_sizes.call_args.args[1], [1, 32])
 
-    def test_staged_sfa_sampling_preserves_original_maximum_bucket(self):
+    def test_staged_sfa_cross_layer_capture_drops_native_buckets(self):
         compilation_config = mock.MagicMock()
         compilation_config.cudagraph_capture_sizes = list(range(1, 101))
         compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -500,7 +498,7 @@ class TestUtils(TestBase):
             utils.update_aclgraph_sizes(vllm_config)
 
         update_sizes.assert_called_once()
-        self.assertEqual(update_sizes.call_args.args[1], [1, 32, 100])
+        self.assertEqual(update_sizes.call_args.args[1], [1, 32])
 
     def test_staged_sfa_no_sampling_updates_derived_maximum(self):
         compilation_config = mock.MagicMock()
@@ -544,10 +542,7 @@ class TestUtils(TestBase):
         ):
             utils.update_aclgraph_sizes(vllm_config)
 
-        self.assertEqual(
-            compilation_config.cudagraph_capture_sizes,
-            [1, 8, 32],
-        )
+        self.assertEqual(compilation_config.cudagraph_capture_sizes, [1, 32])
         self.assertEqual(
             compilation_config.max_cudagraph_capture_size,
             32,

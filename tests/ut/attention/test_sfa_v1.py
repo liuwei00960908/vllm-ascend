@@ -1,6 +1,4 @@
-import gc
 import sys
-import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,8 +13,6 @@ from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import (
     STAGED_SFA_SINGLETON_GRAPH_KEY,
-    StagedSFAGraphKey,
-    StagedSFALiveParityState,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -172,6 +168,34 @@ class TestLMCacheSparseFrontier(TestBase):
                 [0, 256],
             )
 
+    def test_sparse_wait_forwards_existing_payload_event(self):
+        connector = MagicMock()
+        event = object()
+        selected = torch.ones(1, 4, dtype=torch.int32)
+        target_slots = torch.arange(4).view(1, 4)
+        with (
+            patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+            patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+            patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+            patch.object(attention_utils, "_dsa_lmcache_log_layer", return_value=False),
+        ):
+            attention_utils.wait_for_kv_layer_from_connector(
+                "layer-0",
+                selected_tokens=selected,
+                request_ids=["req-0"],
+                target_slot_mapping=target_slots,
+                payload_event=event,
+            )
+
+        connector.wait_for_layer_load.assert_called_once_with(
+            "layer-0",
+            selected,
+            None,
+            ["req-0"],
+            target_slot_mapping=target_slots,
+            payload_event=event,
+        )
+
     def test_scratch_reservation_and_table_capacity_fail_closed(self):
         with self.assertRaisesRegex(
             RuntimeError,
@@ -238,18 +262,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.cache_config.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
-        impl._staged_sfa_capture_phases = set()
-        impl._staged_sfa_capture_records = set()
-        impl._staged_sfa_capture_failures = []
-        impl._staged_sfa_graph_input_signatures = {}
-        impl._staged_sfa_replay_proved = set()
-        impl._staged_sfa_pre_output_buffers = None
-        impl._staged_sfa_replay_canaries = {}
-        impl._staged_sfa_live_capture_validated = False
-        impl._staged_sfa_live_validated_request_ids = None
         impl._staged_sfa_dummy_cache_initialized = False
-        impl._staged_sfa_parity_output = None
-        impl._staged_sfa_parity_latent_scratch = None
         return impl
 
     @staticmethod
@@ -317,226 +330,130 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_remap_boundary_ready = False
         return metadata
 
-    def test_eager_pre_reference_has_no_cache_or_connector_side_effects(
-        self,
-    ):
+    def test_cross_layer_pre_uses_native_path_without_authorized_key(self):
         impl = self._make_eligible_impl()
-        impl.kv_lora_rank = 2
-        impl.qk_rope_head_dim = 2
-        impl.num_kv_heads = 1
-        hidden_states = torch.arange(4, dtype=torch.bfloat16).view(1, 4)
-        qkv_lora = torch.arange(8, dtype=torch.bfloat16).view(1, 8)
-        impl.fused_qkv_a_proj = MagicMock(return_value=(qkv_lora,))
-        impl.q_a_layernorm = MagicMock(side_effect=lambda value: value)
-        impl._q_proj_and_k_up_proj = MagicMock(side_effect=lambda value: (value[:, :2], value[:, 2:]))
-        impl.rope_single = MagicMock(side_effect=lambda value, *_: value)
-        impl.kv_a_layernorm = MagicMock()
-        impl.kv_a_layernorm.weight = torch.ones(2, dtype=torch.bfloat16)
-        impl.kv_a_layernorm.variance_epsilon = 1e-6
-        expected_index = torch.tensor(
-            [[[5.0, 6.0]]],
-            dtype=torch.bfloat16,
-        )
-        impl.indexer_select_pre_process = MagicMock(return_value=(expected_index, None))
-        impl._get_full_kv = MagicMock(side_effect=lambda value, _: value)
-        topk_indices = torch.tensor(
-            [[[1, 2, 3, 4]]],
-            dtype=torch.int32,
-        )
-        selected_packed = torch.tensor(
-            [[1, 2, 3, 4]],
-            dtype=torch.int32,
-        )
-        impl.indexer_select_post_process = MagicMock(return_value=topk_indices)
-        impl.exec_kv = MagicMock()
-        expected_nope = torch.tensor(
-            [[[[1.0, 2.0]]]],
-            dtype=torch.bfloat16,
-        )
-        expected_pe = torch.tensor(
-            [[[[3.0, 4.0]]]],
-            dtype=torch.bfloat16,
-        )
-        kv_cache = self._make_eligible_kv_cache()
-        for cache in kv_cache:
-            cache.zero_()
-        live_cache_before = tuple(cache.clone() for cache in kv_cache)
-        cos = torch.ones(1, 1, 1, 2, dtype=torch.bfloat16)
-        sin = torch.zeros_like(cos)
-        latent_slot = torch.tensor([129], dtype=torch.int32)
-        indexer_slot = torch.tensor([130], dtype=torch.int32)
+        impl.local_num_heads = 2
+        impl.forward = MagicMock()
+        impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
+        context = SimpleNamespace(staged_sfa_graph_key=None)
+        hidden_states = torch.empty(16, 4)
+        output = torch.empty_like(hidden_states)
+
+        with patch.object(sfa_v1, "get_forward_context", return_value=context):
+            outputs = impl.cross_layer_graph_pre(
+                "layer-0",
+                hidden_states,
+                self._make_eligible_kv_cache(),
+                self._make_decode_metadata(),
+                False,
+                output,
+            )
+
+        impl.forward.assert_called_once()
+        self.assertEqual([tuple(tensor.shape[:1]) for tensor in outputs], [(1,)] * 4)
+
+    def test_cross_layer_pre_fails_if_authorized_key_becomes_ineligible(self):
+        impl = self._make_eligible_impl()
+        impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
+        impl._cross_layer_ineligible_reason = MagicMock(return_value="changed metadata")
+        context = SimpleNamespace(staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY)
 
         with (
-            patch.object(
-                sfa_v1,
-                "scratch_remap",
-                return_value=(topk_indices, selected_packed),
-            ) as remap,
-            patch.object(
-                sfa_v1.torch_npu,
-                "npu_scatter_nd_update_",
-            ) as scatter,
-            patch.object(
-                sfa_v1,
-                "wait_for_kv_layer_from_connector",
-            ) as wait_for_layer,
-            patch.object(
-                sfa_v1.torch_npu,
-                "npu_kv_rmsnorm_rope_cache",
-                return_value=(None, None, expected_pe, expected_nope),
-            ) as latent_reference,
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            self.assertRaisesRegex(RuntimeError, "changed metadata"),
         ):
-            first_result = impl._staged_sfa_eager_pre_reference_poc(
-                hidden_states,
-                kv_cache,
-                cos,
-                sin,
-                latent_slot,
-                indexer_slot,
-                torch.tensor([1]),
-                torch.tensor([9]),
-                torch.tensor([[0]]),
-                torch.tensor([8], dtype=torch.int32),
-            )
-            first_scratch = impl._staged_sfa_parity_latent_scratch
-            second_result = impl._staged_sfa_eager_pre_reference_poc(
-                hidden_states,
-                kv_cache,
-                cos,
-                sin,
-                latent_slot,
-                indexer_slot,
-                torch.tensor([1]),
-                torch.tensor([9]),
-                torch.tensor([[0]]),
-                torch.tensor([8], dtype=torch.int32),
+            impl.cross_layer_graph_pre(
+                "layer-0",
+                torch.empty(1, 4),
+                self._make_eligible_kv_cache(),
+                self._make_decode_metadata(),
+                False,
+                torch.empty(1, 4),
             )
 
-        for result in (first_result, second_result):
-            self.assertIs(result[2], topk_indices)
-            self.assertIs(result[3], selected_packed)
-            self.assertTrue(torch.equal(result[4], expected_nope.view(1, 2)))
-            self.assertTrue(torch.equal(result[5], expected_pe.view(1, 2)))
-            self.assertTrue(torch.equal(result[6], expected_index.view(1, 2)))
-        for live, before in zip(kv_cache, live_cache_before):
-            self.assertTrue(torch.equal(live, before))
-        self.assertEqual(latent_reference.call_count, 2)
-        impl.exec_kv.assert_not_called()
-        scatter.assert_not_called()
-        wait_for_layer.assert_not_called()
-        self.assertEqual(remap.call_count, 2)
-        second_scratch = impl._staged_sfa_parity_latent_scratch
-        self.assertIsNotNone(first_scratch)
-        self.assertIs(first_scratch[0], second_scratch[0])
-        self.assertIs(first_scratch[1], second_scratch[1])
-        self.assertNotEqual(
-            first_scratch[0].data_ptr(),
-            kv_cache[0].data_ptr(),
-        )
-        self.assertNotEqual(
-            first_scratch[1].data_ptr(),
-            kv_cache[1].data_ptr(),
-        )
-
-        for operator_call in latent_reference.call_args_list:
-            args = operator_call.args
-            kwargs = operator_call.kwargs
-            self.assertEqual(
-                tuple(args[0].shape),
-                (1, 1, 1, 4),
-            )
-            self.assertEqual(args[0].dtype, torch.bfloat16)
-            self.assertIs(args[1], impl.kv_a_layernorm.weight)
-            self.assertIs(args[2], cos)
-            self.assertIs(args[3], sin)
-            self.assertEqual(args[4].dtype, torch.int64)
-            self.assertEqual(args[4].tolist(), [0])
-            self.assertIs(args[5], first_scratch[1])
-            self.assertIs(args[6], first_scratch[0])
-            self.assertEqual(
-                tuple(args[5].shape),
-                tuple(kv_cache[1][:1].shape),
-            )
-            self.assertEqual(
-                tuple(args[6].shape),
-                tuple(kv_cache[0][:1].shape),
-            )
-            self.assertEqual(args[5].dtype, kv_cache[1].dtype)
-            self.assertEqual(args[6].dtype, kv_cache[0].dtype)
-            self.assertEqual(args[5].device, kv_cache[1].device)
-            self.assertEqual(args[6].device, kv_cache[0].device)
-            self.assertEqual(
-                kwargs["epsilon"],
-                impl.kv_a_layernorm.variance_epsilon,
-            )
-            self.assertEqual(kwargs["cache_mode"], "PA")
-            self.assertTrue(kwargs["is_output_kv"])
-
-    def test_cache_write_parity_detects_wrong_physical_slot(self):
+    def test_cross_layer_retrieve_prefetches_next_index(self):
         impl = self._make_eligible_impl()
-        cache = torch.tensor(
-            [
-                [[[1.0, 2.0]]],
-                [[[3.0, 4.0]]],
-            ]
+        impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
+        impl._staged_sfa_cross_layer_producer_event = object()
+        metadata = self._make_decode_metadata()
+        next_metadata = self._make_decode_metadata()
+        context = SimpleNamespace(
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_graph_dummy_run=False,
+            attn_metadata={"layer-1.attn": next_metadata},
         )
-        wrong_slot = torch.tensor([1], dtype=torch.int64)
-        actual_row = cache.reshape(-1, cache.shape[-1]).index_select(
-            0,
-            wrong_slot,
-        )
-        expected_current_value = torch.tensor([[1.0, 2.0]])
-
-        flags = impl._staged_sfa_parity_flags(
-            (
-                (
-                    "cache_nope",
-                    actual_row,
-                    expected_current_value,
-                    False,
-                ),
-            )
-        )
-
-        self.assertEqual(flags[0][0], "cache_nope")
-        self.assertFalse(bool(flags[0][1].item()))
-
-    def test_save_submission_is_held_for_any_live_parity_candidate(
-        self,
-    ):
-        impl = self._make_eligible_impl()
-        parity_state = StagedSFALiveParityState(
-            request_id="req-0",
-            seq_len=9,
-            expected_layers=1,
-        )
-        forward_context = MagicMock()
-        forward_context.staged_sfa_live_parity_state = parity_state
-        latent_cache = torch.tensor([1.0])
-        index_cache = torch.tensor([2.0])
-        operations = [
-            ("layer-0", [latent_cache]),
-            ("layer-0.index", [index_cache]),
-        ]
-
+        waits = []
         with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
             patch.object(
                 sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
+                "_prepare_dsa_sparse_lmcache_payload",
+                return_value=(torch.ones(1, 4), ["req-0"], torch.zeros(1)),
             ),
             patch.object(
                 sfa_v1,
-                "maybe_save_kv_layer_to_connector",
-            ) as save_layer,
+                "wait_for_kv_layer_from_connector",
+                side_effect=lambda name, *args, **kwargs: waits.append(name),
+            ) as wait_for_layer,
+            patch.object(sfa_v1, "_sync_compute_stream_after_lmcache_sparse_wait"),
+            patch.object(sfa_v1, "_prepare_sfa_remap_boundary") as prepare_boundary,
+            patch.object(
+                sfa_v1.torch.profiler,
+                "record_function",
+                return_value=nullcontext(),
+            ),
         ):
-            impl._submit_sfa_save_operations(operations)
+            impl.cross_layer_lmcache_retrieve(
+                "layer-0",
+                "layer-1.attn",
+                torch.ones(1, 4, dtype=torch.int32),
+                metadata,
+            )
 
-        save_layer.assert_not_called()
-        self.assertEqual(
-            parity_state.pending_saves,
-            operations,
+        self.assertEqual(waits, ["layer-0", "layer-1.indexer.k_cache"])
+        self.assertIs(
+            metadata.reshape_cache_event,
+            impl._staged_sfa_cross_layer_producer_event,
         )
+        self.assertIs(
+            wait_for_layer.call_args_list[0].kwargs["payload_event"],
+            impl._staged_sfa_cross_layer_producer_event,
+        )
+        prepare_boundary.assert_called_once_with(
+            next_metadata,
+            next_metadata.req_ids,
+            is_dummy_run=False,
+            index_topk=impl.index_topk,
+        )
+
+    def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        context = SimpleNamespace(attn_metadata={"layer-0.attn": metadata})
+        order = []
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "_prepare_sfa_remap_boundary",
+                side_effect=lambda *args, **kwargs: order.append("boundary"),
+            ),
+            patch.object(sfa_v1, "_dsa_index_lmcache_enabled", return_value=True),
+            patch.object(
+                sfa_v1,
+                "wait_for_kv_layer_from_connector",
+                side_effect=lambda *args, **kwargs: order.append("index"),
+            ) as wait_for_layer,
+            patch.object(
+                sfa_v1.torch.profiler,
+                "record_function",
+                return_value=nullcontext(),
+            ),
+        ):
+            impl.bootstrap_cross_layer("layer-0.attn")
+
+        self.assertEqual(order, ["boundary", "index"])
+        wait_for_layer.assert_called_once_with("layer-0.indexer.k_cache")
 
     def test_remap_boundary_is_resolved_once_per_step(self):
         metadata = self._make_decode_metadata()
@@ -657,39 +574,6 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(payload[1], ["req-0", "req-0", "req-1"])
         self.assertIs(payload[2], targets)
 
-    def test_piecewise_dummy_requires_eager_cache_initialization(self):
-        impl = self._make_eligible_impl()
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(MagicMock(), MagicMock()))
-        forward_context = MagicMock()
-        forward_context.staged_sfa_graph_dummy_run = True
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "eager dummy warmup",
-            ),
-        ):
-            impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name=None,
-                index_lmcache_enabled=False,
-                hidden_states=torch.empty(1, 4),
-                kv_cache=(
-                    torch.empty(1),
-                    torch.empty(1),
-                    torch.empty(1),
-                ),
-                attn_metadata=self._make_decode_metadata(),
-                output=torch.empty(1, 4),
-            )
-
     def test_eligibility_accepts_single_native_piecewise_decode(self):
         impl = self._make_eligible_impl()
         metadata = self._make_decode_metadata()
@@ -725,7 +609,7 @@ class TestStagedSFAGraphPoc(TestBase):
         ):
             for dtype in (torch.float16, torch.bfloat16):
                 with self.subTest(dtype=dtype):
-                    reason = impl._staged_sfa_graph_ineligible_reason(
+                    reason = impl._cross_layer_ineligible_reason(
                         torch.empty(1, 4, dtype=dtype),
                         self._make_eligible_kv_cache(dtype=dtype),
                         metadata,
@@ -841,7 +725,7 @@ class TestStagedSFAGraphPoc(TestBase):
         ):
             for name, kv_cache, expected_reason in invalid_contracts:
                 with self.subTest(name=name):
-                    reason = impl._staged_sfa_graph_ineligible_reason(
+                    reason = impl._cross_layer_ineligible_reason(
                         torch.empty(1, 4, dtype=torch.bfloat16),
                         kv_cache,
                         metadata,
@@ -882,98 +766,13 @@ class TestStagedSFAGraphPoc(TestBase):
                 False,
             ),
         ):
-            reason = impl._staged_sfa_graph_ineligible_reason(
+            reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4),
                 self._make_eligible_kv_cache(),
                 metadata,
             )
 
         self.assertEqual(reason, "weight prefetch is enabled")
-
-    def test_eligibility_accepts_exact_batched_q1(self):
-        impl = self._make_eligible_impl()
-        metadata = self._make_decode_metadata(2)
-        forward_context = MagicMock()
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.capturing = False
-        forward_context.staged_sfa_graph_dummy_run = False
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.staged_sfa_graph_key = StagedSFAGraphKey.exact_q1(2)
-        forward_context.batch_descriptor = BatchDescriptor(num_tokens=2)
-        forward_context.dsa_offload_manager = None
-        forward_context.dsa_adapter_cache = None
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1,
-                "staged_sfa_graph_capture_sizes",
-                return_value=(1, 2),
-            ),
-            patch.object(
-                sfa_v1,
-                "get_weight_prefetch_method",
-                return_value=None,
-            ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
-        ):
-            reason = impl._staged_sfa_graph_ineligible_reason(
-                torch.empty(2, 4, dtype=torch.bfloat16),
-                self._make_eligible_kv_cache(num_blocks=2),
-                metadata,
-            )
-
-        self.assertIsNone(reason)
-
-    def test_eligibility_rejects_padded_exact_q1_batch(self):
-        impl = self._make_eligible_impl()
-        metadata = self._make_decode_metadata(2)
-        metadata.num_actual_tokens = 1
-        forward_context = MagicMock()
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.capturing = False
-        forward_context.staged_sfa_graph_dummy_run = False
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.staged_sfa_graph_key = StagedSFAGraphKey.exact_q1(2)
-        forward_context.batch_descriptor = BatchDescriptor(num_tokens=2)
-        forward_context.dsa_offload_manager = None
-        forward_context.dsa_adapter_cache = None
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1,
-                "staged_sfa_graph_capture_sizes",
-                return_value=(1, 2),
-            ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
-        ):
-            reason = impl._staged_sfa_graph_ineligible_reason(
-                torch.empty(2, 4),
-                self._make_eligible_kv_cache(),
-                metadata,
-            )
-
-        self.assertEqual(
-            reason,
-            "only exact, unpadded one-token-per-request decode batches are supported",
-        )
 
     def test_eligibility_accepts_explicit_eager_dummy_warmup(self):
         impl = self._make_eligible_impl()
@@ -1008,1240 +807,13 @@ class TestStagedSFAGraphPoc(TestBase):
                 False,
             ),
         ):
-            reason = impl._staged_sfa_graph_ineligible_reason(
+            reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4),
                 self._make_eligible_kv_cache(),
                 metadata,
             )
 
         self.assertIsNone(reason)
-
-    def test_per_key_state_is_isolated_and_reset_releases_registry(self):
-        impl = self._make_eligible_impl()
-        key_one = STAGED_SFA_SINGLETON_GRAPH_KEY
-        key_two = StagedSFAGraphKey.exact_q1(2)
-
-        impl._activate_staged_sfa_graph_key(key_one)
-        one_output = torch.zeros(1)
-        one_canary = torch.ones(1, dtype=torch.int32)
-        impl._staged_sfa_capture_records.add("pre")
-        impl._staged_sfa_graph_input_signatures["pre"] = ("one",)
-        impl._staged_sfa_pre_output_buffers = (one_output,)
-        impl._staged_sfa_replay_canaries["pre"] = one_canary
-        impl._staged_sfa_replay_proved.add("pre")
-        impl._staged_sfa_dummy_cache_initialized = True
-        impl._staged_sfa_parity_output = one_output
-
-        impl._activate_staged_sfa_graph_key(key_two)
-        self.assertEqual(impl._staged_sfa_capture_records, set())
-        self.assertEqual(impl._staged_sfa_graph_input_signatures, {})
-        self.assertIsNone(impl._staged_sfa_pre_output_buffers)
-        self.assertFalse(impl._staged_sfa_dummy_cache_initialized)
-        two_output = torch.zeros(2)
-        impl._staged_sfa_capture_records.add("post")
-        impl._staged_sfa_pre_output_buffers = (two_output,)
-        impl._staged_sfa_dummy_cache_initialized = True
-
-        impl._activate_staged_sfa_graph_key(key_one)
-        self.assertEqual(impl._staged_sfa_capture_records, {"pre"})
-        self.assertIs(impl._staged_sfa_pre_output_buffers[0], one_output)
-        self.assertIs(impl._staged_sfa_replay_canaries["pre"], one_canary)
-        self.assertEqual(impl._staged_sfa_replay_proved, {"pre"})
-        self.assertTrue(impl._staged_sfa_dummy_cache_initialized)
-        self.assertIs(impl._staged_sfa_parity_output, one_output)
-
-        states = dict(impl._iter_staged_sfa_graph_states())
-        self.assertEqual(set(states), {key_one, key_two})
-        self.assertIs(states[key_two].pre_output_buffers[0], two_output)
-        self.assertIsNot(
-            states[key_one].pre_output_buffers,
-            states[key_two].pre_output_buffers,
-        )
-
-        impl._reset_staged_sfa_graph_states()
-        reset_states = dict(impl._iter_staged_sfa_graph_states())
-        self.assertEqual(set(reset_states), {key_one})
-        self.assertIsNone(reset_states[key_one].pre_output_buffers)
-        self.assertEqual(reset_states[key_one].replay_canaries, {})
-        self.assertFalse(reset_states[key_one].dummy_cache_initialized)
-
-    def test_wrapper_factory_creates_two_piecewise_graphs(self):
-        impl = self._make_eligible_impl()
-        impl.vllm_config = MagicMock()
-        impl._staged_sfa_pre_graph = None
-        impl._staged_sfa_post_graph = None
-        pre_wrapper = MagicMock(name="pre_wrapper")
-        post_wrapper = MagicMock(name="post_wrapper")
-
-        with (
-            patch(
-                "vllm_ascend.compilation.acl_graph.ACLGraphWrapper",
-                side_effect=[pre_wrapper, post_wrapper],
-            ) as wrapper_cls,
-            patch.object(sfa_v1.logger, "warning_once"),
-        ):
-            result = impl._get_staged_sfa_graph_wrappers()
-
-        self.assertEqual(result, (pre_wrapper, post_wrapper))
-        self.assertEqual(wrapper_cls.call_count, 2)
-        for call in wrapper_cls.call_args_list:
-            self.assertEqual(
-                call.kwargs["runtime_mode"],
-                CUDAGraphMode.PIECEWISE,
-            )
-            self.assertFalse(call.kwargs["cudagraph_options"].weak_ref_output)
-            self.assertFalse(call.kwargs["synchronize_before_replay"])
-
-    def test_live_validation_accepts_matching_graph_input_addresses(self):
-        impl = self._make_eligible_impl()
-        graph_inputs = (torch.empty(1), torch.empty(1))
-        batch_descriptor = BatchDescriptor(
-            num_tokens=1,
-            num_reqs=None,
-            uniform=False,
-        )
-        impl._staged_sfa_graph_input_signatures["pre"] = tuple(
-            impl._staged_sfa_tensor_signature(tensor) for tensor in graph_inputs
-        )
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        pre_entry = MagicMock()
-        pre_entry.aclgraph = object()
-        pre_entry.input_addresses = [tensor.data_ptr() for tensor in graph_inputs]
-        pre_wrapper = MagicMock()
-        pre_wrapper.concrete_aclgraph_entries = {
-            batch_descriptor: pre_entry,
-        }
-
-        with patch.object(
-            sfa_v1,
-            "get_forward_context",
-            return_value=forward_context,
-        ):
-            result = impl._validate_staged_sfa_graph_entry(
-                "pre",
-                pre_wrapper,
-                graph_inputs,
-            )
-
-        self.assertIs(result, pre_entry)
-
-    def test_live_validation_rejects_same_pointer_view_metadata_drift(self):
-        impl = self._make_eligible_impl()
-        backing = torch.empty(4)
-        captured_view = backing.view(2, 2)
-        live_view = backing.view(4)
-        self.assertEqual(captured_view.data_ptr(), live_view.data_ptr())
-        impl._staged_sfa_graph_input_signatures["pre"] = (impl._staged_sfa_tensor_signature(captured_view),)
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        graph_entry = MagicMock()
-        graph_entry.aclgraph = object()
-        graph_entry.input_addresses = [live_view.data_ptr()]
-        graph_wrapper = MagicMock()
-        graph_wrapper.concrete_aclgraph_entries = {
-            batch_descriptor: graph_entry,
-        }
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "full tensor signature.*differing input indices=\\[0\\]",
-            ),
-        ):
-            impl._validate_staged_sfa_graph_entry(
-                "pre",
-                graph_wrapper,
-                (live_view,),
-            )
-
-        graph_wrapper.assert_not_called()
-
-    def test_live_validation_rejects_a_missing_post_graph(self):
-        impl = self._make_eligible_impl()
-        batch_descriptor = BatchDescriptor(
-            num_tokens=1,
-            num_reqs=None,
-            uniform=False,
-        )
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        post_wrapper = MagicMock()
-        post_wrapper.concrete_aclgraph_entries = {}
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "post region was not captured",
-            ),
-        ):
-            impl._validate_staged_sfa_graph_entry(
-                "post",
-                post_wrapper,
-            )
-
-    def test_live_validation_rejects_changed_graph_input_addresses(self):
-        impl = self._make_eligible_impl()
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        graph_entry = MagicMock()
-        graph_entry.aclgraph = object()
-        graph_entry.input_addresses = [1, 2]
-        graph_wrapper = MagicMock()
-        graph_wrapper.concrete_aclgraph_entries = {
-            batch_descriptor: graph_entry,
-        }
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "differing input indices",
-            ),
-        ):
-            impl._validate_staged_sfa_graph_entry(
-                "pre",
-                graph_wrapper,
-                (torch.empty(1), torch.empty(1)),
-            )
-
-    def test_live_validation_requires_recorded_graph_input_addresses(self):
-        impl = self._make_eligible_impl()
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        graph_entry = MagicMock()
-        graph_entry.aclgraph = object()
-        graph_entry.input_addresses = None
-        graph_wrapper = MagicMock()
-        graph_wrapper.concrete_aclgraph_entries = {
-            batch_descriptor: graph_entry,
-        }
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "did not record its input addresses",
-            ),
-        ):
-            impl._validate_staged_sfa_graph_entry(
-                "pre",
-                graph_wrapper,
-                (torch.empty(1),),
-            )
-
-    def test_live_signature_validation_runs_after_first_validated_call(self):
-        impl = self._make_eligible_impl()
-        impl._staged_sfa_capture_phases = {
-            "pre:enter",
-            "pre:exit",
-            "post:enter",
-            "post:exit",
-        }
-        impl._staged_sfa_replay_proved = {"pre", "post"}
-        impl._staged_sfa_live_capture_validated = True
-        impl._staged_sfa_live_validated_request_ids = ("req-0",)
-        metadata = self._make_decode_metadata()
-        hidden_states = torch.empty(1, 4)
-        output = torch.empty_like(hidden_states)
-        kv_cache = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
-        impl._staged_sfa_replay_canaries = {
-            "pre": torch.zeros(1, dtype=torch.int32),
-            "post": torch.zeros(1, dtype=torch.int32),
-        }
-        metadata.decode_remap_boundary_ready = True
-        pre_graph = MagicMock()
-        post_graph = MagicMock()
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(pre_graph, post_graph))
-        forward_context = MagicMock()
-        forward_context.staged_sfa_graph_dummy_run = False
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.staged_sfa_live_parity_state = None
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.batch_descriptor = BatchDescriptor(num_tokens=1)
-
-        signature_validator = MagicMock(side_effect=RuntimeError("signature drift"))
-        impl._validate_staged_sfa_graph_entry = signature_validator
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            patch.object(
-                sfa_v1,
-                "_decode_window_save_window_size",
-                return_value=256,
-            ),
-            self.assertRaisesRegex(RuntimeError, "signature drift"),
-        ):
-            impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name=None,
-                index_lmcache_enabled=False,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=metadata,
-                output=output,
-            )
-
-        signature_validator.assert_called_once()
-        self.assertEqual(signature_validator.call_args.args[0], "pre")
-        pre_graph.assert_not_called()
-        post_graph.assert_not_called()
-
-    def test_capture_phase_outside_stream_accumulates_failure(self):
-        impl = self._make_eligible_impl()
-        forward_context = MagicMock()
-        forward_context.staged_sfa_graph_dummy_run = True
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1.torch.npu,
-                "is_current_stream_capturing",
-                return_value=False,
-            ),
-        ):
-            impl._observe_staged_sfa_capture_phase("pre", "enter")
-
-        self.assertEqual(impl._staged_sfa_capture_phases, set())
-        self.assertEqual(len(impl._staged_sfa_capture_failures), 1)
-        self.assertIn(
-            "pre: runnable reached its enter phase outside NPU stream capture",
-            impl._staged_sfa_capture_failures[0],
-        )
-
-    def test_capture_record_is_non_destructive_and_does_not_replay(self):
-        impl = self._make_eligible_impl()
-        impl._staged_sfa_capture_phases = {"pre:enter", "pre:exit"}
-        graph_input = torch.tensor([3.0])
-        graph_output = torch.tensor([1.0, 2.0])
-        input_before = graph_input.clone()
-        output_before = graph_output.clone()
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = batch_descriptor
-        graph_entry = MagicMock()
-        graph_entry.aclgraph = object()
-        graph_entry.input_addresses = [graph_input.data_ptr()]
-        graph_wrapper = MagicMock()
-        graph_wrapper.concrete_aclgraph_entries = {
-            batch_descriptor: graph_entry,
-        }
-
-        with (
-            patch.object(
-                impl,
-                "_staged_sfa_capture_dummy_active",
-                return_value=True,
-            ),
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-        ):
-            impl._record_staged_sfa_graph_capture(
-                "pre",
-                graph_wrapper,
-                (graph_input, "non-tensor"),
-                (graph_output,),
-            )
-
-        graph_wrapper.assert_not_called()
-        self.assertTrue(torch.equal(graph_input, input_before))
-        self.assertTrue(torch.equal(graph_output, output_before))
-        self.assertEqual(impl._staged_sfa_capture_records, {"pre"})
-        self.assertEqual(impl._staged_sfa_capture_failures, [])
-        self.assertEqual(
-            impl._staged_sfa_graph_input_signatures["pre"],
-            (impl._staged_sfa_tensor_signature(graph_input),),
-        )
-
-    def test_capture_record_accumulates_structure_failures(self):
-        impl = self._make_eligible_impl()
-        graph_wrapper = MagicMock()
-        graph_wrapper.concrete_aclgraph_entries = {}
-        forward_context = MagicMock()
-        forward_context.batch_descriptor = BatchDescriptor(num_tokens=1)
-
-        with (
-            patch.object(
-                impl,
-                "_staged_sfa_capture_dummy_active",
-                return_value=True,
-            ),
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-        ):
-            impl._record_staged_sfa_graph_capture(
-                "post",
-                graph_wrapper,
-                (torch.tensor([3.0]),),
-                (),
-            )
-
-        graph_wrapper.assert_not_called()
-        self.assertEqual(impl._staged_sfa_capture_records, {"post"})
-        failures = "\n".join(impl._staged_sfa_capture_failures)
-        self.assertIn("post: missing capture phases", failures)
-        self.assertIn("post: no captured graph entry", failures)
-        self.assertIn("post: capture returned no graph outputs", failures)
-
-    def test_eager_none_allocates_distinct_persistent_replay_canaries(self):
-        impl = self._make_eligible_impl()
-
-        canaries = impl._ensure_staged_sfa_replay_canaries(
-            torch.device("cpu"),
-            CUDAGraphMode.NONE,
-        )
-
-        self.assertIs(canaries, impl._staged_sfa_replay_canaries)
-        self.assertEqual(set(canaries), {"pre", "post"})
-        for canary in canaries.values():
-            self.assertEqual(canary.shape, (1,))
-            self.assertEqual(canary.dtype, torch.int32)
-            self.assertEqual(canary.device, torch.device("cpu"))
-            self.assertEqual(canary.item(), 0)
-        self.assertNotEqual(
-            canaries["pre"].data_ptr(),
-            canaries["post"].data_ptr(),
-        )
-        reused = impl._ensure_staged_sfa_replay_canaries(
-            torch.device("cpu"),
-            CUDAGraphMode.PIECEWISE,
-        )
-        self.assertIs(reused, canaries)
-
-    def test_graph_a_persistent_buffers_are_strong_reused_and_exact(self):
-        impl = self._make_eligible_impl()
-        graph_outputs = (
-            torch.tensor([[1.0, 2.0]]),
-            torch.tensor([[3.0, 4.0]]),
-            torch.tensor([[[1, 2, 3, 4]]], dtype=torch.int32),
-            torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
-        )
-
-        persistent = impl._bind_staged_sfa_pre_output_buffers(
-            graph_outputs,
-            is_dummy_run=True,
-            runtime_mode=CUDAGraphMode.NONE,
-        )
-
-        self.assertIs(persistent, impl._staged_sfa_pre_output_buffers)
-        for captured, original in zip(persistent, graph_outputs):
-            self.assertIsNot(captured, original)
-            self.assertTrue(torch.equal(captured, original))
-        persistent_refs = tuple(weakref.ref(tensor) for tensor in persistent)
-        del persistent
-        gc.collect()
-        for index, persistent_ref in enumerate(persistent_refs):
-            self.assertIs(
-                persistent_ref(),
-                impl._staged_sfa_pre_output_buffers[index],
-            )
-
-        persistent = impl._staged_sfa_pre_output_buffers
-        reused = impl._bind_staged_sfa_pre_output_buffers(
-            persistent,
-            is_dummy_run=True,
-            runtime_mode=CUDAGraphMode.PIECEWISE,
-        )
-        self.assertIs(reused, persistent)
-        for actual, expected in zip(reused, persistent):
-            self.assertEqual(actual.data_ptr(), expected.data_ptr())
-
-        changed_storage = tuple(tensor.clone() for tensor in persistent)
-        with (
-            patch.object(
-                impl,
-                "_staged_sfa_capture_dummy_active",
-                return_value=False,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "did not return its persistent output storage",
-            ),
-        ):
-            impl._bind_staged_sfa_pre_output_buffers(
-                changed_storage,
-                is_dummy_run=False,
-                runtime_mode=CUDAGraphMode.PIECEWISE,
-            )
-
-    def test_graph_a_runnable_writes_caller_owned_outputs_and_canary(self):
-        impl = self._make_eligible_impl()
-        qkv_lora = torch.arange(8, dtype=torch.float32).view(1, 8)
-        computed_ql_nope = torch.tensor([[1.0, 2.0]])
-        computed_q_pe = torch.tensor([[3.0, 4.0]])
-        computed_topk = torch.tensor(
-            [[[1, 2, 3, 4]]],
-            dtype=torch.int32,
-        )
-        computed_selected = torch.tensor(
-            [[1, 2, 3, 4]],
-            dtype=torch.int32,
-        )
-        k_li = torch.tensor([[5.0, 6.0]])
-        impl.fused_qkv_a_proj = MagicMock(return_value=(qkv_lora,))
-        impl.q_a_layernorm = MagicMock(side_effect=lambda value: value)
-        impl.indexer_select_pre_process = MagicMock(return_value=(k_li, None))
-        impl.exec_kv = MagicMock()
-        impl._q_proj_and_k_up_proj = MagicMock(return_value=(computed_ql_nope, computed_q_pe))
-        impl.rope_single = MagicMock(side_effect=lambda value, *args: value)
-        impl._get_full_kv = MagicMock(side_effect=lambda value, *args: value)
-        impl.indexer_select_post_process = MagicMock(return_value=computed_topk)
-        impl._observe_staged_sfa_capture_phase = MagicMock()
-        persistent_outputs = tuple(
-            torch.empty_like(tensor)
-            for tensor in (
-                computed_ql_nope,
-                computed_q_pe,
-                computed_topk,
-                computed_selected,
-            )
-        )
-        canary = torch.zeros(1, dtype=torch.int32)
-        prefetch = MagicMock()
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_weight_prefetch_method",
-                return_value=prefetch,
-            ),
-            patch.object(sfa_v1.torch_npu, "npu_scatter_nd_update_"),
-            patch.object(
-                sfa_v1,
-                "scratch_remap",
-                return_value=(computed_topk, computed_selected),
-            ),
-        ):
-            result = impl._staged_sfa_graph_pre_poc(
-                torch.ones(1, 4),
-                torch.zeros(1, 2),
-                torch.zeros(1, 2),
-                torch.zeros(1, 2),
-                torch.ones(1, 2),
-                torch.zeros(1, 2),
-                torch.tensor([0]),
-                torch.tensor([0]),
-                torch.tensor([1]),
-                torch.tensor([9]),
-                torch.tensor([[0]]),
-                torch.tensor([8], dtype=torch.int32),
-                *persistent_outputs,
-                canary,
-            )
-
-        for actual, persistent, computed in zip(
-            result,
-            persistent_outputs,
-            (
-                computed_ql_nope,
-                computed_q_pe,
-                computed_topk,
-                computed_selected,
-            ),
-        ):
-            self.assertIs(actual, persistent)
-            self.assertTrue(torch.equal(actual, computed))
-        self.assertEqual(canary.item(), 1)
-        self.assertEqual(
-            [call.args for call in impl._observe_staged_sfa_capture_phase.call_args_list],
-            [("pre", "enter"), ("pre", "exit")],
-        )
-
-    def test_graph_b_runnable_writes_caller_owned_output_and_canary(self):
-        impl = self._make_eligible_impl()
-        output = torch.zeros(1, 4)
-        expected = torch.arange(4, dtype=torch.float32).view(1, 4)
-        canary = torch.zeros(1, dtype=torch.int32)
-        impl._observe_staged_sfa_capture_phase = MagicMock()
-
-        def post_compute(*args, **kwargs):
-            self.assertEqual(kwargs["trace_label"], "staged_graph_poc")
-            return args[8].copy_(expected)
-
-        impl._staged_sfa_post_compute_poc = MagicMock(side_effect=post_compute)
-        result = impl._staged_sfa_graph_post_poc(
-            torch.empty(1, 2),
-            torch.empty(1, 2),
-            torch.empty(1, 1, 4, dtype=torch.int32),
-            torch.empty(1),
-            torch.empty(1),
-            torch.tensor([1]),
-            torch.tensor([9]),
-            torch.tensor([[0]]),
-            output,
-            canary,
-        )
-
-        self.assertIs(result, output)
-        self.assertTrue(torch.equal(output, expected))
-        self.assertEqual(canary.item(), 1)
-        self.assertEqual(
-            [call.args for call in impl._observe_staged_sfa_capture_phase.call_args_list],
-            [("post", "enter"), ("post", "exit")],
-        )
-
-    def test_live_path_rejects_an_incomplete_startup_proof(self):
-        impl = self._make_eligible_impl()
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "startup ordered replay-canary check is incomplete",
-        ):
-            impl._require_staged_sfa_startup_proof()
-
-    def test_retrieve_barrier_runs_between_pre_and_post_graphs(self):
-        impl = self._make_eligible_impl()
-        impl._staged_sfa_capture_phases = {
-            "pre:enter",
-            "pre:exit",
-            "post:enter",
-            "post:exit",
-        }
-        impl._staged_sfa_replay_proved = {"pre", "post"}
-        impl.is_kv_producer = True
-        impl.dsa_offload_unbundle = True
-        metadata = self._make_decode_metadata()
-        # A 256-token decode window starts at zero for the default synthetic
-        # sequence length 9, which correctly aliases the four scratch rows.
-        # Use the first valid window boundary for this ordering-only test.
-        metadata.seq_lens.fill_(257)
-        metadata.seq_lens_cpu.fill_(257)
-        hidden_states = torch.empty(1, 4)
-        output = torch.zeros_like(hidden_states)
-        kv_cache = (
-            torch.zeros(1),
-            torch.zeros(1),
-            torch.zeros(1),
-        )
-        ql_nope = torch.tensor([[1.0, 2.0]])
-        q_pe = torch.tensor([[3.0, 4.0]])
-        topk_indices = torch.tensor([[[1, 2, 3, 4]]], dtype=torch.int32)
-        selected_packed = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
-        impl._staged_sfa_pre_output_buffers = (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            selected_packed,
-        )
-        impl._staged_sfa_replay_canaries = {
-            "pre": torch.zeros(1, dtype=torch.int32),
-            "post": torch.zeros(1, dtype=torch.int32),
-        }
-        order = []
-        reshape_event = MagicMock()
-        reshape_event.record.side_effect = lambda: order.append("event")
-
-        def pre_graph(*args):
-            order.append("pre")
-            return ql_nope, q_pe, topk_indices, selected_packed
-
-        def post_graph(*args):
-            order.append("post")
-            return output
-
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        pre_entry = MagicMock()
-        pre_entry.aclgraph = object()
-        pre_inputs = (
-            hidden_states,
-            *kv_cache,
-            metadata.cos,
-            metadata.sin,
-            metadata.slot_mapping,
-            metadata.indexer_slot_mapping,
-            metadata.cum_query_lens,
-            metadata.seq_lens,
-            metadata.indexer_block_table,
-            metadata.decode_remap_boundary,
-            *impl._staged_sfa_pre_output_buffers,
-            impl._staged_sfa_replay_canaries["pre"],
-        )
-        pre_entry.input_addresses = [tensor.data_ptr() for tensor in pre_inputs]
-        post_entry = MagicMock()
-        post_entry.aclgraph = object()
-        post_inputs = (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            kv_cache[0],
-            kv_cache[1],
-            metadata.cum_query_lens,
-            metadata.seq_lens,
-            metadata.block_table,
-            output,
-            impl._staged_sfa_replay_canaries["post"],
-        )
-        post_entry.input_addresses = [tensor.data_ptr() for tensor in post_inputs]
-        impl._staged_sfa_graph_input_signatures = {
-            "pre": tuple(impl._staged_sfa_tensor_signature(tensor) for tensor in pre_inputs),
-            "post": tuple(impl._staged_sfa_tensor_signature(tensor) for tensor in post_inputs),
-        }
-        pre_graph.concrete_aclgraph_entries = {
-            batch_descriptor: pre_entry,
-        }
-        post_graph.concrete_aclgraph_entries = {
-            batch_descriptor: post_entry,
-        }
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(pre_graph, post_graph))
-        forward_context = MagicMock()
-        forward_context.capturing = False
-        forward_context.staged_sfa_graph_dummy_run = False
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.batch_descriptor = batch_descriptor
-        parity_state = StagedSFALiveParityState(
-            request_id="req-0",
-            seq_len=257,
-            expected_layers=1,
-        )
-        forward_context.staged_sfa_live_parity_state = parity_state
-
-        def wait_for_layer_side_effect(layer_name, *args, **kwargs):
-            if kwargs.get("selected_tokens") is None:
-                order.append("index-retrieve")
-            else:
-                order.append("latent-retrieve")
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1,
-                "wait_for_kv_layer_from_connector",
-                side_effect=wait_for_layer_side_effect,
-            ) as wait_for_layer,
-            patch.object(
-                sfa_v1,
-                "maybe_save_kv_layer_to_connector",
-                side_effect=lambda *args, **kwargs: order.append("save"),
-            ) as save_layer,
-            patch.object(
-                sfa_v1.torch.npu,
-                "Event",
-                return_value=reshape_event,
-            ),
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            patch.object(
-                impl,
-                "_staged_sfa_eager_pre_reference_poc",
-                return_value=(
-                    ql_nope.clone(),
-                    q_pe.clone(),
-                    topk_indices.clone(),
-                    selected_packed.clone(),
-                    kv_cache[0].view(1, 1).clone(),
-                    kv_cache[1].view(1, 1).clone(),
-                    kv_cache[2].view(1, 1).clone(),
-                ),
-            ) as eager_pre_reference,
-            patch.object(
-                impl,
-                "_staged_sfa_eager_post_reference_poc",
-                return_value=output.clone(),
-            ) as eager_post_reference,
-            patch.object(sfa_v1._dsa_prof, "step"),
-            patch.object(sfa_v1.logger, "info_once") as info_once,
-            patch.object(
-                sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
-                return_value=[8],
-            ),
-            patch.object(
-                sfa_v1,
-                "_decode_window_save_window_size",
-                return_value=256,
-            ),
-            patch.object(
-                sfa_v1,
-                "_LMCACHE_SPARSE_WAIT_SYNC_ONCE",
-                False,
-            ),
-        ):
-            result = impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name="model.layers.0.self_attn.indexer.k_cache",
-                index_lmcache_enabled=True,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=metadata,
-                output=output,
-            )
-
-        self.assertIs(result, output)
-        self.assertTrue(impl._staged_sfa_live_capture_validated)
-        self.assertEqual(impl._staged_sfa_live_validated_request_ids, ("req-0",))
-        info_once.assert_called_once()
-        self.assertEqual(
-            order,
-            [
-                "index-retrieve",
-                "pre",
-                "event",
-                "latent-retrieve",
-                "post",
-            ],
-        )
-        self.assertEqual(wait_for_layer.call_count, 2)
-        self.assertEqual(
-            wait_for_layer.call_args_list[0].args,
-            ("model.layers.0.self_attn.indexer.k_cache",),
-        )
-        latent_call = wait_for_layer.call_args_list[1]
-        self.assertEqual(
-            latent_call.args,
-            ("model.layers.0.self_attn.attn",),
-        )
-        self.assertIs(latent_call.kwargs["selected_tokens"], selected_packed)
-        self.assertIsNone(latent_call.kwargs["token_start_index"])
-        self.assertEqual(latent_call.kwargs["request_ids"], ["req-0"])
-        self.assertIsNone(latent_call.kwargs["target_slot_mapping"])
-        self.assertIs(metadata.reshape_cache_event, reshape_event)
-        eager_pre_reference.assert_called_once()
-        eager_post_reference.assert_called_once()
-        self.assertEqual(parity_state.checked_impl_ids, {id(impl)})
-        self.assertEqual(
-            parity_state.checked_layer_names,
-            ["model.layers.0.self_attn.attn"],
-        )
-        self.assertEqual(len(parity_state.match_flags), 8)
-        self.assertEqual(parity_state.failures, [])
-        save_layer.assert_not_called()
-        self.assertEqual(len(parity_state.pending_saves), 2)
-        latent_save_name, latent_save_tensors = parity_state.pending_saves[0]
-        self.assertEqual(
-            latent_save_name,
-            "model.layers.0.self_attn.attn",
-        )
-        self.assertIs(latent_save_tensors[0], kv_cache[0])
-        self.assertIs(latent_save_tensors[1], kv_cache[1])
-        index_save_name, index_save_tensors = parity_state.pending_saves[1]
-        self.assertEqual(
-            index_save_name,
-            "model.layers.0.self_attn.indexer.k_cache",
-        )
-        self.assertIs(index_save_tensors[0], kv_cache[2])
-
-    def test_exact_batched_q1_keeps_lmcache_rows_aligned_between_graphs(
-        self,
-    ):
-        impl = self._make_eligible_impl()
-        graph_key = StagedSFAGraphKey.exact_q1(2)
-        impl._activate_staged_sfa_graph_key(graph_key)
-        impl._staged_sfa_capture_phases = {
-            "pre:enter",
-            "pre:exit",
-            "post:enter",
-            "post:exit",
-        }
-        impl._staged_sfa_replay_proved = {"pre", "post"}
-        impl.is_kv_producer = False
-        impl.dsa_offload_unbundle = False
-        metadata = self._make_decode_metadata(batch_size=2)
-        hidden_states = torch.empty(2, 4)
-        output = torch.zeros_like(hidden_states)
-        kv_cache = (
-            torch.zeros(2),
-            torch.zeros(2),
-            torch.zeros(2),
-        )
-        ql_nope = torch.tensor([[1.0, 2.0], [5.0, 6.0]])
-        q_pe = torch.tensor([[3.0, 4.0], [7.0, 8.0]])
-        topk_indices = torch.tensor(
-            [
-                [[1, 2, 3, 4]],
-                [[5, 6, 7, 8]],
-            ],
-            dtype=torch.int32,
-        )
-        selected_packed = torch.tensor(
-            [[1, 2, 3, 4], [5, 6, 7, 8]],
-            dtype=torch.int32,
-        )
-        impl._staged_sfa_pre_output_buffers = (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            selected_packed,
-        )
-        impl._staged_sfa_replay_canaries = {
-            "pre": torch.zeros(1, dtype=torch.int32),
-            "post": torch.zeros(1, dtype=torch.int32),
-        }
-        pre_graph = MagicMock(return_value=impl._staged_sfa_pre_output_buffers)
-        post_graph = MagicMock(return_value=output)
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(pre_graph, post_graph))
-        impl._validate_staged_sfa_graph_entry = MagicMock()
-
-        forward_context = MagicMock()
-        forward_context.capturing = False
-        forward_context.staged_sfa_graph_dummy_run = False
-        forward_context.staged_sfa_graph_key = graph_key
-        forward_context.staged_sfa_live_parity_state = None
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.batch_descriptor = BatchDescriptor(num_tokens=2)
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1,
-                "wait_for_kv_layer_from_connector",
-            ) as wait_for_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            patch.object(sfa_v1._dsa_prof, "step"),
-            patch.object(sfa_v1.logger, "info_once"),
-            patch.object(
-                sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
-                return_value=[8, 8],
-            ) as get_cached_tokens,
-            patch.object(
-                sfa_v1,
-                "_decode_window_save_window_size",
-                return_value=0,
-            ),
-            patch.object(
-                sfa_v1,
-                "_LMCACHE_SPARSE_WAIT_SYNC_ONCE",
-                False,
-            ),
-        ):
-            result = impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name=None,
-                index_lmcache_enabled=False,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=metadata,
-                output=output,
-            )
-
-        self.assertIs(result, output)
-        pre_graph.assert_called_once()
-        post_graph.assert_called_once()
-        get_cached_tokens.assert_called_once_with(["req-0", "req-1"])
-        wait_for_layer.assert_called_once()
-        latent_call = wait_for_layer.call_args
-        self.assertEqual(
-            latent_call.args,
-            ("model.layers.0.self_attn.attn",),
-        )
-        self.assertIs(
-            latent_call.kwargs["selected_tokens"],
-            selected_packed,
-        )
-        self.assertEqual(
-            latent_call.kwargs["request_ids"],
-            ["req-0", "req-1"],
-        )
-        self.assertIsNone(latent_call.kwargs["target_slot_mapping"])
-        self.assertEqual(impl._staged_sfa_active_graph_key, graph_key)
-
-    def test_piecewise_dummy_captures_each_graph_once_without_lmcache(self):
-        impl = self._make_eligible_impl()
-        impl._staged_sfa_dummy_cache_initialized = True
-        impl.is_kv_producer = True
-        impl.dsa_offload_unbundle = True
-        metadata = self._make_decode_metadata()
-        hidden_states = torch.ones(1, 4)
-        output = torch.full_like(hidden_states, 7.0)
-        kv_cache = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
-        ql_nope = torch.tensor([[1.0, 2.0]])
-        q_pe = torch.tensor([[3.0, 4.0]])
-        topk_indices = torch.tensor([[[1, 2, 3, 4]]], dtype=torch.int32)
-        selected_packed = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
-        impl._staged_sfa_pre_output_buffers = (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            selected_packed,
-        )
-        impl._staged_sfa_replay_canaries = {
-            "pre": torch.zeros(1, dtype=torch.int32),
-            "post": torch.zeros(1, dtype=torch.int32),
-        }
-        post_reference = output.clone()
-        batch_descriptor = BatchDescriptor(num_tokens=1)
-        forward_context = MagicMock()
-        forward_context.capturing = True
-        forward_context.staged_sfa_graph_dummy_run = True
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        forward_context.batch_descriptor = batch_descriptor
-        capture_state = {"active": False}
-        call_count = {"pre": 0, "post": 0}
-        order = []
-
-        def pre_graph(*args):
-            call_count["pre"] += 1
-            capture_state["active"] = True
-            try:
-                impl._observe_staged_sfa_capture_phase("pre", "enter")
-                args[-1].fill_(1)
-                impl._observe_staged_sfa_capture_phase("pre", "exit")
-            finally:
-                capture_state["active"] = False
-            order.append("pre-capture")
-            return impl._staged_sfa_pre_output_buffers
-
-        def post_graph(*args):
-            call_count["post"] += 1
-            capture_state["active"] = True
-            try:
-                impl._observe_staged_sfa_capture_phase("post", "enter")
-                output.copy_(post_reference)
-                args[-1].fill_(1)
-                impl._observe_staged_sfa_capture_phase("post", "exit")
-            finally:
-                capture_state["active"] = False
-            order.append("post-capture")
-            return output
-
-        pre_entry = MagicMock()
-        pre_entry.aclgraph = object()
-        pre_inputs = (
-            hidden_states,
-            *kv_cache,
-            metadata.cos,
-            metadata.sin,
-            metadata.slot_mapping,
-            metadata.indexer_slot_mapping,
-            metadata.cum_query_lens,
-            metadata.seq_lens,
-            metadata.indexer_block_table,
-            metadata.decode_remap_boundary,
-            *impl._staged_sfa_pre_output_buffers,
-            impl._staged_sfa_replay_canaries["pre"],
-        )
-        pre_entry.input_addresses = [tensor.data_ptr() for tensor in pre_inputs]
-        pre_graph.concrete_aclgraph_entries = {
-            batch_descriptor: pre_entry,
-        }
-        post_inputs = (
-            ql_nope,
-            q_pe,
-            topk_indices,
-            kv_cache[0],
-            kv_cache[1],
-            metadata.cum_query_lens,
-            metadata.seq_lens,
-            metadata.block_table,
-            output,
-            impl._staged_sfa_replay_canaries["post"],
-        )
-        post_entry = MagicMock()
-        post_entry.aclgraph = object()
-        post_entry.input_addresses = [tensor.data_ptr() for tensor in post_inputs]
-        post_graph.concrete_aclgraph_entries = {
-            batch_descriptor: post_entry,
-        }
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(pre_graph, post_graph))
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1.torch.npu,
-                "is_current_stream_capturing",
-                side_effect=lambda: capture_state["active"],
-            ),
-            patch.object(
-                sfa_v1,
-                "wait_for_kv_layer_from_connector",
-            ) as wait_for_layer,
-            patch.object(
-                sfa_v1,
-                "maybe_save_kv_layer_to_connector",
-            ) as save_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            patch.object(sfa_v1._dsa_prof, "step") as profile_step,
-        ):
-            result = impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name="model.layers.0.self_attn.indexer.k_cache",
-                index_lmcache_enabled=True,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=metadata,
-                output=output,
-            )
-
-        self.assertIs(result, output)
-        self.assertEqual(call_count, {"pre": 1, "post": 1})
-        self.assertEqual(order, ["pre-capture", "post-capture"])
-        self.assertEqual(
-            impl._staged_sfa_capture_phases,
-            {"pre:enter", "pre:exit", "post:enter", "post:exit"},
-        )
-        self.assertEqual(impl._staged_sfa_capture_records, {"pre", "post"})
-        self.assertEqual(impl._staged_sfa_capture_failures, [])
-        self.assertEqual(impl._staged_sfa_replay_proved, set())
-        self.assertEqual(
-            impl._staged_sfa_graph_input_signatures["pre"],
-            tuple(impl._staged_sfa_tensor_signature(tensor) for tensor in pre_inputs),
-        )
-        self.assertEqual(
-            impl._staged_sfa_graph_input_signatures["post"],
-            tuple(impl._staged_sfa_tensor_signature(tensor) for tensor in post_inputs),
-        )
-        self.assertEqual(impl._staged_sfa_replay_canaries["pre"].item(), 1)
-        self.assertEqual(impl._staged_sfa_replay_canaries["post"].item(), 1)
-        self.assertTrue(torch.equal(output, post_reference))
-        wait_for_layer.assert_not_called()
-        save_layer.assert_not_called()
-        profile_step.assert_not_called()
-
-    def test_eager_dummy_runs_both_regions_without_advancing_lmcache(self):
-        impl = self._make_eligible_impl()
-        impl.is_kv_producer = True
-        impl.dsa_offload_unbundle = True
-        metadata = self._make_decode_metadata()
-        hidden_states = torch.empty(1, 4)
-        output = torch.empty_like(hidden_states)
-        kv_cache = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
-        order = []
-        topk_indices = torch.tensor([[[1, 2, 3, 4]]], dtype=torch.int32)
-        selected_packed = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
-
-        def pre_graph(*args):
-            order.append("pre")
-            return (
-                hidden_states,
-                hidden_states,
-                topk_indices,
-                selected_packed,
-            )
-
-        def post_graph(*args):
-            order.append("post")
-            return output
-
-        impl._get_staged_sfa_graph_wrappers = MagicMock(return_value=(pre_graph, post_graph))
-        forward_context = MagicMock()
-        forward_context.capturing = False
-        forward_context.staged_sfa_graph_dummy_run = True
-        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
-
-        with (
-            patch.object(
-                sfa_v1,
-                "get_forward_context",
-                return_value=forward_context,
-            ),
-            patch.object(
-                sfa_v1,
-                "wait_for_kv_layer_from_connector",
-            ) as wait_for_layer,
-            patch.object(
-                sfa_v1,
-                "maybe_save_kv_layer_to_connector",
-            ) as save_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                side_effect=lambda *args, **kwargs: nullcontext(),
-            ),
-            patch.object(sfa_v1._dsa_prof, "step") as profile_step,
-            patch.object(
-                sfa_v1,
-                "_decode_window_save_window_size",
-                return_value=0,
-            ),
-        ):
-            result = impl._forward_staged_sfa_graph_poc(
-                layer_name="model.layers.0.self_attn.attn",
-                index_layer_name="model.layers.0.self_attn.indexer.k_cache",
-                index_lmcache_enabled=True,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=metadata,
-                output=output,
-            )
-
-        self.assertIs(result, output)
-        self.assertEqual(order, ["pre", "post"])
-        self.assertTrue(impl._staged_sfa_dummy_cache_initialized)
-        for cache in kv_cache:
-            self.assertTrue(torch.equal(cache, torch.zeros_like(cache)))
-        wait_for_layer.assert_not_called()
-        save_layer.assert_not_called()
-        profile_step.assert_not_called()
 
 
 class TestAscendSFABackend(TestBase):

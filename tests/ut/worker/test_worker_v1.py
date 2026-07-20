@@ -664,91 +664,6 @@ class TestNPUWorker(TestBase):
                 worker._create_profiler("test_trace")
             self.assertIn("torch_profiler_dir cannot be empty", str(cm.exception))
 
-    def test_staged_sfa_graph_memory_reserve(self):
-        import vllm_ascend.worker.worker as worker_module
-
-        vllm_config = MagicMock()
-        hf_text_config = vllm_config.model_config.hf_text_config
-        hf_text_config.num_hidden_layers = 80
-        hf_text_config.kv_lora_rank = 512
-        hf_text_config.qk_rope_head_dim = 64
-        hf_text_config.index_head_dim = 128
-        hf_text_config.topk_tokens = 2048
-        vllm_config.model_config.dtype = torch.bfloat16
-        vllm_config.model_config.get_hidden_size.return_value = 6144
-        vllm_config.model_config.get_num_attention_heads.return_value = 8
-        vllm_config.model_config.get_head_size.return_value = 64
-        vllm_config.parallel_config = SimpleNamespace(
-            tensor_parallel_size=8,
-        )
-        vllm_config.cache_config.block_size = 128
-
-        with patch.object(
-            worker_module,
-            "staged_sfa_graph_configured",
-            return_value=False,
-        ):
-            disabled = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
-
-        reserves = {}
-        for capture_sizes in ((1,), (1, 32)):
-            with (
-                self.subTest(capture_sizes=capture_sizes),
-                patch.object(
-                    worker_module,
-                    "staged_sfa_graph_configured",
-                    return_value=True,
-                ),
-                patch.object(
-                    worker_module,
-                    "staged_sfa_graph_capture_sizes",
-                    return_value=capture_sizes,
-                ),
-            ):
-                reserves[capture_sizes] = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
-
-        index_head_state = worker_module._staged_sfa_key_state_reserved_bytes(
-            vllm_config,
-            32,
-        )
-
-        with (
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_configured",
-                return_value=True,
-            ),
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_capture_sizes",
-                return_value=(1, 32),
-            ),
-        ):
-            hf_text_config.topk_tokens = 4096
-            larger_topk_reserve = worker_module._staged_sfa_graph_reserved_bytes(vllm_config)
-
-        hf_text_config.topk_tokens = 2048
-        hf_text_config.index_head_dim = 256
-        larger_index_head_state = worker_module._staged_sfa_key_state_reserved_bytes(
-            vllm_config,
-            32,
-        )
-
-        self.assertEqual(disabled, 0)
-        self.assertGreater(reserves[(1,)], 160 * (1 << 20))
-        self.assertGreater(
-            reserves[(1, 32)],
-            2 * reserves[(1,)],
-        )
-        self.assertGreater(
-            larger_topk_reserve,
-            reserves[(1, 32)],
-        )
-        self.assertGreater(
-            larger_index_head_state,
-            index_head_state,
-        )
-
     @staticmethod
     def _build_memory_profile_worker(
         requested_memory,
@@ -795,11 +710,6 @@ class TestNPUWorker(TestBase):
             ) as mock_memory_profiling,
             patch.object(
                 worker_module,
-                "_staged_sfa_graph_reserved_bytes",
-                return_value=0,
-            ),
-            patch.object(
-                worker_module,
                 "envs_ascend",
                 self._memory_profile_envs_without_optional_reserves(),
             ),
@@ -832,11 +742,6 @@ class TestNPUWorker(TestBase):
                 worker_module,
                 "memory_profiling",
             ) as mock_memory_profiling,
-            patch.object(
-                worker_module,
-                "_staged_sfa_graph_reserved_bytes",
-                return_value=0,
-            ),
             patch.object(
                 worker_module,
                 "envs_ascend",
@@ -885,11 +790,6 @@ class TestNPUWorker(TestBase):
                 worker_module,
                 "memory_profiling",
             ) as mock_memory_profiling,
-            patch.object(
-                worker_module,
-                "_staged_sfa_graph_reserved_bytes",
-                return_value=0,
-            ),
             patch.object(
                 worker_module,
                 "envs_ascend",

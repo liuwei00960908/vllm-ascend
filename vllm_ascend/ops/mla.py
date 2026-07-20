@@ -20,6 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -143,6 +145,12 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         _is_vl = is_vl_model(vllm_config)
         _layer_idx = parse_layer_idx(prefix)
         self.is_vl_first_layer = bool(_is_vl and _layer_idx == 0)
+        self.next_layer_name = (
+            re.sub(r"layers\.\d+", f"layers.{_layer_idx + 1}", prefix, count=1) + ".attn"
+            if _layer_idx is not None and _layer_idx + 1 < self.layers
+            else ""
+        )
+        self.use_cross_layer_sfa = getattr(self.mla_attn.impl, "enable_staged_sfa_graph", False) is True
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -166,7 +174,34 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
             output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+        if self.use_cross_layer_sfa:
+            impl = self.mla_attn.impl
+            ql_nope, q_pe, topk_indices, selected_packed = torch.ops.vllm.sfa_forward_pre(
+                hidden_states,
+                need_gather_q_kv,
+                output,
+                self.prefix,
+                impl.local_num_heads,
+                impl.kv_lora_rank,
+                impl.qk_rope_head_dim,
+                impl.index_topk,
+            )
+            torch.ops.vllm.sfa_lmcache_retrieve(
+                selected_packed,
+                output,
+                self.prefix,
+                self.next_layer_name,
+            )
+            torch.ops.vllm.sfa_forward_post(
+                ql_nope,
+                q_pe,
+                topk_indices,
+                selected_packed,
+                output,
+                self.prefix,
+            )
+        else:
+            torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
         output = output.view(-1, hidden_dim)
         return output
 
@@ -204,5 +239,146 @@ direct_register_custom_op(
     op_func=mla_forward,
     mutates_args=["output"],
     fake_impl=mla_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def _mla_runtime_state(layer_name: str):
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    attn_metadata = (
+        forward_context.attn_metadata[layer.mla_attn.layer_name]
+        if forward_context.attn_metadata
+        else forward_context.attn_metadata
+    )
+    virtual_engine = forward_context.virtual_engine if vllm_version_is("0.18.0") else 0
+    return layer.mla_attn.impl, layer.mla_attn.layer_name, layer.mla_attn.kv_cache[virtual_engine], attn_metadata
+
+
+def sfa_forward_pre(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+    )
+
+
+def sfa_forward_pre_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Cross-layer replay is currently restricted to one exact-Q1 row. Keeping
+    # this static also prevents native prefill from materializing prompt-sized
+    # bridge tensors that its no-op retrieve/post path never consumes.
+    num_tokens = 1
+    return (
+        hidden_states.new_empty((num_tokens, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((num_tokens, local_num_heads, qk_rope_head_dim)),
+        torch.empty(
+            (num_tokens, 1, index_topk),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (num_tokens, index_topk),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+    )
+
+
+def sfa_lmcache_retrieve(
+    selected_packed: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    impl, attn_layer_name, _, attn_metadata = _mla_runtime_state(layer_name)
+    impl.cross_layer_lmcache_retrieve(
+        attn_layer_name,
+        next_layer_name,
+        selected_packed,
+        attn_metadata,
+    )
+
+
+def sfa_lmcache_retrieve_fake(
+    selected_packed: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    return
+
+
+def sfa_forward_post(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    impl.cross_layer_graph_post(
+        attn_layer_name,
+        ql_nope,
+        q_pe,
+        topk_indices,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+
+def sfa_forward_post_fake(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="sfa_forward_pre",
+    op_func=sfa_forward_pre,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_pre_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_lmcache_retrieve",
+    op_func=sfa_lmcache_retrieve,
+    mutates_args=["output"],
+    fake_impl=sfa_lmcache_retrieve_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_post",
+    op_func=sfa_forward_post,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_post_fake,
     dispatch_key="PrivateUse1",
 )
