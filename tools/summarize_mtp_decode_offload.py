@@ -487,6 +487,8 @@ def _format_report(summary: dict[str, Any]) -> str:
     committed: set[tuple[int, int]] = set()
     retrieve_groups: set[int] = set()
     safety_events: list[dict[str, Any]] = []
+    store_content: dict[int, dict[str, Any]] = {}
+    transfer_content: dict[int, dict[str, Any]] = {}
     for event in events:
         window = (event.get("window_start"), event.get("window_end"))
         if (
@@ -511,6 +513,18 @@ def _format_report(summary: dict[str, Any]) -> str:
             and event.get("event") == "scratch_target_safety"
         ):
             safety_events.append(event)
+        if (
+            event.get("stage") == "deep"
+            and event.get("event") == "content_store"
+            and isinstance(event.get("kv_group"), int)
+        ):
+            store_content.setdefault(event["kv_group"], event)
+        if (
+            event.get("stage") == "deep"
+            and event.get("event") == "content_transfer"
+            and isinstance(event.get("kv_group"), int)
+        ):
+            transfer_content.setdefault(event["kv_group"], event)
 
     windows = sorted(set(stores) | committed)
     for start, end in windows[:6]:
@@ -521,6 +535,30 @@ def _format_report(summary: dict[str, Any]) -> str:
         )
     groups = ",".join(str(group) for group in sorted(retrieve_groups)) or "-"
     lines.append(f"RETRIEVE groups={groups}")
+    for group in sorted(set(store_content) | set(transfer_content)):
+        store_event = store_content.get(group)
+        transfer_event = transfer_content.get(group)
+        store_fingerprints = (
+            store_event.get("chunk_fingerprints") if store_event is not None else None
+        )
+        retrieve_fingerprints = (
+            transfer_event.get("source_chunk_fingerprints")
+            if transfer_event is not None
+            else None
+        )
+        source_match = (
+            store_fingerprints == retrieve_fingerprints
+            if store_fingerprints is not None and retrieve_fingerprints is not None
+            else None
+        )
+        probe = transfer_event.get("content_probe", {}) if transfer_event else {}
+        lines.append(
+            f"CONTENT group={group} store_cpu={'yes' if store_event else 'no'} "
+            f"retrieve_cpu={'yes' if transfer_event else 'no'} "
+            f"store_retrieve_match={source_match} "
+            f"scatter_supported={probe.get('supported')} "
+            f"scatter_match={probe.get('all_match')}"
+        )
 
     safety_by_row: dict[tuple[int, int, int], dict[str, Any]] = {}
     for event in safety_events:
@@ -537,15 +575,9 @@ def _format_report(summary: dict[str, Any]) -> str:
     findings: list[str] = []
     for event in unique_safety_events:
         row = event.get("row")
-        within = event.get("target_within_committed")
-        beyond = event.get("target_beyond_current_sequence")
         live_aliases = event.get("actual_target_live_intersection_count")
         unmapped = event.get("target_unmapped_count")
-        if within is False:
-            findings.append(f"row{row}_target_outside_committed")
-        if beyond is True or (
-            isinstance(unmapped, int) and unmapped > 0
-        ):
+        if isinstance(unmapped, int) and unmapped > 0:
             findings.append(f"row{row}_target_unmapped")
         if isinstance(live_aliases, int) and live_aliases > 0:
             findings.append(f"row{row}_target_live_alias")

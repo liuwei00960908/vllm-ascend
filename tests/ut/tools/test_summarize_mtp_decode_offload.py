@@ -189,7 +189,46 @@ def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
     assert "WINDOW [0,256) store_groups=0,1 committed=yes" in report
     assert report.count("SCRATCH frontier=261 row=0") == 1
     assert "SCRATCH frontier=262 row=1 dest=[2048,2304) boundary=256" in report
-    assert "FINDING row1_target_outside_committed,row1_target_live_alias" in report
+    assert "FINDING row1_target_live_alias" in report
+
+
+def test_report_displays_content_probe_status() -> None:
+    lines = _lines()
+    lines.extend(
+        [
+            MARKER
+            + json.dumps(
+                {
+                    "schema": 1,
+                    "req": "chatcmpl-1-internal",
+                    "stage": "deep",
+                    "event": "content_store",
+                    "kv_group": 0,
+                    "chunk_fingerprints": [11, 12],
+                }
+            ),
+            MARKER
+            + json.dumps(
+                {
+                    "schema": 1,
+                    "req": "chatcmpl-1-internal",
+                    "stage": "deep",
+                    "event": "content_transfer",
+                    "kv_group": 0,
+                    "source_chunk_fingerprints": [11, 12],
+                    "content_probe": {"supported": True, "all_match": True},
+                }
+            ),
+        ]
+    )
+
+    report = _format_report(summarize_events(parse_lines(lines)))
+
+    assert (
+        "CONTENT group=0 store_cpu=yes retrieve_cpu=yes "
+        "store_retrieve_match=True scatter_supported=True scatter_match=True"
+        in report
+    )
 
 
 def test_failure_reports_first_invariant() -> None:
