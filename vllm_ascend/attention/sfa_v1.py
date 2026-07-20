@@ -1917,7 +1917,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 _diag_boundaries = _split_boundary.detach().cpu().tolist()
                 _diag_prompt_lens = (
-                    attn_metadata.prompt_lens.detach().cpu().tolist()
+                    _diag_context.dsa_prompt_lens.detach().cpu().tolist()
+                    if getattr(_diag_context, "dsa_prompt_lens", None) is not None
+                    else []
                 )
                 _diag_windows = (
                     _diag_current_window_start.detach().cpu().tolist()
