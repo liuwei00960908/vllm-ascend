@@ -272,6 +272,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
 
     def test_live_key_requires_exact_unpadded_q1_before_mutation(self):
         runner = self._build_runner()
+        request_ids = [f"req-{index}" for index in range(4)]
         kwargs = {
             "cudagraph_mode": CUDAGraphMode.PIECEWISE,
             "batch_descriptor": BatchDescriptor(num_tokens=4),
@@ -284,6 +285,17 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "num_tokens_across_dp": None,
             "should_ubatch": False,
             "has_cascade_attention": False,
+            "request_ids": request_ids,
+            "kv_connector_metadata": SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id=req_id,
+                        is_sparse_decode=True,
+                        load_spec=SimpleNamespace(can_load=True),
+                    )
+                    for req_id in request_ids
+                ]
+            ),
         }
         with (
             patch.object(
@@ -319,6 +331,18 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 },
                 "short_prompt": {
                     "prompt_lens": np.array([4096, 2047, 4096, 4096]),
+                },
+                "dense_prefix_hit": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=False,
+                                load_spec=SimpleNamespace(can_load=True),
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
                 },
             }.items():
                 rejected = dict(kwargs)

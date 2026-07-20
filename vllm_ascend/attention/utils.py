@@ -386,6 +386,27 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
+def staged_sfa_metadata_has_sparse_loads(
+    metadata: Any,
+    request_ids: Any,
+) -> bool:
+    """Whether every active request has one loadable sparse-decode entry."""
+    if metadata is None or request_ids is None:
+        return False
+    active_request_ids = [str(req_id) for req_id in request_ids]
+    if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
+        return False
+    active_request_id_set = set(active_request_ids)
+    sparse_request_ids = [
+        str(getattr(request, "req_id", ""))
+        for request in getattr(metadata, "requests", ())
+        if getattr(request, "is_sparse_decode", False)
+        and getattr(getattr(request, "load_spec", None), "can_load", False)
+        and str(getattr(request, "req_id", "")) in active_request_id_set
+    ]
+    return len(sparse_request_ids) == len(active_request_ids) and set(sparse_request_ids) == active_request_id_set
+
+
 def wait_for_kv_layer_from_connector(
     layer_name: str,
     selected_tokens=None,

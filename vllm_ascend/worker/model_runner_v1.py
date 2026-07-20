@@ -97,6 +97,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     staged_sfa_connector_supports_sparse_load,
+    staged_sfa_metadata_has_sparse_loads,
     using_paged_attention,
 )
 
@@ -1446,6 +1447,8 @@ class NPUModelRunner(GPUModelRunner):
             has_cascade_attention=(
                 cascade_attn_prefix_lens is not None
             ),
+            request_ids=dsa_req_ids,
+            kv_connector_metadata=scheduler_output.kv_connector_metadata,
         )
         if (
             staged_sfa_graph_configured(self.vllm_config)
@@ -2526,6 +2529,8 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp: torch.Tensor | None,
         should_ubatch: bool,
         has_cascade_attention: bool,
+        request_ids: Any,
+        kv_connector_metadata: Any,
     ) -> StagedSFAGraphKey | None:
         """Authorize an exact-Q1 live key before model/SFA mutation."""
         if (
@@ -2539,6 +2544,10 @@ class NPUModelRunner(GPUModelRunner):
             or self.attn_state != AscendAttentionState.DecodeOnly
             or should_ubatch
             or has_cascade_attention
+            or not staged_sfa_metadata_has_sparse_loads(
+                kv_connector_metadata,
+                request_ids,
+            )
         ):
             return None
         batch_size = int(num_tokens_unpadded)

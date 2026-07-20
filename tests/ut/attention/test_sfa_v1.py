@@ -185,6 +185,41 @@ class TestLMCacheSparseFrontier(TestBase):
                 [0, 256],
             )
 
+    def test_dense_prefix_hit_is_not_a_sparse_graph_step(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="req-0",
+                    is_sparse_decode=False,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=18879,
+                    ),
+                )
+            ]
+        )
+
+        self.assertFalse(
+            attention_utils.staged_sfa_metadata_has_sparse_loads(
+                metadata,
+                ["req-0"],
+            )
+        )
+        metadata.requests[0].is_sparse_decode = True
+        self.assertTrue(
+            attention_utils.staged_sfa_metadata_has_sparse_loads(
+                metadata,
+                ["req-0"],
+            )
+        )
+        metadata.requests[0].load_spec.can_load = False
+        self.assertFalse(
+            attention_utils.staged_sfa_metadata_has_sparse_loads(
+                metadata,
+                ["req-0"],
+            )
+        )
+
     def test_sparse_wait_forwards_existing_payload_event(self):
         connector = MagicMock()
         event = object()
