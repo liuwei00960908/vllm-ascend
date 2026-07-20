@@ -97,7 +97,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     staged_sfa_connector_supports_sparse_load,
-    staged_sfa_metadata_has_sparse_loads,
+    staged_sfa_metadata_sparse_load,
     using_paged_attention,
 )
 
@@ -126,6 +126,9 @@ from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 from vllm_ascend.utils import (
+    StagedSFARouteAction,
+    StagedSFARouteDecision,
+    StagedSFARouteReason,
     calc_split_factor,
     check_gdn_layer,
     enable_sp,
@@ -1433,7 +1436,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
-        staged_sfa_graph_key = self._staged_sfa_live_graph_key(
+        staged_sfa_route = self._staged_sfa_live_route(
             cudagraph_mode=cudagraph_mode,
             batch_descriptor=batch_desc,
             num_tokens_unpadded=num_tokens_unpadded,
@@ -1450,6 +1453,7 @@ class NPUModelRunner(GPUModelRunner):
             request_ids=dsa_req_ids,
             kv_connector_metadata=scheduler_output.kv_connector_metadata,
         )
+        staged_sfa_graph_key = self._apply_staged_sfa_route(staged_sfa_route)
         if (
             staged_sfa_graph_configured(self.vllm_config)
             and staged_sfa_graph_key is None
@@ -1475,6 +1479,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
+                staged_sfa_route=staged_sfa_route,
                 staged_sfa_graph_key=staged_sfa_graph_key,
             ),
             self.maybe_get_kv_connector_output(
@@ -1696,8 +1701,6 @@ class NPUModelRunner(GPUModelRunner):
                                 ),
                                 window_end,
                             )
-                else:
-                    get_kv_transfer_group().clear_connector_metadata()
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -2515,7 +2518,7 @@ class NPUModelRunner(GPUModelRunner):
             return None
         return batch_size
 
-    def _staged_sfa_live_graph_key(
+    def _staged_sfa_live_route(
         self,
         *,
         cudagraph_mode: CUDAGraphMode,
@@ -2531,47 +2534,103 @@ class NPUModelRunner(GPUModelRunner):
         has_cascade_attention: bool,
         request_ids: Any,
         kv_connector_metadata: Any,
-    ) -> StagedSFAGraphKey | None:
-        """Authorize an exact-Q1 live key before model/SFA mutation."""
-        if (
-            not staged_sfa_graph_configured(self.vllm_config)
-            or cudagraph_mode != CUDAGraphMode.PIECEWISE
-            or getattr(self.parallel_config, "data_parallel_size", 1)
-            != 1
-            or num_tokens_across_dp is not None
-            or self.speculative_config is not None
-            or getattr(self.vllm_config, "lora_config", None) is not None
-            or self.attn_state != AscendAttentionState.DecodeOnly
-            or should_ubatch
-            or has_cascade_attention
-            or not staged_sfa_metadata_has_sparse_loads(
-                kv_connector_metadata,
-                request_ids,
+    ) -> StagedSFARouteDecision:
+        """Choose one exact-Q1 route before connector or graph mutation."""
+        def native(reason):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
             )
+        if not staged_sfa_graph_configured(self.vllm_config):
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
+            return native(StagedSFARouteReason.RUNTIME_MODE)
+        if (
+            getattr(self.parallel_config, "data_parallel_size", 1) != 1
+            or num_tokens_across_dp is not None
         ):
-            return None
+            return native(StagedSFARouteReason.RUNTIME_PARALLELISM)
+        if self.speculative_config is not None:
+            return native(StagedSFARouteReason.SPECULATIVE_DECODE)
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return native(StagedSFARouteReason.LORA)
+        if self.attn_state != AscendAttentionState.DecodeOnly:
+            return native(StagedSFARouteReason.NOT_DECODE)
+        if should_ubatch:
+            return native(StagedSFARouteReason.UBATCH)
+        if has_cascade_attention:
+            return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
         if (
             batch_size <= 0
             or batch_size
             not in staged_sfa_graph_capture_sizes(self.vllm_config)
-            or num_tokens_padded != batch_size
-            or num_reqs != batch_size
         ):
-            return None
+            return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
+        if num_tokens_padded != batch_size or num_reqs != batch_size:
+            return native(StagedSFARouteReason.PADDED_BATCH)
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
         prompt_lens = np.asarray(prompt_lens).reshape(-1)
-        if (
-            scheduled.shape != (batch_size,)
-            or not np.all(scheduled == 1)
-            or prompt_lens.shape != (batch_size,)
-            or np.any(prompt_lens < index_topk)
-        ):
-            return None
+        if scheduled.shape != (batch_size,) or not np.all(scheduled == 1):
+            return native(StagedSFARouteReason.NON_Q1)
         graph_key = StagedSFAGraphKey.exact_q1(batch_size)
         if batch_descriptor != graph_key.to_legacy_batch_descriptor():
-            return None
-        return graph_key
+            return native(StagedSFARouteReason.BATCH_DESCRIPTOR)
+        metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
+            kv_connector_metadata,
+            request_ids,
+        )
+        if metadata_reason == StagedSFARouteReason.DENSE_PREFIX_HIT:
+            return native(metadata_reason)
+        if metadata_reason != StagedSFARouteReason.ELIGIBLE:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
+        if len(frontiers) != batch_size:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
+            )
+        if prompt_lens.shape != (batch_size,) or np.any(prompt_lens < index_topk):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                StagedSFARouteReason.SHORT_PROMPT,
+            )
+        if any(frontier < index_topk for frontier in frontiers):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                StagedSFARouteReason.FRONTIER_TOO_SHORT,
+            )
+        return StagedSFARouteDecision(
+            StagedSFARouteAction.STAGED,
+            StagedSFARouteReason.ELIGIBLE,
+            graph_key,
+            frontiers,
+        )
+
+    def _apply_staged_sfa_route(
+        self,
+        route: StagedSFARouteDecision,
+    ) -> StagedSFAGraphKey | None:
+        if route.action == StagedSFARouteAction.STAGED:
+            return route.graph_key
+        message = (
+            f"[SFA_ROUTE] action={route.action.value} "
+            f"reason={route.reason.value}"
+        )
+        if route.action in (
+            StagedSFARouteAction.RECOMPUTE,
+            StagedSFARouteAction.FATAL,
+        ):
+            raise RuntimeError(message)
+        logged = getattr(self, "_staged_sfa_logged_routes", None)
+        if logged is None:
+            logged = self._staged_sfa_logged_routes = set()
+        if route.reason not in logged and route.reason != StagedSFARouteReason.NOT_CONFIGURED:
+            logged.add(route.reason)
+            logger.info(message)
+        return None
 
     @staticmethod
     def _staged_sfa_q1_query_start_locs(
@@ -2989,6 +3048,11 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            staged_dummy_key = (
+                StagedSFAGraphKey.exact_q1(staged_sfa_dummy_batch_size)
+                if staged_sfa_dummy_batch_size is not None
+                else None
+            )
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3002,13 +3066,16 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_offload_manager=getattr(self, "dsa_offload_manager", None),
                 dsa_adapter_cache=getattr(self, "dsa_adapter_cache", None),
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
-                staged_sfa_graph_key=(
-                    StagedSFAGraphKey.exact_q1(
-                        staged_sfa_dummy_batch_size
+                staged_sfa_route=(
+                    StagedSFARouteDecision(
+                        StagedSFARouteAction.STAGED,
+                        StagedSFARouteReason.ELIGIBLE,
+                        staged_dummy_key,
                     )
-                    if staged_sfa_dummy_batch_size is not None
+                    if staged_dummy_key is not None
                     else None
                 ),
+                staged_sfa_graph_key=staged_dummy_key,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds

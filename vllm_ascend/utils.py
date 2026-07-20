@@ -24,6 +24,7 @@ import functools
 import math
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from threading import Lock
@@ -63,6 +64,64 @@ _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
+
+
+class StagedSFARouteAction(str, Enum):
+    STAGED = "staged"
+    SAFE_NATIVE = "safe_native"
+    RECOMPUTE = "recompute"
+    FATAL = "fatal"
+
+
+class StagedSFAConfigReason(str, Enum):
+    DSA_UNBUNDLE = "dsa_unbundle"
+    DSA_TWO_GROUPS = "dsa_two_groups"
+    SHRINK_LATENT = "shrink_latent"
+    CUDAGRAPH_MODE = "cudagraph_mode"
+    MODEL_NOT_MLA = "model_not_mla"
+    INDEX_TOPK_MISSING = "index_topk_missing"
+    CONNECTOR_MISSING = "connector_missing"
+    SPECULATIVE_DECODE = "speculative_decode"
+    LORA = "lora"
+    DATA_PARALLEL = "data_parallel"
+    PIPELINE_PARALLEL = "pipeline_parallel"
+    CONTEXT_PARALLEL = "context_parallel"
+
+
+class StagedSFARouteReason(str, Enum):
+    ELIGIBLE = "eligible"
+    NOT_CONFIGURED = "not_configured"
+    RUNTIME_MODE = "runtime_mode"
+    RUNTIME_PARALLELISM = "runtime_parallelism"
+    SPECULATIVE_DECODE = "speculative_decode"
+    LORA = "lora"
+    NOT_DECODE = "not_decode"
+    UBATCH = "ubatch"
+    CASCADE = "cascade"
+    UNSUPPORTED_BATCH = "unsupported_batch"
+    PADDED_BATCH = "padded_batch"
+    NON_Q1 = "non_q1"
+    SHORT_PROMPT = "short_prompt"
+    BATCH_DESCRIPTOR = "batch_descriptor"
+    INVALID_REQUEST_IDS = "invalid_request_ids"
+    DENSE_PREFIX_HIT = "dense_prefix_hit"
+    MIXED_CONNECTOR_LOAD = "mixed_connector_load"
+    MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
+    SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
+    FRONTIER_TOO_SHORT = "frontier_too_short"
+    FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
+    DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class StagedSFARouteDecision:
+    action: StagedSFARouteAction
+    reason: StagedSFARouteReason
+    graph_key: Any = None
+    frontiers: tuple[int, ...] = ()
+
+
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
@@ -453,22 +512,22 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
     vllm_config.compilation_config.post_init_cudagraph_sizes()
 
 
-def staged_sfa_graph_configuration_errors(
+def staged_sfa_graph_configuration_reasons(
     vllm_config: VllmConfig,
-) -> tuple[str, ...]:
-    """Return structural reasons an explicitly requested staged graph is invalid."""
+) -> tuple[StagedSFAConfigReason, ...]:
+    """Return typed reasons an explicitly requested staged graph is invalid."""
     from vllm.config import CUDAGraphMode
 
     model_config = getattr(vllm_config, "model_config", None)
     hf_text_config = getattr(model_config, "hf_text_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
-    errors: list[str] = []
+    reasons: list[StagedSFAConfigReason] = []
     if not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE:
-        errors.append("VLLM_ASCEND_DSA_UNBUNDLE must be 1")
+        reasons.append(StagedSFAConfigReason.DSA_UNBUNDLE)
     if not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
-        errors.append("VLLM_ASCEND_DSA_TWO_GROUPS must be 1")
+        reasons.append(StagedSFAConfigReason.DSA_TWO_GROUPS)
     if envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2:
-        errors.append("VLLM_ASCEND_DSA_SHRINK_LATENT must be 2")
+        reasons.append(StagedSFAConfigReason.SHRINK_LATENT)
     if (
         getattr(
             getattr(vllm_config, "compilation_config", None),
@@ -477,30 +536,53 @@ def staged_sfa_graph_configuration_errors(
         )
         != CUDAGraphMode.PIECEWISE
     ):
-        errors.append("cudagraph_mode must be PIECEWISE")
+        reasons.append(StagedSFAConfigReason.CUDAGRAPH_MODE)
     if not bool(getattr(model_config, "use_mla", False)):
-        errors.append("the model must use MLA/SFA")
+        reasons.append(StagedSFAConfigReason.MODEL_NOT_MLA)
     if hf_text_config is None or not hasattr(hf_text_config, "index_topk"):
-        errors.append("the model must expose index_topk")
+        reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
     if getattr(vllm_config, "kv_transfer_config", None) is None:
-        errors.append("a KV transfer connector must be configured")
+        reasons.append(StagedSFAConfigReason.CONNECTOR_MISSING)
     if getattr(vllm_config, "speculative_config", None) is not None:
-        errors.append("speculative decoding/MTP is not implemented")
+        reasons.append(StagedSFAConfigReason.SPECULATIVE_DECODE)
     if getattr(vllm_config, "lora_config", None) is not None:
-        errors.append("LoRA is not implemented")
+        reasons.append(StagedSFAConfigReason.LORA)
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
     if isinstance(data_parallel_size, int) and data_parallel_size != 1:
-        errors.append("data parallel staged graphs are not implemented")
+        reasons.append(StagedSFAConfigReason.DATA_PARALLEL)
     pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
     if isinstance(pipeline_parallel_size, int) and pipeline_parallel_size != 1:
-        errors.append("pipeline parallel staged graphs are not implemented")
+        reasons.append(StagedSFAConfigReason.PIPELINE_PARALLEL)
     prefill_context_parallel_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
     decode_context_parallel_size = getattr(parallel_config, "decode_context_parallel_size", 1)
     if any(
         isinstance(size, int) and size != 1 for size in (prefill_context_parallel_size, decode_context_parallel_size)
     ):
-        errors.append("context parallel staged graphs are not implemented")
-    return tuple(errors)
+        reasons.append(StagedSFAConfigReason.CONTEXT_PARALLEL)
+    return tuple(reasons)
+
+
+_STAGED_SFA_CONFIG_MESSAGES = {
+    StagedSFAConfigReason.DSA_UNBUNDLE: "VLLM_ASCEND_DSA_UNBUNDLE must be 1",
+    StagedSFAConfigReason.DSA_TWO_GROUPS: "VLLM_ASCEND_DSA_TWO_GROUPS must be 1",
+    StagedSFAConfigReason.SHRINK_LATENT: "VLLM_ASCEND_DSA_SHRINK_LATENT must be 2",
+    StagedSFAConfigReason.CUDAGRAPH_MODE: "cudagraph_mode must be PIECEWISE",
+    StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA/SFA",
+    StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must expose index_topk",
+    StagedSFAConfigReason.CONNECTOR_MISSING: "a KV transfer connector must be configured",
+    StagedSFAConfigReason.SPECULATIVE_DECODE: "speculative decoding/MTP is not implemented",
+    StagedSFAConfigReason.LORA: "LoRA is not implemented",
+    StagedSFAConfigReason.DATA_PARALLEL: "data parallel staged graphs are not implemented",
+    StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline parallel staged graphs are not implemented",
+    StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallel staged graphs are not implemented",
+}
+
+
+def staged_sfa_graph_configuration_errors(
+    vllm_config: VllmConfig,
+) -> tuple[str, ...]:
+    """Render typed staged-SFA configuration reasons for user-facing errors."""
+    return tuple(_STAGED_SFA_CONFIG_MESSAGES[reason] for reason in staged_sfa_graph_configuration_reasons(vllm_config))
 
 
 def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
@@ -510,7 +592,7 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
     on one predicate. Merely exporting the experimental flag must not shrink
     unrelated models' graph-size or KV-cache budgets.
     """
-    return bool(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH and not staged_sfa_graph_configuration_errors(vllm_config))
+    return bool(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH and not staged_sfa_graph_configuration_reasons(vllm_config))
 
 
 def staged_sfa_graph_capture_sizes(

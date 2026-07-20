@@ -68,6 +68,8 @@ from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
+    StagedSFARouteAction,
+    StagedSFARouteReason,
     _round_up,
     dispose_layer,
     enable_dsa_cp,
@@ -135,6 +137,7 @@ def _prepare_sfa_remap_boundary(
     *,
     is_dummy_run: bool,
     index_topk: int,
+    cached_tokens: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Fill the stable Graph-A remap-boundary input once per step.
 
@@ -168,7 +171,10 @@ def _prepare_sfa_remap_boundary(
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    cached_tokens = None if is_dummy_run else get_lmcache_sparse_cached_tokens(request_ids)
+    if not is_dummy_run and cached_tokens is None:
+        cached_tokens = tuple(get_lmcache_sparse_cached_tokens(request_ids))
+    if not is_dummy_run and len(cached_tokens) != len(seq_lens):
+        raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}")
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
     for row_index, request_index_value in enumerate(row_req_indices_np):
@@ -183,7 +189,7 @@ def _prepare_sfa_remap_boundary(
             )
         cached_for_request = None
         if cached_tokens is not None:
-            cached_for_request = int(cached_tokens[request_index]) if request_index < len(cached_tokens) else 0
+            cached_for_request = int(cached_tokens[request_index])
         if decode_window_size > 0:
             current_position = max(seq_lens[request_index] - 1, 0)
             row_boundary = current_position // decode_window_size * decode_window_size
@@ -2122,6 +2128,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 output,
             )
             return self._cross_layer_empty_outputs(hidden_states)
+        route = getattr(context, "staged_sfa_route", None)
+        if route is None or route.action != StagedSFARouteAction.STAGED or route.graph_key != graph_key:
+            raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}")
         reason = self._cross_layer_ineligible_reason(hidden_states, kv_cache, attn_metadata)
         if reason is not None:
             raise RuntimeError(
@@ -2158,6 +2167,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.req_ids,
                 is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
+                cached_tokens=getattr(
+                    getattr(context, "staged_sfa_route", None),
+                    "frontiers",
+                    None,
+                ),
             )
             if is_dummy:
                 self._staged_sfa_cross_layer_remap_boundary = remap_boundary
@@ -2211,6 +2225,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 or getattr(context, "staged_sfa_graph_dummy_run", False)
             ):
                 return
+            route = context.staged_sfa_route
             index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
             producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
             if producer_event is not None:
@@ -2237,6 +2252,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     next_metadata.req_ids,
                     is_dummy_run=False,
                     index_topk=self.index_topk,
+                    cached_tokens=route.frontiers,
                 )
                 if index_enabled:
                     wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(next_layer_name))
@@ -2251,6 +2267,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 metadata.req_ids,
                 is_dummy_run=False,
                 index_topk=self.index_topk,
+                cached_tokens=context.staged_sfa_route.frontiers,
             )
             if _dsa_index_lmcache_enabled():
                 wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(layer_name))

@@ -604,8 +604,11 @@ class TestUtils(TestBase):
             VLLM_ASCEND_DSA_TWO_GROUPS=True,
             VLLM_ASCEND_DSA_SHRINK_LATENT=2,
         ):
+            reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
             errors = utils.staged_sfa_graph_configuration_errors(vllm_config)
 
+        self.assertIn(utils.StagedSFAConfigReason.SPECULATIVE_DECODE, reasons)
+        self.assertIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
         self.assertIn("speculative decoding/MTP is not implemented", errors)
         self.assertIn("LoRA is not implemented", errors)
         self.assertIn("data parallel staged graphs are not implemented", errors)

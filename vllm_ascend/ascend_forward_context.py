@@ -13,6 +13,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import (
     AscendDeviceType,
+    StagedSFARouteDecision,
     enable_sp,
     flashcomm2_enable,
     get_ascend_device_type,
@@ -103,6 +104,7 @@ def set_ascend_forward_context(
     dsa_prompt_lens=None,
     dsa_adapter_cache=None,
     staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_route: StagedSFARouteDecision | None = None,
     staged_sfa_graph_key: StagedSFAGraphKey | None = None,
 ):
     """A context manager that stores the current forward context,
@@ -136,6 +138,7 @@ def set_ascend_forward_context(
         # passes used by the staged SFA proof of concept. Connector generators
         # and save hooks must not advance during either dummy pass.
         forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
+        forward_context.staged_sfa_route = staged_sfa_route
         forward_context.staged_sfa_graph_key = staged_sfa_graph_key
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method

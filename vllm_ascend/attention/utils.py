@@ -11,7 +11,12 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend import envs
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    StagedSFARouteReason,
+    get_ascend_config,
+    get_ascend_device_type,
+)
 
 logger = init_logger(__name__)
 
@@ -326,19 +331,13 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
             getattr(connector, "supports_staged_sfa_sparse_load", False)
             and getattr(connector, "uses_layerwise_model_callbacks", False)
             and callable(getattr(connector, "wait_for_layer_load", None))
-            and callable(getattr(connector, "_get_connector_metadata", None))
         )
     except Exception:
         return False
 
 
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
-    """Return a proven sparse frontier for every active request.
-
-    SHRINK_LATENT=2 has already released latent blocks beyond the compact
-    scratch reservation. Missing connector metadata is therefore a correctness
-    error, not permission to substitute the prompt length.
-    """
+    """Return a proven sparse frontier for every active request."""
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
     normalized_request_ids = [str(req_id) for req_id in list(request_ids)]
@@ -352,8 +351,7 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
             "staged sparse selective-load/frontier contract."
         )
 
-    connector = get_kv_transfer_group()
-    get_metadata = getattr(connector, "_get_connector_metadata", None)
+    get_metadata = getattr(get_kv_transfer_group(), "_get_connector_metadata", None)
     if not callable(get_metadata):
         raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
     try:
@@ -373,10 +371,9 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
                 f"[SFA sparse remap] sparse connector metadata contains a duplicate request ID: {req_id!r}."
             )
         load_spec = getattr(request, "load_spec", None)
-        if load_spec is None or not getattr(load_spec, "can_load", False):
-            cached_by_req[req_id] = 0
-        else:
-            cached_by_req[req_id] = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
+        cached_by_req[req_id] = (
+            int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0) if getattr(load_spec, "can_load", False) else 0
+        )
 
     missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
     if missing:
@@ -386,25 +383,46 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
-def staged_sfa_metadata_has_sparse_loads(
+def staged_sfa_metadata_sparse_load(
     metadata: Any,
     request_ids: Any,
-) -> bool:
-    """Whether every active request has one loadable sparse-decode entry."""
+) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
+    """Classify active connector metadata and return ordered frontiers."""
     if metadata is None or request_ids is None:
-        return False
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
     active_request_ids = [str(req_id) for req_id in request_ids]
     if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
-        return False
+        return StagedSFARouteReason.INVALID_REQUEST_IDS, ()
     active_request_id_set = set(active_request_ids)
-    sparse_request_ids = [
-        str(getattr(request, "req_id", ""))
-        for request in getattr(metadata, "requests", ())
-        if getattr(request, "is_sparse_decode", False)
-        and getattr(getattr(request, "load_spec", None), "can_load", False)
-        and str(getattr(request, "req_id", "")) in active_request_id_set
-    ]
-    return len(sparse_request_ids) == len(active_request_ids) and set(sparse_request_ids) == active_request_id_set
+    sparse_frontiers: dict[str, int] = {}
+    dense_request_ids: set[str] = set()
+    matched_request_ids: set[str] = set()
+    for request in getattr(metadata, "requests", ()):
+        req_id = str(getattr(request, "req_id", ""))
+        if req_id not in active_request_id_set:
+            continue
+        matched_request_ids.add(req_id)
+        load_spec = getattr(request, "load_spec", None)
+        if not getattr(load_spec, "can_load", False):
+            continue
+        if not getattr(request, "is_sparse_decode", False):
+            dense_request_ids.add(req_id)
+            continue
+        if req_id in sparse_frontiers:
+            return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+        sparse_frontiers[req_id] = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
+
+    if dense_request_ids.intersection(sparse_frontiers):
+        return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
+    if len(sparse_frontiers) == len(active_request_ids):
+        return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
+    if len(dense_request_ids) == len(active_request_ids):
+        return StagedSFARouteReason.DENSE_PREFIX_HIT, ()
+    if matched_request_ids != active_request_id_set:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
+    if dense_request_ids:
+        return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
+    return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
 
 
 def wait_for_kv_layer_from_connector(

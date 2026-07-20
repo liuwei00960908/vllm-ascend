@@ -22,7 +22,21 @@ if "torch_npu._inductor" not in sys.modules:
 import vllm_ascend.attention.sfa_v1 as sfa_v1
 import vllm_ascend.attention.utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
-from vllm_ascend.utils import enable_dsa_cp
+from vllm_ascend.utils import (
+    StagedSFARouteAction,
+    StagedSFARouteDecision,
+    StagedSFARouteReason,
+    enable_dsa_cp,
+)
+
+
+def _staged_route(frontiers=(4096,)):
+    return StagedSFARouteDecision(
+        StagedSFARouteAction.STAGED,
+        StagedSFARouteReason.ELIGIBLE,
+        STAGED_SFA_SINGLETON_GRAPH_KEY,
+        frontiers,
+    )
 
 
 class TestLMCacheSparseWaitSync(TestBase):
@@ -95,15 +109,6 @@ class TestDSASparsePadding(TestBase):
 
 
 class TestLMCacheSparseFrontier(TestBase):
-    @staticmethod
-    def _connector(metadata):
-        return SimpleNamespace(
-            supports_staged_sfa_sparse_load=True,
-            uses_layerwise_model_callbacks=True,
-            wait_for_layer_load=lambda *args, **kwargs: None,
-            _get_connector_metadata=lambda: metadata,
-        )
-
     def test_missing_active_request_frontier_fails_closed(self):
         metadata = SimpleNamespace(
             requests=[
@@ -117,29 +122,13 @@ class TestLMCacheSparseFrontier(TestBase):
                 )
             ]
         )
-        connector = self._connector(metadata)
-        with (
-            patch.object(
-                attention_utils,
-                "has_kv_transfer_group",
-                return_value=True,
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0", "req-1"],
             ),
-            patch.object(
-                attention_utils,
-                "is_v1_kv_transfer_group",
-                return_value=True,
-            ),
-            patch.object(
-                attention_utils,
-                "get_kv_transfer_group",
-                return_value=connector,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "no proven sparse frontier",
-            ),
-        ):
-            attention_utils.get_lmcache_sparse_cached_tokens(["req-0", "req-1"])
+            (StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()),
+        )
 
     def test_frontiers_preserve_native_request_order(self):
         metadata = SimpleNamespace(
@@ -156,34 +145,19 @@ class TestLMCacheSparseFrontier(TestBase):
                     req_id="req-0",
                     is_sparse_decode=True,
                     load_spec=SimpleNamespace(
-                        can_load=False,
-                        lmcache_cached_tokens=0,
+                        can_load=True,
+                        lmcache_cached_tokens=128,
                     ),
                 ),
             ]
         )
-        connector = self._connector(metadata)
-        with (
-            patch.object(
-                attention_utils,
-                "has_kv_transfer_group",
-                return_value=True,
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0", "req-1"],
             ),
-            patch.object(
-                attention_utils,
-                "is_v1_kv_transfer_group",
-                return_value=True,
-            ),
-            patch.object(
-                attention_utils,
-                "get_kv_transfer_group",
-                return_value=connector,
-            ),
-        ):
-            self.assertEqual(
-                attention_utils.get_lmcache_sparse_cached_tokens(["req-0", "req-1"]),
-                [0, 256],
-            )
+            (StagedSFARouteReason.ELIGIBLE, (128, 256)),
+        )
 
     def test_dense_prefix_hit_is_not_a_sparse_graph_step(self):
         metadata = SimpleNamespace(
@@ -199,25 +173,19 @@ class TestLMCacheSparseFrontier(TestBase):
             ]
         )
 
-        self.assertFalse(
-            attention_utils.staged_sfa_metadata_has_sparse_loads(
-                metadata,
-                ["req-0"],
-            )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
         )
         metadata.requests[0].is_sparse_decode = True
-        self.assertTrue(
-            attention_utils.staged_sfa_metadata_has_sparse_loads(
-                metadata,
-                ["req-0"],
-            )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
+            (StagedSFARouteReason.ELIGIBLE, (18879,)),
         )
         metadata.requests[0].load_spec.can_load = False
-        self.assertFalse(
-            attention_utils.staged_sfa_metadata_has_sparse_loads(
-                metadata,
-                ["req-0"],
-            )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
+            (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
         )
 
     def test_sparse_wait_forwards_existing_payload_event(self):
@@ -414,7 +382,10 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = self._make_eligible_impl()
         impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value="changed metadata")
-        context = SimpleNamespace(staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY)
+        context = SimpleNamespace(
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_route=_staged_route(),
+        )
 
         with (
             patch.object(sfa_v1, "get_forward_context", return_value=context),
@@ -443,11 +414,13 @@ class TestStagedSFAGraphPoc(TestBase):
         contexts = (
             SimpleNamespace(
                 staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+                staged_sfa_route=_staged_route(),
                 staged_sfa_graph_dummy_run=True,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ),
             SimpleNamespace(
                 staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+                staged_sfa_route=_staged_route(),
                 staged_sfa_graph_dummy_run=True,
                 cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
             ),
@@ -480,6 +453,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.req_ids,
             is_dummy_run=True,
             index_topk=impl.index_topk,
+            cached_tokens=(4096,),
         )
         self.assertIs(
             impl._staged_sfa_cross_layer_remap_boundary,
@@ -498,6 +472,7 @@ class TestStagedSFAGraphPoc(TestBase):
         next_metadata = self._make_decode_metadata()
         context = SimpleNamespace(
             staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_route=_staged_route(),
             staged_sfa_graph_dummy_run=False,
             attn_metadata={"layer-1.attn": next_metadata},
         )
@@ -543,12 +518,16 @@ class TestStagedSFAGraphPoc(TestBase):
             next_metadata.req_ids,
             is_dummy_run=False,
             index_topk=impl.index_topk,
+            cached_tokens=(4096,),
         )
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
         metadata = self._make_decode_metadata()
-        context = SimpleNamespace(attn_metadata={"layer-0.attn": metadata})
+        context = SimpleNamespace(
+            attn_metadata={"layer-0.attn": metadata},
+            staged_sfa_route=_staged_route(),
+        )
         order = []
         with (
             patch.object(sfa_v1, "get_forward_context", return_value=context),
@@ -583,32 +562,57 @@ class TestStagedSFAGraphPoc(TestBase):
         with (
             patch.object(
                 sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
-                return_value=[900],
-            ) as get_cached_tokens,
-            patch.object(
-                sfa_v1,
                 "_decode_window_save_window_size",
                 return_value=256,
             ),
+            patch.object(sfa_v1, "get_lmcache_sparse_cached_tokens") as lookup,
         ):
             first = sfa_v1._prepare_sfa_remap_boundary(
                 metadata,
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                cached_tokens=(900,),
             )
             second = sfa_v1._prepare_sfa_remap_boundary(
                 metadata,
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                cached_tokens=(900,),
             )
 
         self.assertIs(first, second)
         self.assertEqual(first.data_ptr(), original_address)
         self.assertEqual(first.tolist(), [900])
-        get_cached_tokens.assert_called_once_with(["req-0"])
+        lookup.assert_not_called()
+
+    def test_native_remap_boundary_retains_connector_frontier_lookup(self):
+        metadata = self._make_decode_metadata()
+        metadata.prompt_lens_cpu_rows = [1000]
+        metadata.seq_lens_cpu = torch.tensor([1025])
+
+        with (
+            patch.object(
+                sfa_v1,
+                "_decode_window_save_window_size",
+                return_value=256,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_lmcache_sparse_cached_tokens",
+                return_value=[900],
+            ) as lookup,
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                metadata,
+                ["req-0"],
+                is_dummy_run=False,
+                index_topk=4,
+            )
+
+        self.assertEqual(boundary.tolist(), [900])
+        lookup.assert_called_once_with(["req-0"])
 
     def test_remap_boundary_uses_unique_request_ids_for_mtp_rows(self):
         metadata = self._make_decode_metadata()
@@ -619,27 +623,20 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_remap_boundary = torch.empty(4, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
-        with (
-            patch.object(
-                sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
-                return_value=[90, 180],
-            ) as get_cached_tokens,
-            patch.object(
-                sfa_v1,
-                "_decode_window_save_window_size",
-                return_value=0,
-            ),
+        with patch.object(
+            sfa_v1,
+            "_decode_window_save_window_size",
+            return_value=0,
         ):
             boundary = sfa_v1._prepare_sfa_remap_boundary(
                 metadata,
                 ["req-0", "req-1"],
                 is_dummy_run=False,
                 index_topk=4,
+                cached_tokens=(90, 180),
             )
 
         self.assertEqual(boundary.tolist(), [90, 90, 180, 180])
-        get_cached_tokens.assert_called_once_with(["req-0", "req-1"])
 
     def test_remap_boundary_rejects_scratch_live_alias(self):
         metadata = self._make_decode_metadata()
@@ -651,11 +648,6 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_remap_boundary_ready = False
 
         with (
-            patch.object(
-                sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
-                return_value=[7],
-            ),
             patch.object(
                 sfa_v1,
                 "_decode_window_save_window_size",
@@ -671,6 +663,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                cached_tokens=(7,),
             )
 
         self.assertFalse(metadata.decode_remap_boundary_ready)

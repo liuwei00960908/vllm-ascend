@@ -17,6 +17,10 @@ from vllm_ascend.ascend_forward_context import (
     StagedSFAQueryProfile,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.utils import (
+    StagedSFARouteAction,
+    StagedSFARouteReason,
+)
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -291,7 +295,10 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=True,
-                        load_spec=SimpleNamespace(can_load=True),
+                        load_spec=SimpleNamespace(
+                            can_load=True,
+                            lmcache_cached_tokens=4096,
+                        ),
                     )
                     for req_id in request_ids
                 ]
@@ -309,10 +316,11 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 return_value=(1, 4),
             ),
         ):
-            self.assertEqual(
-                runner._staged_sfa_live_graph_key(**kwargs),
-                StagedSFAGraphKey.exact_q1(4),
-            )
+            route = runner._staged_sfa_live_route(**kwargs)
+            self.assertEqual(route.action, StagedSFARouteAction.STAGED)
+            self.assertEqual(route.reason, StagedSFARouteReason.ELIGIBLE)
+            self.assertEqual(route.graph_key, StagedSFAGraphKey.exact_q1(4))
+            self.assertEqual(route.frontiers, (4096,) * 4)
             for name, overrides in {
                 "padding": {
                     "num_tokens_padded": 8,
@@ -333,6 +341,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     "prompt_lens": np.array([4096, 2047, 4096, 4096]),
                 },
                 "dense_prefix_hit": {
+                    "prompt_lens": np.full(4, 1, dtype=np.int32),
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
                             SimpleNamespace(
@@ -344,14 +353,73 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         ]
                     ),
                 },
+                "short_frontier": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=True,
+                                load_spec=SimpleNamespace(
+                                    can_load=True,
+                                    lmcache_cached_tokens=1024,
+                                ),
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                },
             }.items():
                 rejected = dict(kwargs)
                 rejected.update(overrides)
                 with self.subTest(name=name):
-                    self.assertIsNone(runner._staged_sfa_live_graph_key(**rejected))
+                    route = runner._staged_sfa_live_route(**rejected)
+                    self.assertEqual(
+                        route.action,
+                        StagedSFARouteAction.FATAL
+                        if name in ("short_prompt", "short_frontier")
+                        else StagedSFARouteAction.SAFE_NATIVE,
+                    )
+                    if name == "dense_prefix_hit":
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.DENSE_PREFIX_HIT,
+                        )
+                    elif name == "short_frontier":
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.FRONTIER_TOO_SHORT,
+                        )
 
             runner.attn_state = AscendAttentionState.PrefillNoCache
-            self.assertIsNone(runner._staged_sfa_live_graph_key(**kwargs))
+            route = runner._staged_sfa_live_route(**kwargs)
+            self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
+            self.assertEqual(route.reason, StagedSFARouteReason.NOT_DECODE)
+
+    def test_fatal_route_reports_stable_action_and_reason(self):
+        runner = self._build_runner()
+        route = model_runner_module.StagedSFARouteDecision(
+            StagedSFARouteAction.FATAL,
+            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"\[SFA_ROUTE\] action=fatal reason=sparse_load_unavailable",
+        ):
+            runner._apply_staged_sfa_route(route)
+
+    def test_native_route_logs_once_per_reason(self):
+        runner = self._build_runner()
+        route = model_runner_module.StagedSFARouteDecision(
+            StagedSFARouteAction.SAFE_NATIVE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+        )
+
+        with patch.object(model_runner_module.logger, "info") as log:
+            self.assertIsNone(runner._apply_staged_sfa_route(route))
+            self.assertIsNone(runner._apply_staged_sfa_route(route))
+
+        log.assert_called_once_with("[SFA_ROUTE] action=safe_native reason=dense_prefix_hit")
 
     def test_native_q1_rows_have_unique_ids_and_query_starts(self):
         request_ids = NPUModelRunner._staged_sfa_dummy_request_ids(4)
