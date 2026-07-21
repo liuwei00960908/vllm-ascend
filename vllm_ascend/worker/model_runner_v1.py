@@ -2447,6 +2447,11 @@ class NPUModelRunner(GPUModelRunner):
                 if self.dsa_shrink_latent
                 else None
             ),
+            dsa_request_block_counts=(
+                self.input_batch.block_table[0].num_blocks_per_row[:num_reqs].copy()
+                if self.dsa_shrink_latent
+                else None
+            ),
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

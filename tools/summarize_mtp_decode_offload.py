@@ -625,6 +625,8 @@ def _format_report(summary: dict[str, Any]) -> str:
         oor = event.get("target_blocks_out_of_range")
         if isinstance(oor, int) and oor > 0:
             findings.append(f"row{row}_blocks_out_of_range")
+        if event.get("target_blocks_in_capacity") is False:
+            findings.append(f"row{row}_target_block_oob")
 
     for event in unique_safety_events[:8]:
         row = event.get("row")
@@ -637,12 +639,17 @@ def _format_report(summary: dict[str, Any]) -> str:
         unmapped = event.get("target_unmapped_count")
         num_blocks = event.get("num_blocks")
         blocks_oor = event.get("target_blocks_out_of_range")
+        capacity = event.get("physical_block_capacity")
+        target_blocks = event.get("target_physical_block_ids")
+        target_in_capacity = event.get("target_blocks_in_capacity")
         lines.append(
             f"SCRATCH frontier={event.get('frontier')} row={row} "
             f"dest=[{start},{end}) boundary={boundary} "
             f"within_committed={within} beyond_sequence={beyond} "
             f"unmapped={unmapped} live_aliases={live_aliases} "
-            f"num_blocks={num_blocks} blocks_oor={blocks_oor}"
+            f"num_blocks={num_blocks} blocks_oor={blocks_oor} "
+            f"capacity={capacity} target_blocks={target_blocks} "
+            f"target_in_capacity={target_in_capacity}"
         )
     if not unique_safety_events:
         findings.append("scratch_target_safety_missing")

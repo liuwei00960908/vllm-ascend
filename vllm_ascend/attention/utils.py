@@ -215,6 +215,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    # Authoritative count of normal block-table entries assigned per request.
+    # This is distinct from the block table's fixed tensor width.
+    dsa_request_block_counts: Any = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -245,6 +248,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             request_ids=(
                 self.request_ids[:num_actual_reqs]
                 if self.request_ids is not None
+                else None
+            ),
+            dsa_request_block_counts=(
+                self.dsa_request_block_counts[:num_actual_reqs]
+                if self.dsa_request_block_counts is not None
                 else None
             ),
         )

@@ -320,6 +320,7 @@ class AscendSFAMetadata:
     decode_current_positions_cpu: Any = None
     decode_scratch_base: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
+    decode_request_block_counts: Any = None
     need_sparse_lmcache_payload: bool = False
     decode_split_boundary: torch.Tensor | None = None
 
@@ -643,6 +644,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             ),
             decode_scratch_base=decode_scratch_base_rows,
             decode_target_slot_mapping=decode_target_slot_mapping,
+            decode_request_block_counts=getattr(
+                common_attn_metadata, "dsa_request_block_counts", None
+            ),
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             num_decode_tokens=num_decode_rows,
         )
@@ -1980,6 +1984,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if _diag_deep_req_ids
                     else []
                 )
+                _diag_request_block_counts = diagnostic_values_to_list(
+                    getattr(attn_metadata, "decode_request_block_counts", None)
+                )
                 _diag_selected_counts = (
                     _selected_token_counts.detach().cpu().tolist()
                     if _diag_deep_req_ids and _selected_token_counts is not None
@@ -2090,14 +2097,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                             .cpu()
                             .tolist()
                         )
-                        _diag_seq_len = (
-                            int(attn_metadata.seq_lens[int(req_index)])
-                            if req_index < int(attn_metadata.seq_lens.shape[0])
-                            else current_position + 1
-                        )
                         _diag_num_blocks = (
-                            _diag_seq_len + block_size - 1
-                        ) // block_size
+                            int(_diag_request_block_counts[req_index])
+                            if req_index < len(_diag_request_block_counts)
+                            else None
+                        )
                         scratch_safety = scratch_target_safety(
                             block_table_row,
                             effective_scratch_base,
@@ -2171,6 +2175,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                             target_slots = actual_target_slots or []
                             live_slots = scratch_safety["live_slots"]
                             aliases = actual_aliases
+                        target_physical_blocks = list(
+                            dict.fromkeys(
+                                int(slot) // block_size
+                                for slot in consumed_target_slots
+                            )
+                        )
+                        physical_block_capacity = int(kv_cache[0].shape[0])
+                        target_blocks_in_capacity = all(
+                            0 <= block < physical_block_capacity
+                            for block in target_physical_blocks
+                        )
                         deep_common = {
                             "tp_rank": self.tp_rank,
                             "tp_world": self.tp_size,
@@ -2231,6 +2246,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                             target_tokens_out_of_range=scratch_safety[
                                 "target_tokens_out_of_range"
                             ],
+                            physical_block_capacity=physical_block_capacity,
+                            target_physical_block_count=len(
+                                target_physical_blocks
+                            ),
+                            target_physical_block_ids=target_physical_blocks[:8],
+                            target_physical_block_checksum=diagnostic_int_checksum(
+                                target_physical_blocks
+                            ),
+                            target_blocks_in_capacity=target_blocks_in_capacity,
                             valid_logical_end=scratch_safety["valid_logical_end"],
                             target_within_committed=scratch_safety[
                                 "target_within_committed"

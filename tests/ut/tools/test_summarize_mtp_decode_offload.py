@@ -227,6 +227,39 @@ def test_report_flags_blocks_out_of_range() -> None:
     assert "FINDING row1_blocks_out_of_range" in report
 
 
+def test_report_flags_target_physical_block_out_of_capacity() -> None:
+    """A physical target ID past the KV cache capacity must be reported."""
+    lines = _lines()
+    lines.append(
+        MARKER
+        + json.dumps(
+            {
+                "schema": 1,
+                "req": "chatcmpl-1-internal",
+                "stage": "deep",
+                "event": "scratch_target_safety",
+                "frontier": 262,
+                "committed_end": 256,
+                "row": 1,
+                "target_logical_start": 2048,
+                "target_logical_end": 2304,
+                "boundary": 256,
+                "target_within_committed": False,
+                "target_beyond_current_sequence": True,
+                "target_unmapped_count": 0,
+                "actual_target_live_intersection_count": 0,
+                "physical_block_capacity": 32,
+                "target_physical_block_ids": [18, 42],
+                "target_blocks_in_capacity": False,
+            }
+        )
+    )
+
+    report = _format_report(summarize_events(parse_lines(lines)))
+    assert "capacity=32 target_blocks=[18, 42] target_in_capacity=False" in report
+    assert "FINDING row1_target_block_oob" in report
+
+
 def test_report_displays_content_probe_status() -> None:
     lines = _lines()
     lines.extend(
