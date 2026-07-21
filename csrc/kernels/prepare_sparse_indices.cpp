@@ -296,6 +296,10 @@ private:
         // never numerically converted to float.
         Cast(clampedInput, prefixRanks, RoundMode::CAST_ROUND, rowWidth_);
         PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+        const int32_t selectedCount =
+            clampedInput.GetValue(rowWidth_ - 1);
         Adds(clampedInput, clampedInput, base - 1, rowWidth_);
         PipeBarrier<PIPE_V>();
         Select(
@@ -318,10 +322,10 @@ private:
         if (updateRowTable_) {
             const uint64_t rowTableOffset =
                 static_cast<uint64_t>(sourceRow) * blockTableWidth_;
-            const uint32_t selectedCount = static_cast<uint32_t>(carry);
-            const uint32_t usedBlocks =
-                (selectedCount + blockSize_ - 1) / blockSize_;
-            for (uint32_t block = 0; block < usedBlocks; ++block) {
+            const int32_t usedBlocks =
+                (selectedCount + static_cast<int32_t>(blockSize_) - 1) /
+                static_cast<int32_t>(blockSize_);
+            for (int32_t block = 0; block < usedBlocks; ++block) {
                 rowBlockTableGm_.SetValue(
                     rowTableOffset + block,
                     static_cast<int32_t>(scratchBlockIdsGm_.GetValue(
