@@ -233,7 +233,7 @@ def test_report_displays_content_probe_status() -> None:
     assert (
         "CONTENT frontier=256 group=0 store_cpu=yes retrieve_cpu=yes "
         "store_ranges=[(0, 256)] retrieve_ranges=[(0, 256)] "
-        "store_retrieve_match=True"
+        "store_retrieve_match=True matched=1 overlap=[(0, 256)]"
         in report
     )
 

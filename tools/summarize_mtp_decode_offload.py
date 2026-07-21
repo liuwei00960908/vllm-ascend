@@ -578,6 +578,7 @@ def _format_report(summary: dict[str, Any]) -> str:
             source_detail = (
                 f"matched={len(overlapping)}"
                 + (f" mismatch={mismatches[:2]}" if mismatches else "")
+                + (f" overlap={overlapping[:2]}" if not mismatches else "")
             )
         else:
             source_match = None

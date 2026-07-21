@@ -96,7 +96,6 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mtp_dw_diag import (
-    first_post_commit_requests,
     post_commit_sample_requests,
 )
 from vllm_ascend.attention.utils import (
@@ -1606,17 +1605,16 @@ class NPUModelRunner(GPUModelRunner):
                             self._mtp_dw_diag_committed_frontiers = (
                                 previous_frontiers
                             )
-                        if envs_ascend.VLLM_ASCEND_MTP_DW_DEEP_DIAG:
-                            diag_deep_req_ids = first_post_commit_requests(
-                                previous_frontiers,
-                                decode_req_ids,
-                                decode_committed_frontiers,
-                            )
                         diag_post_commit_req_ids = post_commit_sample_requests(
                             previous_frontiers,
                             decode_req_ids,
                             decode_committed_frontiers,
                         )
+                        if envs_ascend.VLLM_ASCEND_MTP_DW_DEEP_DIAG:
+                            # Sample every committed-window advance. The connector
+                            # keys content probes by frontier, so this preserves one
+                            # bounded probe per group and window.
+                            diag_deep_req_ids = diag_post_commit_req_ids
                         diag_req_ids.update(diag_post_commit_req_ids)
                         forward_context = get_forward_context()
                         forward_context.mtp_dw_diag_req_ids = diag_req_ids

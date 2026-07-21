@@ -6,7 +6,6 @@ import torch
 from vllm_ascend.attention.mtp_dw_diag import (
     diagnostic_int_checksum,
     diagnostic_values_to_list,
-    first_post_commit_requests,
     logical_to_physical_slots,
     post_commit_sample_requests,
     scratch_live_slot_aliases,
@@ -30,14 +29,6 @@ def test_post_commit_sampling_forces_first_nonzero_and_changes() -> None:
     ) == {"req"}
     assert post_commit_sample_requests(previous, ["req"], [256]) == set()
     assert post_commit_sample_requests(previous, ["req"], [512]) == {"req"}
-
-
-def test_deep_sampling_only_uses_first_post_commit_transition() -> None:
-    previous = {"old": 256, "new": 0}
-
-    assert first_post_commit_requests(
-        previous, ["old", "new", "zero"], [512, 256, 0]
-    ) == {"new"}
 
 
 def test_diagnostic_int_checksum_is_stable_ordered_and_bounded() -> None:

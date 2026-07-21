@@ -134,20 +134,6 @@ def scratch_target_safety(
     }
 
 
-def first_post_commit_requests(
-    previous_frontiers: dict[str, int],
-    request_ids: Iterable[str],
-    committed_frontiers: Iterable[int],
-) -> set[str]:
-    """Return requests making their first transition to a committed prefix."""
-    return {
-        str(req_id)
-        for req_id, committed in zip(request_ids, committed_frontiers)
-        if int(committed) > 0
-        and previous_frontiers.get(str(req_id), 0) <= 0
-    }
-
-
 def post_commit_sample_requests(
     previous_frontiers: dict[str, int],
     request_ids: Iterable[str],
