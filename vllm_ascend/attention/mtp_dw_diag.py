@@ -81,6 +81,7 @@ def scratch_target_safety(
     committed_end: int,
     current_position: int,
     block_size: int,
+    num_blocks: int | None = None,
 ) -> dict[str, Any]:
     """Describe whether an active scratch range is safe to overwrite.
 
@@ -88,6 +89,12 @@ def scratch_target_safety(
     table. This diagnostic is intentionally read-only: it reports the logical
     range, block-table coverage, and physical overlap without changing remap
     or transfer behavior.
+
+    When *num_blocks* is provided (the request's actual allocated block count),
+    the function also reports how many scratch target blocks fall outside the
+    allocated range. Block-table entries beyond num_blocks may be stale
+    residual values from a previous request and must not be treated as valid
+    scratch destinations.
     """
     if scratch_start < 0 or scratch_count < 0:
         raise ValueError("scratch range must be non-negative")
@@ -116,12 +123,29 @@ def scratch_target_safety(
         blocks, range(live_start, live_end), block_size
     )
 
+    if num_blocks is not None:
+        allocated_logical_end = num_blocks * block_size
+        target_blocks_out_of_range = sum(
+            1
+            for idx in range(target_block_start, target_block_end)
+            if idx >= num_blocks
+        )
+        target_tokens_out_of_range = max(
+            0, target_end - min(target_end, allocated_logical_end)
+        )
+    else:
+        target_blocks_out_of_range = None
+        target_tokens_out_of_range = None
+
     return {
         "target_logical_start": scratch_start,
         "target_logical_end": target_end,
         "target_block_start": target_block_start,
         "target_block_end": target_block_end,
         "target_block_values": target_block_values,
+        "num_blocks": num_blocks,
+        "target_blocks_out_of_range": target_blocks_out_of_range,
+        "target_tokens_out_of_range": target_tokens_out_of_range,
         "valid_logical_end": valid_logical_end,
         "target_within_committed": target_end <= committed_end,
         "target_beyond_current_sequence": target_end > current_position + 1,
