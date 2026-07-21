@@ -79,10 +79,12 @@ removing an eligibility guard is never support.
 R1 can be released as a bounded production feature. R2-R5 expand coverage; they
 must not weaken the R1 safety contract.
 
-## Current implementation checkpoint: first cross-layer milestone
+## Current implementation checkpoint: cross-layer exact-Q1 milestone
 
-The worktree now contains the narrow single-request implementation that must be
-qualified before broader production work continues:
+The branch now contains the cross-layer implementation plus exact-size Q1
+batching. Singleton execution has passed its first Ascend functional and
+performance trial; exact batched replay is implemented but is not yet qualified
+on NPU:
 
 - `vllm::sfa_lmcache_retrieve` is the only staged-SFA FX split;
 - Graph A and Graph B reuse the already-validated SFA math but are captured by
@@ -98,28 +100,62 @@ qualified before broader production work continues:
   production;
 - decode saves are submitted at the model boundary because per-layer Python
   save callbacks cannot remain inside the cross-layer islands;
-- capture is intentionally restricted to exact unpadded Q=1 with one request;
-  unsupported steps run the existing native SFA path with graph replay disabled;
-- startup rejects missing SFA layers, producer events, or stable save state.
+- capture is restricted to configured exact unpadded Q=1 request counts. A
+  fixed-capacity contiguous bridge uses the largest configured capture size;
+  smaller exact keys populate that bridge and slice back to their authorized
+  rows. This is an internal stable-layout ABI, not general padded-Q1 support;
+- LMCache row routing preserves the exact batched request order, and startup
+  verifies every configured key on every local SFA layer;
+- parity verification is once per graph key rather than once per replay;
+- a scheduler step containing both prefill and decode currently disables outer
+  replay for the whole step and uses native SFA. Only its decode request rows
+  may require sparse frontiers; the trial-exposed filtering fix is implemented
+  in the worktree and awaits an NPU rerun;
+- other unsupported steps run the existing native SFA path with outer replay
+  disabled before model forward;
+- startup rejects missing SFA layers, producer events, stable save state, or an
+  invalid bridge layout.
 
-This is not yet a release boundary. It has static checks and focused tests, but
-still requires NPU startup, deterministic-output, LMCache-hit, trace-ordering,
-and no-profiler TPOT proof against the two-wrapper commit. The nested-wrapper
-implementation and its parity/canary state have been removed from this branch;
-the earlier commit is the external comparison and rollback point.
+This is not yet a release boundary. The singleton TP2 trial established correct
+startup, deterministic/acceptable output, decode save, dense-prefix-hit TTFT
+reduction, once-per-key parity, repeat-run stability, and no-profiler TPOT of
+about 120 ms average (108 ms observed peak) versus about 170 ms for the earlier
+two-wrapper path and 326 ms without staged graph capture. Exact batch-2 replay,
+the precise `N + 1` cross-layer trace, failure behavior, resource bounds, and
+the production ownership plan remain open. The nested-wrapper implementation
+has been removed from this branch; its earlier commit remains the comparison
+and rollback point.
+
+### Trial-closed issues and newly exposed work
+
+`DONE` below means the stated trial issue is closed; it does not imply that the
+whole R1 production gate is complete.
+
+| Trial item | Status | Evidence or remaining gate |
+| --- | --- | --- |
+| Singleton startup, output, and repeated decode | **DONE** | TP2 startup and repeated requests complete without runtime errors; output is deterministic/acceptable |
+| Singleton throughput checkpoint | **DONE** | No-profiler TPOT is about 120 ms average, with 108 ms observed peak, versus about 170 ms for the two-wrapper implementation and 326 ms without staged graph capture |
+| Dense prefix hit and decode offload/save | **DONE** | Repeated prompt obtains reduced TTFT; decode save/offload operates as expected |
+| Parity verification frequency | **DONE** | Verification runs once per graph key and preserves existing output behavior |
+| TP worker profiler control and offline trace parsing | **DONE** | Smoke tooling requires `ignore_frontend=true`, accepts the expected TP rank count, and parses Ascend traces outside daemon workers |
+| Fake/native custom-op bridge layout mismatch during large startup profile | **DONE** | The bridge now has one contiguous fixed-capacity ABI based on the largest configured exact key; startup succeeds after the fix |
+| Exact batched LMCache row routing and per-key startup completeness | **DONE in code/unit/startup** | Exact request order is covered by focused tests and every configured key is checked for every local SFA layer |
+| Mixed prefill/decode native sparse-frontier lookup | **IMPLEMENTED; NPU RERUN PENDING** | The worktree queries frontiers only for request indices referenced by decode rows; rerun the concurrent smoke before closing |
+| Exact batch-2 runtime replay | **OPEN** | Two synchronized HTTP calls do not prove that the scheduler co-scheduled a pure-decode size-2 step or replayed key 2 |
+| Cross-layer island and event topology | **OPEN** | Capture an NPU trace proving the precise `N + 1` island plan, middle-island fusion, one eager retrieve per layer, and no nested wrappers |
 
 ### Current support and rejection matrix
 
 | Mode | Current behavior | Production requirement |
 | --- | --- | --- |
-| Exact unpadded Q=1 | Cross-layer capture for one request; not NPU-qualified | Finish the first numerical/TPOT checkpoint, then P0 safety work |
-| Long generation | Intended to reuse the single shape key with live metadata tensors | Prove every block/window/maximum-length boundary |
+| Exact unpadded Q=1 | Cross-layer capture for configured exact request counts; singleton TP2 is trial-qualified, batched replay is not | Prove actual replay and parity for every enabled key, then finish the P0 safety work |
+| Long generation | Singleton repeated decode is stable with live metadata tensors | Prove every block/window/maximum-length boundary and every enabled exact key |
 | Unconfigured or padded Q=1 | Runner disables replay before model forward; native SFA executes | Add planned padded buckets in R2 |
 | MTP/speculative target | Startup/runtime rejection | Fixed candidate-width keys, row masks, disjoint scratch in R3 |
-| Mixed prefill/decode | Rejected | Decode-row compaction plus native prefill design in R5 |
+| Mixed prefill/decode | Whole scheduler step uses safe-native SFA; decode-only frontier filtering is implemented and awaits NPU rerun | R1 must qualify this native route; optional native-prefill/staged-decode row partition belongs to R5 |
 | Compact-scratch LMCache native path | Available for many rows | Classify precisely when it is safe; never assume it is always a fallback |
 | Legacy manager/free-paged/adapter | Rejected by staged path | Stay eager until their existing connector lifecycle and event behavior are independently qualified |
-| TP | Local startup completeness checks only in the new path | Restore rank-consistent startup/admission verdicts and TP1/2/8 gates |
+| TP | TP2 singleton startup/performance works and startup checks every local layer/key; collective failure admission is not complete | Restore rank-consistent startup/admission verdicts and TP1/2/8 gates |
 | DP | Staged configuration rejected | Common structural bucket, rank-local masks, empty-rank handling in R4 |
 | PP/multiple virtual engines | No capture namespace/lifecycle contract | Isolate cache epochs and in-flight slots or reject in R1-R3 |
 | LoRA, CP/o-proj TP, C8, MLAPO, prefetch | Rejected in layer eligibility | Centralize the rejection before capture and enable individually in R5 |
@@ -135,23 +171,25 @@ correctness need.
 
 | ID | Current evidence | Risk | Required outcome |
 | --- | --- | --- | --- |
-| P0.0 cross-layer compiler contract | The worktree decomposes staged SFA into pre/retrieve/post custom ops, registers only retrieve as the staged split, and a mock FX test proves the intended middle partition | Source structure can still differ from the ACL graphs produced by the Ascend runtime | Prove on NPU that an island contains `Graph B(i) -> layer tail(i) -> Graph A(i+1)`, with no nested SFA wrappers and lower TPOT than the two-wrapper baseline |
-| P0.1 atomic dispatch | The runner authorizes one exact-Q1 key and disables replay before model forward for every other step; captured layer bodies do not make live fallback decisions | Admission is not yet one immutable all-layer/TP plan, so dynamic metadata or rank drift after runner admission is not collectively rejected | One immutable all-layer plan, final TP admission, and TP phase verdicts around rank-local connector gaps; no layer-local fallback |
-| P0.2 fallback safety | Unsupported steps now enter native execution with outer replay disabled before model forward; the native compact-scratch constraints, including `prompt_len < index_topk`, are still not represented by a typed route decision | A path labelled native can lack all latent data required by its selected compact-scratch mode | Classify `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`; admission must prove the selected route has all required latent data |
-| P0.3 pre-mutation validation | Startup checks that every local SFA layer created an event and stable save binding, but live cache/frontier/pointer identity is not validated as one plan before bootstrap | Pointer drift or connector failure can be detected only after the first index wait or captured write | Validate the complete island/split plan, frontiers, buffers, and rank agreement before the first wait/write |
+| P0.0 cross-layer compiler contract | Pre/retrieve/post decomposition and mock FX partitioning pass; singleton TP2 serving shows a large TPOT gain over both baselines | Throughput proves the route is useful but not the exact device partition; the precise middle-island topology has not been signed from an NPU trace | Prove an NPU island contains `Graph B(i) -> layer tail(i) -> Graph A(i+1)`, with nominal `N + 1` islands, one eager retrieve per layer, and no nested wrappers |
+| P0.1 atomic dispatch | The runner authorizes configured exact-Q1 keys, disables replay before model forward for unsupported steps, and startup verifies every configured key/layer | Admission is not yet one immutable all-layer/TP plan, so dynamic metadata or rank drift after runner admission is not collectively rejected | One immutable all-layer plan, final TP admission, and TP phase verdicts around rank-local connector gaps; no layer-local fallback |
+| P0.2 fallback safety | Unsupported and mixed-phase steps enter native execution with outer replay disabled. A concurrent trial exposed that frontier validation incorrectly included a prefill-only request; the decode-row-only fix is implemented but not NPU-qualified | Another path labelled native may still lack required latent data or apply decode-only validation to unrelated rows | First close the mixed-phase NPU rerun, then classify every route as `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL` and prove the selected route has all required latent data |
+| P0.3 pre-mutation validation | Startup verifies every configured key on every local SFA layer, including producer event, stable save binding, and fixed-capacity bridge layout | Live cache/frontier/pointer identity is still not validated as one rank-consistent plan before bootstrap | Validate the complete island/split plan, frontiers, buffers, and rank agreement before the first wait/write |
 | P0.4 store-before-free | Decode-window release already waits for `completed_decode_window_saves`, but required latent/index groups and TP-owner aggregation are not yet fault-qualified | The only resident copy could be freed after an incomplete or rank-asymmetric save | Prove the existing completion path covers every required group/owner and frees only acknowledged aligned bundles; strengthen its implementation only where a failing test demonstrates a gap |
 | P0.5 retrieval readiness | Strict misses and incomplete transfer masks can surface only when a layer generator resumes; exact top-k rows do not exist until Graph A | A post-selection load can fail after index/cache side effects | Fault-test the current `start_load_kv`/`wait_for_layer_load` path before mutation and after Graph A; use coordinated recovery for post-mutation failure, and extend the connector contract only if the existing lifecycle cannot express a correct result |
 | P0.6 connector lifecycle failures | The production connector lifecycle and implicit `current_layer` cursor work on the qualified success path; exception, retry, cancellation, preemption, and rank-asymmetric behavior are not yet fully exercised | An unhandled failure could double-advance or strand connector state | Prove exactly-once callback progress and cleanup through the existing connector contract; prefer local guards/finalization, and require a reproduced correctness failure before proposing any shared API change |
 | P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | The event chain is not NPU-trace-qualified, while retaining generic fences can cap TPOT and jitter | Prove producer/load/following-island ordering, then remove only synchronization demonstrated redundant by the closed event chain |
 | P0.8 stable ownership | Outer PIECEWISE wrappers own the cross-layer graph storage, and startup retains per-layer cache/event bindings, but the namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Island registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
 | P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
-| P0.10 qualification evidence | Static schemas, retrieve-only FX partitioning, focused smoke parsing, and startup completeness checks pass; no Ascend result exists yet for the new path | Source/static evidence cannot prove device capture, numerical correctness, or the TPOT improvement | Automate NPU numerical, partition, trace, lifecycle, and failure matrices; assert the compiled island plan and zero nested staged wrappers |
+| P0.10 qualification evidence | Singleton TP2 startup, deterministic output, prefix hit, decode save, repeat stability, and TPOT improvement pass. Focused batch routing/startup tests pass, but client concurrency has not proven a pure-decode key-2 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide size-1 replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
 | P1.1 padded rows | Only remap boundary is persistent; builder allocates per-step CPU/NumPy/device metadata | Exact keys cause graph explosion/fallbacks and cannot safely pad | Stable fixed-capacity row arena, safe pad block/slots, masks through both logical SFA phases and connector filtering |
 | P1.2 rich ACL dispatch | `StagedSFAGraphKey` collapses to legacy `BatchDescriptor(num_tokens)` | Padded Q1 and `SPEC_FIXED` entries can collide at equal token counts | Carry the full structural key through `ACLGraphWrapper` dispatch |
 | P1.3 MTP scratch | Native metadata has row-specific groundwork; staged eligibility rejects it | Candidate rows can alias scratch or lose request-row order | Fixed-width profile, unique-request frontier expansion, disjoint scratch/targets, valid-row mask |
 | P1.4 scheduler ownership | Input rows can be condensed/swapped after scheduler output is formed; scratch is configured through scattered environment reads | Request IDs, block rows, selected rows, and targets can describe different generations | Build plan after row condensation; use generation/step identity and typed KV scratch configuration |
-| P1.5 DP/PP/concurrency | DP/ubatch are rejected and active-key aliases are mutable without locking | Rank deadlock, cross-request state reuse, stale virtual-engine cache addresses | DP-wide bucket agreement, per-VE/cache namespace, and either isolated in-flight slots or enforced no overlap |
+| P1.5 DP/PP/concurrency | Exact co-scheduled Q1 request batching is implemented for configured sizes; DP/ubatch are rejected and active-key aliases are mutable without locking | Exact batching does not establish DP agreement, overlapping invocation safety, or virtual-engine isolation | Qualify exact batching first; then add DP-wide bucket agreement, per-VE/cache namespace, and either isolated in-flight slots or enforced no overlap |
 | P1.6 compatibility | Layer eligibility, startup config, memory budgeting, and connector checks encode different support subsets | Service can reserve/capture before discovering an unsupported operator combination | One capability fingerprint and reason enum used by every stage |
+| P1.7 mixed-phase hybrid replay | A step containing prefill and decode deliberately runs wholly native; the trial confirmed that ordinary client concurrency naturally produces this scheduler phase | Throughput can fall during arrivals even though already-decoding rows match a captured key | Optional R5 feature: compact/partition decode rows, run prefill through native MLA, replay a qualified staged decode key, and recombine outputs without changing LMCache's public connector API |
+| P1.8 runtime key observability | Startup logs/counters establish captured keys, but the smoke client cannot prove which key a live scheduler step admitted and replayed | Qualification and operations can confuse a captured key with a used key or a safe-native mixed step | Expose low-cardinality per-key admission/replay/fallback counters and include them in smoke assertions |
 | P2.2 vLLM-owned remap frontier | The current path obtains the committed frontier from bound LMCache metadata through `_get_connector_metadata` | This is connector-specific coupling and may complicate upstream review, but no runtime defect has been demonstrated for the pinned version pair | Optional cleanup: retain the remap boundary but derive it from the latent range vLLM actually released. Do not add a connector API solely for encapsulation or refactor resistance |
 
 ## Target ownership model
@@ -644,7 +682,9 @@ Remain explicit native/reject until separately designed:
 - sparse-C8 indexer and other quantization layouts;
 - MLAPO and weight prefetch;
 - free-paged manager, legacy `dsa_offload_manager`, and adapter cache;
-- mixed prefill/decode and prefix-caching combinations;
+- mixed prefill/decode scheduler steps. A dense prefix load followed by an
+  admitted exact-Q1 decode is already part of the singleton checkpoint; other
+  prefix-cache phase/layout combinations remain unqualified;
 - unsupported target/draft combinations.
 
 Use four operational policies rather than one ambiguous boolean:
@@ -755,30 +795,56 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
 
 ## Delivery route and dependencies
 
+### Immediate execution order after the current trial
+
+1. Rerun the concurrent smoke with the decode-row-only frontier fix. Close the
+   mixed-phase native-route issue only if both the prefill and decode requests
+   complete, the decode row still uses the native sparse path correctly, and no
+   prefill-only frontier is requested.
+2. Add per-key runtime admission/replay/fallback evidence, then drive a
+   phase-aligned pure-decode size-2 step. Prove output parity, LMCache row
+   identity, key-2 replay, and the `1 -> 2 -> 1` transition. Client-side request
+   synchronization alone is not sufficient evidence.
+3. Capture the cross-layer NPU profile for one qualified key and sign the
+   `N + 1` island, middle-island fusion, eager retrieve, and event-ordering
+   assertions.
+4. Continue W1 tightening and fault qualification before adding padded Q1,
+   MTP, DP, or hybrid mixed-phase replay. Do not change the shared LMCache-vLLM
+   API unless a reproduced correctness failure cannot be repaired within the
+   existing lifecycle.
+
 ### W0: prove the cross-layer partition and capture contract
 
-- Add a narrowly gated staged decomposition in `ops/mla.py`: graph-safe pre,
+Status: **implementation and singleton functional/performance checkpoint
+complete; trace exit still open**.
+
+- **Done:** add a narrowly gated staged decomposition in `ops/mla.py`: graph-safe pre,
   eager retrieve, and graph-safe post. Make selected rows, destinations,
   affected caches, and a dependency token explicit operands.
-- Add an Ascend-owned per-layer binding for model-owned KV tensors and stable
+- **Implemented, ownership hardening remains:** add an Ascend-owned per-layer
+  binding for model-owned KV tensors and stable
   plan/arena metadata; do not change the model-facing MLA or shared connector
   API. Assert binding identity before capture and replay.
-- Register only the retrieve op as a staged-SFA splitting op. Stop using
+- **Done:** register only the retrieve op as a staged-SFA splitting op. Stop using
   `vllm::mla_forward` as the boundary only for this qualified route; preserve
   the existing path for all other MLA modes.
-- In the enabled process, preserve prefill and pre-admitted native execution
+- **Implemented; mixed-phase NPU rerun pending:** in the enabled process,
+  preserve prefill and pre-admitted native execution
   under runtime mode `NONE` by calling the existing MLA implementation exactly
   once; add regression tests that retrieve/post do not duplicate its effects.
-- Reuse the current exact-Q1 Graph-A/Graph-B bodies without nested
+- **Done:** reuse the current exact-Q1 Graph-A/Graph-B bodies without nested
   `ACLGraphWrapper` instances in the new route.
-- Add a CPU/mock FX partition test proving that two adjacent layers produce
+- **Done:** add a CPU/mock FX partition test proving that two adjacent layers produce
   `pre(0) | retrieve(0) | post(0)+tail(0)+pre(1) | retrieve(1) | post(1)` and
   that retrieval remains eager and mutation-ordered.
-- On NPU, start with the current eight-layer test model and one exact-Q1 key.
-  Assert nominal `local_sfa_layers + 1` outer graph islands, zero nested staged
+- **Functional/performance trial done; trace open:** on NPU, the current
+  eight-layer test model and singleton exact-Q1 key have
+  passed startup, output, LMCache, and TPOT trials. The remaining W0 proof is to
+  assert nominal `local_sfa_layers + 1` outer graph islands, zero nested staged
   entries, one retrieve call per layer, stable addresses, and a middle island
   containing `Graph B(i)`, the layer tail, and `Graph A(i+1)`.
-- Invoke `latent-load(i)` and `index-load(i+1)` through the existing connector
+- **Implemented; trace/fault proof open:** invoke `latent-load(i)` and
+  `index-load(i+1)` through the existing connector
   callbacks in one split and prove exact cursor progression. Do not change the
   connector API for this spike.
 
@@ -790,6 +856,10 @@ remain unchanged. If any exit condition fails, stop and document the concrete
 compiler/operator/connector constraint before doing production ownership work.
 
 ### W1: freeze support behavior and qualify the existing connector lifecycle
+
+Status: **next active production-tightening package**. The mixed-phase native
+frontier repair is its immediate qualification item; hybrid mixed-phase replay
+is an R5 feature and is not part of W1.
 
 - Convert the compatibility table into typed capability/reason data shared by
   startup, resource planning, runner, and layer assertions.
@@ -809,9 +879,12 @@ compiler/operator/connector constraint before doing production ownership work.
   with automated NPU trace assertions.
 - Move scratch/window capacity into typed vLLM-owned configuration where
   practical and record the pinned connector/software/configuration fingerprint.
-- Repair profiler smoke (`ignore_frontend=true`, configurable TP rank count),
-  update graph-count assertions to the compiled island plan, and add the
-  metrics/log qualification schema.
+- Keep the completed profiler-smoke contract (`ignore_frontend=true`,
+  configurable TP rank count, offline analysis); update graph-count assertions
+  to the compiled island plan and add the metrics/log qualification schema.
+- Add runtime evidence for the admitted structural key and the route actually
+  executed (`STAGED`, `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`), so batch smoke
+  tests cannot mistake captured keys for replayed keys.
 
 API-change gate: propose a shared connector extension only if a fault test
 demonstrates a correctness failure that cannot be fixed through the existing
@@ -865,6 +938,10 @@ early slot/resource release, or reuse of partial state. Depends on W1 and W2.
   the archived two-wrapper commit and the valid native LMCache route.
 - Automate partition/operator/event assertions and performance gates, including
   graph-island cardinality and zero nested staged wrappers.
+- For every configured exact size, prove a phase-aligned pure-decode replay,
+  request-row identity through LMCache, numerical parity, and key transitions
+  including `1 -> B -> 1`; include mixed arrival/decode steps as safe-native
+  fallback tests rather than counting them as staged batch coverage.
 - Run verify/canary soak, release parity-only storage, and validate kill switch.
 - Publish the qualified hardware/software/operator fingerprint.
 
@@ -943,7 +1020,11 @@ additional prefix-cache configurations. Each work item supplies:
 - resource formula for local PP layers, target/draft, every key and slot;
 - offline-bound overrun and two-pass teardown/recapture resource paths;
 - smoke log/count tests for one/multiple keys, TP1/2/8 trace counts, and the
-  worker-only (`ignore_frontend=true`) profiler requirement.
+  worker-only (`ignore_frontend=true`) profiler requirement;
+- exact-batch row routing and runtime key-selection counters for `1 -> B -> 1`;
+- a mixed scheduler step in which prefill-only request metadata has no sparse
+  frontier while every decode row does, proving native lookup touches only the
+  decode request indices.
 
 ### NPU correctness matrix
 
@@ -955,6 +1036,9 @@ logits, and deterministic generated tokens.
 Axes include:
 
 - every enabled capacity, every real padded size, and `1 -> B -> 1`;
+- phase-aligned pure-decode batching for every enabled exact key, with runtime
+  evidence that the intended key—not a singleton key or safe-native route—was
+  executed;
 - heterogeneous sequence/prompt lengths and request reorder/churn;
 - block boundaries 127/128/129;
 - decode-window boundaries 255/256/257;
@@ -976,6 +1060,8 @@ Axes include:
 - target executor cardinality equals the compiled island plan: nominally local
   SFA layers plus one per structural key when retrieval is the only split, with
   no nested Graph-A/Graph-B entries;
+- runtime admission/replay counters identify the exact structural key and do
+  not increment staged replay for a whole-step mixed-phase native route;
 - no nested two-wrapper executor is present in the production R1 branch or
   included in target resource/cardinality accounting;
 - no unbounded recapture after readiness;
@@ -995,6 +1081,8 @@ Axes include:
 - stream/event counts stay within the runtime quota;
 - long-generation and high-churn soak has zero parity, cursor, stale-pointer,
   or cross-request failures;
+- arrival/decode churn across exact batch sizes has zero unexpected fallback,
+  and every expected mixed-phase fallback has a typed reason;
 - throughput and TPOT improve for the workload/buckets that justify the feature;
 - TTFT/TPOT p50 and p99 have no unapproved regression from index waits, event
   hand-off, plan building, or first-use synchronization;

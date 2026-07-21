@@ -730,6 +730,34 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(boundary.tolist(), [900])
         lookup.assert_called_once_with(["req-0"])
 
+    def test_native_mixed_remap_looks_up_decode_requests_only(self):
+        metadata = self._make_decode_metadata(batch_size=2)
+        metadata.prompt_lens_cpu_rows = [100, 0]
+        metadata.decode_req_indices_cpu = [0, -1]
+        metadata.seq_lens_cpu = torch.tensor([110, 6400])
+
+        with (
+            patch.object(
+                sfa_v1,
+                "_decode_window_save_window_size",
+                return_value=0,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_lmcache_sparse_cached_tokens",
+                return_value=[90],
+            ) as lookup,
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                metadata,
+                ["decode-req", "prefill-req"],
+                is_dummy_run=False,
+                index_topk=4,
+            )
+
+        self.assertEqual(boundary.tolist(), [90, 0])
+        lookup.assert_called_once_with(["decode-req"])
+
     def test_remap_boundary_uses_unique_request_ids_for_mtp_rows(self):
         metadata = self._make_decode_metadata()
         metadata.prompt_lens_cpu_rows = [100, 100, 200, 200]

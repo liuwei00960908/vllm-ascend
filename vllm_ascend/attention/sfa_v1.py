@@ -171,28 +171,42 @@ def _prepare_sfa_remap_boundary(
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    if is_dummy_run:
-        cached_tokens = None
-    else:
-        if cached_tokens is None:
-            cached_tokens = tuple(get_lmcache_sparse_cached_tokens(request_ids))
-        if len(cached_tokens) != len(seq_lens):
-            raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}")
-    decode_window_size = _decode_window_save_window_size()
-    boundary_rows = prompt_rows_np.copy()
-    for row_index, request_index_value in enumerate(row_req_indices_np):
-        request_index = int(request_index_value)
-        if request_index < 0:
-            continue
+    decode_request_indices = sorted(
+        {int(request_index) for request_index in row_req_indices_np if int(request_index) >= 0}
+    )
+    for request_index in decode_request_indices:
         if request_index >= len(seq_lens):
             raise RuntimeError(
                 "[SFA staged graph POC] decode row references request "
                 f"{request_index}, but only {len(seq_lens)} sequence lengths "
                 "are available."
             )
-        cached_for_request = None
-        if cached_tokens is not None:
-            cached_for_request = int(cached_tokens[request_index])
+
+    cached_tokens_by_request: dict[int, int] = {}
+    if not is_dummy_run:
+        if cached_tokens is None:
+            if decode_request_indices:
+                if request_ids is None:
+                    raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
+                request_ids = list(request_ids)
+                if decode_request_indices[-1] >= len(request_ids):
+                    raise RuntimeError("[SFA sparse remap] active request IDs do not cover all decode rows.")
+                decode_request_ids = [request_ids[index] for index in decode_request_indices]
+                resolved_tokens = get_lmcache_sparse_cached_tokens(decode_request_ids)
+                cached_tokens_by_request = dict(zip(decode_request_indices, resolved_tokens, strict=True))
+        else:
+            if len(cached_tokens) != len(seq_lens):
+                raise RuntimeError(
+                    f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}"
+                )
+            cached_tokens_by_request = dict(enumerate(cached_tokens))
+    decode_window_size = _decode_window_save_window_size()
+    boundary_rows = prompt_rows_np.copy()
+    for row_index, request_index_value in enumerate(row_req_indices_np):
+        request_index = int(request_index_value)
+        if request_index < 0:
+            continue
+        cached_for_request = cached_tokens_by_request.get(request_index)
         if decode_window_size > 0:
             current_position = max(seq_lens[request_index] - 1, 0)
             row_boundary = current_position // decode_window_size * decode_window_size
