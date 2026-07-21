@@ -110,6 +110,33 @@ class TestDSASparsePadding(TestBase):
 
 
 class TestLMCacheSparseFrontier(TestBase):
+    def test_invalid_or_duplicate_request_identity_fails_closed(self):
+        sparse = SimpleNamespace(
+            req_id="req-0",
+            is_sparse_decode=True,
+            load_spec=SimpleNamespace(
+                can_load=True,
+                lmcache_cached_tokens=128,
+            ),
+        )
+        metadata = SimpleNamespace(requests=[sparse])
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0", "req-0"],
+            ),
+            (StagedSFARouteReason.INVALID_REQUEST_IDS, ()),
+        )
+
+        metadata.requests.append(sparse)
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()),
+        )
+
     def test_missing_active_request_frontier_fails_closed(self):
         metadata = SimpleNamespace(
             requests=[

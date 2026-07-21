@@ -415,18 +415,26 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
             self.assertEqual(route.reason, StagedSFARouteReason.NOT_DECODE)
 
-    def test_fatal_route_reports_stable_action_and_reason(self):
+    def test_non_native_routes_report_stable_action_and_reason(self):
         runner = self._build_runner()
-        route = model_runner_module.StagedSFARouteDecision(
+        for action in (
+            StagedSFARouteAction.RECOMPUTE,
             StagedSFARouteAction.FATAL,
-            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"\[SFA_ROUTE\] action=fatal reason=sparse_load_unavailable",
         ):
-            runner._apply_staged_sfa_route(route)
+            route = model_runner_module.StagedSFARouteDecision(
+                action,
+                StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+            )
+
+            with (
+                self.subTest(action=action),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"\[SFA_ROUTE\] action={action.value} "
+                    r"reason=sparse_load_unavailable",
+                ),
+            ):
+                runner._apply_staged_sfa_route(route)
 
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()

@@ -866,9 +866,8 @@ compiler/operator/connector constraint before doing production ownership work.
 
 ### W1: freeze support behavior and qualify the existing connector lifecycle
 
-Status: **next active production-tightening package**. The mixed-phase native
-frontier repair is its immediate qualification item; hybrid mixed-phase replay
-is an R5 feature and is not part of W1.
+Status: **implementation complete; NPU fault/soak sign-off pending**. Hybrid
+mixed-phase replay is an R5 feature and is not part of W1.
 
 - Convert the compatibility table into typed capability/reason data shared by
   startup, resource planning, runner, and layer assertions.
@@ -881,16 +880,19 @@ is an R5 feature and is not part of W1.
 - Inject sparse source miss/partial transfer, timeout, exception, cancel,
   preemption, retry, and rank-asymmetric failure around bootstrap, each
   combined retrieve split, and each following island.
-- Prove exactly-once use and cleanup of the existing layerwise cursor/generators;
-  add local runner/finalizer guards or connector-internal fixes only for
-  reproduced defects.
-- Prove producer, load-stream completion, and following-island consumer ordering
-  with automated NPU trace assertions.
+- **Done:** make partial batched load setup and cancellation close every published
+  layerwise generator, release sparse request state/pins, and leave the next step
+  reusable. The success path adds no device synchronization or tensor transfer.
+- **Done:** publish decode-window completion only after the final store fence;
+  atomically discard group/finalizer failures while preserving the retry frontier.
+- **Done:** fault-test deferred consumer joins for submission, event-record, and
+  event-wait failure. Detailed timeline assertions remain in W8 as agreed after
+  the functional and throughput qualification.
 - Move scratch/window capacity into typed vLLM-owned configuration where
   practical and record the pinned connector/software/configuration fingerprint.
 - Keep the completed profiler-smoke contract (`ignore_frontend=true`,
-  configurable TP rank count, offline analysis); update graph-count assertions
-  to the compiled island plan and add the metrics/log qualification schema.
+  configurable TP rank count, offline analysis). Compiled-island timeline and
+  graph-count analysis is part of W8 rather than a W1 implementation gate.
 - Add runtime evidence for the admitted structural key and the route actually
   executed (`STAGED`, `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL`), so batch smoke
   tests cannot mistake captured keys for replayed keys.
@@ -900,9 +902,12 @@ demonstrates a correctness failure that cannot be fixed through the existing
 lifecycle. Removing `_get_connector_metadata` and deriving the remap frontier
 from vLLM-owned released-range state is optional P2.2 cleanup, not W1 exit work.
 
-Exit: every rejection has a tested action; mocked and NPU fault injection prove
-store-before-free, island event ordering, and exactly-once existing-callback
-behavior for success, timeout, exception, cancel, preempt, and retry.
+Implementation exit: every rejection has a tested action; mocked faults prove
+store-before-free and exactly-once cleanup for setup, group finalization, final
+store fencing, event submission/record/wait, cancellation, and retry. Release
+sign-off still runs these paths under TP2/TP8, including a rank-asymmetric fault
+and a normal request immediately afterward; do not add an always-on TP
+consensus unless that run reproduces rank divergence.
 
 ### W2: island registry, prebound arena, invalidation, and resource budget
 
