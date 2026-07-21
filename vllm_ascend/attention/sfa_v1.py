@@ -2090,6 +2090,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                             .cpu()
                             .tolist()
                         )
+                        _diag_seq_len = (
+                            int(attn_metadata.seq_lens[int(req_index)])
+                            if req_index < int(attn_metadata.seq_lens.shape[0])
+                            else current_position + 1
+                        )
+                        _diag_num_blocks = (
+                            _diag_seq_len + block_size - 1
+                        ) // block_size
                         scratch_safety = scratch_target_safety(
                             block_table_row,
                             effective_scratch_base,
@@ -2097,6 +2105,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             boundary,
                             current_position,
                             block_size,
+                            num_blocks=_diag_num_blocks,
                         )
                         actual_target_slots = (
                             [int(value) for value in _diag_target_slots[compact_row]]
@@ -2215,6 +2224,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 for value in scratch_safety["target_block_values"]
                                 if value is not None
                             ),
+                            num_blocks=scratch_safety["num_blocks"],
+                            target_blocks_out_of_range=scratch_safety[
+                                "target_blocks_out_of_range"
+                            ],
+                            target_tokens_out_of_range=scratch_safety[
+                                "target_tokens_out_of_range"
+                            ],
                             valid_logical_end=scratch_safety["valid_logical_end"],
                             target_within_committed=scratch_safety[
                                 "target_within_committed"
@@ -2283,6 +2299,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 **deep_common,
                                 intersection_count=len(aliases),
                                 intersection_sample=aliases[:8],
+                            )
+                        _oor = scratch_safety.get("target_blocks_out_of_range")
+                        if isinstance(_oor, int) and _oor > 0:
+                            _mtp_dw_event(
+                                "fail",
+                                invariant="scratch_target_out_of_range",
+                                **deep_common,
+                                num_blocks=scratch_safety["num_blocks"],
+                                target_blocks_out_of_range=_oor,
+                                target_tokens_out_of_range=scratch_safety[
+                                    "target_tokens_out_of_range"
+                                ],
+                                target_block_values=scratch_safety[
+                                    "target_block_values"
+                                ][:8],
                             )
                     if req_id is not None and scratch_base is not None:
                         bases = seen_scratch.setdefault(req_id, set())

@@ -130,3 +130,54 @@ def test_scratch_target_safety_reports_unmapped_tail() -> None:
     assert safety["target_block_values"] == [-1]
     assert safety["target_unmapped_count"] == 2
     assert safety["target_live_intersection"] == []
+
+
+def test_scratch_target_safety_detects_out_of_range_blocks() -> None:
+    """Stale residual block-table entries past num_blocks must be flagged."""
+    safety = scratch_target_safety(
+        [10, 20, 30, 40],
+        scratch_start=8,
+        scratch_count=4,
+        committed_end=4,
+        current_position=9,
+        block_size=4,
+        num_blocks=2,
+    )
+
+    assert safety["num_blocks"] == 2
+    assert safety["target_block_start"] == 2
+    assert safety["target_block_end"] == 3
+    assert safety["target_blocks_out_of_range"] == 2
+    assert safety["target_tokens_out_of_range"] == 4
+
+
+def test_scratch_target_safety_all_blocks_in_range() -> None:
+    """When all scratch targets fall within allocated blocks, oor is 0."""
+    safety = scratch_target_safety(
+        [10, 20, 30, 40],
+        scratch_start=0,
+        scratch_count=8,
+        committed_end=8,
+        current_position=9,
+        block_size=4,
+        num_blocks=4,
+    )
+
+    assert safety["target_blocks_out_of_range"] == 0
+    assert safety["target_tokens_out_of_range"] == 0
+
+
+def test_scratch_target_safety_num_blocks_none_disables_oor() -> None:
+    """Without num_blocks the oor fields should be None."""
+    safety = scratch_target_safety(
+        [10, 20],
+        scratch_start=0,
+        scratch_count=4,
+        committed_end=4,
+        current_position=5,
+        block_size=4,
+    )
+
+    assert safety["num_blocks"] is None
+    assert safety["target_blocks_out_of_range"] is None
+    assert safety["target_tokens_out_of_range"] is None

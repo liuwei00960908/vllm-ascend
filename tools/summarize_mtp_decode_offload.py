@@ -622,6 +622,9 @@ def _format_report(summary: dict[str, Any]) -> str:
             findings.append(f"row{row}_target_unmapped")
         if isinstance(live_aliases, int) and live_aliases > 0:
             findings.append(f"row{row}_target_live_alias")
+        oor = event.get("target_blocks_out_of_range")
+        if isinstance(oor, int) and oor > 0:
+            findings.append(f"row{row}_blocks_out_of_range")
 
     for event in unique_safety_events[:8]:
         row = event.get("row")
@@ -632,11 +635,14 @@ def _format_report(summary: dict[str, Any]) -> str:
         beyond = event.get("target_beyond_current_sequence")
         live_aliases = event.get("actual_target_live_intersection_count")
         unmapped = event.get("target_unmapped_count")
+        num_blocks = event.get("num_blocks")
+        blocks_oor = event.get("target_blocks_out_of_range")
         lines.append(
             f"SCRATCH frontier={event.get('frontier')} row={row} "
             f"dest=[{start},{end}) boundary={boundary} "
             f"within_committed={within} beyond_sequence={beyond} "
-            f"unmapped={unmapped} live_aliases={live_aliases}"
+            f"unmapped={unmapped} live_aliases={live_aliases} "
+            f"num_blocks={num_blocks} blocks_oor={blocks_oor}"
         )
     if not unique_safety_events:
         findings.append("scratch_target_safety_missing")

@@ -189,7 +189,42 @@ def test_report_identifies_noncommitted_mtp_scratch_target() -> None:
     assert "WINDOW [0,256) store_groups=0,1 committed=yes" in report
     assert report.count("SCRATCH frontier=261 row=0") == 1
     assert "SCRATCH frontier=262 row=1 dest=[2048,2304) boundary=256" in report
+    assert "num_blocks=" in report
+    assert "blocks_oor=" in report
     assert "FINDING row1_target_live_alias" in report
+
+
+def test_report_flags_blocks_out_of_range() -> None:
+    """Stale block-table entries past num_blocks must appear in FINDING."""
+    lines = _lines()
+    lines.append(
+        MARKER
+        + json.dumps(
+            {
+                "schema": 1,
+                "req": "chatcmpl-1-internal",
+                "stage": "deep",
+                "event": "scratch_target_safety",
+                "frontier": 262,
+                "committed_end": 256,
+                "row": 1,
+                "target_logical_start": 2048,
+                "target_logical_end": 2304,
+                "boundary": 256,
+                "target_within_committed": False,
+                "target_beyond_current_sequence": True,
+                "target_unmapped_count": 0,
+                "actual_target_live_intersection_count": 0,
+                "num_blocks": 2,
+                "target_blocks_out_of_range": 2,
+                "target_tokens_out_of_range": 256,
+            }
+        )
+    )
+
+    report = _format_report(summarize_events(parse_lines(lines)))
+    assert "num_blocks=2 blocks_oor=2" in report
+    assert "FINDING row1_blocks_out_of_range" in report
 
 
 def test_report_displays_content_probe_status() -> None:
