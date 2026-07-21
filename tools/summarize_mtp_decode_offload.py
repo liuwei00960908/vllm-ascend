@@ -540,25 +540,47 @@ def _format_report(summary: dict[str, Any]) -> str:
     for frontier, group in sorted(set(store_content) | set(transfer_content)):
         store_event = store_content.get((frontier, group))
         transfer_event = transfer_content.get((frontier, group))
-        store_fingerprints = (
-            store_event.get("chunk_fingerprints") if store_event is not None else None
+        store_ranges = (
+            {
+                (chunk.get("start"), chunk.get("end")): chunk.get("fingerprint")
+                for chunk in store_event.get("chunk_ranges", [])
+                if isinstance(chunk, dict)
+            }
+            if store_event is not None
+            else {}
         )
-        retrieve_fingerprints = (
-            transfer_event.get("source_chunk_fingerprints")
+        retrieve_ranges = (
+            {
+                (chunk.get("start"), chunk.get("end")): chunk.get("fingerprint")
+                for chunk in transfer_event.get("source_chunk_ranges", [])
+                if isinstance(chunk, dict)
+            }
             if transfer_event is not None
-            else None
+            else {}
         )
-        source_match = (
-            store_fingerprints == retrieve_fingerprints
-            if store_fingerprints is not None and retrieve_fingerprints is not None
-            else None
-        )
+        overlapping = sorted(set(store_ranges) & set(retrieve_ranges))
+        if overlapping:
+            mismatches = [
+                f"[{s},{e})"
+                for (s, e) in overlapping
+                if store_ranges[(s, e)] != retrieve_ranges[(s, e)]
+            ]
+            source_match = len(mismatches) == 0
+            source_detail = (
+                f"matched={len(overlapping)}"
+                + (f" mismatch={mismatches[:2]}" if mismatches else "")
+            )
+        else:
+            source_match = None
+            source_detail = "no_overlap"
         probe = transfer_event.get("content_probe", {}) if transfer_event else {}
         lines.append(
             f"CONTENT frontier={frontier} group={group} "
             f"store_cpu={'yes' if store_event else 'no'} "
             f"retrieve_cpu={'yes' if transfer_event else 'no'} "
-            f"store_retrieve_match={source_match} "
+            f"store_ranges={sorted(store_ranges)[:4]} "
+            f"retrieve_ranges={sorted(retrieve_ranges)[:4]} "
+            f"store_retrieve_match={source_match} {source_detail} "
             f"scatter_supported={probe.get('supported')} "
             f"scatter_match={probe.get('all_match')}"
         )
