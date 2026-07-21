@@ -587,6 +587,19 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(first.tolist(), [900])
         lookup.assert_not_called()
 
+    def test_dummy_remap_boundary_ignores_empty_route_frontiers(self):
+        metadata = self._make_decode_metadata()
+
+        boundary = sfa_v1._prepare_sfa_remap_boundary(
+            metadata,
+            ["req-0"],
+            is_dummy_run=True,
+            index_topk=4,
+            cached_tokens=(),
+        )
+
+        self.assertEqual(boundary.tolist(), [8])
+
     def test_native_remap_boundary_retains_connector_frontier_lookup(self):
         metadata = self._make_decode_metadata()
         metadata.prompt_lens_cpu_rows = [1000]

@@ -171,10 +171,13 @@ def _prepare_sfa_remap_boundary(
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    if not is_dummy_run and cached_tokens is None:
-        cached_tokens = tuple(get_lmcache_sparse_cached_tokens(request_ids))
-    if not is_dummy_run and len(cached_tokens) != len(seq_lens):
-        raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}")
+    if is_dummy_run:
+        cached_tokens = None
+    else:
+        if cached_tokens is None:
+            cached_tokens = tuple(get_lmcache_sparse_cached_tokens(request_ids))
+        if len(cached_tokens) != len(seq_lens):
+            raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}")
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
     for row_index, request_index_value in enumerate(row_req_indices_np):
