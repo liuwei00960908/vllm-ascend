@@ -82,9 +82,9 @@ must not weaken the R1 safety contract.
 ## Current implementation checkpoint: cross-layer exact-Q1 milestone
 
 The branch now contains the cross-layer implementation plus exact-size Q1
-batching. Singleton execution has passed its first Ascend functional and
-performance trial; exact batched replay is implemented but is not yet qualified
-on NPU:
+batching. Singleton execution and TP2 batch sizes 1/2/4 have passed initial
+Ascend functional/performance trials; runtime per-key replay and trace evidence
+are still required before the batched path is qualified:
 
 - `vllm::sfa_lmcache_retrieve` is the only staged-SFA FX split;
 - Graph A and Graph B reuse the already-validated SFA math but are captured by
@@ -116,15 +116,18 @@ on NPU:
 - startup rejects missing SFA layers, producer events, stable save state, or an
   invalid bridge layout.
 
-This is not yet a release boundary. The singleton TP2 trial established correct
-startup, deterministic/acceptable output, decode save, dense-prefix-hit TTFT
-reduction, once-per-key parity, repeat-run stability, and no-profiler TPOT of
-about 120 ms average (108 ms observed peak) versus about 170 ms for the earlier
-two-wrapper path and 326 ms without staged graph capture. Exact batch-2 replay,
-the precise `N + 1` cross-layer trace, failure behavior, resource bounds, and
-the production ownership plan remain open. The nested-wrapper implementation
-has been removed from this branch; its earlier commit remains the comparison
-and rollback point.
+This is not yet a release boundary. The TP2 trials established correct startup,
+deterministic/acceptable output, decode save, dense-prefix-hit TTFT reduction,
+once-per-key parity, repeat-run stability, and a large singleton TPOT gain over
+the earlier two-wrapper and native baselines. On the eight-layer TP2 test model,
+steady throughput for exact batches 1/2/4 is 56/94/144 tok/s with LMCache and
+72/124/184 tok/s with `start_load_kv`/`wait_for_layer_load` bypassed. The nearly
+identical batch scaling places most sub-linear scaling outside LMCache, while
+the stable 22-24% LMCache gap remains an optimization opportunity. Runtime
+proof of exact batch-2/4 replay, the precise `N + 1` cross-layer trace, failure
+behavior, resource bounds, and the production ownership plan remain open. The
+nested-wrapper implementation has been removed from this branch; its earlier
+commit remains the comparison and rollback point.
 
 ### Trial-closed issues and newly exposed work
 
@@ -140,15 +143,16 @@ whole R1 production gate is complete.
 | TP worker profiler control and offline trace parsing | **DONE** | Smoke tooling requires `ignore_frontend=true`, accepts the expected TP rank count, and parses Ascend traces outside daemon workers |
 | Fake/native custom-op bridge layout mismatch during large startup profile | **DONE** | The bridge now has one contiguous fixed-capacity ABI based on the largest configured exact key; startup succeeds after the fix |
 | Exact batched LMCache row routing and per-key startup completeness | **DONE in code/unit/startup** | Exact request order is covered by focused tests and every configured key is checked for every local SFA layer |
+| Exact TP2 batch throughput checkpoint | **DONE** | On the eight-layer model, batches 1/2/4 reach 56/94/144 tok/s with LMCache and 72/124/184 tok/s with LMCache loading bypassed; normal and bypass scaling are nearly identical |
 | Mixed prefill/decode native sparse-frontier lookup | **IMPLEMENTED; NPU RERUN PENDING** | The worktree queries frontiers only for request indices referenced by decode rows; rerun the concurrent smoke before closing |
-| Exact batch-2 runtime replay | **OPEN** | Two synchronized HTTP calls do not prove that the scheduler co-scheduled a pure-decode size-2 step or replayed key 2 |
+| Exact batch-2/4 runtime replay qualification | **OPEN** | Throughput from concurrent clients does not prove that every steady step was pure decode or identify the exact replay key |
 | Cross-layer island and event topology | **OPEN** | Capture an NPU trace proving the precise `N + 1` island plan, middle-island fusion, one eager retrieve per layer, and no nested wrappers |
 
 ### Current support and rejection matrix
 
 | Mode | Current behavior | Production requirement |
 | --- | --- | --- |
-| Exact unpadded Q=1 | Cross-layer capture for configured exact request counts; singleton TP2 is trial-qualified, batched replay is not | Prove actual replay and parity for every enabled key, then finish the P0 safety work |
+| Exact unpadded Q=1 | Cross-layer capture for configured exact request counts; TP2 batches 1/2/4 have a functional/performance checkpoint, but per-key batched replay is not trace-qualified | Prove actual replay and parity for every enabled key, then finish the P0 safety work |
 | Long generation | Singleton repeated decode is stable with live metadata tensors | Prove every block/window/maximum-length boundary and every enabled exact key |
 | Unconfigured or padded Q=1 | Runner disables replay before model forward; native SFA executes | Add planned padded buckets in R2 |
 | MTP/speculative target | Startup/runtime rejection | Fixed candidate-width keys, row masks, disjoint scratch in R3 |
@@ -165,9 +169,9 @@ whole R1 production gate is complete.
 ## Blocking gap ledger
 
 The P0 items are release blockers even for exact Q1. Feature breadth work
-begins only after they are closed. P2 items are optional cleanup; they do not
-block R1 and may not change the existing connector API without a demonstrated
-correctness need.
+begins only after they are closed. P2 items are post-feature optimization or
+optional cleanup; they do not block R1 and may not change the existing
+connector API without a demonstrated correctness need.
 
 | ID | Current evidence | Risk | Required outcome |
 | --- | --- | --- | --- |
@@ -181,7 +185,7 @@ correctness need.
 | P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | The event chain is not NPU-trace-qualified, while retaining generic fences can cap TPOT and jitter | Prove producer/load/following-island ordering, then remove only synchronization demonstrated redundant by the closed event chain |
 | P0.8 stable ownership | Outer PIECEWISE wrappers own the cross-layer graph storage, and startup retains per-layer cache/event bindings, but the namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Island registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
 | P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
-| P0.10 qualification evidence | Singleton TP2 startup, deterministic output, prefix hit, decode save, repeat stability, and TPOT improvement pass. Focused batch routing/startup tests pass, but client concurrency has not proven a pure-decode key-2 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide size-1 replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
+| P0.10 qualification evidence | TP2 startup, deterministic output, prefix hit, decode save, repeat stability, singleton TPOT improvement, and batch-1/2/4 throughput checkpoints pass. Focused batch routing/startup tests pass, but client concurrency has not proven pure-decode key-2/4 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide smaller-key replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
 | P1.1 padded rows | Only remap boundary is persistent; builder allocates per-step CPU/NumPy/device metadata | Exact keys cause graph explosion/fallbacks and cannot safely pad | Stable fixed-capacity row arena, safe pad block/slots, masks through both logical SFA phases and connector filtering |
 | P1.2 rich ACL dispatch | `StagedSFAGraphKey` collapses to legacy `BatchDescriptor(num_tokens)` | Padded Q1 and `SPEC_FIXED` entries can collide at equal token counts | Carry the full structural key through `ACLGraphWrapper` dispatch |
 | P1.3 MTP scratch | Native metadata has row-specific groundwork; staged eligibility rejects it | Candidate rows can alias scratch or lose request-row order | Fixed-width profile, unique-request frontier expansion, disjoint scratch/targets, valid-row mask |
@@ -191,6 +195,7 @@ correctness need.
 | P1.7 mixed-phase hybrid replay | A step containing prefill and decode deliberately runs wholly native; the trial confirmed that ordinary client concurrency naturally produces this scheduler phase | Throughput can fall during arrivals even though already-decoding rows match a captured key | Optional R5 feature: compact/partition decode rows, run prefill through native MLA, replay a qualified staged decode key, and recombine outputs without changing LMCache's public connector API |
 | P1.8 runtime key observability | Startup logs/counters establish captured keys, but the smoke client cannot prove which key a live scheduler step admitted and replayed | Qualification and operations can confuse a captured key with a used key or a safe-native mixed step | Expose low-cardinality per-key admission/replay/fallback counters and include them in smoke assertions |
 | P2.2 vLLM-owned remap frontier | The current path obtains the committed frontier from bound LMCache metadata through `_get_connector_metadata` | This is connector-specific coupling and may complicate upstream review, but no runtime defect has been demonstrated for the pinned version pair | Optional cleanup: retain the remap boundary but derive it from the latent range vLLM actually released. Do not add a connector API solely for encapsulation or refactor resistance |
+| P2.3 batch throughput efficiency | TP2 eight-layer throughput is 56/94/144 tok/s for batches 1/2/4 and 72/124/184 tok/s with LMCache loading bypassed. Normal/bypass ratios stay near 76-78%, so LMCache does not introduce a new batch-4 scaling collapse | Absolute LMCache cost remains material, while SFA/indexer, LM head, TP collectives, graph fences, or host work may limit aggregate scaling | After core feature support, attribute steady-step time by layer count and subsystem, then optimize only measured bottlenecks without weakening correctness, fallback, or the connector contract |
 
 ## Target ownership model
 
@@ -812,6 +817,10 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
    MTP, DP, or hybrid mixed-phase replay. Do not change the shared LMCache-vLLM
    API unless a reproduced correctness failure cannot be repaired within the
    existing lifecycle.
+5. Keep performance regression gates active throughout feature work, but defer
+   discretionary throughput optimization until the core padded-Q1, MTP, and
+   serving-parallelism feature packages are stable. Execute W8 before expanding
+   into the lower-priority optional-mode matrix.
 
 ### W0: prove the cross-layer partition and capture contract
 
@@ -979,7 +988,37 @@ Exit: DP2/DP4, PP2/VE2, and qualified TP combinations sustain heterogeneous
 loads without hangs, row leakage, cursor drift, or stale capture. Depends on
 W2-W5; MTP+DP qualification additionally depends on W6.
 
-### W8: optional execution modes
+### W8: post-feature throughput and latency optimization
+
+Status: **planned immediately after core feature support; lower priority than
+W5-W7 feature breadth, higher priority than optional-mode expansion**.
+
+- Preserve no-profiler batch-1/2/4 baselines with and without LMCache loading;
+  report step time plus throughput/TTFT/TPOT p50, p90, and p99 rather than only
+  peak aggregate throughput.
+- Attribute the batch-dependent step-time slope with short profiles and a
+  1/4/8-layer sweep. Separate SFA index selection, sparse attention, projections,
+  LM head/logits/sampling, TP collectives, outer-island replay/fences, scheduler
+  and model-runner host work, LMCache submission, transfer, and consumer join.
+- Treat the current TP2 result as evidence against a new LMCache batch-4
+  serialization bottleneck, not as proof that its absolute 22-24% gap is
+  irreducible. Optimize connector submission or transfer only when the profile
+  identifies it on the critical path.
+- Replace generic replay synchronization only after W1-W2 event, ownership, and
+  failure proofs demonstrate that a narrower event dependency is correct.
+- Qualify every optimization on the full target layer count and TP2/TP8; keep
+  the eight-layer model as an iteration tool because its full LM head can
+  exaggerate non-layer costs.
+- Do not trade output quality, deterministic behavior, failure safety, resource
+  bounds, or the existing public LMCache-vLLM contract for throughput.
+
+Exit: the signed workload meets its aggregate-throughput and TTFT/TPOT p50/p99
+targets on the full target model; traces account for the remaining batch-scaling
+loss, no correctness/feature matrix regresses, and every retained synchronization
+has a documented dependency purpose. Depends on W1-W4 and should follow stable
+W5-W7 feature behavior.
+
+### W9: optional execution modes
 
 Enable one at a time: mixed prefill/decode, LoRA, CP/o-proj TP, sparse-C8,
 MLAPO, weight prefetch, free-paged manager, legacy manager, adapter cache, and
