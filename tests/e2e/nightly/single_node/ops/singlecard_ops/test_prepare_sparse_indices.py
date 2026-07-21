@@ -44,6 +44,65 @@ def _measure_ms(fn, warmup=20, iterations=200):
     return (time.perf_counter() - started) * 1000 / iterations
 
 
+def test_fused_remap_updates_preallocated_row_block_table():
+    enable_custom_op()
+    topk = torch.tensor(
+        [[1, 9, 2, 10] + [10] * 60, [3, 4, 11, 12] + [12] * 60],
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_table = torch.tensor(
+        [[10, 11, 12], [20, 21, 22]], dtype=torch.int32, device="npu"
+    )
+    original = request_table.clone()
+    row_table = torch.empty((2, 3), dtype=torch.int32, device="npu")
+    split_boundary = torch.tensor([8, 8], dtype=torch.int32, device="npu")
+    scratch_base = torch.zeros(2, dtype=torch.int32, device="npu")
+    valid_rows = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    row_req_indices = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    scratch_block_ids = torch.tensor(
+        [[100, 101], [110, 111]], dtype=torch.int64, device="npu"
+    )
+    expected_row_table = torch.empty_like(row_table)
+    expected_topk, expected_packed = _prepare_sparse_indices_torch(
+        topk.clone(),
+        split_boundary,
+        scratch_base=scratch_base,
+        valid_row_indices=valid_rows,
+        row_req_indices=row_req_indices,
+        row_block_req_indices=row_req_indices,
+        request_block_table=request_table,
+        row_block_table=expected_row_table,
+        scratch_block_ids=scratch_block_ids,
+        block_size=2,
+    )
+    actual_topk, actual_packed = prepare_sparse_indices(
+        topk,
+        split_boundary,
+        scratch_base=scratch_base,
+        valid_row_indices=valid_rows,
+        row_req_indices=row_req_indices,
+        row_block_req_indices=row_req_indices,
+        request_block_table=request_table,
+        row_block_table=row_table,
+        scratch_block_ids=scratch_block_ids,
+        block_size=2,
+    )
+    torch.npu.synchronize()
+
+    assert torch.equal(actual_topk, expected_topk)
+    assert torch.equal(actual_packed, expected_packed)
+    assert torch.equal(row_table, expected_row_table)
+    assert row_table.cpu().tolist() == [[100, 11, 12], [110, 21, 22]]
+    assert torch.equal(request_table, original)
+    row_table_cpu = row_table.cpu()
+    request_blocks = set(request_table.cpu().reshape(-1).tolist())
+    assert int(row_table_cpu[0, 0]) != int(row_table_cpu[1, 0])
+    assert {int(row_table_cpu[0, 0]), int(row_table_cpu[1, 0])}.isdisjoint(
+        request_blocks
+    )
+
+
 @pytest.mark.parametrize(
     "rows,k,valid",
     [

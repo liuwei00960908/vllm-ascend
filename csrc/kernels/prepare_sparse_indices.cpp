@@ -33,12 +33,20 @@ public:
         __gm__ int32_t* scratchBase,
         __gm__ int32_t* selectedPacked,
         __gm__ int32_t* rowReqIndices,
+        __gm__ int32_t* rowBlockReqIndices,
+        __gm__ int32_t* requestBlockTable,
+        __gm__ int32_t* rowBlockTable,
+        __gm__ int64_t* scratchBlockIds,
         uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t validRowCount,
+        uint32_t blockTableWidth,
+        uint32_t scratchBlocksPerRow,
+        uint32_t blockSize,
         uint32_t coreCount,
         uint32_t needPacked,
-        uint32_t clearInvalidRows)
+        uint32_t clearInvalidRows,
+        uint32_t updateRowTable)
     {
         rowCount_ = rowCount;
         rowWidth_ = rowWidth;
@@ -46,6 +54,10 @@ public:
         coreCount_ = coreCount;
         needPacked_ = needPacked != 0;
         clearInvalidRows_ = clearInvalidRows != 0;
+        updateRowTable_ = updateRowTable != 0;
+        blockTableWidth_ = blockTableWidth;
+        scratchBlocksPerRow_ = scratchBlocksPerRow;
+        blockSize_ = blockSize;
 
         topkIndicesGm_.SetGlobalBuffer(topkIndices);
         splitBoundaryGm_.SetGlobalBuffer(splitBoundary);
@@ -58,6 +70,12 @@ public:
         }
         if (clearInvalidRows_) {
             rowReqIndicesGm_.SetGlobalBuffer(rowReqIndices, rowCount);
+        }
+        if (updateRowTable_) {
+            rowBlockReqIndicesGm_.SetGlobalBuffer(rowBlockReqIndices, rowCount);
+            requestBlockTableGm_.SetGlobalBuffer(requestBlockTable);
+            rowBlockTableGm_.SetGlobalBuffer(rowBlockTable);
+            scratchBlockIdsGm_.SetGlobalBuffer(scratchBlockIds);
         }
 
         const uint32_t rowBytes = rowWidth * sizeof(int32_t);
@@ -80,6 +98,28 @@ public:
     __aicore__ inline void Process()
     {
         const uint32_t coreIdx = AscendC::GetBlockIdx();
+        if (updateRowTable_) {
+            for (uint32_t sourceRow = coreIdx; sourceRow < rowCount_;
+                 sourceRow += coreCount_) {
+                CopyRequestBlockTable(sourceRow);
+                uint32_t packedRow = validRowCount_;
+                for (uint32_t candidate = 0; candidate < validRowCount_;
+                     ++candidate) {
+                    if (validRowsGm_.GetValue(candidate) ==
+                        static_cast<int32_t>(sourceRow)) {
+                        packedRow = candidate;
+                        break;
+                    }
+                }
+                if (packedRow < validRowCount_) {
+                    ProcessRow(packedRow);
+                } else if (clearInvalidRows_ &&
+                           rowReqIndicesGm_.GetValue(sourceRow) < 0) {
+                    ZeroPaddingRow(sourceRow);
+                }
+            }
+            return;
+        }
         for (uint32_t packedRow = coreIdx; packedRow < validRowCount_;
              packedRow += coreCount_) {
             ProcessRow(packedRow);
@@ -95,6 +135,20 @@ public:
     }
 
 private:
+    __aicore__ inline void CopyRequestBlockTable(uint32_t sourceRow)
+    {
+        const int32_t requestRow = rowBlockReqIndicesGm_.GetValue(sourceRow);
+        const uint64_t requestOffset =
+            static_cast<uint64_t>(requestRow) * blockTableWidth_;
+        const uint64_t rowTableOffset =
+            static_cast<uint64_t>(sourceRow) * blockTableWidth_;
+        for (uint32_t block = 0; block < blockTableWidth_; ++block) {
+            rowBlockTableGm_.SetValue(
+                rowTableOffset + block,
+                requestBlockTableGm_.GetValue(requestOffset + block));
+        }
+    }
+
     __aicore__ inline void ProcessRow(uint32_t packedRow)
     {
         using namespace AscendC;
@@ -261,6 +315,20 @@ private:
             LocalTensor<int32_t> packed = packedBuf_.Get<int32_t>();
             DataCopy(selectedPackedGm_[packedOffset], packed, rowWidth_);
         }
+        if (updateRowTable_) {
+            const uint64_t rowTableOffset =
+                static_cast<uint64_t>(sourceRow) * blockTableWidth_;
+            const uint32_t selectedCount = static_cast<uint32_t>(carry);
+            const uint32_t usedBlocks =
+                (selectedCount + blockSize_ - 1) / blockSize_;
+            for (uint32_t block = 0; block < usedBlocks; ++block) {
+                rowBlockTableGm_.SetValue(
+                    rowTableOffset + block,
+                    static_cast<int32_t>(scratchBlockIdsGm_.GetValue(
+                        static_cast<uint64_t>(packedRow) *
+                            scratchBlocksPerRow_ + block)));
+            }
+        }
         SetFlag<HardEvent::MTE3_MTE2>(0);
         WaitFlag<HardEvent::MTE3_MTE2>(0);
     }
@@ -304,6 +372,10 @@ private:
     AscendC::GlobalTensor<int32_t> scratchBaseGm_;
     AscendC::GlobalTensor<int32_t> selectedPackedGm_;
     AscendC::GlobalTensor<int32_t> rowReqIndicesGm_;
+    AscendC::GlobalTensor<int32_t> rowBlockReqIndicesGm_;
+    AscendC::GlobalTensor<int32_t> requestBlockTableGm_;
+    AscendC::GlobalTensor<int32_t> rowBlockTableGm_;
+    AscendC::GlobalTensor<int64_t> scratchBlockIdsGm_;
 
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
@@ -311,6 +383,10 @@ private:
     uint32_t coreCount_ = 0;
     bool needPacked_ = false;
     bool clearInvalidRows_ = false;
+    bool updateRowTable_ = false;
+    uint32_t blockTableWidth_ = 0;
+    uint32_t scratchBlocksPerRow_ = 0;
+    uint32_t blockSize_ = 0;
 };
 
 }  // namespace
@@ -322,12 +398,20 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
     __gm__ int32_t* scratchBase,
     __gm__ int32_t* selectedPacked,
     __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* rowBlockReqIndices,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* rowBlockTable,
+    __gm__ int64_t* scratchBlockIds,
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t validRowCount,
+    uint32_t blockTableWidth,
+    uint32_t scratchBlocksPerRow,
+    uint32_t blockSize,
     uint32_t coreCount,
     uint32_t needPacked,
-    uint32_t clearInvalidRows)
+    uint32_t clearInvalidRows,
+    uint32_t updateRowTable)
 {
     DSAPrepareSparseIndicesKernel op;
     op.Init(
@@ -337,12 +421,20 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
         scratchBase,
         selectedPacked,
         rowReqIndices,
+        rowBlockReqIndices,
+        requestBlockTable,
+        rowBlockTable,
+        scratchBlockIds,
         rowCount,
         rowWidth,
         validRowCount,
+        blockTableWidth,
+        scratchBlocksPerRow,
+        blockSize,
         coreCount,
         needPacked,
-        clearInvalidRows);
+        clearInvalidRows,
+        updateRowTable);
     op.Process();
 }
 
@@ -356,12 +448,20 @@ void dsa_prepare_sparse_indices_impl(
     void* scratchBase,
     void* selectedPacked,
     void* rowReqIndices,
+    void* rowBlockReqIndices,
+    void* requestBlockTable,
+    void* rowBlockTable,
+    void* scratchBlockIds,
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t validRowCount,
+    uint32_t blockTableWidth,
+    uint32_t scratchBlocksPerRow,
+    uint32_t blockSize,
     uint32_t coreCount,
     bool needPacked,
-    bool clearInvalidRows)
+    bool clearInvalidRows,
+    bool updateRowTable)
 {
     dsa_prepare_sparse_indices_kernel<<<coreCount, nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -370,12 +470,20 @@ void dsa_prepare_sparse_indices_impl(
         static_cast<int32_t*>(scratchBase),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(rowBlockReqIndices),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(rowBlockTable),
+        static_cast<int64_t*>(scratchBlockIds),
         rowCount,
         rowWidth,
         validRowCount,
+        blockTableWidth,
+        scratchBlocksPerRow,
+        blockSize,
         coreCount,
         needPacked ? 1U : 0U,
-        clearInvalidRows ? 1U : 0U);
+        clearInvalidRows ? 1U : 0U,
+        updateRowTable ? 1U : 0U);
 }
 
 }  // namespace vllm_ascend

@@ -228,7 +228,12 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     const at::Tensor &valid_rows,
     const at::Tensor &scratch_base,
     bool need_packed,
-    const c10::optional<at::Tensor> &row_req_indices)
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_block_req_indices,
+    const c10::optional<at::Tensor> &request_block_table,
+    const c10::optional<at::Tensor> &row_block_table,
+    const c10::optional<at::Tensor> &scratch_block_ids,
+    int64_t block_size)
 {
     TORCH_CHECK(topk_indices.is_privateuseone(),
                 "topk_indices must be on an NPU device");
@@ -291,6 +296,38 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
             "selected_packed must start at a 256-byte-aligned address");
     }
     const bool clear_invalid_rows = row_req_indices.has_value();
+    const bool update_row_table = row_block_table.has_value();
+    TORCH_CHECK(!update_row_table ||
+                    (request_block_table.has_value() &&
+                     scratch_block_ids.has_value() &&
+                     row_block_req_indices.has_value()),
+                "row block-table update requires request_block_table, "
+                "scratch_block_ids, and row_block_req_indices");
+    if (update_row_table) {
+        TORCH_CHECK(block_size > 0, "block_size must be positive");
+        TORCH_CHECK(request_block_table->scalar_type() == at::kInt &&
+                        row_block_table->scalar_type() == at::kInt &&
+                        scratch_block_ids->scalar_type() == at::kLong,
+                    "block tables must be int32 and scratch ids int64");
+        TORCH_CHECK(request_block_table->device() == topk_indices.device() &&
+                        row_block_table->device() == topk_indices.device() &&
+                        scratch_block_ids->device() == topk_indices.device(),
+                    "row block-table tensors must be on the same NPU device");
+        TORCH_CHECK(row_block_req_indices->device() == topk_indices.device() &&
+                        row_block_req_indices->scalar_type() == at::kInt &&
+                        row_block_req_indices->is_contiguous() &&
+                        row_block_req_indices->numel() >= row_count,
+                    "row_block_req_indices must be contiguous int32 on NPU");
+        TORCH_CHECK(request_block_table->dim() == 2 &&
+                        row_block_table->dim() == 2 &&
+                        scratch_block_ids->dim() == 2,
+                    "row block-table tensors must be two-dimensional");
+        TORCH_CHECK(row_block_table->size(0) >= row_count &&
+                        row_block_table->size(1) == request_block_table->size(1),
+                    "preallocated row_block_table has incompatible shape");
+        TORCH_CHECK(request_block_table->size(1) <= row_width,
+                    "block-table width exceeds remap row workspace");
+    }
     if (valid_row_count == 0 && !clear_invalid_rows) {
         return selected_packed;
     }
@@ -323,7 +360,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     const int64_t rows_per_core = std::max<int64_t>(
         1, target_elements_per_core / row_width);
     const int64_t work_row_count =
-        clear_invalid_rows ? row_count : valid_row_count;
+        (clear_invalid_rows || update_row_table) ? row_count : valid_row_count;
     const int64_t requested_cores =
         (work_row_count + rows_per_core - 1) / rows_per_core;
     const uint32_t core_count = static_cast<uint32_t>(
@@ -337,6 +374,18 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     void *row_req_indices_ptr = clear_invalid_rows
         ? row_req_indices->data_ptr()
         : split_boundary.data_ptr();
+    void *request_block_table_ptr = update_row_table
+        ? request_block_table->data_ptr() : split_boundary.data_ptr();
+    void *row_block_table_ptr = update_row_table
+        ? row_block_table->data_ptr() : split_boundary.data_ptr();
+    void *scratch_block_ids_ptr = update_row_table
+        ? scratch_block_ids->data_ptr() : split_boundary.data_ptr();
+    void *row_block_req_indices_ptr = update_row_table
+        ? row_block_req_indices->data_ptr() : split_boundary.data_ptr();
+    const uint32_t block_table_width = update_row_table
+        ? static_cast<uint32_t>(request_block_table->size(1)) : 0U;
+    const uint32_t scratch_blocks_per_row = update_row_table
+        ? static_cast<uint32_t>(scratch_block_ids->size(1)) : 0U;
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
     at_npu::native::OpCommand cmd;
@@ -349,12 +398,20 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
         scratch_base_ptr,
         selected_packed_ptr,
         row_req_indices_ptr,
+        row_block_req_indices_ptr,
+        request_block_table_ptr,
+        row_block_table_ptr,
+        scratch_block_ids_ptr,
         row_count,
         row_width,
         valid_row_count,
+        block_table_width,
+        scratch_blocks_per_row,
+        block_size,
         core_count,
         need_packed,
-        clear_invalid_rows]() -> int {
+        clear_invalid_rows,
+        update_row_table]() -> int {
         dsa_prepare_sparse_indices_impl(
             stream,
             topk_ptr,
@@ -363,12 +420,20 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
             scratch_base_ptr,
             selected_packed_ptr,
             row_req_indices_ptr,
+            row_block_req_indices_ptr,
+            request_block_table_ptr,
+            row_block_table_ptr,
+            scratch_block_ids_ptr,
             static_cast<uint32_t>(row_count),
             static_cast<uint32_t>(row_width),
             static_cast<uint32_t>(valid_row_count),
+            block_table_width,
+            scratch_blocks_per_row,
+            static_cast<uint32_t>(block_size),
             core_count,
             need_packed,
-            clear_invalid_rows);
+            clear_invalid_rows,
+            update_row_table);
         return 0;
     });
     cmd.Run();
@@ -881,7 +946,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_dsa_prepare_sparse_indices_(Tensor(a!) topk_indices, Tensor split_boundary, "
         "Tensor valid_rows, Tensor scratch_base, bool need_packed, "
-        "Tensor? row_req_indices=None) -> Tensor");
+        "Tensor? row_req_indices=None, Tensor? row_block_req_indices=None, "
+        "Tensor? request_block_table=None, "
+        "Tensor? row_block_table=None, Tensor? scratch_block_ids=None, "
+        "int block_size=0) -> Tensor");
     ops.impl(
         "npu_dsa_prepare_sparse_indices_",
         torch::kPrivateUse1,

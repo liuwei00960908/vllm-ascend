@@ -320,6 +320,9 @@ class AscendSFAMetadata:
     decode_current_positions_cpu: Any = None
     decode_scratch_base: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
+    decode_scratch_block_ids: torch.Tensor | None = None
+    decode_row_block_table: torch.Tensor | None = None
+    row_block_req_indices: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     decode_split_boundary: torch.Tensor | None = None
 
@@ -387,6 +390,18 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             if self.dsa_shrink_latent
             else None
         )
+        self._dsa_row_block_table = (
+            torch.empty(
+                (
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    self.max_blocks,
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
+            if self.dsa_shrink_latent
+            else None
+        )
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -445,6 +460,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_scratch_base_rows = None
         decode_scratch_base_compact = None
         decode_target_slot_mapping = None
+        decode_scratch_block_ids = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         plens_cpu = (
@@ -455,6 +471,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         if plens_cpu is not None:
             rows = np.zeros(num_input_tokens, dtype=np.int32)
             req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
+            table_req_rows = np.zeros(num_input_tokens, dtype=np.int32)
             row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
             current_positions = (
                 np.zeros(num_input_tokens, dtype=np.int64)
@@ -467,6 +484,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
             for r in range(n_real):
                 s, e = int(qsl[r]), int(qsl[r + 1])
+                table_req_rows[s:e] = r
                 plen = int(plens_cpu[r])
                 first_decode = max(s, s + plen - int(computed[r]))
                 if first_decode < e:
@@ -482,11 +500,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_decode_rows = int(np.count_nonzero(req_rows >= 0))
             split_boundary_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
-            scratch_base_np = row_offsets.astype(np.int32) * self.index_topk
+            scratch_base_np = np.zeros(num_input_tokens, dtype=np.int32)
             # Plain decode has one row per request and uses the legacy per-request
             # sparse slot mapping. Only MTP/spec rows need disjoint scratch bases
             # and explicit target-slot tensors.
-            needs_row_scratch_base = bool(np.any(scratch_base_np))
+            needs_row_scratch_base = False
             if num_decode_rows > 0:
                 decode_scratch_base_rows = torch.from_numpy(scratch_base_np).to(
                     block_table.device
@@ -505,6 +523,35 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     decode_request_ids_compact = [
                         req_ids[int(req_idx)] for req_idx in valid_req_indices_np
                     ]
+                    scratch_by_req = common_attn_metadata.dsa_scratch_block_ids or {}
+                    blocks_per_row = (self.index_topk + self.block_size - 1) // self.block_size
+                    row_scratch: list[list[int]] = []
+                    for req_idx, row_offset in zip(
+                        valid_req_indices_np, row_offsets[valid_row_indices_np]
+                    ):
+                        req_id = req_ids[int(req_idx)]
+                        start = int(row_offset) * blocks_per_row
+                        blocks = scratch_by_req.get(req_id, [])[start:start + blocks_per_row]
+                        if len(blocks) != blocks_per_row:
+                            raise RuntimeError(
+                                f"DSA scratch blocks are not bound for request {req_id}: "
+                                f"row={int(row_offset)} needs {blocks_per_row} blocks, "
+                                f"found {len(blocks)}. Scheduler admission must reserve "
+                                "and first decode must bind row_scratch_blocks."
+                            )
+                        row_scratch.append(blocks)
+                    decode_scratch_block_ids = torch.tensor(
+                        row_scratch, dtype=torch.long, device=block_table.device
+                    )
+                    offsets = torch.arange(
+                        self.index_topk, dtype=torch.long, device=block_table.device
+                    )
+                    decode_target_slot_mapping = (
+                        decode_scratch_block_ids.repeat_interleave(
+                            self.block_size, dim=1
+                        )[:, :self.index_topk] * self.block_size
+                        + offsets.remainder(self.block_size).reshape(1, -1)
+                    )
                 # This ordered-unique list is also the fused kernel's ownership
                 # map: one AIV owns each complete source row.
                 decode_valid_row_indices = torch.from_numpy(
@@ -643,6 +690,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             ),
             decode_scratch_base=decode_scratch_base_rows,
             decode_target_slot_mapping=decode_target_slot_mapping,
+            decode_scratch_block_ids=decode_scratch_block_ids,
+            decode_row_block_table=(
+                self._dsa_row_block_table[:num_input_tokens]
+                if self._dsa_row_block_table is not None
+                else None
+            ),
+            row_block_req_indices=(
+                torch.from_numpy(table_req_rows).to(block_table.device)
+                if decode_req_indices_rows is not None
+                else None
+            ),
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             num_decode_tokens=num_decode_rows,
         )
@@ -1377,7 +1435,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv = kv_override
             key_rope = key_rope_override
         else:
-            block_table = attn_metadata.block_table
+            block_table = (
+                block_table_override
+                if block_table_override is not None
+                else attn_metadata.block_table
+            )
             kv = kv_cache[0]
             key_rope = kv_cache[1]
 
@@ -1472,6 +1534,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         )
         _sparse_indices_padding_zeroed = False
+        _sparse_block_table_override = None
         index_layer_name = (
             _dsa_indexer_layer_name(layer_name)
             if self.dsa_offload_unbundle
@@ -1777,30 +1840,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 _split_boundary_override = None
                 if _decode_window_size > 0:
-                    _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                    _window_start = (
-                        _cur_pos // _decode_window_size * _decode_window_size
-                    ).to(
-                        device=_split_boundary.device,
-                        dtype=_split_boundary.dtype,
-                    )
-                    _diag_current_window_start = _window_start
                     if _lmcache_split_boundary is not None:
-                        if _lmcache_split_boundary.numel() < _window_start.numel():
-                            _lmcache_split_boundary = torch.nn.functional.pad(
-                                _lmcache_split_boundary,
-                                (
-                                    0,
-                                    _window_start.numel()
-                                    - _lmcache_split_boundary.numel(),
-                                ),
-                            )
-                        _committed_end = _lmcache_split_boundary[
-                            : _window_start.numel()
-                        ]
+                        _committed_end = _lmcache_split_boundary
                         _diag_committed_end = _committed_end
-                        _window_start = torch.minimum(_window_start, _committed_end)
-                    _split_boundary_override = _window_start
+                        _diag_current_window_start = _committed_end
+                        _split_boundary_override = _committed_end
                 elif _lmcache_split_boundary is not None:
                     # No decode-window save, but LMCache still reports the prefix
                     # that sparse direct can safely provide. Use that exact frontier
@@ -1883,6 +1927,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     scratch_base=_scratch_base,
                     valid_row_indices=_valid_row_indices,
                     row_req_indices=_padding_row_req_indices,
+                    row_block_req_indices=attn_metadata.row_block_req_indices,
+                    request_block_table=attn_metadata.block_table,
+                    row_block_table=attn_metadata.decode_row_block_table,
+                    scratch_block_ids=attn_metadata.decode_scratch_block_ids,
+                    block_size=self.block_size,
+                )
+            if attn_metadata.decode_row_block_table is not None:
+                _sparse_block_table_override = (
+                    attn_metadata.decode_row_block_table[:_topk_rows]
                 )
             _sparse_indices_padding_zeroed = (
                 _padding_row_req_indices is not None
@@ -2629,6 +2682,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     layer_name=layer_name,
                     trace_label="native",
                     padding_rows_zeroed=_sparse_indices_padding_zeroed,
+                    block_table_override=_sparse_block_table_override,
                 )
             # one step per layer-call on the native (user) path so the profiler
             # logs mean ms/layer-call periodically (mirrors the manager path).

@@ -57,11 +57,21 @@ at::Tensor npu_dsa_prepare_sparse_indices_meta(
     const at::Tensor &valid_rows,
     const at::Tensor &scratch_base,
     bool need_packed,
-    const c10::optional<at::Tensor> &row_req_indices)
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_block_req_indices,
+    const c10::optional<at::Tensor> &request_block_table,
+    const c10::optional<at::Tensor> &row_block_table,
+    const c10::optional<at::Tensor> &scratch_block_ids,
+    int64_t block_size)
 {
     (void)split_boundary;
     (void)scratch_base;
     (void)row_req_indices;
+    (void)row_block_req_indices;
+    (void)request_block_table;
+    (void)row_block_table;
+    (void)scratch_block_ids;
+    (void)block_size;
     const int64_t rows = topk_indices.size(0);
     TORCH_CHECK(rows > 0, "topk_indices must contain at least one row");
     const int64_t row_width = topk_indices.numel() / rows;

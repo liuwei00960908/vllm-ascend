@@ -46,12 +46,20 @@ namespace vllm_ascend {
     void* scratch_base,
     void* selected_packed,
     void* row_req_indices,
+    void* row_block_req_indices,
+    void* request_block_table,
+    void* row_block_table,
+    void* scratch_block_ids,
     uint32_t row_count,
     uint32_t row_width,
     uint32_t valid_row_count,
+    uint32_t block_table_width,
+    uint32_t scratch_blocks_per_row,
+    uint32_t block_size,
     uint32_t core_count,
     bool need_packed,
-    bool clear_invalid_rows);
+    bool clear_invalid_rows,
+    bool update_row_table);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {

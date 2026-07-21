@@ -21,6 +21,11 @@ def _prepare_sparse_indices_torch(
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
     row_req_indices: torch.Tensor | None = None,
+    row_block_req_indices: torch.Tensor | None = None,
+    request_block_table: torch.Tensor | None = None,
+    row_block_table: torch.Tensor | None = None,
+    scratch_block_ids: torch.Tensor | None = None,
+    block_size: int = 0,
 ):
     """Original Torch implementation, retained only as a test oracle."""
     orig_shape = topk_indices.shape
@@ -40,6 +45,31 @@ def _prepare_sparse_indices_torch(
     if row_req_indices is not None:
         invalid_rows = row_req_indices.reshape(-1)[: sel.shape[0]] < 0
         new_indices.masked_fill_(invalid_rows.reshape(-1, 1), 0)
+    if row_block_table is not None:
+        assert request_block_table is not None
+        assert row_req_indices is not None or row_block_req_indices is not None
+        assert scratch_block_ids is not None and block_size > 0
+        table_req = (
+            row_block_req_indices
+            if row_block_req_indices is not None
+            else row_req_indices
+        )
+        safe_req = table_req[: sel.shape[0]].clamp(min=0).long()
+        row_block_table[: sel.shape[0]].copy_(
+            request_block_table.index_select(0, safe_req)
+        )
+        selected_counts = is_lmcache.index_select(
+            0, valid_row_indices.long()
+        ).sum(dim=1)
+        used_blocks = (selected_counts + block_size - 1) // block_size
+        cols = torch.arange(scratch_block_ids.shape[1], device=sel.device)
+        rows = row_block_table.index_select(0, valid_row_indices.long())
+        rows[:, : scratch_block_ids.shape[1]] = torch.where(
+            cols[None, :] < used_blocks[:, None],
+            scratch_block_ids.to(rows.dtype),
+            rows[:, : scratch_block_ids.shape[1]],
+        )
+        row_block_table.index_copy_(0, valid_row_indices.long(), rows)
 
     if not need_packed:
         return new_indices.reshape(orig_shape), None
@@ -65,6 +95,11 @@ def prepare_sparse_indices(
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
     row_req_indices: torch.Tensor | None = None,
+    row_block_req_indices: torch.Tensor | None = None,
+    request_block_table: torch.Tensor | None = None,
+    row_block_table: torch.Tensor | None = None,
+    scratch_block_ids: torch.Tensor | None = None,
+    block_size: int = 0,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -112,6 +147,9 @@ def prepare_sparse_indices(
             "rebuild the custom-op extension"
         ) from exc
 
+    if row_block_table is not None and row_block_req_indices is None:
+        row_block_req_indices = row_req_indices
+
     packed = fused_op(
         topk_indices,
         split_boundary,
@@ -119,5 +157,10 @@ def prepare_sparse_indices(
         scratch_base,
         need_packed,
         row_req_indices,
+        row_block_req_indices,
+        request_block_table,
+        row_block_table,
+        scratch_block_ids,
+        block_size,
     )
     return topk_indices, packed if need_packed else None

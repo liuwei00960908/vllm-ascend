@@ -215,6 +215,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    # Stable per-request physical scratch blocks reserved by the scheduler and
+    # bound on first decode. The SFA builder slices these per speculative row.
+    dsa_scratch_block_ids: dict[str, list[int]] | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -247,6 +250,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
                 if self.request_ids is not None
                 else None
             ),
+            dsa_scratch_block_ids=self.dsa_scratch_block_ids,
         )
 
 
@@ -344,7 +348,9 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
             cached_by_req[getattr(request, "req_id", "")] = 0
         else:
             cached_by_req[getattr(request, "req_id", "")] = int(
-                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
+                getattr(load_spec, "dsa_committed_end", None)
+                if getattr(load_spec, "dsa_committed_end", None) is not None
+                else getattr(load_spec, "lmcache_cached_tokens", 0) or 0
             )
 
     if not cached_by_req:

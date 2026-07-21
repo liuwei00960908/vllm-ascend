@@ -413,7 +413,15 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
-        self._dsa_short_prompt_warned = False
+            decode_window_size = _mtp_dw_window_size()
+            if decode_window_size and decode_window_size % self.block_size:
+                raise ValueError(
+                    "VLLM_ASCEND_MTP_DW_WINDOW_SIZE must be an integer multiple "
+                    f"of cache block_size ({self.block_size}); got "
+                    f"{decode_window_size}. Set the external configuration to "
+                    "N * block_size so committed_end remains block aligned."
+                )
+        self._dsa_scratch_block_ids_by_req: dict[str, list[int]] = {}
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1290,6 +1298,11 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                for req_id in scheduler_output.finished_req_ids:
+                    self._dsa_scratch_block_ids_by_req.pop(req_id, None)
+                self._dsa_scratch_block_ids_by_req.update(
+                    getattr(scheduler_output, "dsa_scratch_block_ids", None) or {}
+                )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2444,6 +2457,11 @@ class NPUModelRunner(GPUModelRunner):
             prefill_context_parallel_metadata=self.long_seq_metadata,
             request_ids=(
                 self.input_batch.req_ids[:num_reqs]
+                if self.dsa_shrink_latent
+                else None
+            ),
+            dsa_scratch_block_ids=(
+                self._dsa_scratch_block_ids_by_req
                 if self.dsa_shrink_latent
                 else None
             ),

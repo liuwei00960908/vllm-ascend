@@ -324,6 +324,56 @@ def test_hooks_gather_decode_full_step():
 class TestPrepareSparseIndices:
     """Step B2: prepare decode top-k for compact scratch and LMCache."""
 
+    def test_remap_builds_preallocated_row_block_table_without_mutating_source(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor([[1, 9, 2, 10], [3, 4, 11, 12]], dtype=torch.int32)
+        request_table = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+        original = request_table.clone()
+        row_table = torch.empty((2, 3), dtype=torch.int32)
+        new_idx, packed = prepare_sparse_indices(
+            topk,
+            torch.tensor([8, 8], dtype=torch.int32),
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.tensor([0, 1]),
+            row_req_indices=torch.tensor([0, 1]),
+            request_block_table=request_table,
+            row_block_table=row_table,
+            scratch_block_ids=torch.tensor([[100, 101], [110, 111]]),
+            block_size=2,
+        )
+
+        assert new_idx.tolist() == [[0, 9, 1, 10], [0, 1, 11, 12]]
+        assert packed.tolist() == [[1, 2, 0, 0], [3, 4, 0, 0]]
+        assert row_table.tolist() == [[100, 11, 12], [110, 21, 22]]
+        assert torch.equal(request_table, original)
+
+    def test_row_block_table_copies_mixed_prefill_rows_without_remapping_them(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor([[1, 9, 2, 10], [3, 4, 5, 6]], dtype=torch.int32)
+        request_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+        row_table = torch.empty_like(request_table)
+        new_idx, _ = prepare_sparse_indices(
+            topk,
+            torch.tensor([8, 0], dtype=torch.int32),
+            need_packed=False,
+            scratch_base=torch.zeros(2, dtype=torch.int32),
+            valid_row_indices=torch.tensor([0]),
+            row_block_req_indices=torch.tensor([0, 1]),
+            request_block_table=request_table,
+            row_block_table=row_table,
+            scratch_block_ids=torch.tensor([[100, 101]]),
+            block_size=2,
+        )
+
+        assert new_idx.tolist() == [[0, 9, 1, 10], [3, 4, 5, 6]]
+        assert row_table.tolist() == [[100, 11], [20, 21]]
+
     def test_remap_splits_prefill_compact_and_decode_absolute(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
             _prepare_sparse_indices_torch as prepare_sparse_indices,
