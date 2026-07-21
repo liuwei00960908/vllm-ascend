@@ -527,6 +527,15 @@ def _format_report(summary: dict[str, Any]) -> str:
             and isinstance(event.get("frontier"), int)
         ):
             transfer_content.setdefault((event["frontier"], event["kv_group"]), event)
+        if (
+            event.get("stage") == "deep"
+            and event.get("event") == "content_skip"
+            and isinstance(event.get("kv_group"), int)
+            and isinstance(event.get("frontier"), int)
+        ):
+            key = (event["frontier"], event["kv_group"])
+            if key not in transfer_content:
+                transfer_content[key] = event
 
     windows = sorted(set(stores) | committed)
     for start, end in windows[:6]:
@@ -574,15 +583,21 @@ def _format_report(summary: dict[str, Any]) -> str:
             source_match = None
             source_detail = "no_overlap"
         probe = transfer_event.get("content_probe", {}) if transfer_event else {}
+        skip_reason = (
+            transfer_event.get("reason")
+            if transfer_event and transfer_event.get("event") == "content_skip"
+            else None
+        )
         lines.append(
             f"CONTENT frontier={frontier} group={group} "
             f"store_cpu={'yes' if store_event else 'no'} "
-            f"retrieve_cpu={'yes' if transfer_event else 'no'} "
-            f"store_ranges={sorted(store_ranges)[:4]} "
-            f"retrieve_ranges={sorted(retrieve_ranges)[:4]} "
+            f"retrieve_cpu={'yes' if transfer_event and transfer_event.get('event') == 'content_transfer' else 'no'} "
+            f"store_ranges={sorted(store_ranges)[:6]} "
+            f"retrieve_ranges={sorted(retrieve_ranges)[:6]} "
             f"store_retrieve_match={source_match} {source_detail} "
             f"scatter_supported={probe.get('supported')} "
             f"scatter_match={probe.get('all_match')}"
+            + (f" skip={skip_reason}" if skip_reason else "")
         )
 
     safety_by_row: dict[tuple[int, int, int], dict[str, Any]] = {}
