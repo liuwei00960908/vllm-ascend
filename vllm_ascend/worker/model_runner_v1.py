@@ -2580,7 +2580,10 @@ class NPUModelRunner(GPUModelRunner):
             kv_connector_metadata,
             request_ids,
         )
-        if metadata_reason == StagedSFARouteReason.DENSE_PREFIX_HIT:
+        if metadata_reason in (
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
             return native(metadata_reason)
         if metadata_reason != StagedSFARouteReason.ELIGIBLE:
             return StagedSFARouteDecision(
@@ -4246,7 +4249,8 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 if hasattr(impl, attr):
                     delattr(impl, attr)
-            impl._staged_sfa_dummy_cache_initialized = False
+            impl._staged_sfa_dummy_cache_capacity = 0
+            impl._staged_sfa_captured_graph_keys = set()
 
 
 
@@ -4280,6 +4284,10 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "[SFA cross-layer graph] no local SFA layers were captured"
                 )
+            graph_keys = tuple(
+                StagedSFAGraphKey.exact_q1(size)
+                for size in staged_sfa_graph_capture_sizes(self.vllm_config)
+            )
             incomplete = [
                 layer_name
                 for layer_name, impl in self._staged_sfa_impls
@@ -4296,12 +4304,20 @@ class NPUModelRunner(GPUModelRunner):
                 or getattr(impl, "_staged_sfa_cross_layer_runtime", None)
                 is None
             ]
-            if incomplete:
+            missing_keys = {
+                layer_name: tuple(
+                    key.request_capacity
+                    for key in graph_keys
+                    if key not in getattr(impl, "_staged_sfa_captured_graph_keys", ())
+                )
+                for layer_name, impl in self._staged_sfa_impls
+            }
+            missing_keys = {layer: keys for layer, keys in missing_keys.items() if keys}
+            if incomplete or missing_keys:
                 raise RuntimeError(
                     "[SFA cross-layer graph] eager warmup/capture was "
-                    f"incomplete for layers {incomplete}"
+                    f"incomplete: state={incomplete}, missing_keys={missing_keys}"
                 )
-            graph_keys = staged_sfa_graph_capture_sizes(self.vllm_config)
             logger.info(
                 "[SFA cross-layer graph] captured retrieve-split outer graphs "
                 "for %d local SFA layers and %d keys",

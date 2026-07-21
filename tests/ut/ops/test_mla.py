@@ -8,7 +8,11 @@ from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.mla import MLAModules
 
 from tests.ut.base import TestBase
-from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention, IndexerWrapper
+from vllm_ascend.ops.mla import (
+    AscendMultiHeadLatentAttention,
+    IndexerWrapper,
+    sfa_forward_pre_fake,
+)
 
 
 class TestIndexerWrapper(TestBase):
@@ -40,6 +44,23 @@ class TestIndexerWrapper(TestBase):
 
         self.assertIsNone(mock_indexer.topk_indices_buffer)
         self.assertIsNone(mock_indexer.k_cache)
+
+    def test_staged_sfa_fake_bridge_tracks_exact_batch(self):
+        outputs = sfa_forward_pre_fake(
+            torch.empty(4, 8),
+            False,
+            torch.empty(4, 8),
+            "layer-0",
+            2,
+            4,
+            2,
+            16,
+        )
+
+        self.assertEqual(
+            [tuple(output.shape) for output in outputs],
+            [(4, 2, 4), (4, 2, 2), (4, 1, 16), (4, 16)],
+        )
 
     def test_forward(self):
         mock_indexer = MagicMock()

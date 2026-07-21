@@ -598,7 +598,7 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
-    """Return the single-request exact-Q1 cross-layer graph key."""
+    """Return configured exact-Q1 cross-layer graph batch sizes."""
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
@@ -611,9 +611,6 @@ def staged_sfa_graph_capture_sizes(
         ) from exc
     if not sizes or any(size <= 0 for size in sizes):
         raise ValueError("VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain positive integers.")
-    if sizes != (1,):
-        raise ValueError("Cross-layer staged SFA currently supports only capture size 1.")
-
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     limits = (
         getattr(scheduler_config, "max_num_seqs", None),

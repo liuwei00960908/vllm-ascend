@@ -159,8 +159,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
-    # Exact, unpadded Q=1 batch size for staged SFA. The first cross-layer
-    # milestone intentionally supports only one concurrent request.
+    # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
+    # capacity. Defaults to singleton capture; not sensitive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
         "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
         "1",

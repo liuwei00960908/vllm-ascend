@@ -1,9 +1,9 @@
 # Cross-layer staged SFA smoke
 
-This checkpoint targets one exact-Q1 decode request. LMCache retrieval is the
-only staged-SFA FX split; the surrounding PIECEWISE ACL graphs should cross
-transformer-layer boundaries. MTP, DP, LoRA, CP, MLAPO, sparse-C8, and weight
-prefetch remain outside the supported envelope.
+This checkpoint targets configured exact, unpadded Q=1 decode batch sizes.
+LMCache retrieval is the only staged-SFA FX split; the surrounding PIECEWISE
+ACL graphs should cross transformer-layer boundaries. Padding, MTP, DP, LoRA,
+CP, MLAPO, sparse-C8, and weight prefetch remain outside the supported envelope.
 
 ## 1. Run correctness and TPOT first
 
@@ -35,9 +35,9 @@ vllm serve "${MODEL}" \
 ```
 
 Add your existing `--hf-overrides`, model path, memory utilization, host, and
-port arguments unchanged. Do not set
-`VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES`: this milestone accepts only the
-default value `1`.
+port arguments unchanged. Keep
+`VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES` unset for this singleton baseline;
+the default remains `1`.
 
 Run the same deterministic request at least twice. The acceptance gates are:
 
@@ -63,7 +63,34 @@ python3 tools/staged_sfa_graph_smoke.py \
 It requires the cross-layer startup-capture marker but does not prove output
 quality or performance.
 
-## 2. Profile only after the no-profiler gate passes
+## 2. Qualify exact batch 2
+
+First add only one new key to the no-profiler server:
+
+```bash
+VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES=1,2 \
+```
+
+Then run two synchronized, equal-length requests:
+
+```bash
+python3 tools/staged_sfa_graph_smoke.py \
+  --base-url http://127.0.0.1:9000 \
+  --model "${MODEL}" \
+  --server-log "${LOG}" \
+  --profile-dir "${PROFILE_DIR}" \
+  --expected-ranks 2 \
+  --expected-keys 2 \
+  --concurrency 2 \
+  --skip-profile
+```
+
+Run key switching in the order `1 -> 2 -> 1`, compare both batch responses to
+native execution, and confirm no cross-request contamination. A mixed
+dense-prefix/sparse-decode step intentionally uses the native path; incomplete
+sparse metadata remains fatal.
+
+## 3. Profile only after the no-profiler gate passes
 
 Restart with a unique log/profile directory and add:
 
@@ -84,9 +111,11 @@ python3 tools/staged_sfa_graph_smoke.py \
 ```
 
 `ignore_frontend=true` is required so `/stop_profile` finalizes only TP worker
-traces.
+traces. To profile exact batch 2, add `--expected-keys 2 --concurrency 2`;
+the first synchronized request owns the single profiler start/stop interval
+while both requests continue streaming.
 
-## 3. MindStudio acceptance
+## 4. MindStudio acceptance
 
 For one rank and one steady decode step, verify:
 

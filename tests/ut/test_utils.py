@@ -214,7 +214,7 @@ class TestUtils(TestBase):
 
         self.assertEqual(0, len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
 
-    def test_staged_sfa_graph_capture_sizes_accepts_single_request(self):
+    def test_staged_sfa_graph_capture_sizes_accepts_exact_q1_batches(self):
         vllm_config = mock.MagicMock()
         vllm_config.scheduler_config.max_num_seqs = 64
         vllm_config.scheduler_config.max_num_batched_tokens = 128
@@ -227,12 +227,12 @@ class TestUtils(TestBase):
             ),
             mock.patch.dict(
                 os.environ,
-                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 1,1 "},
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 4,1,4,2 "},
             ),
         ):
             capture_sizes = utils.staged_sfa_graph_capture_sizes(vllm_config)
 
-        self.assertEqual(capture_sizes, (1,))
+        self.assertEqual(capture_sizes, (1, 2, 4))
 
     def test_staged_sfa_graph_capture_sizes_ignored_when_disabled(self):
         with (
@@ -258,8 +258,6 @@ class TestUtils(TestBase):
             ("", "must contain positive integers"),
             ("1,not-an-integer", "comma-separated list"),
             ("0,1", "must contain positive integers"),
-            ("2", "only capture size 1"),
-            ("1,2", "only capture size 1"),
         )
 
         with mock.patch.object(
@@ -296,11 +294,11 @@ class TestUtils(TestBase):
                 ),
                 mock.patch.dict(
                     os.environ,
-                    {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "32"},
+                    {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,16,32"},
                 ),
                 self.assertRaisesRegex(
                     ValueError,
-                    "only capture size 1",
+                    "scheduler capacity 16: \\[32\\]",
                 ),
             ):
                 utils.staged_sfa_graph_capture_sizes(vllm_config)

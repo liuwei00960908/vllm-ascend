@@ -286,10 +286,7 @@ def sfa_forward_pre_fake(
     qk_rope_head_dim: int,
     index_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Cross-layer replay is currently restricted to one exact-Q1 row. Keeping
-    # this static also prevents native prefill from materializing prompt-sized
-    # bridge tensors that its no-op retrieve/post path never consumes.
-    num_tokens = 1
+    num_tokens = hidden_states.shape[0]
     return (
         hidden_states.new_empty((num_tokens, local_num_heads, kv_lora_rank)),
         hidden_states.new_empty((num_tokens, local_num_heads, qk_rope_head_dim)),

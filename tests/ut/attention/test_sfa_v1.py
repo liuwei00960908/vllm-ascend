@@ -13,6 +13,7 @@ from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import (
     STAGED_SFA_SINGLETON_GRAPH_KEY,
+    StagedSFAGraphKey,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -188,6 +189,30 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
         )
 
+    def test_mixed_load_requires_every_row_to_be_loadable(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="dense",
+                    is_sparse_decode=False,
+                    load_spec=SimpleNamespace(can_load=True),
+                ),
+                SimpleNamespace(
+                    req_id="sparse",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(can_load=False),
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["dense", "sparse"],
+            ),
+            (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
+        )
+
     def test_sparse_wait_forwards_existing_payload_event(self):
         connector = MagicMock()
         event = object()
@@ -249,7 +274,7 @@ class TestStagedSFAGraphPoc(TestBase):
         capture_sizes = patch.object(
             sfa_v1,
             "staged_sfa_graph_capture_sizes",
-            return_value=(1,),
+            return_value=(1, 4),
         )
         connector_support = patch.object(
             sfa_v1,
@@ -282,7 +307,8 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.cache_config.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
-        impl._staged_sfa_dummy_cache_initialized = False
+        impl._staged_sfa_dummy_cache_capacity = 0
+        impl._staged_sfa_captured_graph_keys = set()
         return impl
 
     @staticmethod
@@ -376,7 +402,8 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         impl.forward.assert_called_once()
-        self.assertEqual([tuple(tensor.shape[:1]) for tensor in outputs], [(1,)] * 4)
+        self.assertEqual([tuple(tensor.shape[:1]) for tensor in outputs], [(16,)] * 4)
+        self.assertTrue(all(tensor.stride(0) == 0 for tensor in outputs))
 
     def test_cross_layer_pre_fails_if_authorized_key_becomes_ineligible(self):
         impl = self._make_eligible_impl()
@@ -403,7 +430,7 @@ class TestStagedSFAGraphPoc(TestBase):
     def test_cross_layer_capture_reuses_eager_boundary_storage(self):
         impl = self._make_eligible_impl()
         kv_cache = self._make_eligible_kv_cache()
-        impl._staged_sfa_dummy_cache_initialized = True
+        impl._staged_sfa_dummy_cache_capacity = 1
         impl._staged_sfa_cross_layer_producer_event = MagicMock()
         impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
@@ -463,6 +490,55 @@ class TestStagedSFAGraphPoc(TestBase):
             impl._cross_layer_pre_compute.call_args_list[1].args[-3],
             eager_metadata.decode_remap_boundary,
         )
+        self.assertEqual(
+            impl._staged_sfa_captured_graph_keys,
+            {STAGED_SFA_SINGLETON_GRAPH_KEY},
+        )
+
+    def test_dummy_cache_initialization_grows_with_capture_key(self):
+        impl = self._make_eligible_impl()
+        kv_cache = tuple(torch.ones_like(cache) for cache in self._make_eligible_kv_cache(num_blocks=4))
+        impl._staged_sfa_cross_layer_producer_event = MagicMock()
+        impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
+        impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
+        impl._cross_layer_pre_compute = MagicMock(return_value=tuple(torch.empty(1) for _ in range(4)))
+
+        def run(batch_size: int) -> None:
+            key = StagedSFAGraphKey.exact_q1(batch_size)
+            metadata = self._make_decode_metadata(batch_size)
+            context = SimpleNamespace(
+                staged_sfa_graph_key=key,
+                staged_sfa_route=StagedSFARouteDecision(
+                    StagedSFARouteAction.STAGED,
+                    StagedSFARouteReason.ELIGIBLE,
+                    key,
+                ),
+                staged_sfa_graph_dummy_run=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+            with (
+                patch.object(sfa_v1, "get_forward_context", return_value=context),
+                patch.object(
+                    sfa_v1,
+                    "_prepare_sfa_remap_boundary",
+                    return_value=metadata.decode_remap_boundary,
+                ),
+            ):
+                impl.cross_layer_graph_pre(
+                    "layer-0",
+                    torch.empty(batch_size, 4),
+                    kv_cache,
+                    metadata,
+                    False,
+                    torch.empty(batch_size, 4),
+                )
+
+        run(2)
+        self.assertTrue(all(torch.count_nonzero(cache[:2]) == 0 for cache in kv_cache))
+        self.assertTrue(all(torch.count_nonzero(cache[2:]) > 0 for cache in kv_cache))
+        run(4)
+        self.assertTrue(all(torch.count_nonzero(cache) == 0 for cache in kv_cache))
+        self.assertEqual(impl._staged_sfa_dummy_cache_capacity, 4)
 
     def test_cross_layer_retrieve_prefetches_next_index(self):
         impl = self._make_eligible_impl()
@@ -741,6 +817,40 @@ class TestStagedSFAGraphPoc(TestBase):
                         metadata,
                     )
                     self.assertIsNone(reason)
+
+    def test_eligibility_accepts_exact_multi_request_q1_batch(self):
+        batch_size = 4
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata(batch_size)
+        graph_key = StagedSFAGraphKey.exact_q1(batch_size)
+        forward_context = MagicMock(
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            staged_sfa_graph_dummy_run=False,
+            staged_sfa_graph_key=graph_key,
+            batch_descriptor=graph_key.to_legacy_batch_descriptor(),
+            dsa_offload_manager=None,
+            dsa_adapter_cache=None,
+        )
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=forward_context),
+            patch.object(sfa_v1, "get_weight_prefetch_method", return_value=None),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(batch_size, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(
+                    dtype=torch.bfloat16,
+                    num_blocks=batch_size,
+                ),
+                metadata,
+            )
+
+        self.assertIsNone(reason)
 
     def test_eligibility_rejects_invalid_cache_contract(self):
         impl = self._make_eligible_impl()

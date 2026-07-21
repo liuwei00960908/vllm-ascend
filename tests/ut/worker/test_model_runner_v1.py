@@ -353,6 +353,21 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         ]
                     ),
                 },
+                "mixed_connector_load": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=index >= 2,
+                                load_spec=SimpleNamespace(
+                                    can_load=True,
+                                    lmcache_cached_tokens=4096,
+                                ),
+                            )
+                            for index, req_id in enumerate(request_ids)
+                        ]
+                    ),
+                },
                 "short_frontier": {
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
@@ -383,6 +398,11 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         self.assertEqual(
                             route.reason,
                             StagedSFARouteReason.DENSE_PREFIX_HIT,
+                        )
+                    elif name == "mixed_connector_load":
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
                         )
                     elif name == "short_frontier":
                         self.assertEqual(
@@ -813,7 +833,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         capture_sizes = patch.object(
             model_runner_module,
             "staged_sfa_graph_capture_sizes",
-            return_value=(1,),
+            return_value=(1, 2),
         )
         configured.start()
         capture_sizes.start()
@@ -844,7 +864,12 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         calls = []
         impl = SimpleNamespace(
             _staged_sfa_cross_layer_producer_event=object(),
+            _staged_sfa_cross_layer_remap_boundary=object(),
             _staged_sfa_cross_layer_runtime=object(),
+            _staged_sfa_captured_graph_keys={
+                StagedSFAGraphKey.exact_q1(1),
+                StagedSFAGraphKey.exact_q1(2),
+            },
         )
         with (
             patch.object(
@@ -885,6 +910,43 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         self.assertTrue(runner._staged_sfa_startup_capture_attempted)
         self.assertEqual(runner._staged_sfa_impls, (("layer-0", impl),))
         parent_capture.assert_called_once_with(runner)
+
+    def test_capture_model_rejects_a_missing_configured_key(self):
+        runner = self._build_runner()
+        impl = SimpleNamespace(
+            _staged_sfa_cross_layer_producer_event=object(),
+            _staged_sfa_cross_layer_remap_boundary=object(),
+            _staged_sfa_cross_layer_runtime=object(),
+            _staged_sfa_captured_graph_keys={StagedSFAGraphKey.exact_q1(1)},
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(runner, "_reset_staged_sfa_startup_capture"),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                return_value=0,
+            ),
+            patch.object(
+                runner,
+                "_collect_staged_sfa_impls",
+                return_value=(("layer-0", impl),),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"missing_keys=.*layer-0.*2",
+            ),
+        ):
+            runner.capture_model()
 
     def test_failed_parent_capture_cannot_retry_stale_outer_graphs(self):
         runner = self._build_runner()

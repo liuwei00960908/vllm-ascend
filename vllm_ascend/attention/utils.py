@@ -413,15 +413,16 @@ def staged_sfa_metadata_sparse_load(
         sparse_frontiers[req_id] = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
 
     if dense_request_ids.intersection(sparse_frontiers):
-        return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
-    if len(sparse_frontiers) == len(active_request_ids):
-        return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
-    if len(dense_request_ids) == len(active_request_ids):
+        return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+    loadable_request_ids = dense_request_ids.union(sparse_frontiers)
+    if loadable_request_ids == active_request_id_set:
+        if dense_request_ids and sparse_frontiers:
+            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
+        if sparse_frontiers:
+            return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
         return StagedSFARouteReason.DENSE_PREFIX_HIT, ()
     if matched_request_ids != active_request_id_set:
         return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
-    if dense_request_ids:
-        return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
     return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
 
 

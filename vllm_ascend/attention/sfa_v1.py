@@ -1002,7 +1002,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
         )
-        self._staged_sfa_dummy_cache_initialized = False
+        self._staged_sfa_dummy_cache_capacity = 0
+        self._staged_sfa_captured_graph_keys: set[StagedSFAGraphKey] = set()
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2080,22 +2081,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The bridge has a fixed one-row contract in the first milestone. The
-        # native path ignores these tensors, so do not scale them with prefill.
-        num_tokens = 1
+        # Native retrieve/post are no-ops. Match the fake bridge shape without
+        # allocating prompt-sized storage for these ignored tensors.
+        num_tokens = hidden_states.shape[0]
+
+        def ignored_row(*shape: int, dtype: torch.dtype | None = None) -> torch.Tensor:
+            return torch.empty(
+                (1, *shape),
+                dtype=hidden_states.dtype if dtype is None else dtype,
+                device=hidden_states.device,
+            ).expand(num_tokens, *shape)
+
         return (
-            hidden_states.new_empty((num_tokens, self.local_num_heads, self.kv_lora_rank)),
-            hidden_states.new_empty((num_tokens, self.local_num_heads, self.qk_rope_head_dim)),
-            torch.empty(
-                (num_tokens, 1, self.index_topk),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            ),
-            torch.empty(
-                (num_tokens, self.index_topk),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            ),
+            ignored_row(self.local_num_heads, self.kv_lora_rank),
+            ignored_row(self.local_num_heads, self.qk_rope_head_dim),
+            ignored_row(1, self.index_topk, dtype=torch.int32),
+            ignored_row(self.index_topk, dtype=torch.int32),
         )
 
     def cross_layer_graph_pre(
@@ -2141,10 +2142,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
-        if is_dummy and not self._staged_sfa_dummy_cache_initialized:
+        initialized_capacity = self._staged_sfa_dummy_cache_capacity
+        if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
-                cache[: graph_key.request_capacity].zero_()
-            self._staged_sfa_dummy_cache_initialized = True
+                cache[initialized_capacity : graph_key.request_capacity].zero_()
+            self._staged_sfa_dummy_cache_capacity = graph_key.request_capacity
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             # ACL capture cannot include the host copy in boundary preparation.
             # The immediately preceding eager warmup filled this stable buffer.
@@ -2163,6 +2165,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 raise RuntimeError(
                     "[SFA cross-layer graph] remap boundary was not prepared in stable storage by eager warmup"
                 )
+            self._staged_sfa_captured_graph_keys.add(graph_key)
             remap_boundary = capture_boundary
         else:
             remap_boundary = _prepare_sfa_remap_boundary(

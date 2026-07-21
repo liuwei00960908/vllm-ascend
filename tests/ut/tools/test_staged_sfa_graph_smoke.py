@@ -85,6 +85,89 @@ def test_start_failure_still_gets_one_cleanup_stop(
     assert actions == ["start", "stop"]
 
 
+def test_concurrent_decode_starts_two_distinct_equal_length_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    args = _decode_args()
+    args.concurrency = 2
+    args.skip_profile = True
+    prompts = []
+
+    def urlopen(request, **kwargs):
+        prompts.append(smoke.json.loads(request.data)["prompt"])
+        return _StreamingResponse(chunks=2)
+
+    monkeypatch.setattr(smoke.urllib.request, "urlopen", urlopen)
+
+    assert smoke.run_streaming_decodes(args) == [2, 2]
+    assert len(set(prompts)) == 2
+    assert {len(prompt.split()) for prompt in prompts} == {args.prompt_words}
+
+
+def test_concurrent_profile_has_one_controller(monkeypatch: pytest.MonkeyPatch):
+    args = _decode_args()
+    args.concurrency = 2
+    progress = {}
+    snapshots = []
+
+    class Response(_StreamingResponse):
+        def __init__(self, prompt):
+            super().__init__(chunks=2)
+            self.prompt = prompt
+
+        def __iter__(self):
+            for chunk, line in enumerate(self._lines, start=1):
+                progress[self.prompt] = chunk
+                yield line
+
+    def urlopen(request, **kwargs):
+        prompt = smoke.json.loads(request.data)["prompt"]
+        return Response(prompt)
+
+    def profile_control(base_url, action, timeout):
+        snapshots.append((action, sorted(progress.values())))
+
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        urlopen,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "profile_control",
+        profile_control,
+    )
+
+    assert smoke.run_streaming_decodes(args) == [2, 2]
+    assert snapshots == [("start", [1, 1]), ("stop", [2, 2])]
+
+
+def test_concurrent_profile_start_failure_has_one_cleanup_stop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    args = _decode_args()
+    args.concurrency = 2
+    actions = []
+
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _StreamingResponse(chunks=2),
+    )
+
+    def profile_control(base_url, action, timeout):
+        actions.append(action)
+        if action == "start":
+            raise urllib.error.URLError("response lost")
+
+    monkeypatch.setattr(smoke, "profile_control", profile_control)
+
+    with pytest.raises((urllib.error.URLError, smoke.SmokeFailure)):
+        smoke.run_streaming_decodes(args)
+
+    assert actions == ["start", "stop"]
+
+
 def test_offline_analysis_runs_in_bounded_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -147,6 +230,13 @@ def test_server_log_accepts_cross_layer_capture(tmp_path: Path):
     )
 
     assert smoke.check_server_log(server_log) == 2
+
+
+def test_server_log_requires_configured_key_count(tmp_path: Path):
+    server_log = _write_server_log(tmp_path, expected_keys=2)
+
+    with pytest.raises(smoke.SmokeFailure, match="captured 2.*expected 3"):
+        smoke.check_server_log(server_log, required_keys=3)
 
 
 def test_server_log_rejects_cross_layer_capture_failure(tmp_path: Path):

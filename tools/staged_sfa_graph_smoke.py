@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Drive and check the single-request cross-layer SFA graph milestone.
+"""Drive and check the exact-Q1 cross-layer SFA graph milestone.
 
 The server must already be running with the requested TP size, no speculative decoding,
 SHRINK_LATENT=2, PIECEWISE graph mode, and the staged-SFA POC enabled.  This
-client sends one long, streaming completion and profiles its steady-state
-decode.
+The default sends one long streaming completion and profiles steady-state
+decode. ``--concurrency N`` drives synchronized exact-Q1 batch requests; only
+the first request controls the shared profiler interval.
 
 Automated checks require successful cross-layer startup capture and worker
 traces containing eager LMCache retrieval plus ACL model replay. They do not
@@ -23,7 +24,9 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, BrokenBarrierError
 
 _TRACE_MARKERS = (
     "sfa_cross_layer::bootstrap",
@@ -44,6 +47,7 @@ _FAILURE_MARKERS = (
     "[SFA cross-layer graph] no local SFA layers were captured",
     "[SFA cross-layer graph] eager warmup/capture was incomplete",
     "[SFA cross-layer graph] runner-authorized key became ineligible",
+    "[SFA_ROUTE] action=fatal",
 )
 
 
@@ -149,7 +153,7 @@ def analyse_profile_data(
     print("offline profiler analysis completed", flush=True)
 
 
-def make_prompt(word_count: int) -> str:
+def make_prompt(word_count: int, offset: int = 0) -> str:
     words = (
         "alpha",
         "bravo",
@@ -168,13 +172,28 @@ def make_prompt(word_count: int) -> str:
         "oscar",
         "papa",
     )
-    return " ".join(words[index % len(words)] for index in range(word_count))
+    return " ".join(words[(index + offset) % len(words)] for index in range(word_count))
 
 
-def run_streaming_decode(args: argparse.Namespace) -> int:
+def _wait_at_barrier(barrier: Barrier, timeout: float, phase: str) -> None:
+    try:
+        barrier.wait(timeout=timeout)
+    except BrokenBarrierError as exc:
+        raise SmokeFailure(f"concurrent requests did not reach the {phase} barrier") from exc
+
+
+def run_streaming_decode(
+    args: argparse.Namespace,
+    *,
+    prompt_offset: int = 0,
+    start_barrier: Barrier | None = None,
+    profile_start_barrier: Barrier | None = None,
+    profile_stop_barrier: Barrier | None = None,
+    control_profile: bool = True,
+) -> int:
     payload = {
         "model": args.model,
-        "prompt": make_prompt(args.prompt_words),
+        "prompt": make_prompt(args.prompt_words, prompt_offset),
         "max_tokens": args.max_tokens,
         "temperature": 0,
         "stream": True,
@@ -192,7 +211,10 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
     profile_started = False
     profile_stop_attempted = False
     profile_stopped = False
+    profile_enabled = not args.skip_profile and (control_profile or profile_start_barrier is not None)
     try:
+        if start_barrier is not None:
+            _wait_at_barrier(start_barrier, args.request_timeout, "start")
         with urllib.request.urlopen(
             request,
             timeout=args.request_timeout,
@@ -213,21 +235,29 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                     continue
                 content_chunks += 1
 
-                if not args.skip_profile and not profile_started and content_chunks >= args.profile_after_chunks:
+                if profile_enabled and not profile_started and content_chunks >= args.profile_after_chunks:
                     # A lost HTTP response can hide a successful server-side
                     # start. Remember the attempt first so finally always sends
                     # a best-effort stop in that case.
-                    profile_start_attempted = True
-                    profile_control(
-                        args.base_url,
-                        "start",
-                        args.profile_control_timeout,
-                    )
+                    profile_start_attempted = profile_start_barrier is None or control_profile
+                    if profile_start_barrier is None:
+                        profile_control(
+                            args.base_url,
+                            "start",
+                            args.profile_control_timeout,
+                        )
+                    else:
+                        _wait_at_barrier(
+                            profile_start_barrier,
+                            args.request_timeout,
+                            "profile-start",
+                        )
                     profile_started = True
-                    print(
-                        f"profiler started after {content_chunks} streamed content chunks",
-                        flush=True,
-                    )
+                    if control_profile:
+                        print(
+                            f"profiler started after {content_chunks} streamed content chunks",
+                            flush=True,
+                        )
 
                 if (
                     profile_started
@@ -237,17 +267,25 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
                     # torch_npu profiler stop is not safely idempotent. Mark
                     # the attempt before sending it so a lost response does
                     # not cause finally to issue a second stop request.
-                    profile_stop_attempted = True
-                    profile_control(
-                        args.base_url,
-                        "stop",
-                        args.profile_control_timeout,
-                    )
+                    profile_stop_attempted = profile_stop_barrier is None or control_profile
+                    if profile_stop_barrier is None:
+                        profile_control(
+                            args.base_url,
+                            "stop",
+                            args.profile_control_timeout,
+                        )
+                    else:
+                        _wait_at_barrier(
+                            profile_stop_barrier,
+                            args.request_timeout,
+                            "profile-stop",
+                        )
                     profile_stopped = True
-                    print(
-                        f"profiler stopped after {content_chunks} streamed content chunks",
-                        flush=True,
-                    )
+                    if control_profile:
+                        print(
+                            f"profiler stopped after {content_chunks} streamed content chunks",
+                            flush=True,
+                        )
     finally:
         if profile_start_attempted and not profile_stopped and not profile_stop_attempted:
             try:
@@ -259,15 +297,53 @@ def run_streaming_decode(args: argparse.Namespace) -> int:
             except Exception as exc:  # best-effort cleanup after a primary failure
                 print(f"warning: failed to stop profiler: {exc}", file=sys.stderr)
 
-    minimum_chunks = args.profile_after_chunks + args.profile_chunks if not args.skip_profile else 2
+    minimum_chunks = args.profile_after_chunks + args.profile_chunks if profile_enabled else 2
     if content_chunks < minimum_chunks:
         raise SmokeFailure(f"completion produced only {content_chunks} content chunks; need at least {minimum_chunks}")
-    if not args.skip_profile and not profile_stopped:
+    if profile_enabled and not profile_stopped:
         raise SmokeFailure("profile interval did not complete")
     return content_chunks
 
 
-def check_server_log(path: Path) -> int:
+def run_streaming_decodes(args: argparse.Namespace) -> list[int]:
+    if args.concurrency == 1:
+        return [run_streaming_decode(args)]
+    barrier = Barrier(args.concurrency)
+    profile_start_barrier = profile_stop_barrier = None
+    if not args.skip_profile:
+        profile_start_barrier = Barrier(
+            args.concurrency,
+            action=lambda: profile_control(
+                args.base_url,
+                "start",
+                args.profile_control_timeout,
+            ),
+        )
+        profile_stop_barrier = Barrier(
+            args.concurrency,
+            action=lambda: profile_control(
+                args.base_url,
+                "stop",
+                args.profile_control_timeout,
+            ),
+        )
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = [
+            executor.submit(
+                run_streaming_decode,
+                args,
+                prompt_offset=index,
+                start_barrier=barrier,
+                profile_start_barrier=profile_start_barrier,
+                profile_stop_barrier=profile_stop_barrier,
+                control_profile=index == 0,
+            )
+            for index in range(args.concurrency)
+        ]
+        return [future.result() for future in futures]
+
+
+def check_server_log(path: Path, required_keys: int | None = None) -> int:
     if not path.is_file():
         raise SmokeFailure(f"server log does not exist: {path}")
 
@@ -309,6 +385,8 @@ def check_server_log(path: Path) -> int:
         missing.append("positive local staged-SFA layer count")
     if expected_keys is None or expected_keys <= 0:
         missing.append("positive staged graph key count")
+    elif required_keys is not None and expected_keys != required_keys:
+        failures.append(f"captured {expected_keys} staged graph keys; expected {required_keys}")
     if missing:
         failures.append("missing log gates: " + ", ".join(missing))
     if failures:
@@ -443,6 +521,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--profile-dir", type=Path, required=True)
     parser.add_argument("--expected-ranks", type=int, default=2)
+    parser.add_argument("--expected-keys", type=int)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="simultaneous exact-Q1 requests; the first request controls profiling",
+    )
     parser.add_argument(
         "--prompt-words",
         type=int,
@@ -471,6 +556,10 @@ def parse_args() -> argparse.Namespace:
 
     if args.expected_ranks <= 0:
         parser.error("--expected-ranks must be positive")
+    if args.expected_keys is not None and args.expected_keys <= 0:
+        parser.error("--expected-keys must be positive")
+    if args.concurrency <= 0:
+        parser.error("--concurrency must be positive")
     if args.prompt_words <= 0:
         parser.error("--prompt-words must be positive")
     if args.profile_after_chunks < 3:
@@ -492,9 +581,9 @@ def main() -> int:
         wait_until_ready(args.base_url, args.ready_timeout)
         if not args.skip_profile:
             require_worker_only_profiling(args.server_log)
-        chunks = run_streaming_decode(args)
-        print(f"streaming decode completed with {chunks} content chunks")
-        expected_layers = check_server_log(args.server_log)
+        chunks = run_streaming_decodes(args)
+        print(f"streaming decodes completed with content chunks per request: {chunks}")
+        expected_layers = check_server_log(args.server_log, args.expected_keys)
 
         if args.skip_profile:
             print("LOG GATES PASSED. Trace and output/TPOT proof were skipped.")
