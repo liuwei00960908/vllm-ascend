@@ -169,40 +169,6 @@ def _dsa_mask_padding_sparse_rows(
     return topk_indices, topk_2d
 
 
-def _dsa_build_target_slot_mapping(
-    block_table: torch.Tensor,
-    row_req_indices: torch.Tensor,
-    scratch_base: torch.Tensor,
-    width: int,
-    block_size: int,
-    position_offsets: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build per-row target slots for compact DSA scratch loads."""
-    if width <= 0 or row_req_indices.numel() == 0:
-        return torch.empty(
-            (int(row_req_indices.numel()), max(width, 0)),
-            dtype=torch.long,
-            device=block_table.device,
-        )
-
-    row_req_indices = row_req_indices.to(device=block_table.device, dtype=torch.long)
-    scratch_base = scratch_base.to(device=block_table.device, dtype=torch.long)
-    block_table_rows = block_table.index_select(0, row_req_indices).to(torch.long)
-    if position_offsets is None:
-        position_offsets = torch.arange(
-            width, dtype=torch.long, device=block_table.device
-        )
-    positions = scratch_base.reshape(-1, 1) + position_offsets[:width].reshape(
-        1, -1
-    )
-    logical_blocks = positions // block_size
-    offsets = positions % block_size
-    max_logical_block = max(int(block_table_rows.shape[1]) - 1, 0)
-    safe_logical_blocks = torch.clamp(logical_blocks, min=0, max=max_logical_block)
-    physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
-    return physical_blocks * block_size + offsets
-
-
 def _dsa_indexer_layer_name(layer_name: str) -> str:
     return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
 
@@ -314,12 +280,13 @@ class AscendSFAMetadata:
     req_ids: list[str] | None = None
     split_boundary: torch.Tensor | None = None
     decode_req_indices: torch.Tensor | None = None
-    decode_valid_row_indices: torch.Tensor | None = None
     decode_request_ids_compact: list[str] | None = None
     decode_row_offsets: torch.Tensor | None = None
     decode_current_positions_cpu: Any = None
-    decode_scratch_base: torch.Tensor | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
+    decode_selected_tokens: torch.Tensor | None = None
+    decode_selected_counts: torch.Tensor | None = None
+    decode_hash_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     decode_split_boundary: torch.Tensor | None = None
 
@@ -382,13 +349,40 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 getattr(hf_text_config or hf_config, "index_topk", 2048),
             )
         )
-        self._dsa_target_position_offsets = (
-            torch.arange(self.index_topk, dtype=torch.long, device=device)
-            if self.dsa_shrink_latent
-            else None
-        )
+        if self.dsa_shrink_latent and self.index_topk % self.block_size:
+            raise ValueError(
+                "DSA index_topk must be an integer multiple of block_size: "
+                f"index_topk={self.index_topk}, block_size={self.block_size}. "
+                "Configure index_topk to N * block_size."
+            )
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.scratch_capacity = self.decode_threshold * self.index_topk
+        hash_capacity = 1
+        while hash_capacity < 2 * self.scratch_capacity:
+            hash_capacity *= 2
+        if self.dsa_shrink_latent:
+            self._dsa_selected_tokens = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._dsa_selected_counts = torch.empty(
+                max_num_reqs, dtype=torch.int32, device=device
+            )
+            self._dsa_target_slots = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.long,
+                device=device,
+            )
+            self._dsa_hash_workspace = torch.empty(
+                (max_num_reqs, hash_capacity), dtype=torch.int32, device=device
+            )
+        else:
+            self._dsa_selected_tokens = None
+            self._dsa_selected_counts = None
+            self._dsa_target_slots = None
+            self._dsa_hash_workspace = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
 
@@ -439,12 +433,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # Prefill and padding rows get 0 and stay untouched by the remap.
         split_boundary_rows = None
         decode_req_indices_rows = None
-        decode_valid_row_indices = None
-        decode_req_indices_compact = None
         decode_request_ids_compact = None
-        decode_scratch_base_rows = None
-        decode_scratch_base_compact = None
         decode_target_slot_mapping = None
+        decode_selected_tokens = None
+        decode_selected_counts = None
+        decode_hash_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         plens_cpu = (
@@ -482,15 +475,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_decode_rows = int(np.count_nonzero(req_rows >= 0))
             split_boundary_rows = torch.from_numpy(rows).to(block_table.device)
             decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
-            scratch_base_np = row_offsets.astype(np.int32) * self.index_topk
-            # Plain decode has one row per request and uses the legacy per-request
-            # sparse slot mapping. Only MTP/spec rows need disjoint scratch bases
-            # and explicit target-slot tensors.
-            needs_row_scratch_base = bool(np.any(scratch_base_np))
-            if num_decode_rows > 0:
-                decode_scratch_base_rows = torch.from_numpy(scratch_base_np).to(
-                    block_table.device
-                )
             need_sparse_lmcache_payload = (
                 self.dsa_shrink_latent != 3
                 and has_kv_transfer_group()
@@ -498,33 +482,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
             valid_row_indices_np = np.flatnonzero(req_rows >= 0).astype(np.int32)
             if valid_row_indices_np.size:
-                valid_req_indices_np = req_rows[valid_row_indices_np].astype(np.int64)
-                valid_scratch_base_np = scratch_base_np[valid_row_indices_np]
+                assert self._dsa_target_slots is not None
+                assert self._dsa_selected_tokens is not None
+                assert self._dsa_selected_counts is not None
+                assert self._dsa_hash_workspace is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
-                    decode_request_ids_compact = [
-                        req_ids[int(req_idx)] for req_idx in valid_req_indices_np
-                    ]
+                    decode_request_ids_compact = list(req_ids[:num_reqs])
                 # This ordered-unique list is also the fused kernel's ownership
                 # map: one AIV owns each complete source row.
-                decode_valid_row_indices = torch.from_numpy(
-                    valid_row_indices_np
-                ).to(block_table.device)
-                decode_req_indices_compact = torch.from_numpy(
-                    valid_req_indices_np
-                ).to(block_table.device)
-                if needs_row_scratch_base:
-                    decode_scratch_base_compact = torch.from_numpy(
-                        valid_scratch_base_np
-                    ).to(block_table.device)
-                    decode_target_slot_mapping = _dsa_build_target_slot_mapping(
-                        block_table,
-                        decode_req_indices_compact,
-                        decode_scratch_base_compact,
-                        self.index_topk,
-                        self.block_size,
-                        self._dsa_target_position_offsets,
-                    )
+                decode_target_slot_mapping = self._dsa_target_slots[:num_reqs]
+                decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
+                decode_selected_counts = self._dsa_selected_counts[:num_reqs]
+                decode_hash_workspace = self._dsa_hash_workspace[:num_reqs]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -632,7 +602,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             req_ids=getattr(common_attn_metadata, "request_ids", None),
             split_boundary=split_boundary_rows,
             decode_req_indices=decode_req_indices_rows,
-            decode_valid_row_indices=decode_valid_row_indices,
             decode_request_ids_compact=decode_request_ids_compact,
             decode_row_offsets=(
                 torch.from_numpy(row_offsets).to(block_table.device)
@@ -641,8 +610,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_current_positions_cpu=(
                 current_positions if decode_req_indices_rows is not None else None
             ),
-            decode_scratch_base=decode_scratch_base_rows,
             decode_target_slot_mapping=decode_target_slot_mapping,
+            decode_selected_tokens=decode_selected_tokens,
+            decode_selected_counts=decode_selected_counts,
+            decode_hash_workspace=decode_hash_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             num_decode_tokens=num_decode_rows,
         )
@@ -729,6 +700,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
+        self.block_size = self.vllm_config.cache_config.block_size
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -1740,17 +1712,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # it (and its scatter) when no v1 connector will consume it (profiling /
             # no-offload runs). Production with an LMCache connector is unchanged.
             _need_packed = attn_metadata.need_sparse_lmcache_payload
-            _valid_row_indices = attn_metadata.decode_valid_row_indices
             _topk_rows = int(topk_indices.shape[0])
-            _scratch_base = attn_metadata.decode_scratch_base
-            if _valid_row_indices is None or _scratch_base is None:
-                raise RuntimeError(
-                    "DSA sparse-index metadata is incomplete: "
-                    "decode_valid_row_indices and decode_scratch_base are required"
-                )
-            _scratch_base = _scratch_base[:_topk_rows]
-            if _scratch_base.device != topk_indices.device:
-                _scratch_base = _scratch_base.to(device=topk_indices.device)
             _split_boundary = attn_metadata.split_boundary
             _decode_window_size = _decode_window_save_window_size()
             _diag_remap_build = False
@@ -1859,34 +1821,30 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.decode_split_boundary = _split_boundary
                 _diag_remap_build = True
             _absolute_topk_for_diag = topk_indices
-            _padding_row_req_indices = (
-                attn_metadata.decode_req_indices if _is_pure_decode else None
-            )
-            _selected_token_counts = None
-            if _need_packed:
-                _topk_before_remap = topk_indices.reshape(_topk_rows, -1)
-                _boundary_before_remap = _split_boundary[:_topk_rows].reshape(
-                    -1, 1
-                ).to(dtype=_topk_before_remap.dtype)
-                _all_selected_counts = (
-                    (_topk_before_remap >= 0)
-                    & (_topk_before_remap < _boundary_before_remap)
-                ).sum(dim=1, dtype=torch.int32)
-                _selected_token_counts = _all_selected_counts.index_select(
-                    0, _valid_row_indices.to(dtype=torch.long)
-                )
+            _row_req_indices = attn_metadata.decode_req_indices
+            if _row_req_indices is None:
+                raise RuntimeError("DSA union remap requires row request indices")
+            _selected_token_counts = attn_metadata.decode_selected_counts
             with _dsa_prof.section("prepare_sparse_indices"):
-                topk_indices, _sel_packed = prepare_sparse_indices(
+                (
+                    topk_indices,
+                    _sel_packed,
+                    _selected_token_counts,
+                    _target_slot_mapping,
+                ) = prepare_sparse_indices(
                     topk_indices,
                     _split_boundary,
+                    row_req_indices=_row_req_indices,
+                    request_block_table=attn_metadata.block_table,
+                    selected_packed=attn_metadata.decode_selected_tokens,
+                    selected_counts=attn_metadata.decode_selected_counts,
+                    target_slot_mapping=attn_metadata.decode_target_slot_mapping,
+                    hash_workspace=attn_metadata.decode_hash_workspace,
+                    block_size=self.block_size,
                     need_packed=_need_packed,
-                    scratch_base=_scratch_base,
-                    valid_row_indices=_valid_row_indices,
-                    row_req_indices=_padding_row_req_indices,
+                    clear_invalid_rows=_is_pure_decode,
                 )
-            _sparse_indices_padding_zeroed = (
-                _padding_row_req_indices is not None
-            )
+            _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = (
                 get_forward_context()
                 if _mtp_dw_diag_enabled() and _diag_remap_build
@@ -1932,11 +1890,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if _diag_committed_end is not None
                     else []
                 )
-                _diag_scratch = (
-                    _scratch_base.detach().cpu().tolist()
-                    if _scratch_base is not None
-                    else []
-                )
+                _diag_scratch = []
                 _diag_absolute = _absolute_topk_for_diag.detach().cpu()
                 _diag_packed = (
                     _sel_packed.detach().cpu() if _sel_packed is not None else None
@@ -1987,14 +1941,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 _diag_compact_row = (
                     {
-                        source_row: compact_row
-                        for compact_row, source_row in enumerate(
-                            row
-                            for row, req_index in enumerate(
-                                _diag_row_req_indices_list
-                            )
-                            if int(req_index) >= 0
+                        source_row: int(req_index)
+                        for source_row, req_index in enumerate(
+                            _diag_row_req_indices_list
                         )
+                        if int(req_index) >= 0
                     }
                     if _diag_deep_req_ids
                     else {}
@@ -2019,9 +1970,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         (absolute_row >= 0) & (absolute_row < boundary)
                     ]
                     packed_row = (
-                        _diag_packed[row].reshape(-1)
+                        _diag_packed[int(req_index)].reshape(-1)
                         if _diag_packed is not None
-                        and row < _diag_packed.shape[0]
+                        and int(req_index) < _diag_packed.shape[0]
                         else torch.empty(0, dtype=torch.long)
                     )
                     scratch_base = (

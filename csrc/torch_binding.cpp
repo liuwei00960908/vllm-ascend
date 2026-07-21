@@ -222,7 +222,8 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     return {masked_input, mask};
 }
 
-at::Tensor npu_dsa_prepare_sparse_indices_(
+#if 0
+at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
     const at::Tensor &valid_rows,
@@ -373,6 +374,115 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     });
     cmd.Run();
     return selected_packed;
+}
+
+#endif
+
+at::Tensor npu_dsa_prepare_sparse_indices_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &hash_workspace,
+    int64_t block_size,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    const auto device = topk_indices.device();
+    TORCH_CHECK(split_boundary.device() == device &&
+                    row_req_indices.device() == device &&
+                    request_block_table.device() == device &&
+                    selected_packed.device() == device &&
+                    selected_counts.device() == device &&
+                    target_slots.device() == device &&
+                    hash_workspace.device() == device,
+                "all sparse-index preparation tensors must share one NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    split_boundary.scalar_type() == at::kInt &&
+                    row_req_indices.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    selected_counts.scalar_type() == at::kInt &&
+                    hash_workspace.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong,
+                "sparse indices/counts/tables must be int32 and target slots int64");
+    TORCH_CHECK(topk_indices.is_contiguous() && split_boundary.is_contiguous() &&
+                    row_req_indices.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    selected_counts.is_contiguous() &&
+                    target_slots.is_contiguous() && hash_workspace.is_contiguous(),
+                "all sparse-index preparation tensors must be contiguous");
+    TORCH_CHECK(topk_indices.dim() == 2 ||
+                    (topk_indices.dim() == 3 && topk_indices.size(1) == 1),
+                "topk_indices must have shape [rows,k] or [rows,1,k]");
+    TORCH_CHECK(request_block_table.dim() == 2 && selected_packed.dim() == 2 &&
+                    target_slots.sizes() == selected_packed.sizes() &&
+                    hash_workspace.dim() == 2,
+                "request tables and preallocated payload buffers must be 2D");
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(row_count > 0, "topk_indices must contain at least one row");
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_count = request_block_table.size(0);
+    const int64_t block_table_width = request_block_table.size(1);
+    TORCH_CHECK(request_count > 0, "request block table must contain a request");
+    TORCH_CHECK(split_boundary.numel() >= row_count &&
+                    row_req_indices.numel() >= row_count,
+                "split_boundary and row_req_indices must cover every row");
+    TORCH_CHECK(selected_packed.size(0) == request_count &&
+                    selected_counts.numel() == request_count &&
+                    hash_workspace.size(0) == request_count,
+                "preallocated payload rows must match request block-table rows");
+    TORCH_CHECK(block_size > 0 && row_width > 0 && row_width <= 4096,
+                "block_size and sparse row width must be supported and positive");
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t hash_capacity = hash_workspace.size(1);
+    TORCH_CHECK(scratch_capacity >= row_width &&
+                    hash_capacity >= 2 * scratch_capacity &&
+                    (hash_capacity & (hash_capacity - 1)) == 0,
+                "hash workspace width must be a power of two and at least "
+                "twice the scratch capacity");
+    TORCH_CHECK(request_block_table.size(1) * block_size >= scratch_capacity,
+                "request block table is too short for the fixed scratch prefix");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* boundary_ptr = split_boundary.data_ptr();
+    void* row_req_ptr = row_req_indices.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* counts_ptr = selected_counts.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    void* hash_ptr = hash_workspace.data_ptr();
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_prepare_sparse_indices_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+        counts_ptr, slots_ptr, hash_ptr, row_count, row_width, request_count,
+        block_table_width, scratch_capacity, hash_capacity, block_size,
+        need_packed, clear_invalid_rows]() -> int {
+        dsa_prepare_sparse_indices_impl(
+            stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+            counts_ptr, slots_ptr, hash_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(hash_capacity),
+            static_cast<uint32_t>(block_size), need_packed,
+            clear_invalid_rows);
+        return 0;
+    });
+    cmd.Run();
+    return selected_counts;
 }
 
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
@@ -880,8 +990,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "npu_dsa_prepare_sparse_indices_(Tensor(a!) topk_indices, Tensor split_boundary, "
-        "Tensor valid_rows, Tensor scratch_base, bool need_packed, "
-        "Tensor? row_req_indices=None) -> Tensor");
+        "Tensor row_req_indices, Tensor request_block_table, "
+        "Tensor(b!) selected_packed, Tensor(c!) selected_counts, "
+        "Tensor(d!) target_slots, Tensor(e!) hash_workspace, "
+        "int block_size, bool need_packed, bool clear_invalid_rows) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_prepare_sparse_indices_",
         torch::kPrivateUse1,

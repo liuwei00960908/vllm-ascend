@@ -54,20 +54,27 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
 at::Tensor npu_dsa_prepare_sparse_indices_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
-    const at::Tensor &valid_rows,
-    const at::Tensor &scratch_base,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &hash_workspace,
+    int64_t block_size,
     bool need_packed,
-    const c10::optional<at::Tensor> &row_req_indices)
+    bool clear_invalid_rows)
 {
+    (void)topk_indices;
     (void)split_boundary;
-    (void)scratch_base;
     (void)row_req_indices;
-    const int64_t rows = topk_indices.size(0);
-    TORCH_CHECK(rows > 0, "topk_indices must contain at least one row");
-    const int64_t row_width = topk_indices.numel() / rows;
-    return at::empty(
-        {need_packed ? valid_rows.numel() : 0, row_width},
-        topk_indices.options());
+    (void)request_block_table;
+    (void)selected_packed;
+    (void)target_slots;
+    (void)hash_workspace;
+    (void)block_size;
+    (void)need_packed;
+    (void)clear_invalid_rows;
+    return selected_counts;
 }
 
 at::Tensor bgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y,

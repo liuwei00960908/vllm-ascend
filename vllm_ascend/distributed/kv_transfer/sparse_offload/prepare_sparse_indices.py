@@ -17,54 +17,99 @@ import torch
 def _prepare_sparse_indices_torch(
     topk_indices: torch.Tensor,
     split_boundary: torch.Tensor,
+    row_req_indices: torch.Tensor | None = None,
+    request_block_table: torch.Tensor | None = None,
+    block_size: int = 1,
     need_packed: bool = True,
+    clear_invalid_rows: bool = False,
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
-    row_req_indices: torch.Tensor | None = None,
 ):
-    """Original Torch implementation, retained only as a test oracle."""
+    """Request-level stable-union reference, retained only as a test oracle."""
     orig_shape = topk_indices.shape
     sel = topk_indices.reshape(orig_shape[0], -1)
-    k = sel.shape[1]
-    boundary = split_boundary.reshape(-1, 1).to(device=sel.device, dtype=sel.dtype)
-    if scratch_base is None:
-        base = torch.zeros((sel.shape[0], 1), dtype=sel.dtype, device=sel.device)
-    else:
-        base = scratch_base.reshape(-1, 1).to(device=sel.device, dtype=sel.dtype)
-
-    is_lmcache = (sel >= 0) & (sel < boundary)
-    # torch.cumsum promotes integer dtypes to int64 by default; the sparse FA
-    # kernel requires int32 indices, so pin the dtype explicitly.
-    rank = torch.cumsum(is_lmcache, dim=1, dtype=sel.dtype) - 1
-    new_indices = torch.where(is_lmcache, base + rank, sel)
-    if row_req_indices is not None:
-        invalid_rows = row_req_indices.reshape(-1)[: sel.shape[0]] < 0
-        new_indices.masked_fill_(invalid_rows.reshape(-1, 1), 0)
-
-    if not need_packed:
-        return new_indices.reshape(orig_shape), None
-
-    # Add one trash column so non-LMCache entries scatter harmlessly off the
-    # end, then return only the front-packed absolute positions.
-    packed = sel.new_zeros(sel.shape[0], k + 1)
-    dst = torch.where(is_lmcache, rank, torch.full_like(rank, k))
-    packed.scatter_(1, dst.long(), sel)
-    packed = packed[:, :k].to(torch.int32)
-    if valid_row_indices is not None:
-        packed = packed.index_select(
-            0,
-            valid_row_indices.reshape(-1).to(device=sel.device, dtype=torch.long),
+    if request_block_table is None:
+        boundary = split_boundary.reshape(-1, 1).to(sel)
+        base = (
+            torch.zeros((sel.shape[0], 1), dtype=sel.dtype, device=sel.device)
+            if scratch_base is None
+            else scratch_base.reshape(-1, 1).to(sel)
         )
-    return new_indices.reshape(orig_shape), packed
+        selected = (sel >= 0) & (sel < boundary)
+        rank = torch.cumsum(selected, dim=1, dtype=sel.dtype) - 1
+        remapped = torch.where(selected, base + rank, sel)
+        if row_req_indices is not None:
+            remapped[row_req_indices[: sel.shape[0]] < 0] = 0
+        if not need_packed:
+            return remapped.reshape(orig_shape), None
+        packed = sel.new_zeros((sel.shape[0], sel.shape[1] + 1))
+        dst = torch.where(selected, rank, torch.full_like(rank, sel.shape[1]))
+        packed.scatter_(1, dst.long(), sel)
+        packed = packed[:, : sel.shape[1]]
+        if valid_row_indices is not None:
+            packed = packed.index_select(0, valid_row_indices.long())
+        return remapped.reshape(orig_shape), packed
+
+    assert row_req_indices is not None
+    request_count = int(request_block_table.shape[0])
+    capacity = sel.shape[1] * max(
+        1,
+        max(
+            (
+                int((row_req_indices == req).sum())
+                for req in range(request_count)
+            ),
+            default=1,
+        ),
+    )
+    packed = sel.new_zeros((request_count, capacity))
+    counts = torch.zeros(request_count, dtype=torch.int32, device=sel.device)
+    targets = torch.zeros(
+        (request_count, capacity), dtype=torch.long, device=sel.device
+    )
+    new_indices = sel.clone()
+    for req in range(request_count):
+        inverse: dict[int, int] = {}
+        for row in range(sel.shape[0]):
+            if int(row_req_indices[row]) != req:
+                continue
+            boundary = int(split_boundary[row])
+            for col in range(sel.shape[1]):
+                token = int(sel[row, col])
+                if 0 <= token < boundary:
+                    slot = inverse.get(token)
+                    if slot is None:
+                        slot = len(inverse)
+                        inverse[token] = slot
+                        packed[req, slot] = token
+                        block_id = int(request_block_table[req, slot // block_size])
+                        targets[req, slot] = (
+                            block_id * block_size + slot % block_size
+                        )
+                    new_indices[row, col] = slot
+        counts[req] = len(inverse)
+    if clear_invalid_rows:
+        new_indices[row_req_indices[: sel.shape[0]] < 0] = 0
+    return (
+        new_indices.reshape(orig_shape),
+        packed if need_packed else None,
+        counts if need_packed else None,
+        targets if need_packed else None,
+    )
 
 
 def prepare_sparse_indices(
     topk_indices: torch.Tensor,
     split_boundary: torch.Tensor,
+    row_req_indices: torch.Tensor,
+    request_block_table: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slot_mapping: torch.Tensor,
+    hash_workspace: torch.Tensor,
+    block_size: int,
     need_packed: bool = True,
-    scratch_base: torch.Tensor | None = None,
-    valid_row_indices: torch.Tensor | None = None,
-    row_req_indices: torch.Tensor | None = None,
+    clear_invalid_rows: bool = False,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -100,10 +145,6 @@ def prepare_sparse_indices(
             "prepare_sparse_indices requires the NPU custom op; use "
             "_prepare_sparse_indices_torch only as a test reference"
         )
-    if valid_row_indices is None or scratch_base is None:
-        raise ValueError(
-            "prepare_sparse_indices requires valid_row_indices and scratch_base"
-        )
     try:
         fused_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_
     except AttributeError as exc:
@@ -112,12 +153,22 @@ def prepare_sparse_indices(
             "rebuild the custom-op extension"
         ) from exc
 
-    packed = fused_op(
+    fused_op(
         topk_indices,
         split_boundary,
-        valid_row_indices,
-        scratch_base,
-        need_packed,
         row_req_indices,
+        request_block_table,
+        selected_packed,
+        selected_counts,
+        target_slot_mapping,
+        hash_workspace,
+        block_size,
+        need_packed,
+        clear_invalid_rows,
     )
-    return topk_indices, packed if need_packed else None
+    return (
+        topk_indices,
+        selected_packed if need_packed else None,
+        selected_counts if need_packed else None,
+        target_slot_mapping if need_packed else None,
+    )
