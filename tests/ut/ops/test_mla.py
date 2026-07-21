@@ -55,12 +55,30 @@ class TestIndexerWrapper(TestBase):
             4,
             2,
             16,
+            4,
         )
 
         self.assertEqual(
             [tuple(output.shape) for output in outputs],
             [(4, 2, 4), (4, 2, 2), (4, 1, 16), (4, 16)],
         )
+        self.assertTrue(all(output.is_contiguous() for output in outputs))
+
+    def test_staged_sfa_fake_bridge_caps_native_profile_shape(self):
+        outputs = sfa_forward_pre_fake(
+            torch.empty(16384, 8),
+            False,
+            torch.empty(16384, 8),
+            "layer-0",
+            2,
+            4,
+            2,
+            16,
+            4,
+        )
+
+        self.assertEqual([output.shape[0] for output in outputs], [4] * 4)
+        self.assertTrue(all(output.is_contiguous() for output in outputs))
 
     def test_forward(self):
         mock_indexer = MagicMock()

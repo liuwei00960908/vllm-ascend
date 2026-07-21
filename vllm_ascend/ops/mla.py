@@ -185,6 +185,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 impl.kv_lora_rank,
                 impl.qk_rope_head_dim,
                 impl.index_topk,
+                impl._staged_sfa_graph_capture_sizes[-1],
             )
             torch.ops.vllm.sfa_lmcache_retrieve(
                 selected_packed,
@@ -264,6 +265,7 @@ def sfa_forward_pre(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     index_topk: int,
+    bridge_capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
     return impl.cross_layer_graph_pre(
@@ -285,18 +287,18 @@ def sfa_forward_pre_fake(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     index_topk: int,
+    bridge_capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens = hidden_states.shape[0]
     return (
-        hidden_states.new_empty((num_tokens, local_num_heads, kv_lora_rank)),
-        hidden_states.new_empty((num_tokens, local_num_heads, qk_rope_head_dim)),
+        hidden_states.new_empty((bridge_capacity, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((bridge_capacity, local_num_heads, qk_rope_head_dim)),
         torch.empty(
-            (num_tokens, 1, index_topk),
+            (bridge_capacity, 1, index_topk),
             dtype=torch.int32,
             device=hidden_states.device,
         ),
         torch.empty(
-            (num_tokens, index_topk),
+            (bridge_capacity, index_topk),
             dtype=torch.int32,
             device=hidden_states.device,
         ),

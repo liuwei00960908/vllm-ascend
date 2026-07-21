@@ -402,8 +402,8 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         impl.forward.assert_called_once()
-        self.assertEqual([tuple(tensor.shape[:1]) for tensor in outputs], [(16,)] * 4)
-        self.assertTrue(all(tensor.stride(0) == 0 for tensor in outputs))
+        self.assertEqual([tuple(tensor.shape[:1]) for tensor in outputs], [(4,)] * 4)
+        self.assertTrue(all(tensor.is_contiguous() for tensor in outputs))
 
     def test_cross_layer_pre_fails_if_authorized_key_becomes_ineligible(self):
         impl = self._make_eligible_impl()
@@ -465,7 +465,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 return_value=eager_metadata.decode_remap_boundary,
             ) as prepare_boundary,
         ):
-            for metadata in (eager_metadata, capture_metadata):
+            outputs = [
                 impl.cross_layer_graph_pre(
                     "layer-0",
                     torch.empty(1, 4),
@@ -474,6 +474,8 @@ class TestStagedSFAGraphPoc(TestBase):
                     False,
                     torch.empty(1, 4),
                 )
+                for metadata in (eager_metadata, capture_metadata)
+            ]
 
         prepare_boundary.assert_called_once_with(
             eager_metadata,
@@ -494,6 +496,7 @@ class TestStagedSFAGraphPoc(TestBase):
             impl._staged_sfa_captured_graph_keys,
             {STAGED_SFA_SINGLETON_GRAPH_KEY},
         )
+        self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
 
     def test_dummy_cache_initialization_grows_with_capture_key(self):
         impl = self._make_eligible_impl()
@@ -559,7 +562,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 sfa_v1,
                 "_prepare_dsa_sparse_lmcache_payload",
                 return_value=(torch.ones(1, 4), ["req-0"], torch.zeros(1)),
-            ),
+            ) as prepare_payload,
             patch.object(
                 sfa_v1,
                 "wait_for_kv_layer_from_connector",
@@ -576,11 +579,12 @@ class TestStagedSFAGraphPoc(TestBase):
             impl.cross_layer_lmcache_retrieve(
                 "layer-0",
                 "layer-1.attn",
-                torch.ones(1, 4, dtype=torch.int32),
+                torch.ones(4, 4, dtype=torch.int32),
                 metadata,
             )
 
         self.assertEqual(waits, ["layer-0", "layer-1.indexer.k_cache"])
+        self.assertEqual(prepare_payload.call_args.args[1].shape, (1, 4))
         self.assertIs(
             metadata.reshape_cache_event,
             impl._staged_sfa_cross_layer_producer_event,
@@ -596,6 +600,29 @@ class TestStagedSFAGraphPoc(TestBase):
             index_topk=impl.index_topk,
             cached_tokens=(4096,),
         )
+
+    def test_cross_layer_post_ignores_padded_bridge_rows(self):
+        impl = self._make_eligible_impl()
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
+        impl._cross_layer_post_compute = MagicMock()
+        context = SimpleNamespace(
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+        )
+
+        with patch.object(sfa_v1, "get_forward_context", return_value=context):
+            impl.cross_layer_graph_post(
+                "layer-0",
+                torch.empty(4, 2, 4),
+                torch.empty(4, 2, 2),
+                torch.empty(4, 1, 16, dtype=torch.int32),
+                kv_cache,
+                self._make_decode_metadata(),
+                torch.empty(1, 4),
+            )
+
+        args = impl._cross_layer_post_compute.call_args.args
+        self.assertEqual([tensor.shape[0] for tensor in args[:3]], [1] * 3)
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()

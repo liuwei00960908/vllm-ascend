@@ -2081,23 +2081,40 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Native retrieve/post are no-ops. Match the fake bridge shape without
-        # allocating prompt-sized storage for these ignored tensors.
-        num_tokens = hidden_states.shape[0]
-
-        def ignored_row(*shape: int, dtype: torch.dtype | None = None) -> torch.Tensor:
-            return torch.empty(
-                (1, *shape),
-                dtype=hidden_states.dtype if dtype is None else dtype,
-                device=hidden_states.device,
-            ).expand(num_tokens, *shape)
+        # Native retrieve/post are no-ops. Keep their ignored outputs
+        # contiguous, but cap them at the largest real staged batch so memory
+        # profiling cannot materialize prompt-sized bridge tensors.
+        num_tokens = self._staged_sfa_graph_capture_sizes[-1]
 
         return (
-            ignored_row(self.local_num_heads, self.kv_lora_rank),
-            ignored_row(self.local_num_heads, self.qk_rope_head_dim),
-            ignored_row(1, self.index_topk, dtype=torch.int32),
-            ignored_row(self.index_topk, dtype=torch.int32),
+            hidden_states.new_empty((num_tokens, self.local_num_heads, self.kv_lora_rank)),
+            hidden_states.new_empty((num_tokens, self.local_num_heads, self.qk_rope_head_dim)),
+            torch.empty(
+                (num_tokens, 1, self.index_topk),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            ),
+            torch.empty(
+                (num_tokens, self.index_topk),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            ),
         )
+
+    def _pad_cross_layer_bridge_output(
+        self,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        capacity = self._staged_sfa_graph_capture_sizes[-1]
+        rows = tensor.shape[0]
+        if rows == capacity:
+            return tensor.contiguous()
+        if rows > capacity:
+            raise RuntimeError(
+                f"staged SFA bridge output exceeds its configured capacity: rows={rows}, capacity={capacity}"
+            )
+        padding = tensor.new_empty((capacity - rows, *tensor.shape[1:]))
+        return torch.cat((tensor, padding), dim=0)
 
     def cross_layer_graph_pre(
         self,
@@ -2200,6 +2217,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             valid_row_indices,
             scratch_base,
         )
+        outputs = (
+            self._pad_cross_layer_bridge_output(outputs[0]),
+            self._pad_cross_layer_bridge_output(outputs[1]),
+            self._pad_cross_layer_bridge_output(outputs[2]),
+            self._pad_cross_layer_bridge_output(outputs[3]),
+        )
         producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
         if producer_event is None:
             if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
@@ -2225,11 +2248,8 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         with torch.profiler.record_function("sfa_cross_layer::lmcache_retrieve"):
             context = get_forward_context()
-            if (
-                attn_metadata is None
-                or getattr(context, "staged_sfa_graph_key", None) is None
-                or getattr(context, "staged_sfa_graph_dummy_run", False)
-            ):
+            graph_key = getattr(context, "staged_sfa_graph_key", None)
+            if attn_metadata is None or graph_key is None or getattr(context, "staged_sfa_graph_dummy_run", False):
                 return
             route = context.staged_sfa_route
             index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
@@ -2238,7 +2258,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event = producer_event
             selected, request_ids, target_slots = _prepare_dsa_sparse_lmcache_payload(
                 attn_metadata,
-                selected_packed,
+                selected_packed[: graph_key.request_capacity],
                 index_topk=self.index_topk,
             )
             wait_for_kv_layer_from_connector(
@@ -2288,13 +2308,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: M | None,
         output: torch.Tensor,
     ) -> None:
-        if attn_metadata is None or getattr(get_forward_context(), "staged_sfa_graph_key", None) is None:
+        graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
+        if attn_metadata is None or graph_key is None:
             return
+        rows = graph_key.request_capacity
         kv_cache, _, _ = self._cross_layer_kv_cache(layer_name, kv_cache)
         self._cross_layer_post_compute(
-            ql_nope,
-            q_pe,
-            topk_indices,
+            ql_nope[:rows],
+            q_pe[:rows],
+            topk_indices[:rows],
             kv_cache[0],
             kv_cache[1],
             attn_metadata.cum_query_lens,
