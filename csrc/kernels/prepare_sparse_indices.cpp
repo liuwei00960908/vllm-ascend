@@ -90,7 +90,7 @@ public:
         // clear to finish before the scalar pipeline starts modifying it;
         // otherwise the delayed clear can erase request-union bits.
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::PipeSync<AscendC::HardEvent::V_S>();
+        PipeSync<AscendC::HardEvent::V_S>();
         const uint64_t packedOffset =
             static_cast<uint64_t>(req) * scratchCapacity_;
 
