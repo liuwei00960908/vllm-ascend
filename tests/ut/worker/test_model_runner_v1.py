@@ -1,6 +1,7 @@
 import unittest
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
+from threading import Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -865,19 +866,16 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             lora_config=None,
         )
         runner._staged_sfa_startup_capture_attempted = False
+        runner._staged_sfa_ready_keys = frozenset()
+        runner._staged_sfa_replay_lock = Lock()
+        runner._profiling_cudagraph_memory = False
         return runner
 
     def test_capture_model_preserves_result_and_validates_cross_layer_warmup(self):
         runner = self._build_runner()
         calls = []
         impl = SimpleNamespace(
-            _staged_sfa_cross_layer_producer_event=object(),
-            _staged_sfa_cross_layer_remap_boundary=object(),
-            _staged_sfa_cross_layer_runtime=object(),
-            _staged_sfa_captured_graph_keys={
-                StagedSFAGraphKey.exact_q1(1),
-                StagedSFAGraphKey.exact_q1(2),
-            },
+            seal_staged_sfa_capture=MagicMock(),
         )
         with (
             patch.object(
@@ -906,6 +904,11 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 side_effect=lambda _runner: calls.append("parent") or 123,
             ) as parent_capture,
             patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "seal_staged_entries",
+                return_value=4,
+            ) as seal_entries,
+            patch.object(
                 runner,
                 "_collect_staged_sfa_impls",
                 return_value=(("layer-0", impl),),
@@ -918,14 +921,18 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         self.assertTrue(runner._staged_sfa_startup_capture_attempted)
         self.assertEqual(runner._staged_sfa_impls, (("layer-0", impl),))
         parent_capture.assert_called_once_with(runner)
+        graph_keys = tuple(
+            StagedSFAGraphKey.exact_q1(size) for size in (1, 2)
+        )
+        impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
+        seal_entries.assert_called_once_with(graph_keys, 2)
 
     def test_capture_model_rejects_a_missing_configured_key(self):
         runner = self._build_runner()
         impl = SimpleNamespace(
-            _staged_sfa_cross_layer_producer_event=object(),
-            _staged_sfa_cross_layer_remap_boundary=object(),
-            _staged_sfa_cross_layer_runtime=object(),
-            _staged_sfa_captured_graph_keys={StagedSFAGraphKey.exact_q1(1)},
+            seal_staged_sfa_capture=MagicMock(
+                side_effect=RuntimeError("missing_keys=(2,)"),
+            ),
         )
         with (
             patch.object(
@@ -951,7 +958,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                r"missing_keys=.*layer-0.*2",
+                r"layer-0.*missing_keys=.*2",
             ),
         ):
             runner.capture_model()
@@ -1022,6 +1029,78 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         reset.assert_not_called()
         parent_capture.assert_not_called()
 
+    def test_graph_memory_profile_resets_temporary_capture_state(self):
+        runner = self._build_runner()
+        with (
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "profile_cudagraph_memory",
+                side_effect=lambda _runner: (
+                    self.assertTrue(runner._profiling_cudagraph_memory)
+                    or 123
+                ),
+            ) as parent_profile,
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ) as reset,
+        ):
+            result = runner.profile_cudagraph_memory()
+
+        self.assertEqual(result, 123)
+        self.assertFalse(runner._profiling_cudagraph_memory)
+        parent_profile.assert_called_once_with(runner)
+        reset.assert_called_once_with()
+
+    def test_graph_memory_profile_cleans_up_after_failure(self):
+        runner = self._build_runner()
+        with (
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "profile_cudagraph_memory",
+                side_effect=RuntimeError("profile failed"),
+            ),
+            patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "clear_all_graphs",
+            ) as clear_graphs,
+            patch.object(
+                runner,
+                "_cleanup_profiling_kv_cache",
+            ) as cleanup_cache,
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ) as reset,
+            self.assertRaisesRegex(RuntimeError, "profile failed"),
+        ):
+            runner.profile_cudagraph_memory()
+
+        self.assertFalse(runner._profiling_cudagraph_memory)
+        clear_graphs.assert_called_once_with()
+        cleanup_cache.assert_called_once_with()
+        reset.assert_called_once_with()
+
     def test_kv_cache_reinitialization_after_capture_is_rejected(self):
         runner = self._build_runner()
         runner._staged_sfa_startup_capture_attempted = True
@@ -1039,6 +1118,45 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             runner.initialize_kv_cache(object())
 
         validate.assert_not_called()
+
+    def test_replay_slot_rejects_unready_and_overlapping_keys(self):
+        runner = self._build_runner()
+        key = StagedSFAGraphKey.exact_q1(1)
+
+        with (
+            self.assertRaisesRegex(RuntimeError, "graph key 1 is not ready"),
+            runner._staged_sfa_replay_slot(key),
+        ):
+            pass
+
+        runner._staged_sfa_ready_keys = frozenset({key})
+        with (
+            runner._staged_sfa_replay_slot(key),
+            self.assertRaisesRegex(RuntimeError, "overlapping replay"),
+            runner._staged_sfa_replay_slot(key),
+        ):
+            pass
+
+    def test_replay_slot_rejects_a_second_thread(self):
+        runner = self._build_runner()
+        key = StagedSFAGraphKey.exact_q1(1)
+        runner._staged_sfa_ready_keys = frozenset({key})
+        errors = []
+
+        def enter_slot():
+            try:
+                with runner._staged_sfa_replay_slot(key):
+                    pass
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        with runner._staged_sfa_replay_slot(key):
+            thread = Thread(target=enter_slot)
+            thread.start()
+            thread.join()
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("overlapping replay", errors[0])
 
 
 if __name__ == "__main__":

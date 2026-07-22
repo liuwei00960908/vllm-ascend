@@ -911,27 +911,40 @@ consensus unless that run reproduces rank divergence.
 
 ### W2: island registry, prebound arena, invalidation, and resource budget
 
-Status: **active; first R1 ownership slice implemented, NPU validation pending**.
+Status: **R1 static-ownership implementation complete; ordered-topology and
+NPU startup/resource/performance sign-off pending**.
 
 - **Done for R1:** dispatch ACL graph entries by the existing full
   `StagedSFAGraphKey`; generic graph paths retain their legacy
   `BatchDescriptor` key. Add namespace/in-flight ownership before PP, virtual
   engines, or overlap are admitted.
-- Allocate stable per-key bridge tensors from Graph A through retrieval into the
-  following island so every island/split binding can be validated before the
-  bootstrap wait.
+- **Done for R1:** retain bridge storage in the existing graph pool and register
+  each key's bridge/cache/boundary/event signatures in one layer-owned state.
+  Require exactly `N + 1` outer islands with the exact configured key set
+  and seal every layer at startup. Live admission checks the sealed key and uses
+  a non-blocking guard to reject overlap before connector entry. The ordered
+  island-to-layer topology remains trace evidence, not a registry claim.
 - **Done for R1:** reject KV-cache recreation after staged capture has started,
   before any cache mutation. Implement cache epochs, quiesce/invalidate/rebuild,
   quarantine, and bounded graph destruction before dynamic lifecycle support.
-- Implement the offline-bound or two-pass resource strategy and feed the result
-  into KV sizing without circular measurement.
-- Add an opt-in event-closed replay policy for these islands and remove
-  per-island host synchronization only after the event and ownership proof.
-- Remove release-mode hot signature scans after arena/epoch proof.
+- **Done for R1:** bound configured and actual ACL graph entries, profile a
+  temporary graph pool before final KV sizing, reserve the measured bytes plus
+  a safety margin, clear the temporary graphs/cache state, and fail startup if
+  free memory cannot cover the reservation or real capture exceeds it. Temporary
+  KV caches skip only connector registration; legacy DSA offload, adapter-cache,
+  and HCCL-AIV configurations are rejected before this profiling lifecycle.
+- The generic replay fence remains unchanged. Activating event-closed replay and
+  removing synchronization stays in W8 until its event trace is signed.
+- **Done for R1:** full signatures are captured only during startup; release
+  replay performs an O(1) sealed-key/in-flight check rather than hot tensor
+  scans.
 
-Exit: all island/split bindings are known before side effects; exact Q1 survives
-`1 -> B -> 1` and every allowed/rejected R1 lifecycle transition with bounded
-memory, no stale-address replay, and no hot-path stream/device synchronize.
+Exit: code validates the exact outer-island population, key set, and per-layer
+bindings before connector entry and keeps the current restart-required lifecycle
+bounded. Sign off W2 after the ordered topology trace and two-pass startup plus
+`1 -> B -> 1` reruns show no stale-address, memory, output, or TPOT regression on
+TP2 and TP8. Dynamic lifecycle and fence removal remain explicitly
+unsupported/deferred rather than silently claimed by R1.
 
 ### W3: runner-owned cross-layer step plan
 

@@ -334,8 +334,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.cache_config.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
-        impl._staged_sfa_dummy_cache_capacity = 0
-        impl._staged_sfa_captured_graph_keys = set()
+        impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         return impl
 
     @staticmethod
@@ -457,8 +456,8 @@ class TestStagedSFAGraphPoc(TestBase):
     def test_cross_layer_capture_reuses_eager_boundary_storage(self):
         impl = self._make_eligible_impl()
         kv_cache = self._make_eligible_kv_cache()
-        impl._staged_sfa_dummy_cache_capacity = 1
-        impl._staged_sfa_cross_layer_producer_event = MagicMock()
+        impl._staged_sfa_capture_state.initialized_cache_capacity = 1
+        impl._staged_sfa_capture_state.producer_event = MagicMock()
         impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
         impl._cross_layer_pre_compute = MagicMock(return_value=tuple(torch.empty(1) for _ in range(4)))
@@ -512,7 +511,7 @@ class TestStagedSFAGraphPoc(TestBase):
             cached_tokens=(4096,),
         )
         self.assertIs(
-            impl._staged_sfa_cross_layer_remap_boundary,
+            impl._staged_sfa_capture_state.remap_boundary,
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
@@ -520,15 +519,56 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
-            impl._staged_sfa_captured_graph_keys,
+            impl._staged_sfa_capture_state.bindings.keys(),
             {STAGED_SFA_SINGLETON_GRAPH_KEY},
         )
         self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
 
+    def test_capture_state_seals_exact_keys(self):
+        state = sfa_v1._StagedSFACaptureState(
+            producer_event=object(),
+            remap_boundary=torch.empty(1, dtype=torch.int32),
+            runtime=("layer-0",),
+        )
+        key = STAGED_SFA_SINGLETON_GRAPH_KEY
+        state.register(
+            key,
+            tuple(torch.empty(1) for _ in range(4)),
+            self._make_eligible_kv_cache(),
+        )
+        state.seal((key,))
+
+        state.require(key)
+        with self.assertRaisesRegex(RuntimeError, "graph key 2 is not ready"):
+            state.require(StagedSFAGraphKey.exact_q1(2))
+
+    def test_capture_state_rejects_binding_drift(self):
+        state = sfa_v1._StagedSFACaptureState(
+            producer_event=object(),
+            remap_boundary=torch.empty(4, dtype=torch.int32),
+            runtime=("layer-0",),
+        )
+        bridge = tuple(torch.empty(4) for _ in range(4))
+        state.register(
+            STAGED_SFA_SINGLETON_GRAPH_KEY,
+            bridge,
+            self._make_eligible_kv_cache(),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "bindings changed between graph keys",
+        ):
+            state.register(
+                StagedSFAGraphKey.exact_q1(2),
+                bridge,
+                self._make_eligible_kv_cache(),
+            )
+
     def test_dummy_cache_initialization_grows_with_capture_key(self):
         impl = self._make_eligible_impl()
         kv_cache = tuple(torch.ones_like(cache) for cache in self._make_eligible_kv_cache(num_blocks=4))
-        impl._staged_sfa_cross_layer_producer_event = MagicMock()
+        impl._staged_sfa_capture_state.producer_event = MagicMock()
         impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
         impl._cross_layer_pre_compute = MagicMock(return_value=tuple(torch.empty(1) for _ in range(4)))
@@ -568,12 +608,15 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertTrue(all(torch.count_nonzero(cache[2:]) > 0 for cache in kv_cache))
         run(4)
         self.assertTrue(all(torch.count_nonzero(cache) == 0 for cache in kv_cache))
-        self.assertEqual(impl._staged_sfa_dummy_cache_capacity, 4)
+        self.assertEqual(
+            impl._staged_sfa_capture_state.initialized_cache_capacity,
+            4,
+        )
 
     def test_cross_layer_retrieve_prefetches_next_index(self):
         impl = self._make_eligible_impl()
         impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
-        impl._staged_sfa_cross_layer_producer_event = object()
+        impl._staged_sfa_capture_state.producer_event = object()
         metadata = self._make_decode_metadata()
         next_metadata = self._make_decode_metadata()
         context = SimpleNamespace(
@@ -614,11 +657,11 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(prepare_payload.call_args.args[1].shape, (1, 4))
         self.assertIs(
             metadata.reshape_cache_event,
-            impl._staged_sfa_cross_layer_producer_event,
+            impl._staged_sfa_capture_state.producer_event,
         )
         self.assertIs(
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
-            impl._staged_sfa_cross_layer_producer_event,
+            impl._staged_sfa_capture_state.producer_event,
         )
         prepare_boundary.assert_called_once_with(
             next_metadata,
@@ -653,10 +696,14 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
+        impl._staged_sfa_capture_state.ready_keys = frozenset(
+            {STAGED_SFA_SINGLETON_GRAPH_KEY},
+        )
         metadata = self._make_decode_metadata()
         context = SimpleNamespace(
             attn_metadata={"layer-0.attn": metadata},
             staged_sfa_route=_staged_route(),
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
         )
         order = []
         with (

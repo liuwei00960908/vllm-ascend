@@ -24,6 +24,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from multiprocessing import Manager
+from threading import Lock
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
@@ -129,6 +130,7 @@ from vllm_ascend.utils import (
     StagedSFARouteAction,
     StagedSFARouteDecision,
     StagedSFARouteReason,
+    aclgraph_entry_limit,
     calc_split_factor,
     check_gdn_layer,
     enable_sp,
@@ -274,6 +276,9 @@ class NPUModelRunner(GPUModelRunner):
         self.attn_state: AscendAttentionState | None = None
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
         self._staged_sfa_startup_capture_attempted = False
+        self._staged_sfa_ready_keys: frozenset[StagedSFAGraphKey] = frozenset()
+        self._staged_sfa_replay_lock = Lock()
+        self._profiling_cudagraph_memory = False
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1464,6 +1469,7 @@ class NPUModelRunner(GPUModelRunner):
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
+            self._staged_sfa_replay_slot(staged_sfa_graph_key),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2635,6 +2641,29 @@ class NPUModelRunner(GPUModelRunner):
             logger.info(message)
         return None
 
+    @contextmanager
+    def _staged_sfa_replay_slot(
+        self,
+        graph_key: StagedSFAGraphKey | None,
+    ):
+        if graph_key is None:
+            yield
+            return
+        if graph_key not in self._staged_sfa_ready_keys:
+            raise RuntimeError(
+                "[SFA_ROUTE] action=fatal reason="
+                f"{StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}: "
+                f"graph key {graph_key.request_capacity} is not ready"
+            )
+        if not self._staged_sfa_replay_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "[SFA cross-layer graph] overlapping replay is not supported"
+            )
+        try:
+            yield
+        finally:
+            self._staged_sfa_replay_lock.release()
+
     @staticmethod
     def _staged_sfa_q1_query_start_locs(
         batch_size: int,
@@ -3281,7 +3310,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
-        if has_kv_transfer_group():
+        if has_kv_transfer_group() and not self._profiling_cudagraph_memory:
             kv_transfer_group = get_kv_transfer_group()
             kv_caches_to_register = kv_caches
             disable_dsa_index_lmcache = bool(
@@ -4251,16 +4280,9 @@ class NPUModelRunner(GPUModelRunner):
     def _reset_staged_sfa_startup_capture(self) -> None:
         """Discard staged state before the one real startup capture."""
         self._staged_sfa_impls = ()
+        self._staged_sfa_ready_keys = frozenset()
         for _layer_name, impl in self._collect_staged_sfa_impls():
-            for attr in (
-                "_staged_sfa_cross_layer_producer_event",
-                "_staged_sfa_cross_layer_remap_boundary",
-                "_staged_sfa_cross_layer_runtime",
-            ):
-                if hasattr(impl, attr):
-                    delattr(impl, attr)
-            impl._staged_sfa_dummy_cache_capacity = 0
-            impl._staged_sfa_captured_graph_keys = set()
+            impl.reset_staged_sfa_capture()
 
 
 
@@ -4282,11 +4304,9 @@ class NPUModelRunner(GPUModelRunner):
         if staged_graph_configured:
             self._staged_sfa_startup_capture_attempted = True
             self._reset_staged_sfa_startup_capture()
-        gpu_model_runner_cls = next((cls for cls in self.__class__.__mro__ if cls.__name__ == "GPUModelRunner"), None)
-        if gpu_model_runner_cls is None:
-            raise TypeError("Could not find GPUModelRunner in the MRO. The class hierarchy may have changed.")
-        parent_module_name = gpu_model_runner_cls.__module__
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+            GPUModelRunner.__module__,
+        ):
             graph_memory_bytes = GPUModelRunner.capture_model(self)
         if staged_graph_configured:
             self._staged_sfa_impls = self._collect_staged_sfa_impls()
@@ -4298,43 +4318,67 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFAGraphKey.exact_q1(size)
                 for size in staged_sfa_graph_capture_sizes(self.vllm_config)
             )
-            incomplete = [
-                layer_name
-                for layer_name, impl in self._staged_sfa_impls
-                if getattr(
-                    impl, "_staged_sfa_cross_layer_producer_event", None
-                )
-                is None
-                or getattr(
-                    impl,
-                    "_staged_sfa_cross_layer_remap_boundary",
-                    None,
-                )
-                is None
-                or getattr(impl, "_staged_sfa_cross_layer_runtime", None)
-                is None
-            ]
-            missing_keys = {
-                layer_name: tuple(
-                    key.request_capacity
-                    for key in graph_keys
-                    if key not in getattr(impl, "_staged_sfa_captured_graph_keys", ())
-                )
-                for layer_name, impl in self._staged_sfa_impls
-            }
-            missing_keys = {layer: keys for layer, keys in missing_keys.items() if keys}
-            if incomplete or missing_keys:
+            for layer_name, impl in self._staged_sfa_impls:
+                try:
+                    impl.seal_staged_sfa_capture(graph_keys)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "[SFA cross-layer graph] eager warmup/capture was "
+                        f"incomplete for {layer_name}: {exc}"
+                    ) from exc
+            graph_entry_count = ACLGraphWrapper.seal_staged_entries(
+                graph_keys,
+                len(self._staged_sfa_impls) + 1,
+            )
+            graph_entry_limit = aclgraph_entry_limit(self.vllm_config)
+            if graph_entry_count > graph_entry_limit:
                 raise RuntimeError(
-                    "[SFA cross-layer graph] eager warmup/capture was "
-                    f"incomplete: state={incomplete}, missing_keys={missing_keys}"
+                    "[SFA cross-layer graph] captured graph entry count "
+                    f"{graph_entry_count} exceeds the device quota "
+                    f"{graph_entry_limit}"
                 )
+            self._staged_sfa_ready_keys = frozenset(graph_keys)
             logger.info(
                 "[SFA cross-layer graph] captured retrieve-split outer graphs "
-                "for %d local SFA layers and %d keys",
+                "for %d local SFA layers and %d keys; entries=%d",
                 len(self._staged_sfa_impls),
                 len(graph_keys),
+                graph_entry_count,
             )
         return graph_memory_bytes
+
+    def profile_cudagraph_memory(self) -> int:
+        """Measure staged ACL graphs before final KV-cache sizing."""
+        if not staged_sfa_graph_configured(self.vllm_config):
+            raise RuntimeError(
+                "ACL graph memory profiling is only enabled for staged SFA"
+            )
+        original_pools = {
+            wrapper: wrapper.graph_pool
+            for wrapper in ACLGraphWrapper._all_instances
+        }
+        completed = False
+        if self._profiling_cudagraph_memory:
+            raise RuntimeError("ACL graph memory profiling is already active")
+        self._profiling_cudagraph_memory = True
+        try:
+            with (
+                _torch_cuda_wrapper(),
+                _replace_gpu_model_runner_function_wrapper(
+                    GPUModelRunner.__module__,
+                ),
+            ):
+                result = GPUModelRunner.profile_cudagraph_memory(self)
+                completed = True
+                return result
+        finally:
+            self._profiling_cudagraph_memory = False
+            ACLGraphWrapper.clear_all_graphs()
+            for wrapper, graph_pool in original_pools.items():
+                wrapper.graph_pool = graph_pool
+            if not completed:
+                self._cleanup_profiling_kv_cache()
+            self._reset_staged_sfa_startup_capture()
 
     def _prepare_multimodal_fields(self):
         """
@@ -4413,17 +4457,27 @@ def _torch_cuda_wrapper():
         torch.cuda.mem_get_info = torch.npu.mem_get_info
 
 
-# TODO: This method will be removed subsequently and implemented in platform.
 @contextmanager
 def _replace_gpu_model_runner_function_wrapper(target_module_name):
+    target_module = sys.modules[target_module_name]
+    original_graph_capture = target_module.graph_capture
+    original_graph_wrapper = getattr(
+        target_module,
+        "CUDAGraphWrapper",
+        None,
+    )
     try:
-        target_module = sys.modules[target_module_name]
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
+        setattr(target_module, "CUDAGraphWrapper", ACLGraphWrapper)  # noqa: B010
         yield
     except Exception as e:
         raise RuntimeError(f"NPUModelRunner failed, error is {e}")
     finally:
-        setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
+        target_module.graph_capture = original_graph_capture
+        if original_graph_wrapper is None:
+            delattr(target_module, "CUDAGraphWrapper")
+        else:
+            target_module.CUDAGraphWrapper = original_graph_wrapper
 
 
 # TODO: remove it when flash_comm1 is removed

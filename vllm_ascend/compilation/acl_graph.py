@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import weakref
 from collections.abc import Callable, Hashable
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -60,6 +61,8 @@ class ACLGraphWrapper:
     enabled when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
+    _all_instances: weakref.WeakSet["ACLGraphWrapper"] = weakref.WeakSet()
+
     def __init__(
         self,
         runnable: Callable,
@@ -85,6 +88,7 @@ class ACLGraphWrapper:
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
         self.graph_pool = current_platform.get_global_graph_pool()
+        self._all_instances.add(self)
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -92,6 +96,61 @@ class ACLGraphWrapper:
         # Staged paths use their full structural key; generic paths keep the
         # legacy batch descriptor.
         self.concrete_aclgraph_entries: dict[Hashable, ACLGraphEntry] = {}
+
+    @classmethod
+    def clear_all_graphs(cls) -> None:
+        """Clear captured graphs from all ACLGraphWrapper instances."""
+        for wrapper in list(cls._all_instances):
+            wrapper.clear_graphs()
+
+    def clear_graphs(self) -> None:
+        self.concrete_aclgraph_entries.clear()
+
+    @classmethod
+    def seal_staged_entries(
+        cls,
+        keys: tuple[Hashable, ...],
+        expected_islands: int,
+    ) -> int:
+        """Validate every captured island before live staged admission."""
+        expected = set(keys)
+        if not expected or expected_islands <= 0:
+            raise RuntimeError("staged ACL graph plan is empty")
+        key_type = type(keys[0])
+        wrappers = [
+            wrapper
+            for wrapper in cls._all_instances
+            if any(
+                isinstance(key, key_type)
+                for key in wrapper.concrete_aclgraph_entries
+            )
+        ]
+        if len(wrappers) != expected_islands:
+            raise RuntimeError(
+                "staged ACL graph island count is incomplete: "
+                f"expected={expected_islands}, captured={len(wrappers)}"
+            )
+        for wrapper in wrappers:
+            actual = set(wrapper.concrete_aclgraph_entries)
+            missing = expected - actual
+            unexpected = actual - expected
+            incomplete = tuple(
+                key
+                for key, entry in wrapper.concrete_aclgraph_entries.items()
+                if key in expected
+                and (
+                    entry.aclgraph is None
+                    or entry.input_addresses is None
+                )
+            )
+            if missing or unexpected or incomplete:
+                raise RuntimeError(
+                    "staged ACL graph island is incomplete: "
+                    f"missing={tuple(missing)}, "
+                    f"unexpected={tuple(unexpected)}, "
+                    f"incomplete={incomplete}"
+                )
+        return sum(len(wrapper.concrete_aclgraph_entries) for wrapper in wrappers)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.

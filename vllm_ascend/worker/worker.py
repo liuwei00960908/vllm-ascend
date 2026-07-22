@@ -59,6 +59,7 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
+    staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -72,6 +73,16 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+_STAGED_SFA_GRAPH_MEMORY_MARGIN_BYTES = 64 << 20
+_STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
+
+
+def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
+    return max(
+        estimate + _STAGED_SFA_GRAPH_MEMORY_MARGIN_BYTES,
+        int(estimate * _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO),
+    )
 
 
 class NPUWorker(WorkerBase):
@@ -336,11 +347,45 @@ class NPUWorker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
+        graph_memory_estimate = 0
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            if staged_sfa_graph:
+                profile_torch_peak = torch.accelerator.memory_stats(
+                    self.device,
+                ).get("allocated_bytes.all.peak", 0)
+                graph_memory_estimate = (
+                    self.model_runner.profile_cudagraph_memory()
+                )
+
+        if staged_sfa_graph:
+            # The graph profiling pass must not inflate the ordinary activation
+            # peak; reserve its measured pool separately with a fixed margin.
+            profile_result.torch_peak_increase = (
+                profile_torch_peak
+                - profile_result.before_profile.torch_peak
+            )
+            profile_result.non_kv_cache_memory = (
+                profile_result.non_torch_increase
+                + profile_result.torch_peak_increase
+                + profile_result.weights_memory
+            )
+            self.staged_sfa_graph_memory_reservation = _staged_sfa_graph_memory_reservation(
+                graph_memory_estimate
+            )
+            logger.info_once(
+                "Reserved %.2f GiB for staged SFA ACL graphs "
+                "(profiled %.2f GiB)",
+                GiB(self.staged_sfa_graph_memory_reservation),
+                GiB(graph_memory_estimate),
+                scope="local",
+            )
+        else:
+            self.staged_sfa_graph_memory_reservation = 0
 
         free_gpu_memory = profile_result.after_profile.free_memory
         assert self.init_snapshot.free_memory > free_gpu_memory, (
@@ -352,7 +397,11 @@ class NPUWorker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+        self.available_kv_cache_memory_bytes = (
+            self.requested_memory
+            - profile_result.non_kv_cache_memory
+            - self.staged_sfa_graph_memory_reservation
+        )
 
         # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
         # buffers out of the KV budget *before* the scheduler splits it into blocks,
@@ -388,6 +437,11 @@ class NPUWorker(WorkerBase):
                     GiB(adapter_reserved_bytes),
                     scope="local",
                 )
+
+        if staged_sfa_graph and self.available_kv_cache_memory_bytes <= 0:
+            raise ValueError(
+                "Staged SFA graph reservation leaves no memory for KV cache"
+            )
 
         logger.debug(profile_result)
         logger.info_once(
@@ -499,7 +553,26 @@ class NPUWorker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model()
+            reservation = getattr(
+                self,
+                "staged_sfa_graph_memory_reservation",
+                0,
+            )
+            staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
+            if staged_sfa_graph:
+                torch.npu.empty_cache()
+                if torch.npu.mem_get_info()[0] < reservation:
+                    raise RuntimeError(
+                        "Free NPU memory is below the staged SFA graph "
+                        f"reservation of {reservation} bytes before capture"
+                    )
+            graph_memory_bytes = self.model_runner.capture_model()
+            if staged_sfa_graph and graph_memory_bytes > reservation:
+                raise RuntimeError(
+                    "Staged SFA ACL graph capture exceeded its pre-KV "
+                    f"reservation: captured={graph_memory_bytes}, "
+                    f"reserved={reservation} bytes."
+                )
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:

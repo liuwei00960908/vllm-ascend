@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -97,6 +97,112 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
 
+
+@dataclass(frozen=True, slots=True)
+class _TensorBinding:
+    address: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def layout(self) -> tuple[Any, ...]:
+        return self.shape, self.stride, self.dtype, self.device
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> "_TensorBinding":
+        return cls(
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedSFALayerBinding:
+    bridge: tuple[_TensorBinding, ...]
+    kv_cache: tuple[_TensorBinding, ...]
+    remap_boundary: _TensorBinding
+    producer_event_id: int
+
+
+@dataclass(slots=True)
+class _StagedSFACaptureState:
+    """Own the immutable capture contract for one local SFA layer."""
+
+    producer_event: Any | None = None
+    remap_boundary: torch.Tensor | None = None
+    runtime: tuple[Any, ...] | None = None
+    initialized_cache_capacity: int = 0
+    bindings: dict[StagedSFAGraphKey, _StagedSFALayerBinding] = field(
+        default_factory=dict,
+    )
+    ready_keys: frozenset[StagedSFAGraphKey] = frozenset()
+
+    def register(
+        self,
+        key: StagedSFAGraphKey,
+        bridge: tuple[torch.Tensor, ...],
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        if self.ready_keys:
+            raise RuntimeError("staged SFA capture state is already sealed")
+        if key in self.bindings:
+            raise RuntimeError(f"staged SFA graph key was captured twice: {key}")
+        if self.producer_event is None or self.remap_boundary is None:
+            raise RuntimeError("staged SFA capture storage is incomplete")
+
+        binding = _StagedSFALayerBinding(
+            tuple(_TensorBinding.from_tensor(tensor) for tensor in bridge),
+            tuple(_TensorBinding.from_tensor(tensor) for tensor in kv_cache),
+            _TensorBinding.from_tensor(self.remap_boundary),
+            id(self.producer_event),
+        )
+        if self.bindings:
+            existing = next(iter(self.bindings.values()))
+            if (
+                binding.kv_cache != existing.kv_cache
+                or binding.producer_event_id != existing.producer_event_id
+                or binding.remap_boundary.address
+                != existing.remap_boundary.address
+                or binding.remap_boundary.layout[1:]
+                != existing.remap_boundary.layout[1:]
+                or tuple(tensor.layout for tensor in binding.bridge)
+                != tuple(tensor.layout for tensor in existing.bridge)
+            ):
+                raise RuntimeError(
+                    "staged SFA capture bindings changed between graph keys"
+                )
+        self.bindings[key] = binding
+
+    def seal(self, expected_keys: tuple[StagedSFAGraphKey, ...]) -> None:
+        expected = frozenset(expected_keys)
+        missing = expected.difference(self.bindings)
+        unexpected = self.bindings.keys() - expected
+        if (
+            self.producer_event is None
+            or self.remap_boundary is None
+            or self.runtime is None
+            or missing
+            or unexpected
+        ):
+            raise RuntimeError(
+                "staged SFA capture state is incomplete: "
+                f"missing_keys={tuple(key.request_capacity for key in missing)}, "
+                f"unexpected_keys={tuple(key.request_capacity for key in unexpected)}"
+            )
+        self.ready_keys = expected
+
+    def require(self, key: StagedSFAGraphKey) -> None:
+        if key not in self.ready_keys:
+            raise RuntimeError(
+                "[SFA_ROUTE] action=fatal reason="
+                f"{StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}: "
+                f"graph key {key.request_capacity} is not ready"
+            )
 
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
     global _lmcache_sparse_wait_sync_once_done
@@ -1016,8 +1122,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
         )
-        self._staged_sfa_dummy_cache_capacity = 0
-        self._staged_sfa_captured_graph_keys: set[StagedSFAGraphKey] = set()
+        self._staged_sfa_capture_state = _StagedSFACaptureState()
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -2115,6 +2220,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             ),
         )
 
+    def reset_staged_sfa_capture(self) -> None:
+        self._staged_sfa_capture_state = _StagedSFACaptureState()
+
+    def seal_staged_sfa_capture(
+        self,
+        graph_keys: tuple[StagedSFAGraphKey, ...],
+    ) -> None:
+        self._staged_sfa_capture_state.seal(graph_keys)
+
     def _pad_cross_layer_bridge_output(
         self,
         tensor: torch.Tensor,
@@ -2173,19 +2287,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
-        initialized_capacity = self._staged_sfa_dummy_cache_capacity
+        state = self._staged_sfa_capture_state
+        initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
                 cache[initialized_capacity : graph_key.request_capacity].zero_()
-            self._staged_sfa_dummy_cache_capacity = graph_key.request_capacity
+            state.initialized_cache_capacity = graph_key.request_capacity
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             # ACL capture cannot include the host copy in boundary preparation.
             # The immediately preceding eager warmup filled this stable buffer.
-            capture_boundary = getattr(
-                self,
-                "_staged_sfa_cross_layer_remap_boundary",
-                None,
-            )
+            capture_boundary = state.remap_boundary
             boundary = attn_metadata.decode_remap_boundary
             if (
                 capture_boundary is None
@@ -2196,7 +2307,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 raise RuntimeError(
                     "[SFA cross-layer graph] remap boundary was not prepared in stable storage by eager warmup"
                 )
-            self._staged_sfa_captured_graph_keys.add(graph_key)
             remap_boundary = capture_boundary
         else:
             remap_boundary = _prepare_sfa_remap_boundary(
@@ -2211,7 +2321,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ),
             )
             if is_dummy:
-                self._staged_sfa_cross_layer_remap_boundary = remap_boundary
+                state.remap_boundary = remap_boundary
         valid_row_indices = attn_metadata.decode_valid_row_indices
         scratch_base = attn_metadata.decode_scratch_base
         assert valid_row_indices is not None and scratch_base is not None
@@ -2237,20 +2347,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._pad_cross_layer_bridge_output(outputs[2]),
             self._pad_cross_layer_bridge_output(outputs[3]),
         )
-        producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
+        producer_event = state.producer_event
         if producer_event is None:
             if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
                 raise RuntimeError("staged SFA producer event was not created by eager warmup")
             producer_event = torch.npu.Event()
-            self._staged_sfa_cross_layer_producer_event = producer_event
+            state.producer_event = producer_event
         attn_metadata.reshape_cache_event = producer_event
         producer_event.record()
-        self._staged_sfa_cross_layer_runtime = (
+        state.runtime = (
             layer_name,
             kv_cache,
             index_layer_name,
             index_enabled,
         )
+        if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            state.register(graph_key, outputs, kv_cache)
         return outputs
 
     def cross_layer_lmcache_retrieve(
@@ -2267,7 +2379,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 return
             route = context.staged_sfa_route
             index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
-            producer_event = getattr(self, "_staged_sfa_cross_layer_producer_event", None)
+            producer_event = self._staged_sfa_capture_state.producer_event
             if producer_event is not None:
                 attn_metadata.reshape_cache_event = producer_event
             selected, request_ids, target_slots = _prepare_dsa_sparse_lmcache_payload(
@@ -2301,6 +2413,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Prepare layer zero before the first captured island is launched."""
         with torch.profiler.record_function("sfa_cross_layer::bootstrap"):
             context = get_forward_context()
+            self._staged_sfa_capture_state.require(
+                context.staged_sfa_graph_key,
+            )
             metadata = context.attn_metadata[layer_name]
             _prepare_sfa_remap_boundary(
                 metadata,
@@ -2341,7 +2456,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
     def submit_cross_layer_save(self) -> None:
-        runtime = getattr(self, "_staged_sfa_cross_layer_runtime", None)
+        runtime = self._staged_sfa_capture_state.runtime
         if runtime is None:
             return
         layer_name, kv_cache, index_layer_name, index_enabled = runtime

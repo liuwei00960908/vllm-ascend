@@ -254,6 +254,116 @@ class TestACLGraphWrapper(TestBase):
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_clear_all_graphs_releases_entries(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+        entry = ACLGraphEntry(
+            batch_descriptor=self.mock_batch_descriptor,
+            aclgraph=MagicMock(),
+            output=object(),
+            input_addresses=[1],
+        )
+        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = entry
+
+        ACLGraphWrapper.clear_all_graphs()
+
+        self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_seal_staged_entries_requires_every_key(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+        first_key = StagedSFAGraphKey.exact_q1(1)
+        second_key = StagedSFAGraphKey.exact_q1(2)
+        wrapper.concrete_aclgraph_entries[first_key] = ACLGraphEntry(
+            batch_descriptor=self.mock_batch_descriptor,
+            aclgraph=MagicMock(),
+            input_addresses=[],
+        )
+
+        with (
+            patch.object(ACLGraphWrapper, "_all_instances", {wrapper}),
+            self.assertRaisesRegex(RuntimeError, "island is incomplete"),
+        ):
+            ACLGraphWrapper.seal_staged_entries(
+                (first_key, second_key),
+                expected_islands=1,
+            )
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_seal_staged_entries_requires_exact_islands_and_keys(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+        key = StagedSFAGraphKey.exact_q1(1)
+        wrapper.concrete_aclgraph_entries[key] = ACLGraphEntry(
+            batch_descriptor=self.mock_batch_descriptor,
+            aclgraph=MagicMock(),
+            input_addresses=[],
+        )
+
+        with patch.object(ACLGraphWrapper, "_all_instances", {wrapper}):
+            self.assertEqual(
+                ACLGraphWrapper.seal_staged_entries(
+                    (key,),
+                    expected_islands=1,
+                ),
+                1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "island count"):
+                ACLGraphWrapper.seal_staged_entries(
+                    (key,),
+                    expected_islands=2,
+                )
+
+            unexpected = StagedSFAGraphKey.exact_q1(2)
+            wrapper.concrete_aclgraph_entries[unexpected] = ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=MagicMock(),
+                input_addresses=[],
+            )
+            with self.assertRaisesRegex(RuntimeError, "unexpected"):
+                ACLGraphWrapper.seal_staged_entries(
+                    (key,),
+                    expected_islands=1,
+                )
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
     def test_initialization_assertion_error(self, mock_envs,
                                             mock_current_platform):
         """Test ACLGraphWrapper initialization raises AssertionError for NONE mode"""
