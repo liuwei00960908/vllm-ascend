@@ -1111,6 +1111,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
         )
         self._staged_sfa_capture_state = _StagedSFACaptureState()
+        self._staged_sfa_row_indices: torch.Tensor | None = None
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1803,12 +1804,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M,
     ) -> str | None:
-        """Return why this step cannot use an exact-Q1 staged graph key.
-
-        Only exact, unpadded one-token-per-request decode batches are admitted.
-        All structural checks happen before Graph A mutates cache state or the
-        layerwise connector advances.
-        """
+        """Return why this step cannot use a fixed-capacity Q1 graph key."""
         forward_context = get_forward_context()
         runtime_mode = getattr(
             forward_context,
@@ -1864,25 +1860,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         ):
             return "the PIECEWISE descriptor does not match the exact Q=1 staged SFA graph key"
 
-        dp_size = getattr(
-            getattr(self.vllm_config, "parallel_config", None),
-            "data_parallel_size",
-            1,
-        )
-        if isinstance(dp_size, int) and dp_size != 1:
-            return "data parallel staged SFA graphs are unsupported"
         if self.vllm_config.speculative_config is not None:
             return "speculative decoding is enabled"
         if self.vllm_config.lora_config is not None:
             return "LoRA is configured"
         if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
             return "only DecodeOnly is supported"
+        actual_rows = int(attn_metadata.num_actual_tokens)
         if (
             attn_metadata.num_input_tokens != batch_size
-            or attn_metadata.num_actual_tokens != batch_size
-            or attn_metadata.num_decode_tokens != batch_size
+            or actual_rows <= 0
+            or actual_rows > batch_size
+            or attn_metadata.num_decode_tokens != actual_rows
         ):
-            return "only exact, unpadded one-token-per-request decode batches are supported"
+            return "the real Q=1 row count exceeds the staged graph capacity"
         if self.dsa_shrink_latent != 2:
             return "SHRINK_LATENT must be 2"
         if (
@@ -1969,29 +1960,27 @@ class AscendSFAImpl(MLAAttentionImpl):
             and not attn_metadata.need_sparse_lmcache_payload
         ):
             return "the v1 sparse LMCache payload path is unavailable"
-        if not attn_metadata.decode_valid_rows_all:
-            return "not every exact-Q1 row is in the compact LMCache payload"
         valid_rows = attn_metadata.decode_valid_row_indices
         scratch_base = attn_metadata.decode_scratch_base
         if (
             valid_rows is None
-            or int(valid_rows.numel()) != batch_size
+            or int(valid_rows.numel()) != actual_rows
             or scratch_base is None
             or int(scratch_base.numel()) != batch_size
             or attn_metadata.decode_scratch_base_compact is not None
             or attn_metadata.decode_target_slot_mapping is not None
         ):
-            return "the fused remap inputs do not match the exact-Q1 graph key"
+            return "the fused remap inputs do not match the Q1 graph capacity"
 
         request_ids = attn_metadata.decode_request_ids_compact
         full_request_ids = attn_metadata.req_ids
         if (
             request_ids is None
             or full_request_ids is None
-            or len(request_ids) != batch_size
-            or len(full_request_ids) != batch_size
+            or len(request_ids) != actual_rows
+            or len(full_request_ids) != actual_rows
             or tuple(request_ids) != tuple(full_request_ids)
-            or len(set(request_ids)) != batch_size
+            or len(set(request_ids)) != actual_rows
         ):
             return "the compact LMCache request ids are not the unique native request order"
         if (
@@ -2022,18 +2011,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             seq_rows = seq_lens_cpu.detach().numpy().reshape(-1)
         else:
             seq_rows = np.asarray(seq_lens_cpu).reshape(-1)
-        expected_request_rows = np.arange(batch_size, dtype=np.int64)
+        expected_request_rows = np.full(batch_size, -1, dtype=np.int64)
+        expected_request_rows[:actual_rows] = np.arange(actual_rows, dtype=np.int64)
         if (
             prompt_rows.size != batch_size
-            or np.any(prompt_rows < self.index_topk)
+            or np.any(prompt_rows[:actual_rows] < self.index_topk)
+            or np.any(prompt_rows[actual_rows:] != 0)
             or request_rows.size != batch_size
             or not np.array_equal(request_rows, expected_request_rows)
             or scratch_bases.size != batch_size
             or np.any(scratch_bases != 0)
             or seq_rows.size != batch_size
-            or np.any(seq_rows < prompt_rows)
+            or np.any(seq_rows[:actual_rows] < prompt_rows[:actual_rows])
+            or np.any(seq_rows[actual_rows:] != 0)
         ):
-            return "the exact-Q1 CPU row metadata does not match the graph key"
+            return "the Q1 CPU row metadata does not match the graph capacity"
         return None
 
     def _submit_sfa_save_operations(
@@ -2126,6 +2118,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_packed=True,
             scratch_base=scratch_base,
             valid_row_indices=valid_row_indices,
+        )
+        topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+        topk_2d.masked_fill_(
+            remap_boundary[: topk_2d.shape[0]].reshape(-1, 1) == 0,
+            0,
         )
         assert selected_packed is not None
         return (
@@ -2317,9 +2314,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if is_dummy:
                 state.remap_boundary = remap_boundary
-        valid_row_indices = attn_metadata.decode_valid_row_indices
+        valid_row_indices = self._staged_sfa_row_indices
+        if valid_row_indices is None:
+            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError("staged SFA row indices were not created by eager warmup")
+            valid_row_indices = torch.arange(
+                self._staged_sfa_graph_capture_sizes[-1],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            self._staged_sfa_row_indices = valid_row_indices
+        valid_row_indices = valid_row_indices[: graph_key.request_capacity]
         scratch_base = attn_metadata.decode_scratch_base
-        assert valid_row_indices is not None and scratch_base is not None
+        assert scratch_base is not None
         outputs = self._cross_layer_pre_compute(
             hidden_states,
             kv_cache[0],
@@ -2370,7 +2377,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         with torch.profiler.record_function("sfa_cross_layer::lmcache_retrieve"):
             context = get_forward_context()
             graph_key = getattr(context, "staged_sfa_graph_key", None)
-            if attn_metadata is None or graph_key is None or getattr(context, "staged_sfa_graph_dummy_run", False):
+            if attn_metadata is None or graph_key is None:
+                return
+            if getattr(context, "staged_sfa_graph_dummy_run", False):
+                if next_layer_name:
+                    next_metadata = context.attn_metadata[next_layer_name]
+                    _prepare_sfa_remap_boundary(
+                        next_metadata,
+                        next_metadata.req_ids,
+                        is_dummy_run=True,
+                        index_topk=self.index_topk,
+                    )
                 return
             route = context.staged_sfa_route
             index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
@@ -2379,7 +2396,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event = producer_event
             selected, request_ids, target_slots = _prepare_dsa_sparse_lmcache_payload(
                 attn_metadata,
-                selected_packed[: graph_key.request_capacity],
+                selected_packed[: attn_metadata.num_decode_tokens],
                 index_topk=self.index_topk,
             )
             wait_for_kv_layer_from_connector(
@@ -2409,14 +2426,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         with torch.profiler.record_function("sfa_cross_layer::bootstrap"):
             context = get_forward_context()
             metadata = context.attn_metadata[layer_name]
+            is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
             _prepare_sfa_remap_boundary(
                 metadata,
                 metadata.req_ids,
-                is_dummy_run=False,
+                is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
-                cached_tokens=context.staged_sfa_route.frontiers,
+                cached_tokens=(
+                    None
+                    if is_dummy
+                    else context.staged_sfa_route.frontiers
+                ),
             )
-            if _dsa_index_lmcache_enabled():
+            if not is_dummy and _dsa_index_lmcache_enabled():
                 wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(layer_name))
 
     def cross_layer_graph_post(

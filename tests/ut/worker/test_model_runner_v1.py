@@ -189,17 +189,14 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         return {
             "is_profile": False,
             "cudagraph_runtime_mode": CUDAGraphMode.PIECEWISE,
-            "uniform_decode": False,
-            "skip_eplb": True,
-            "remove_lora": False,
+            "allow_eager": True,
             "num_active_loras": 0,
             "num_tokens_unpadded": batch_size,
             "num_tokens_padded": batch_size,
             "num_reqs": batch_size,
-            "num_reqs_padded": batch_size,
             "num_scheduled_tokens": np.ones(batch_size, dtype=np.int32),
             "batch_descriptor": BatchDescriptor(num_tokens=batch_size),
-            "num_tokens_across_dp": None,
+            "dp_route_action": StagedSFARouteAction.STAGED,
         }
 
     def test_exact_q1_capture_sizes_are_staged(self):
@@ -228,6 +225,105 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         4,
                     )
 
+    def test_dp_dummy_uses_agreed_graph_capacity(self):
+        runner = self._build_runner()
+        kwargs = self._eligibility_kwargs(batch_size=1)
+        kwargs.update(
+            num_tokens_padded=4,
+            batch_descriptor=BatchDescriptor(num_tokens=4),
+            allow_eager=False,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 4),
+            ),
+        ):
+            self.assertEqual(
+                runner._staged_sfa_dummy_batch_size(**kwargs),
+                4,
+            )
+            kwargs["cudagraph_runtime_mode"] = CUDAGraphMode.NONE
+            self.assertIsNone(
+                runner._staged_sfa_dummy_batch_size(**kwargs)
+            )
+
+    def test_dp_sync_agrees_route_in_existing_collective(self):
+        runner = self._build_runner()
+        runner.dp_size = 2
+        runner.dp_rank = 0
+        runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
+
+        def peer(action):
+            def all_reduce(tensor, group):
+                tensor[0, 1] = 4
+                tensor[1, 1] = CUDAGraphMode.PIECEWISE.value
+                tensor[2, 1] = tuple(StagedSFARouteAction).index(action)
+
+            return all_reduce
+
+        for peer_action in StagedSFARouteAction:
+            with (
+                self.subTest(peer_action=peer_action),
+                patch.object(
+                    model_runner_module,
+                    "get_dp_group",
+                    return_value=SimpleNamespace(cpu_group=object()),
+                ),
+                patch.object(
+                    model_runner_module.dist,
+                    "all_reduce",
+                    side_effect=peer(peer_action),
+                ),
+            ):
+                _, sizes, _, action = runner._sync_batch_across_dp(
+                    num_tokens_padded=1,
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE.value,
+                    allow_dp_padding=True,
+                    staged_sfa_route_action=StagedSFARouteAction.STAGED,
+                )
+                self.assertEqual(sizes.tolist(), [4, 4])
+                self.assertEqual(action, peer_action)
+
+    def test_dp_sync_keeps_non_staged_collective_shape(self):
+        runner = self._build_runner()
+        runner.dp_size = 2
+        runner.dp_rank = 0
+        runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
+
+        def all_reduce(tensor, group):
+            self.assertEqual(tuple(tensor.shape), (2, 2))
+            tensor[0, 1] = 4
+            tensor[1, 1] = CUDAGraphMode.PIECEWISE.value
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_dp_group",
+                return_value=SimpleNamespace(cpu_group=object()),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=all_reduce,
+            ),
+        ):
+            _, sizes, mode, action = runner._sync_batch_across_dp(
+                num_tokens_padded=1,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE.value,
+                allow_dp_padding=True,
+            )
+
+        self.assertEqual(sizes.tolist(), [4, 4])
+        self.assertEqual(mode, CUDAGraphMode.PIECEWISE.value)
+        self.assertIsNone(action)
+
     def test_padded_non_q1_and_unsupported_batches_fall_back(self):
         runner = self._build_runner()
         cases = {
@@ -235,7 +331,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 "num_tokens_unpadded": 2,
                 "num_tokens_padded": 2,
                 "num_reqs": 2,
-                "num_reqs_padded": 2,
                 "num_scheduled_tokens": np.ones(2, dtype=np.int32),
                 "batch_descriptor": BatchDescriptor(num_tokens=2),
             },
@@ -243,7 +338,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 "num_tokens_padded": 8,
                 "batch_descriptor": BatchDescriptor(num_tokens=8),
             },
-            "request_padding": {"num_reqs_padded": 8},
             "non_q1": {
                 "num_scheduled_tokens": np.array([1, 1, 2, 0]),
             },
@@ -253,7 +347,9 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     uniform=True,
                 ),
             },
-            "dp_padding": {"num_tokens_across_dp": torch.ones(1)},
+            "dp_fallback": {
+                "dp_route_action": StagedSFARouteAction.SAFE_NATIVE,
+            },
             "profile": {"is_profile": True},
         }
         with (
@@ -274,20 +370,15 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 with self.subTest(case=case_name):
                     self.assertIsNone(runner._staged_sfa_dummy_batch_size(**kwargs))
 
-    def test_live_key_requires_exact_unpadded_q1_before_mutation(self):
+    def test_live_route_accepts_dp_padding_before_mutation(self):
         runner = self._build_runner()
         request_ids = [f"req-{index}" for index in range(4)]
-        kwargs = {
-            "cudagraph_mode": CUDAGraphMode.PIECEWISE,
-            "batch_descriptor": BatchDescriptor(num_tokens=4),
+        local_kwargs = {
             "num_tokens_unpadded": 4,
-            "num_tokens_padded": 4,
             "num_reqs": 4,
             "num_scheduled_tokens": np.ones(4, dtype=np.int32),
             "prompt_lens": np.full(4, 4096, dtype=np.int32),
             "index_topk": 2048,
-            "num_tokens_across_dp": None,
-            "should_ubatch": False,
             "has_cascade_attention": False,
             "request_ids": request_ids,
             "kv_connector_metadata": SimpleNamespace(
@@ -304,6 +395,15 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 ]
             ),
         }
+        final_kwargs = {
+            "dp_route_action": StagedSFARouteAction.STAGED,
+            "cudagraph_mode": CUDAGraphMode.PIECEWISE,
+            "batch_descriptor": BatchDescriptor(num_tokens=4),
+            "num_tokens_unpadded": 4,
+            "num_tokens_padded": 4,
+            "num_reqs": 4,
+            "should_ubatch": False,
+        }
         with (
             patch.object(
                 model_runner_module,
@@ -316,27 +416,46 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 return_value=(1, 4),
             ),
         ):
-            route = runner._staged_sfa_live_route(**kwargs)
+            local_route = runner._staged_sfa_local_route(**local_kwargs)
+            route = runner._staged_sfa_live_route(
+                local_route=local_route,
+                **final_kwargs,
+            )
             self.assertEqual(route.action, StagedSFARouteAction.STAGED)
             self.assertEqual(route.reason, StagedSFARouteReason.ELIGIBLE)
             self.assertEqual(route.graph_key, StagedSFAGraphKey.exact_q1(4))
             self.assertEqual(route.frontiers, (4096,) * 4)
-            for name, overrides in {
-                "padding": {
-                    "num_tokens_padded": 8,
-                    "batch_descriptor": BatchDescriptor(num_tokens=8),
+
+            one_request_kwargs = dict(local_kwargs)
+            one_request_kwargs.update(
+                num_tokens_unpadded=1,
+                num_reqs=1,
+                num_scheduled_tokens=np.ones(1, dtype=np.int32),
+                prompt_lens=np.full(1, 4096, dtype=np.int32),
+                request_ids=request_ids[:1],
+                kv_connector_metadata=SimpleNamespace(requests=local_kwargs["kv_connector_metadata"].requests[:1]),
+            )
+            padded_route = runner._staged_sfa_live_route(
+                local_route=runner._staged_sfa_local_route(**one_request_kwargs),
+                **{
+                    **final_kwargs,
+                    "num_tokens_unpadded": 1,
+                    "num_reqs": 1,
                 },
+            )
+            self.assertEqual(
+                padded_route.graph_key,
+                StagedSFAGraphKey.exact_q1(4),
+            )
+
+            for name, overrides in {
                 "multi_token": {
                     "num_scheduled_tokens": np.array(
                         [1, 1, 2, 0],
                         dtype=np.int32,
                     ),
                 },
-                "ubatch": {"should_ubatch": True},
                 "cascade": {"has_cascade_attention": True},
-                "dp_padding": {
-                    "num_tokens_across_dp": torch.ones(1),
-                },
                 "short_prompt": {
                     "prompt_lens": np.array([4096, 2047, 4096, 4096]),
                 },
@@ -384,10 +503,10 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
             }.items():
-                rejected = dict(kwargs)
+                rejected = dict(local_kwargs)
                 rejected.update(overrides)
                 with self.subTest(name=name):
-                    route = runner._staged_sfa_live_route(**rejected)
+                    route = runner._staged_sfa_local_route(**rejected)
                     self.assertEqual(
                         route.action,
                         StagedSFARouteAction.FATAL
@@ -410,8 +529,29 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             StagedSFARouteReason.FRONTIER_TOO_SHORT,
                         )
 
+            ubatch_route = runner._staged_sfa_live_route(
+                local_route=local_route,
+                **{**final_kwargs, "should_ubatch": True},
+            )
+            self.assertEqual(
+                ubatch_route.reason,
+                StagedSFARouteReason.UBATCH,
+            )
+
+            peer_fallback = runner._staged_sfa_live_route(
+                local_route=local_route,
+                **{
+                    **final_kwargs,
+                    "dp_route_action": StagedSFARouteAction.SAFE_NATIVE,
+                },
+            )
+            self.assertEqual(
+                peer_fallback.reason,
+                StagedSFARouteReason.RUNTIME_PARALLELISM,
+            )
+
             runner.attn_state = AscendAttentionState.PrefillNoCache
-            route = runner._staged_sfa_live_route(**kwargs)
+            route = runner._staged_sfa_local_route(**local_kwargs)
             self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
             self.assertEqual(route.reason, StagedSFARouteReason.NOT_DECODE)
 
@@ -471,7 +611,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             np.arange(5, dtype=np.int32),
         )
 
-    def test_dp_and_speculative_dummy_batches_fall_back(self):
+    def test_speculative_dummy_batches_fall_back(self):
         runner = self._build_runner()
         kwargs = self._eligibility_kwargs()
         with (
@@ -486,10 +626,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 return_value=(1, 4),
             ),
         ):
-            runner.parallel_config.data_parallel_size = 2
-            self.assertIsNone(runner._staged_sfa_dummy_batch_size(**kwargs))
-
-            runner.parallel_config.data_parallel_size = 1
             runner.speculative_config = SimpleNamespace(method="mtp")
             self.assertIsNone(runner._staged_sfa_dummy_batch_size(**kwargs))
 
@@ -662,20 +798,23 @@ class TestSFALayerwiseGraphModeCompatibility(unittest.TestCase):
         runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
         return runner
 
-    @patch.object(
-        model_runner_module,
-        "staged_sfa_graph_configured",
-        return_value=True,
-    )
-    def test_data_parallel_staged_graph_is_rejected(
-        self,
-        _staged_sfa_graph_configured,
-    ):
+    def test_internal_data_parallel_staged_graph_is_accepted(self):
         runner = self._build_runner(CUDAGraphMode.PIECEWISE)
         runner.vllm_config = object()
         runner.parallel_config = SimpleNamespace(data_parallel_size=2)
 
-        with self.assertRaisesRegex(ValueError, "data parallel"):
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "staged_sfa_connector_supports_sparse_load",
+                return_value=True,
+            ),
+        ):
             runner._validate_sfa_layerwise_connector_cudagraph_mode()
 
     def test_explicit_unsupported_staged_graph_request_is_rejected(self):

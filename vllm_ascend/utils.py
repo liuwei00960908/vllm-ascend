@@ -553,7 +553,18 @@ def staged_sfa_graph_configuration_reasons(
     if getattr(vllm_config, "lora_config", None) is not None:
         reasons.append(StagedSFAConfigReason.LORA)
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
-    if isinstance(data_parallel_size, int) and data_parallel_size != 1:
+    # Internal DP keeps LMCache worker identity TP-local. External launcher
+    # exposes a DP-global rank/world and needs separate ownership qualification.
+    if (
+        isinstance(data_parallel_size, int)
+        and data_parallel_size != 1
+        and getattr(
+            parallel_config,
+            "distributed_executor_backend",
+            None,
+        )
+        == "external_launcher"
+    ):
         reasons.append(StagedSFAConfigReason.DATA_PARALLEL)
     pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
     if isinstance(pipeline_parallel_size, int) and pipeline_parallel_size != 1:
@@ -583,7 +594,7 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.CONNECTOR_MISSING: "a KV transfer connector must be configured",
     StagedSFAConfigReason.SPECULATIVE_DECODE: "speculative decoding/MTP is not implemented",
     StagedSFAConfigReason.LORA: "LoRA is not implemented",
-    StagedSFAConfigReason.DATA_PARALLEL: "data parallel staged graphs are not implemented",
+    StagedSFAConfigReason.DATA_PARALLEL: "external-launcher data parallel staged graphs are not implemented",
     StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline parallel staged graphs are not implemented",
     StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallel staged graphs are not implemented",
     StagedSFAConfigReason.LEGACY_DSA_OFFLOAD: "legacy DSA latent offload is not supported by staged graphs",
@@ -612,7 +623,7 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
-    """Return configured exact-Q1 cross-layer graph batch sizes."""
+    """Return configured Q1 cross-layer graph capacities."""
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
@@ -636,7 +647,7 @@ def staged_sfa_graph_capture_sizes(
         oversized = [size for size in sizes if size > maximum]
         if oversized:
             raise ValueError(
-                f"Staged SFA capture sizes exceed the exact Q=1 scheduler capacity {maximum}: {oversized}."
+                f"Staged SFA capture sizes exceed the Q=1 scheduler capacity {maximum}: {oversized}."
             )
     return sizes
 

@@ -87,6 +87,7 @@ class NPUModelRunner310(NPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        staged_sfa_route_action=None,
     ):
         if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
             force_eager = True
@@ -113,6 +114,7 @@ class NPUModelRunner310(NPUModelRunner):
             force_has_lora=force_has_lora,
             force_num_active_loras=force_num_active_loras,
             num_encoder_reqs=num_encoder_reqs,
+            staged_sfa_route_action=staged_sfa_route_action,
         )
 
     def _pad_query_start_loc_for_fia(

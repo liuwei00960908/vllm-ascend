@@ -634,6 +634,7 @@ class TestUtils(TestBase):
         vllm_config.speculative_config = mock.MagicMock()
         vllm_config.lora_config = mock.MagicMock()
         vllm_config.parallel_config.data_parallel_size = 2
+        vllm_config.parallel_config.distributed_executor_backend = "external_launcher"
         vllm_config.parallel_config.pipeline_parallel_size = 2
         vllm_config.parallel_config.prefill_context_parallel_size = 2
         vllm_config.parallel_config.decode_context_parallel_size = 1
@@ -659,9 +660,16 @@ class TestUtils(TestBase):
         self.assertIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
         self.assertIn("speculative decoding/MTP is not implemented", errors)
         self.assertIn("LoRA is not implemented", errors)
-        self.assertIn("data parallel staged graphs are not implemented", errors)
+        self.assertIn(
+            "external-launcher data parallel staged graphs are not implemented",
+            errors,
+        )
         self.assertIn("pipeline parallel staged graphs are not implemented", errors)
         self.assertIn("context parallel staged graphs are not implemented", errors)
+
+        vllm_config.parallel_config.distributed_executor_backend = "mp"
+        reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
+        self.assertNotIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
 
     def test_staged_sfa_rejects_profiling_side_effect_modes(self):
         vllm_config = mock.MagicMock()

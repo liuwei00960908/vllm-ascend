@@ -59,7 +59,7 @@ class StagedSFAGraphKey:
 
     @classmethod
     def exact_q1(cls, size: int) -> "StagedSFAGraphKey":
-        """Construct an exact, unpadded one-token-per-request key."""
+        """Construct an equal token/request-capacity Q=1 key."""
         return cls(
             token_capacity=size,
             request_capacity=size,
@@ -75,7 +75,7 @@ class StagedSFAGraphKey:
             or self.max_query_len != 1
         ):
             raise NotImplementedError(
-                "Only exact, unpadded Q=1 staged SFA keys can use legacy BatchDescriptor dispatch."
+                "Only equal-capacity Q=1 staged SFA keys can use legacy BatchDescriptor dispatch."
             )
         return BatchDescriptor(num_tokens=self.token_capacity)
 
