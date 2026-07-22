@@ -1,5 +1,4 @@
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -679,6 +678,7 @@ class TestStagedSFAGraphPoc(TestBase):
         graph_key = StagedSFAGraphKey.exact_q1(4)
         impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
         impl._staged_sfa_capture_state.producer_event = object()
+        impl._staged_sfa_capture_state.runtime = (None, None, None, True)
         metadata = self._make_decode_metadata()
         next_metadata = self._make_decode_metadata()
         context = SimpleNamespace(
@@ -694,7 +694,6 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         waits = []
         with (
-            patch.object(sfa_v1, "get_forward_context", return_value=context),
             patch.object(
                 sfa_v1,
                 "_prepare_dsa_sparse_lmcache_payload",
@@ -707,17 +706,13 @@ class TestStagedSFAGraphPoc(TestBase):
             ) as wait_for_layer,
             patch.object(sfa_v1, "_sync_compute_stream_after_lmcache_sparse_wait"),
             patch.object(sfa_v1, "_prepare_sfa_remap_boundary") as prepare_boundary,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                return_value=nullcontext(),
-            ),
         ):
             impl.cross_layer_lmcache_retrieve(
                 "layer-0",
                 "layer-1.attn",
                 torch.ones(4, 4, dtype=torch.int32),
                 metadata,
+                context,
             )
 
         self.assertEqual(waits, ["layer-0", "layer-1.indexer.k_cache"])
@@ -748,20 +743,15 @@ class TestStagedSFAGraphPoc(TestBase):
             attn_metadata={"layer-1.attn": next_metadata},
         )
         with (
-            patch.object(sfa_v1, "get_forward_context", return_value=context),
             patch.object(sfa_v1, "_prepare_sfa_remap_boundary") as prepare_boundary,
             patch.object(sfa_v1, "wait_for_kv_layer_from_connector") as wait_for_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                return_value=nullcontext(),
-            ),
         ):
             impl.cross_layer_lmcache_retrieve(
                 "layer-0",
                 "layer-1.attn",
                 torch.ones(4, 4, dtype=torch.int32),
                 metadata,
+                context,
             )
 
         prepare_boundary.assert_called_once_with(
@@ -797,6 +787,12 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
+        impl._staged_sfa_capture_state.runtime = (
+            None,
+            None,
+            "layer-0.indexer.k_cache",
+            True,
+        )
         metadata = self._make_decode_metadata()
         context = SimpleNamespace(
             attn_metadata={"layer-0.attn": metadata},
@@ -811,17 +807,11 @@ class TestStagedSFAGraphPoc(TestBase):
                 "_prepare_sfa_remap_boundary",
                 side_effect=lambda *args, **kwargs: order.append("boundary"),
             ),
-            patch.object(sfa_v1, "_dsa_index_lmcache_enabled", return_value=True),
             patch.object(
                 sfa_v1,
                 "wait_for_kv_layer_from_connector",
                 side_effect=lambda *args, **kwargs: order.append("index"),
             ) as wait_for_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                return_value=nullcontext(),
-            ),
         ):
             impl.bootstrap_cross_layer("layer-0.attn")
 
@@ -838,13 +828,7 @@ class TestStagedSFAGraphPoc(TestBase):
         with (
             patch.object(sfa_v1, "get_forward_context", return_value=context),
             patch.object(sfa_v1, "_prepare_sfa_remap_boundary") as prepare_boundary,
-            patch.object(sfa_v1, "_dsa_index_lmcache_enabled", return_value=True),
             patch.object(sfa_v1, "wait_for_kv_layer_from_connector") as wait_for_layer,
-            patch.object(
-                sfa_v1.torch.profiler,
-                "record_function",
-                return_value=nullcontext(),
-            ),
         ):
             impl.bootstrap_cross_layer("layer-0.attn")
 
@@ -1051,7 +1035,30 @@ class TestStagedSFAGraphPoc(TestBase):
 
         self.assertIs(payload[0], selected)
         self.assertEqual(payload[1], ["req-0", "req-0", "req-1"])
+        self.assertIs(payload[1], metadata.decode_request_ids_compact)
         self.assertIs(payload[2], targets)
+
+    def test_staged_sparse_payload_validates_once_per_shared_metadata(self):
+        metadata = self._make_decode_metadata()
+        metadata.staged_sfa_payload_validated = False
+        selected = torch.arange(4, dtype=torch.int32).view(1, 4)
+
+        sfa_v1._prepare_dsa_sparse_lmcache_payload(
+            metadata,
+            selected,
+            index_topk=4,
+            validate_once=True,
+        )
+        metadata.decode_valid_row_indices = None
+        payload = sfa_v1._prepare_dsa_sparse_lmcache_payload(
+            metadata,
+            selected,
+            index_topk=4,
+            validate_once=True,
+        )
+
+        self.assertTrue(metadata.staged_sfa_payload_validated)
+        self.assertIs(payload[0], selected)
 
     def test_eligibility_accepts_single_native_piecewise_decode(self):
         impl = self._make_eligible_impl()

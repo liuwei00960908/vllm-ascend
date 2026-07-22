@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
@@ -96,6 +97,12 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 )
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
+
+
+def _staged_sfa_profile_scope(name: str):
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,8 +405,16 @@ def _prepare_dsa_sparse_lmcache_payload(
     selected_packed: torch.Tensor,
     *,
     index_topk: int,
+    validate_once: bool = False,
 ) -> tuple[torch.Tensor, list[str], torch.Tensor | None]:
     """Build and validate the row-aligned sparse LMCache retrieve payload."""
+    if validate_once and getattr(attn_metadata, "staged_sfa_payload_validated", False) is True:
+        return (
+            selected_packed,
+            attn_metadata.decode_request_ids_compact,
+            attn_metadata.decode_target_slot_mapping,
+        )
+
     if selected_packed.dim() != 2:
         raise RuntimeError(
             f"DSA sparse LMCache selected tokens must be rank 2, got shape={tuple(selected_packed.shape)}."
@@ -433,7 +448,6 @@ def _prepare_dsa_sparse_lmcache_payload(
     )
     if request_ids is None:
         raise RuntimeError("DSA sparse LMCache payload has no row-aligned request IDs.")
-    request_ids = list(request_ids)
     num_rows = int(selected_for_wait.shape[0])
     if len(request_ids) != num_rows:
         raise RuntimeError(
@@ -459,6 +473,8 @@ def _prepare_dsa_sparse_lmcache_payload(
             f"tokens: targets={tuple(target_slot_mapping.shape)}, "
             f"selected={tuple(selected_for_wait.shape)}."
         )
+    if validate_once:
+        attn_metadata.staged_sfa_payload_validated = True
     return selected_for_wait, request_ids, target_slot_mapping
 
 
@@ -659,6 +675,7 @@ class AscendSFAMetadata:
     decode_scratch_capacity: int | None = None
     decode_target_slot_mapping: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
+    staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
@@ -2373,9 +2390,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         next_layer_name: str,
         selected_packed: torch.Tensor,
         attn_metadata: M | None,
+        context: Any,
     ) -> None:
-        with torch.profiler.record_function("sfa_cross_layer::lmcache_retrieve"):
-            context = get_forward_context()
+        with _staged_sfa_profile_scope("sfa_cross_layer::lmcache_retrieve"):
             graph_key = getattr(context, "staged_sfa_graph_key", None)
             if attn_metadata is None or graph_key is None:
                 return
@@ -2390,14 +2407,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 return
             route = context.staged_sfa_route
-            index_enabled = bool(self.dsa_offload_unbundle and _dsa_index_lmcache_enabled())
-            producer_event = self._staged_sfa_capture_state.producer_event
+            state = self._staged_sfa_capture_state
+            index_enabled = bool(state.runtime and state.runtime[3])
+            producer_event = state.producer_event
             if producer_event is not None:
                 attn_metadata.reshape_cache_event = producer_event
             selected, request_ids, target_slots = _prepare_dsa_sparse_lmcache_payload(
                 attn_metadata,
                 selected_packed[: attn_metadata.num_decode_tokens],
                 index_topk=self.index_topk,
+                validate_once=True,
             )
             wait_for_kv_layer_from_connector(
                 layer_name,
@@ -2407,7 +2426,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 target_slot_mapping=target_slots,
                 payload_event=producer_event,
             )
-            if _LMCACHE_SPARSE_WAIT_SYNC_ONCE:
+            if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
             if next_layer_name:
                 next_metadata = context.attn_metadata[next_layer_name]
@@ -2423,7 +2442,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def bootstrap_cross_layer(self, layer_name: str) -> None:
         """Prepare layer zero before the first captured island is launched."""
-        with torch.profiler.record_function("sfa_cross_layer::bootstrap"):
+        with _staged_sfa_profile_scope("sfa_cross_layer::bootstrap"):
             context = get_forward_context()
             metadata = context.attn_metadata[layer_name]
             is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
@@ -2438,8 +2457,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else context.staged_sfa_route.frontiers
                 ),
             )
-            if not is_dummy and _dsa_index_lmcache_enabled():
-                wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(layer_name))
+            runtime = self._staged_sfa_capture_state.runtime
+            if not is_dummy and runtime and runtime[2] is not None and runtime[3]:
+                wait_for_kv_layer_from_connector(runtime[2])
 
     def cross_layer_graph_post(
         self,
@@ -2476,11 +2496,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         layer_name, kv_cache, index_layer_name, index_enabled = runtime
         if bool(self.dsa_shrink_latent) and _decode_window_save_window_size() == 0:
             return
-        operations = [(layer_name, [kv_cache[0], kv_cache[1]])]
+        maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
         if index_layer_name is not None and index_enabled:
-            operations.append((index_layer_name, [kv_cache[2]]))
-        self._submit_sfa_save_operations(operations)
-        _dsa_prof.step()
+            maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
 
     def forward(
         self,

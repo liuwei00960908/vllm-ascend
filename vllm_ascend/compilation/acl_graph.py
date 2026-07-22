@@ -256,7 +256,6 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

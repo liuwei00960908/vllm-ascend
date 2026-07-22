@@ -244,7 +244,7 @@ direct_register_custom_op(
 )
 
 
-def _mla_runtime_state(layer_name: str):
+def _mla_runtime_metadata(layer_name: str):
     forward_context: ForwardContext = get_forward_context()
     layer = forward_context.no_compile_layers[layer_name]
     attn_metadata = (
@@ -252,6 +252,11 @@ def _mla_runtime_state(layer_name: str):
         if forward_context.attn_metadata
         else forward_context.attn_metadata
     )
+    return forward_context, layer, attn_metadata
+
+
+def _mla_runtime_state(layer_name: str):
+    forward_context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
     virtual_engine = forward_context.virtual_engine if vllm_version_is("0.18.0") else 0
     return layer.mla_attn.impl, layer.mla_attn.layer_name, layer.mla_attn.kv_cache[virtual_engine], attn_metadata
 
@@ -311,12 +316,13 @@ def sfa_lmcache_retrieve(
     layer_name: str,
     next_layer_name: str,
 ) -> None:
-    impl, attn_layer_name, _, attn_metadata = _mla_runtime_state(layer_name)
-    impl.cross_layer_lmcache_retrieve(
-        attn_layer_name,
+    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    layer.mla_attn.impl.cross_layer_lmcache_retrieve(
+        layer.mla_attn.layer_name,
         next_layer_name,
         selected_packed,
         attn_metadata,
+        context,
     )
 
 
