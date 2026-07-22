@@ -7,15 +7,11 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 )
 
 
-def _buffers(requests: int, capacity: int, max_model_len: int = 32):
-    bitmap_words = (max_model_len + 31) // 32
+def _buffers(requests: int, capacity: int):
     return (
         torch.empty((requests, capacity), dtype=torch.int32, device="npu"),
         torch.empty(requests, dtype=torch.int32, device="npu"),
         torch.empty((requests, capacity), dtype=torch.long, device="npu"),
-        torch.empty(
-            (requests, 2 * bitmap_words), dtype=torch.int32, device="npu"
-        ),
     )
 
 
@@ -47,7 +43,6 @@ def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
-        bitmap_workspace=buffers[3],
         block_size=2,
     )
 
@@ -84,7 +79,6 @@ def test_two_requests_are_deduplicated_independently():
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
-        bitmap_workspace=buffers[3],
         block_size=2,
     )
     assert torch.equal(actual.cpu(), expected)
@@ -114,7 +108,6 @@ def test_bitmap_union_assigns_sorted_position_ranks():
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
-        bitmap_workspace=buffers[3],
         block_size=2,
     )
 

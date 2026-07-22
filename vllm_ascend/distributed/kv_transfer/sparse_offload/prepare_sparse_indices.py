@@ -113,7 +113,6 @@ def prepare_sparse_indices(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
     target_slot_mapping: torch.Tensor,
-    bitmap_workspace: torch.Tensor,
     block_size: int,
     need_packed: bool = True,
     clear_invalid_rows: bool = False,
@@ -128,12 +127,6 @@ def prepare_sparse_indices(
             is the LMCache-committed frontier; selected positions below it are
             remapped through the request-level union scratch prefix.
         need_packed: whether to build the LMCache selected-token payload.
-        scratch_base: [bs] compact scratch base per row. This lets MTP
-            rows for the same request use disjoint compact scratch ranges.
-        valid_row_indices: [num_decode_rows] ordered, unique source-row
-            indices. Only those rows are remapped; selected_packed follows this
-            order with shape [num_decode_rows, k]. The custom op mutates these
-            topk_indices rows in place.
         row_req_indices: [bs] request index for each row; negative entries are
             zeroed in the same kernel. Pass this only for pure
             decode/spec-decode; a mixed prefill row also has a negative request
@@ -143,9 +136,9 @@ def prepare_sparse_indices(
         new_indices: same shape as topk_indices. LMCache-selected entries are
             replaced by their compact scratch row (scratch_base + rank in
             top-k order); live-cache and padding entries stay unchanged.
-        selected_packed: [num_decode_rows, k] int32. LMCache-selected ABSOLUTE
-            positions are front-packed in top-k order (row i goes to scratch
-            slot i), with the tail padded with 0. None when need_packed=False.
+        selected_packed: [num_requests, scratch_capacity] int32. Unique
+            LMCache-selected absolute positions are packed in ascending token
+            order. None when need_packed=False.
     """
     if topk_indices.device.type != "npu":
         raise RuntimeError(
@@ -168,7 +161,6 @@ def prepare_sparse_indices(
         selected_packed,
         selected_counts,
         target_slot_mapping,
-        bitmap_workspace,
         block_size,
         need_packed,
         clear_invalid_rows,

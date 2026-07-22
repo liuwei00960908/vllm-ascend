@@ -79,13 +79,6 @@ def main() -> None:
     targets = torch.empty(
         (args.requests, scratch_capacity), dtype=torch.long, device=device
     )
-    bitmap_words = (
-        block_table_width * args.block_size + 31
-    ) // 32
-    bitmap_workspace = torch.empty(
-        (args.requests, 2 * bitmap_words), dtype=torch.int32, device=device
-    )
-
     expected = _prepare_sparse_indices_torch(
         topk.cpu(),
         split_boundary.cpu(),
@@ -102,7 +95,6 @@ def main() -> None:
         selected,
         counts,
         targets,
-        bitmap_workspace,
         args.block_size,
         True,
         False,
@@ -132,7 +124,6 @@ def main() -> None:
             selected,
             counts,
             targets,
-            bitmap_workspace,
             args.block_size,
             True,
             False,
@@ -142,7 +133,6 @@ def main() -> None:
     print(
         f"requests={args.requests} mtp_rows={args.mtp_rows} topk={args.topk} "
         f"max_model_len={args.max_model_len} boundary={args.boundary} "
-        f"workspace_kib={bitmap_workspace.numel() * 4 / 1024:.1f} "
         f"exact_match=True fused_with_input_copy_ms={fused_ms:.6f}"
     )
 

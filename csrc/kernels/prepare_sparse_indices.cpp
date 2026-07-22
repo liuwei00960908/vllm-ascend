@@ -22,13 +22,12 @@ public:
         __gm__ int32_t* selectedPacked,
         __gm__ int32_t* selectedCounts,
         __gm__ int64_t* targetSlots,
-        __gm__ int32_t* bitmapWorkspace,
         uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t requestCount,
         uint32_t blockTableWidth,
         uint32_t scratchCapacity,
-        uint32_t workspaceWidth,
+        uint32_t bitmapWords,
         uint32_t blockSize,
         uint32_t needPacked,
         uint32_t clearInvalidRows)
@@ -38,8 +37,8 @@ public:
         requestCount_ = requestCount;
         blockTableWidth_ = blockTableWidth;
         scratchCapacity_ = scratchCapacity;
-        workspaceWidth_ = workspaceWidth;
-        bitmapWords_ = workspaceWidth / 2;
+        bitmapWords_ = bitmapWords;
+        bufferWords_ = ((bitmapWords + 7) / 8) * 8;
         blockSize_ = blockSize;
         needPacked_ = needPacked != 0;
         clearInvalidRows_ = clearInvalidRows != 0;
@@ -56,9 +55,8 @@ public:
         targetSlots_.SetGlobalBuffer(
             targetSlots,
             static_cast<uint64_t>(requestCount) * scratchCapacity);
-        bitmapWorkspace_.SetGlobalBuffer(
-            bitmapWorkspace,
-            static_cast<uint64_t>(requestCount) * workspaceWidth);
+        pipe_.InitBuffer(bitmapBuffer_, bufferWords_ * sizeof(int32_t));
+        pipe_.InitBuffer(prefixBuffer_, bufferWords_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
@@ -82,12 +80,11 @@ public:
             }
             return;
         }
-        const uint64_t workspaceOffset =
-            static_cast<uint64_t>(req) * workspaceWidth_;
-        const uint64_t prefixOffset = workspaceOffset + bitmapWords_;
-        for (uint32_t i = 0; i < bitmapWords_; ++i) {
-            bitmapWorkspace_.SetValue(workspaceOffset + i, 0);
-        }
+        AscendC::LocalTensor<int32_t> bitmap =
+            bitmapBuffer_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> prefix =
+            prefixBuffer_.Get<int32_t>();
+        AscendC::Duplicate(bitmap, static_cast<int32_t>(0), bufferWords_);
         const uint64_t packedOffset =
             static_cast<uint64_t>(req) * scratchCapacity_;
 
@@ -107,12 +104,10 @@ public:
                 }
                 const uint32_t word = static_cast<uint32_t>(token) >> 5;
                 const uint32_t bit = static_cast<uint32_t>(token) & 31;
-                const uint64_t bitmapIndex = workspaceOffset + word;
-                const uint32_t value = static_cast<uint32_t>(
-                    bitmapWorkspace_.GetValue(bitmapIndex));
-                bitmapWorkspace_.SetValue(
-                    bitmapIndex,
-                    static_cast<int32_t>(value | (1U << bit)));
+                const uint32_t value =
+                    static_cast<uint32_t>(bitmap.GetValue(word));
+                bitmap.SetValue(
+                    word, static_cast<int32_t>(value | (1U << bit)));
             }
         }
 
@@ -120,10 +115,9 @@ public:
         // in ascending token-position order.
         uint32_t uniqueCount = 0;
         for (uint32_t word = 0; word < bitmapWords_; ++word) {
-            bitmapWorkspace_.SetValue(
-                prefixOffset + word, static_cast<int32_t>(uniqueCount));
-            uniqueCount += Popcount32(static_cast<uint32_t>(
-                bitmapWorkspace_.GetValue(workspaceOffset + word)));
+            prefix.SetValue(word, static_cast<int32_t>(uniqueCount));
+            uniqueCount += Popcount32(
+                static_cast<uint32_t>(bitmap.GetValue(word)));
         }
 
         for (uint32_t row = 0; row < rowCount_; ++row) {
@@ -140,11 +134,11 @@ public:
                 }
                 const uint32_t word = static_cast<uint32_t>(token) >> 5;
                 const uint32_t bit = static_cast<uint32_t>(token) & 31;
-                const uint32_t bitmapValue = static_cast<uint32_t>(
-                    bitmapWorkspace_.GetValue(workspaceOffset + word));
+                const uint32_t bitmapValue =
+                    static_cast<uint32_t>(bitmap.GetValue(word));
                 const uint32_t lowerMask = bit == 0 ? 0 : ((1U << bit) - 1);
-                const uint32_t scratchSlot = static_cast<uint32_t>(
-                    bitmapWorkspace_.GetValue(prefixOffset + word))
+                const uint32_t scratchSlot =
+                    static_cast<uint32_t>(prefix.GetValue(word))
                     + Popcount32(bitmapValue & lowerMask);
                 topkIndices_.SetValue(
                     indexOffset, static_cast<int32_t>(scratchSlot));
@@ -203,14 +197,16 @@ private:
     AscendC::GlobalTensor<int32_t> selectedPacked_;
     AscendC::GlobalTensor<int32_t> selectedCounts_;
     AscendC::GlobalTensor<int64_t> targetSlots_;
-    AscendC::GlobalTensor<int32_t> bitmapWorkspace_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bitmapBuffer_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> prefixBuffer_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t requestCount_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t scratchCapacity_ = 0;
-    uint32_t workspaceWidth_ = 0;
     uint32_t bitmapWords_ = 0;
+    uint32_t bufferWords_ = 0;
     uint32_t blockSize_ = 0;
     bool needPacked_ = false;
     bool clearInvalidRows_ = false;
@@ -226,22 +222,21 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
     __gm__ int32_t* selectedPacked,
     __gm__ int32_t* selectedCounts,
     __gm__ int64_t* targetSlots,
-    __gm__ int32_t* bitmapWorkspace,
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t requestCount,
     uint32_t blockTableWidth,
     uint32_t scratchCapacity,
-    uint32_t workspaceWidth,
+    uint32_t bitmapWords,
     uint32_t blockSize,
     uint32_t needPacked,
     uint32_t clearInvalidRows)
 {
     DSAPrepareSparseIndicesKernel op;
     op.Init(topkIndices, splitBoundary, rowReqIndices, requestBlockTable,
-            selectedPacked, selectedCounts, targetSlots, bitmapWorkspace,
+            selectedPacked, selectedCounts, targetSlots,
             rowCount, rowWidth, requestCount, blockTableWidth, scratchCapacity,
-            workspaceWidth, blockSize, needPacked, clearInvalidRows);
+            bitmapWords, blockSize, needPacked, clearInvalidRows);
     op.Process();
 }
 
@@ -250,10 +245,10 @@ namespace vllm_ascend {
 void dsa_prepare_sparse_indices_impl(
     void* stream, void* topkIndices, void* splitBoundary,
     void* rowReqIndices, void* requestBlockTable, void* selectedPacked,
-    void* selectedCounts, void* targetSlots, void* bitmapWorkspace,
+    void* selectedCounts, void* targetSlots,
     uint32_t rowCount, uint32_t rowWidth, uint32_t requestCount,
     uint32_t blockTableWidth, uint32_t scratchCapacity,
-    uint32_t workspaceWidth, uint32_t blockSize, bool needPacked,
+    uint32_t bitmapWords, uint32_t blockSize, bool needPacked,
     bool clearInvalidRows)
 {
     dsa_prepare_sparse_indices_kernel<<<requestCount, nullptr, stream>>>(
@@ -263,9 +258,8 @@ void dsa_prepare_sparse_indices_impl(
         static_cast<int32_t*>(requestBlockTable),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(selectedCounts),
-        static_cast<int64_t*>(targetSlots),
-        static_cast<int32_t*>(bitmapWorkspace), rowCount, rowWidth,
-        requestCount, blockTableWidth, scratchCapacity, workspaceWidth,
+        static_cast<int64_t*>(targetSlots), rowCount, rowWidth,
+        requestCount, blockTableWidth, scratchCapacity, bitmapWords,
         blockSize, needPacked, clearInvalidRows);
 }
 

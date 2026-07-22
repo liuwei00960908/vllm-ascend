@@ -286,7 +286,6 @@ class AscendSFAMetadata:
     decode_target_slot_mapping: torch.Tensor | None = None
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
-    decode_bitmap_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     decode_split_boundary: torch.Tensor | None = None
 
@@ -358,12 +357,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.scratch_capacity = self.decode_threshold * self.index_topk
-        bitmap_token_capacity = (
-            (self.model_config.max_model_len + self.block_size - 1)
-            // self.block_size
-            * self.block_size
-        )
-        bitmap_words = (bitmap_token_capacity + 31) // 32
         if self.dsa_shrink_latent:
             self._dsa_selected_tokens = torch.empty(
                 (max_num_reqs, self.scratch_capacity),
@@ -378,16 +371,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.long,
                 device=device,
             )
-            self._dsa_bitmap_workspace = torch.empty(
-                (max_num_reqs, 2 * bitmap_words),
-                dtype=torch.int32,
-                device=device,
-            )
         else:
             self._dsa_selected_tokens = None
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
-            self._dsa_bitmap_workspace = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
 
@@ -442,7 +429,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_target_slot_mapping = None
         decode_selected_tokens = None
         decode_selected_counts = None
-        decode_bitmap_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         plens_cpu = (
@@ -490,7 +476,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 assert self._dsa_target_slots is not None
                 assert self._dsa_selected_tokens is not None
                 assert self._dsa_selected_counts is not None
-                assert self._dsa_bitmap_workspace is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = list(req_ids[:num_reqs])
@@ -499,7 +484,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_target_slot_mapping = self._dsa_target_slots[:num_reqs]
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
-                decode_bitmap_workspace = self._dsa_bitmap_workspace[:num_reqs]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -618,7 +602,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_target_slot_mapping=decode_target_slot_mapping,
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
-            decode_bitmap_workspace=decode_bitmap_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             num_decode_tokens=num_decode_rows,
         )
@@ -1844,7 +1827,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     selected_packed=attn_metadata.decode_selected_tokens,
                     selected_counts=attn_metadata.decode_selected_counts,
                     target_slot_mapping=attn_metadata.decode_target_slot_mapping,
-                    bitmap_workspace=attn_metadata.decode_bitmap_workspace,
                     block_size=self.block_size,
                     need_packed=_need_packed,
                     clear_invalid_rows=_is_pure_decode,
