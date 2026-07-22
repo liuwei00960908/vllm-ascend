@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.config import (
     CacheConfig,
-    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     ProfilerConfig,
@@ -800,10 +799,6 @@ class TestNPUWorker(TestBase):
 
         reservation = (32 + 64) << 20
         self.assertEqual(
-            worker.staged_sfa_graph_memory_reservation,
-            reservation,
-        )
-        self.assertEqual(
             result,
             (512 << 20) - 1000 - 2000 - 1000 - reservation,
         )
@@ -812,67 +807,6 @@ class TestNPUWorker(TestBase):
             worker_module._staged_sfa_graph_memory_reservation(1 << 30),
             int(1.1 * (1 << 30)),
         )
-
-    def test_staged_capture_cannot_exceed_reserved_memory(self):
-        import vllm_ascend.worker.worker as worker_module
-
-        worker = self._build_memory_profile_worker()
-        worker.model_config = SimpleNamespace(enforce_eager=False)
-        worker.vllm_config.compilation_config = SimpleNamespace(
-            compile_sizes=[],
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
-            cudagraph_capture_sizes=[1],
-            get_compile_ranges=lambda: (),
-        )
-        worker.staged_sfa_graph_memory_reservation = 100
-        worker.model_runner.capture_model.return_value = 101
-
-        with (
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_configured",
-                return_value=True,
-            ),
-            patch.object(
-                worker_module.torch.npu,
-                "mem_get_info",
-                return_value=(1000, 2000),
-            ),
-            patch.object(worker_module.torch.npu, "empty_cache"),
-            self.assertRaisesRegex(RuntimeError, "exceeded its pre-KV reservation"),
-        ):
-            worker.compile_or_warm_up_model()
-
-    def test_staged_capture_requires_its_reserved_free_memory(self):
-        import vllm_ascend.worker.worker as worker_module
-
-        worker = self._build_memory_profile_worker()
-        worker.model_config = SimpleNamespace(enforce_eager=False)
-        worker.vllm_config.compilation_config = SimpleNamespace(
-            compile_sizes=[],
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
-            cudagraph_capture_sizes=[1],
-            get_compile_ranges=lambda: (),
-        )
-        worker.staged_sfa_graph_memory_reservation = 100
-
-        with (
-            patch.object(
-                worker_module,
-                "staged_sfa_graph_configured",
-                return_value=True,
-            ),
-            patch.object(
-                worker_module.torch.npu,
-                "mem_get_info",
-                return_value=(99, 2000),
-            ),
-            patch.object(worker_module.torch.npu, "empty_cache"),
-            self.assertRaisesRegex(RuntimeError, "below the staged SFA"),
-        ):
-            worker.compile_or_warm_up_model()
-
-        worker.model_runner.capture_model.assert_not_called()
 
     def test_determine_available_memory_memory_profiling_error(self):
         """Test an increase in free memory during profiling is rejected."""

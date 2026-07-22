@@ -481,17 +481,6 @@ class TestUtils(TestBase):
         ):
             utils.update_aclgraph_sizes(vllm_config)
 
-    def test_aclgraph_entry_limit_reserves_collective_streams(self):
-        parallel_config = mock.MagicMock(
-            data_parallel_size=1,
-            tensor_parallel_size=1,
-        )
-        vllm_config = mock.MagicMock(parallel_config=parallel_config)
-
-        self.assertEqual(utils.aclgraph_entry_limit(vllm_config), 1800)
-        parallel_config.tensor_parallel_size = 2
-        self.assertEqual(utils.aclgraph_entry_limit(vllm_config), 1760 // 3)
-
     def test_staged_sfa_cross_layer_capture_drops_native_buckets(self):
         compilation_config = mock.MagicMock()
         compilation_config.cudagraph_capture_sizes = list(range(1, 101))

@@ -24,7 +24,6 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from multiprocessing import Manager
-from threading import Lock
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
@@ -108,6 +107,7 @@ from vllm_ascend.attention.utils import (
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
+    reset_graph_params,
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
@@ -132,7 +132,6 @@ from vllm_ascend.utils import (
     StagedSFARouteAction,
     StagedSFARouteDecision,
     StagedSFARouteReason,
-    aclgraph_entry_limit,
     calc_split_factor,
     check_gdn_layer,
     enable_sp,
@@ -278,8 +277,6 @@ class NPUModelRunner(GPUModelRunner):
         self.attn_state: AscendAttentionState | None = None
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
         self._staged_sfa_startup_capture_attempted = False
-        self._staged_sfa_ready_keys: frozenset[StagedSFAGraphKey] = frozenset()
-        self._staged_sfa_replay_lock = Lock()
         self._profiling_cudagraph_memory = False
 
         # Ascend-specific configurations
@@ -1471,7 +1468,6 @@ class NPUModelRunner(GPUModelRunner):
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
-            self._staged_sfa_replay_slot(staged_sfa_graph_key),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2642,29 +2638,6 @@ class NPUModelRunner(GPUModelRunner):
             logged.add(route.reason)
             logger.info(message)
         return None
-
-    @contextmanager
-    def _staged_sfa_replay_slot(
-        self,
-        graph_key: StagedSFAGraphKey | None,
-    ):
-        if graph_key is None:
-            yield
-            return
-        if graph_key not in self._staged_sfa_ready_keys:
-            raise RuntimeError(
-                "[SFA_ROUTE] action=fatal reason="
-                f"{StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}: "
-                f"graph key {graph_key.request_capacity} is not ready"
-            )
-        if not self._staged_sfa_replay_lock.acquire(blocking=False):
-            raise RuntimeError(
-                "[SFA cross-layer graph] overlapping replay is not supported"
-            )
-        try:
-            yield
-        finally:
-            self._staged_sfa_replay_lock.release()
 
     @staticmethod
     def _staged_sfa_q1_query_start_locs(
@@ -4285,7 +4258,6 @@ class NPUModelRunner(GPUModelRunner):
     def _reset_staged_sfa_startup_capture(self) -> None:
         """Discard staged state before the one real startup capture."""
         self._staged_sfa_impls = ()
-        self._staged_sfa_ready_keys = frozenset()
         for _layer_name, impl in self._collect_staged_sfa_impls():
             impl.reset_staged_sfa_capture()
 
@@ -4335,14 +4307,6 @@ class NPUModelRunner(GPUModelRunner):
                 graph_keys,
                 len(self._staged_sfa_impls) + 1,
             )
-            graph_entry_limit = aclgraph_entry_limit(self.vllm_config)
-            if graph_entry_count > graph_entry_limit:
-                raise RuntimeError(
-                    "[SFA cross-layer graph] captured graph entry count "
-                    f"{graph_entry_count} exceeds the device quota "
-                    f"{graph_entry_limit}"
-                )
-            self._staged_sfa_ready_keys = frozenset(graph_keys)
             logger.info(
                 "[SFA cross-layer graph] captured retrieve-split outer graphs "
                 "for %d local SFA layers and %d keys; entries=%d",
@@ -4366,8 +4330,6 @@ class NPUModelRunner(GPUModelRunner):
             compilation_counter.num_cudagraph_captured
         )
         completed = False
-        if self._profiling_cudagraph_memory:
-            raise RuntimeError("ACL graph memory profiling is already active")
         self._profiling_cudagraph_memory = True
         try:
             with (
@@ -4381,11 +4343,12 @@ class NPUModelRunner(GPUModelRunner):
                 return result
         finally:
             self._profiling_cudagraph_memory = False
-            set_cudagraph_capturing_enabled(False)
-            ACLGraphWrapper.clear_all_graphs()
-            for wrapper, graph_pool in original_pools.items():
-                wrapper.graph_pool = graph_pool
+            reset_graph_params()
             if not completed:
+                set_cudagraph_capturing_enabled(False)
+                ACLGraphWrapper.clear_all_graphs()
+                for wrapper, graph_pool in original_pools.items():
+                    wrapper.graph_pool = graph_pool
                 for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
                     key_set.clear()
                 self.cudagraph_dispatcher.keys_initialized = False

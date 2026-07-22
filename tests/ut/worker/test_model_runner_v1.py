@@ -1,7 +1,6 @@
 import unittest
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
-from threading import Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -887,8 +886,6 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             lora_config=None,
         )
         runner._staged_sfa_startup_capture_attempted = False
-        runner._staged_sfa_ready_keys = frozenset()
-        runner._staged_sfa_replay_lock = Lock()
         runner._profiling_cudagraph_memory = False
         return runner
 
@@ -1075,6 +1072,10 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 runner,
                 "_reset_staged_sfa_startup_capture",
             ) as reset,
+            patch.object(
+                model_runner_module,
+                "reset_graph_params",
+            ) as reset_params,
         ):
             result = runner.profile_cudagraph_memory()
 
@@ -1082,6 +1083,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         self.assertFalse(runner._profiling_cudagraph_memory)
         parent_profile.assert_called_once_with(runner)
         reset.assert_called_once_with()
+        reset_params.assert_called_once_with()
 
     def test_graph_memory_profile_cleans_up_after_failure(self):
         runner = self._build_runner()
@@ -1123,6 +1125,10 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 model_runner_module,
                 "set_cudagraph_capturing_enabled",
             ) as set_capture_enabled,
+            patch.object(
+                model_runner_module,
+                "reset_graph_params",
+            ) as reset_params,
             self.assertRaisesRegex(RuntimeError, "profile failed"),
         ):
             runner.profile_cudagraph_memory()
@@ -1131,6 +1137,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         clear_graphs.assert_called_once_with()
         cleanup_cache.assert_called_once_with()
         reset.assert_called_once_with()
+        reset_params.assert_called_once_with()
         set_capture_enabled.assert_called_once_with(False)
         self.assertFalse(runner.cudagraph_dispatcher.keys_initialized)
         self.assertFalse(
@@ -1156,46 +1163,6 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
             runner.initialize_kv_cache(object())
 
         validate.assert_not_called()
-
-    def test_replay_slot_rejects_unready_and_overlapping_keys(self):
-        runner = self._build_runner()
-        key = StagedSFAGraphKey.exact_q1(1)
-
-        with (
-            self.assertRaisesRegex(RuntimeError, "graph key 1 is not ready"),
-            runner._staged_sfa_replay_slot(key),
-        ):
-            pass
-
-        runner._staged_sfa_ready_keys = frozenset({key})
-        with (
-            runner._staged_sfa_replay_slot(key),
-            self.assertRaisesRegex(RuntimeError, "overlapping replay"),
-            runner._staged_sfa_replay_slot(key),
-        ):
-            pass
-
-    def test_replay_slot_rejects_a_second_thread(self):
-        runner = self._build_runner()
-        key = StagedSFAGraphKey.exact_q1(1)
-        runner._staged_sfa_ready_keys = frozenset({key})
-        errors = []
-
-        def enter_slot():
-            try:
-                with runner._staged_sfa_replay_slot(key):
-                    pass
-            except RuntimeError as exc:
-                errors.append(str(exc))
-
-        with runner._staged_sfa_replay_slot(key):
-            thread = Thread(target=enter_slot)
-            thread.start()
-            thread.join()
-
-        self.assertEqual(len(errors), 1)
-        self.assertIn("overlapping replay", errors[0])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -140,7 +140,6 @@ class _StagedSFACaptureState:
     bindings: dict[StagedSFAGraphKey, _StagedSFALayerBinding] = field(
         default_factory=dict,
     )
-    ready_keys: frozenset[StagedSFAGraphKey] = frozenset()
 
     def register(
         self,
@@ -148,8 +147,6 @@ class _StagedSFACaptureState:
         bridge: tuple[torch.Tensor, ...],
         kv_cache: tuple[torch.Tensor, ...],
     ) -> None:
-        if self.ready_keys:
-            raise RuntimeError("staged SFA capture state is already sealed")
         if key in self.bindings:
             raise RuntimeError(f"staged SFA graph key was captured twice: {key}")
         if self.producer_event is None or self.remap_boundary is None:
@@ -193,15 +190,6 @@ class _StagedSFACaptureState:
                 "staged SFA capture state is incomplete: "
                 f"missing_keys={tuple(key.request_capacity for key in missing)}, "
                 f"unexpected_keys={tuple(key.request_capacity for key in unexpected)}"
-            )
-        self.ready_keys = expected
-
-    def require(self, key: StagedSFAGraphKey) -> None:
-        if key not in self.ready_keys:
-            raise RuntimeError(
-                "[SFA_ROUTE] action=fatal reason="
-                f"{StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}: "
-                f"graph key {key.request_capacity} is not ready"
             )
 
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
@@ -2420,9 +2408,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Prepare layer zero before the first captured island is launched."""
         with torch.profiler.record_function("sfa_cross_layer::bootstrap"):
             context = get_forward_context()
-            self._staged_sfa_capture_state.require(
-                context.staged_sfa_graph_key,
-            )
             metadata = context.attn_metadata[layer_name]
             _prepare_sfa_remap_boundary(
                 metadata,

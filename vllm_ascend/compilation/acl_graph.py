@@ -346,6 +346,13 @@ def get_graph_params():
 _draft_graph_params: GraphParams | None = None
 
 
+def reset_graph_params() -> None:
+    """Discard graph parameters owned by a completed profiling lifecycle."""
+    global _graph_params, _draft_graph_params
+    _graph_params = None
+    _draft_graph_params = None
+
+
 def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
     global _draft_graph_params
     if _draft_graph_params is not None:

@@ -538,9 +538,8 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         state.seal((key,))
 
-        state.require(key)
-        with self.assertRaisesRegex(RuntimeError, "graph key 2 is not ready"):
-            state.require(StagedSFAGraphKey.exact_q1(2))
+        with self.assertRaisesRegex(RuntimeError, "missing_keys=.*2"):
+            state.seal((key, StagedSFAGraphKey.exact_q1(2)))
 
     def test_capture_state_rejects_binding_drift(self):
         state = sfa_v1._StagedSFACaptureState(
@@ -706,9 +705,6 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
-        impl._staged_sfa_capture_state.ready_keys = frozenset(
-            {STAGED_SFA_SINGLETON_GRAPH_KEY},
-        )
         metadata = self._make_decode_metadata()
         context = SimpleNamespace(
             attn_metadata={"layer-0.attn": metadata},

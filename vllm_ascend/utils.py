@@ -641,22 +641,6 @@ def staged_sfa_graph_capture_sizes(
     return sizes
 
 
-def aclgraph_entry_limit(vllm_config: VllmConfig) -> int:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    communication_groups = sum(
-        isinstance(size, int) and size > 1
-        for size in (
-            getattr(parallel_config, "data_parallel_size", 1),
-            getattr(parallel_config, "tensor_parallel_size", 1),
-        )
-    )
-    available_streams = (
-        _MAX_ACL_GRAPH_ENTRIES
-        - communication_groups * _ACL_COMMUNICATION_STREAM_RESERVE
-    )
-    return available_streams // (1 + communication_groups * 2)
-
-
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
     # NOTE: Currently, we can only capture 1800 graphs at most,
@@ -710,7 +694,10 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
     staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
     if staged_sfa_graph_active:
-        entry_limit = aclgraph_entry_limit(vllm_config)
+        entry_limit = (
+            max_capture_size
+            - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE
+        ) // (1 + num_comm_groups * 2)
         required_entries = len(staged_sfa_sizes) * resources_per_graph
         if required_entries > entry_limit:
             raise ValueError(
