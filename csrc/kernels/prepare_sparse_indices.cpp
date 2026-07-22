@@ -12,6 +12,15 @@
 
 namespace {
 
+template <AscendC::HardEvent event>
+__aicore__ inline void SyncPipeline()
+{
+    const int32_t eventId = static_cast<int32_t>(
+        AscendC::GetTPipePtr()->FetchEventID(event));
+    AscendC::SetFlag<event>(eventId);
+    AscendC::WaitFlag<event>(eventId);
+}
+
 class DSAPrepareSparseIndicesKernel {
 public:
     __aicore__ inline void Init(
@@ -90,7 +99,7 @@ public:
         // clear to finish before the scalar pipeline starts modifying it;
         // otherwise the delayed clear can erase request-union bits.
         AscendC::PipeBarrier<PIPE_V>();
-        PipeSync<AscendC::HardEvent::V_S>();
+        SyncPipeline<AscendC::HardEvent::V_S>();
         const uint64_t packedOffset =
             static_cast<uint64_t>(req) * scratchCapacity_;
 
