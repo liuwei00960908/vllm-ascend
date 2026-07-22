@@ -3245,6 +3245,16 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if staged_sfa_graph_configured(self.vllm_config) and getattr(
+            self,
+            "_staged_sfa_startup_capture_attempted",
+            False,
+        ):
+            raise RuntimeError(
+                "[SFA cross-layer graph] KV cache cannot be reinitialized "
+                "after graph capture has started; restart the worker to rebuild "
+                "captured addresses."
+            )
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config

@@ -1022,6 +1022,24 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         reset.assert_not_called()
         parent_capture.assert_not_called()
 
+    def test_kv_cache_reinitialization_after_capture_is_rejected(self):
+        runner = self._build_runner()
+        runner._staged_sfa_startup_capture_attempted = True
+
+        with (
+            patch.object(
+                runner,
+                "_validate_sfa_layerwise_connector_cudagraph_mode",
+            ) as validate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "KV cache cannot be reinitialized after graph capture",
+            ),
+        ):
+            runner.initialize_kv_cache(object())
+
+        validate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

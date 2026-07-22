@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -89,9 +89,9 @@ class ACLGraphWrapper:
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
-        # the entries for different batch descriptors that we need to capture
-        # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        # Staged paths use their full structural key; generic paths keep the
+        # legacy batch descriptor.
+        self.concrete_aclgraph_entries: dict[Hashable, ACLGraphEntry] = {}
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -121,11 +121,14 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+        dispatch_key: Hashable = (
+            getattr(forward_context, "staged_sfa_graph_key", None)
+            or batch_descriptor
+        )
+        if dispatch_key not in self.concrete_aclgraph_entries:
+            self.concrete_aclgraph_entries[dispatch_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[dispatch_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -133,7 +136,7 @@ class ACLGraphWrapper:
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
+                logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, dispatch_key)
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 

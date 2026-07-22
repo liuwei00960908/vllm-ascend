@@ -911,14 +911,18 @@ consensus unless that run reproduces rank divergence.
 
 ### W2: island registry, prebound arena, invalidation, and resource budget
 
-- Add namespace/key/in-flight ownership and full structural ACL dispatch for
-  the compiled island plan.
+Status: **active; first R1 ownership slice implemented, NPU validation pending**.
+
+- **Done for R1:** dispatch ACL graph entries by the existing full
+  `StagedSFAGraphKey`; generic graph paths retain their legacy
+  `BatchDescriptor` key. Add namespace/in-flight ownership before PP, virtual
+  engines, or overlap are admitted.
 - Allocate stable per-key bridge tensors from Graph A through retrieval into the
   following island so every island/split binding can be validated before the
   bootstrap wait.
-- Implement cache epochs, quiesce/invalidate/rebuild, quarantine, and bounded
-  graph destruction. Reject unsupported lifecycle operations before state
-  changes.
+- **Done for R1:** reject KV-cache recreation after staged capture has started,
+  before any cache mutation. Implement cache epochs, quiesce/invalidate/rebuild,
+  quarantine, and bounded graph destruction before dynamic lifecycle support.
 - Implement the offline-bound or two-pass resource strategy and feed the result
   into KV sizing without circular measurement.
 - Add an opt-in event-closed replay policy for these islands and remove

@@ -22,17 +22,20 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, ForwardContext
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.attention_v1 import (AscendMetadata,
-                                                AscendMetadataForDecode)
-from vllm_ascend.attention.context_parallel.attention_cp import \
-    AscendAttentionCPImpl
+from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
+from vllm_ascend.attention.attention_v1 import AscendMetadata, AscendMetadataForDecode
+from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPImpl
 from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
-from vllm_ascend.attention.mla_v1 import (AscendMLADecodeMetadata,
-                                          AscendMLAMetadata)
+from vllm_ascend.attention.mla_v1 import AscendMLADecodeMetadata, AscendMLAMetadata
 from vllm_ascend.compilation.acl_graph import (
-    ACLGraphEntry, ACLGraphWrapper, get_draft_graph_params, get_graph_params,
-    set_draft_graph_params, set_graph_params,
-    update_draft_graph_params_workspaces)
+    ACLGraphEntry,
+    ACLGraphWrapper,
+    get_draft_graph_params,
+    get_graph_params,
+    set_draft_graph_params,
+    set_graph_params,
+    update_draft_graph_params_workspaces,
+)
 
 
 class TestACLGraphEntry(TestBase):
@@ -198,6 +201,56 @@ class TestACLGraphWrapper(TestBase):
         self.assertIs(result, captured_output)
         stream.synchronize.assert_not_called()
         graph.replay.assert_called_once_with()
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_staged_structural_keys_do_not_alias(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        self.mock_vllm_config.speculative_config = None
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            synchronize_before_replay=False,
+        )
+        first_key = StagedSFAGraphKey.exact_q1(1)
+        second_key = StagedSFAGraphKey.exact_q1(2)
+        first_graph, second_graph = MagicMock(), MagicMock()
+        wrapper.concrete_aclgraph_entries = {
+            first_key: ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=first_graph,
+                output="first",
+            ),
+            second_key: ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=second_graph,
+                output="second",
+            ),
+        }
+        context = Mock(
+            batch_descriptor=self.mock_batch_descriptor,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+
+        with patch(
+            'vllm_ascend.compilation.acl_graph.get_forward_context',
+            return_value=context,
+        ):
+            context.staged_sfa_graph_key = first_key
+            self.assertEqual(wrapper(), "first")
+            context.staged_sfa_graph_key = second_key
+            self.assertEqual(wrapper(), "second")
+
+        first_graph.replay.assert_called_once_with()
+        second_graph.replay.assert_called_once_with()
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
