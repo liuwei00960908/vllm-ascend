@@ -178,6 +178,9 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_STAGED_SFA_ROUTE_ACTIONS = tuple(StagedSFARouteAction)
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -276,8 +279,12 @@ class NPUModelRunner(GPUModelRunner):
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
+        self._staged_sfa_graph_capture_sizes = staged_sfa_graph_capture_sizes(
+            vllm_config
+        )
         # Ephemeral output of the existing batch/DP coordination pass.
         self._staged_sfa_dp_route_action: StagedSFARouteAction | None = None
+        self._dp_batch_sync_buffers: dict[int, torch.Tensor] = {}
         self._staged_sfa_startup_capture_attempted = False
         self._profiling_cudagraph_memory = False
 
@@ -1319,7 +1326,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                     staged_sfa_route_action=(
                         staged_sfa_local_route.action
-                        if staged_sfa_graph_configured(self.vllm_config)
+                        if self._staged_sfa_graph_capture_sizes
                         else None
                     ),
                 )
@@ -1349,7 +1356,7 @@ class NPUModelRunner(GPUModelRunner):
                     staged_sfa_route
                 )
                 if (
-                    staged_sfa_graph_configured(self.vllm_config)
+                    self._staged_sfa_graph_capture_sizes
                     and staged_sfa_graph_key is None
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
@@ -2051,57 +2058,51 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
+        rows = 3 if staged_sfa_route_action is not None else 2
+        tensor = self._dp_batch_sync_buffers.get(rows)
+        if tensor is None or tensor.shape[1] != self.dp_size:
+            tensor = torch.empty(
+                rows,
+                self.dp_size,
+                device="cpu",
+                dtype=torch.int32,
+            )
+            self._dp_batch_sync_buffers[rows] = tensor
+        tensor.zero_()
+        num_tokens_across_dp = tensor[0]
+
         if self._skip_all_reduce_across_dp_group():
-            num_tokens_after_padding = torch.tensor([num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32)
+            num_tokens_across_dp.fill_(num_tokens_padded)
             return (
                 False,
-                num_tokens_after_padding,
+                num_tokens_across_dp,
                 cudagraph_mode,
                 staged_sfa_route_action,
             )
 
-        route_actions = (
-            StagedSFARouteAction.STAGED,
-            StagedSFARouteAction.SAFE_NATIVE,
-            StagedSFARouteAction.RECOMPUTE,
-            StagedSFARouteAction.FATAL,
-        )
-        tensor = torch.zeros(
-            3 if staged_sfa_route_action is not None else 2,
-            self.dp_size,
-            device="cpu",
-            dtype=torch.int32,
-        )
-        tensor[0][self.dp_rank] = num_tokens_padded
-        tensor[1][self.dp_rank] = cudagraph_mode
+        tensor[0, self.dp_rank] = num_tokens_padded
+        tensor[1, self.dp_rank] = cudagraph_mode
         if staged_sfa_route_action is not None:
-            tensor[2][self.dp_rank] = route_actions.index(
+            tensor[2, self.dp_rank] = _STAGED_SFA_ROUTE_ACTIONS.index(
                 staged_sfa_route_action
             )
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
-        num_tokens_across_dp = tensor[0, :]
         max_num_tokens = int(num_tokens_across_dp.max().item())
         synced_route_action = (
-            route_actions[int(tensor[2, :].max().item())]
+            _STAGED_SFA_ROUTE_ACTIONS[int(tensor[2, :].max().item())]
             if staged_sfa_route_action is not None
             else None
         )
 
         if allow_dp_padding:
-            num_tokens_after_padding = torch.tensor(
-                [max_num_tokens] * len(num_tokens_across_dp),
-                device="cpu",
-                dtype=torch.int32,
-            )
-        else:
-            num_tokens_after_padding = num_tokens_across_dp.cpu()
+            num_tokens_across_dp.fill_(max_num_tokens)
 
         # Synchronize cudagraph_mode across ranks (take min)
         synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
         return (
             False,
-            num_tokens_after_padding,
+            num_tokens_across_dp,
             synced_cudagraph_mode,
             synced_route_action,
         )
@@ -2189,15 +2190,18 @@ class NPUModelRunner(GPUModelRunner):
             # Extract DP padding if there is any
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
-                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                # Re-dispatch with DP padding
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                    num_tokens_padded,
-                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
-                )
-                # Assert to make sure the agreed upon token count is correct otherwise
-                # num_tokens_across_dp will no-longer be valid
-                assert batch_descriptor.num_tokens == num_tokens_padded
+                agreed_num_tokens = int(num_tokens_across_dp[dp_rank].item())
+                if (
+                    agreed_num_tokens != num_tokens_padded
+                    or synced_cudagraph_mode != cudagraph_mode.value
+                ):
+                    num_tokens_padded = agreed_num_tokens
+                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                        num_tokens_padded,
+                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    )
+                    # The synchronized count must identify an exact graph key.
+                    assert batch_descriptor.num_tokens == num_tokens_padded
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -2571,7 +2575,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> int | None:
         '''Return the fixed Q=1 capacity for a staged dummy batch.'''
         if (
-            not staged_sfa_graph_configured(self.vllm_config)
+            not self._staged_sfa_graph_capture_sizes
             or is_profile
             or cudagraph_runtime_mode
             not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
@@ -2587,7 +2591,7 @@ class NPUModelRunner(GPUModelRunner):
 
         batch_size = int(num_tokens_padded)
         if (
-            batch_size not in staged_sfa_graph_capture_sizes(self.vllm_config)
+            batch_size not in self._staged_sfa_graph_capture_sizes
             or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
             or num_tokens_unpadded <= 0
             or num_tokens_unpadded != num_reqs
@@ -2618,7 +2622,7 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
             )
-        if not staged_sfa_graph_configured(self.vllm_config):
+        if not self._staged_sfa_graph_capture_sizes:
             return native(StagedSFARouteReason.NOT_CONFIGURED)
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
@@ -2631,7 +2635,7 @@ class NPUModelRunner(GPUModelRunner):
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
-        capture_sizes = staged_sfa_graph_capture_sizes(self.vllm_config)
+        capture_sizes = self._staged_sfa_graph_capture_sizes
         if (
             batch_size <= 0
             or not capture_sizes
@@ -2721,7 +2725,7 @@ class NPUModelRunner(GPUModelRunner):
             or batch_size != num_reqs
             or batch_size > capacity
             or capacity
-            not in staged_sfa_graph_capture_sizes(self.vllm_config)
+            not in self._staged_sfa_graph_capture_sizes
         ):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
@@ -2966,7 +2970,7 @@ class NPUModelRunner(GPUModelRunner):
         dp_idle = uniform_decode and cudagraph_runtime_mode is None and self.dp_size > 1
         dummy_route_action = (
             StagedSFARouteAction.STAGED
-            if staged_sfa_graph_configured(self.vllm_config)
+            if self._staged_sfa_graph_capture_sizes
             and not is_profile
             and (staged_capture or dp_idle)
             else None

@@ -182,6 +182,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner.speculative_config = None
         runner.parallel_config = SimpleNamespace(data_parallel_size=1)
         runner.attn_state = AscendAttentionState.DecodeOnly
+        runner._staged_sfa_graph_capture_sizes = (1, 4)
+        runner._dp_batch_sync_buffers = {}
         return runner
 
     @staticmethod
@@ -268,6 +270,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
 
             return all_reduce
 
+        buffer_addresses = set()
         for peer_action in StagedSFARouteAction:
             with (
                 self.subTest(peer_action=peer_action),
@@ -290,6 +293,13 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 )
                 self.assertEqual(sizes.tolist(), [4, 4])
                 self.assertEqual(action, peer_action)
+                buffer_addresses.add(sizes.data_ptr())
+
+        self.assertEqual(len(buffer_addresses), 1)
+        self.assertEqual(
+            runner._skip_all_reduce_across_dp_group.call_count,
+            len(StagedSFARouteAction),
+        )
 
     def test_dp_sync_keeps_non_staged_collective_shape(self):
         runner = self._build_runner()
@@ -323,6 +333,65 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         self.assertEqual(sizes.tolist(), [4, 4])
         self.assertEqual(mode, CUDAGraphMode.PIECEWISE.value)
         self.assertIsNone(action)
+
+    def test_dp_redispatches_only_when_agreement_changes_the_key(self):
+        runner = self._build_runner()
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                tensor_parallel_size=2,
+            ),
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        )
+        runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.ones(1, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.uniform_decode_query_len = 1
+        runner._pad_for_sequence_parallelism = MagicMock(
+            side_effect=lambda value: value
+        )
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            dispatch=MagicMock(
+                side_effect=lambda num_tokens, **_: (
+                    CUDAGraphMode.PIECEWISE,
+                    BatchDescriptor(num_tokens=num_tokens),
+                )
+            )
+        )
+
+        for agreed_size, expected_calls in ((1, 1), (4, 2)):
+            runner.cudagraph_dispatcher.dispatch.reset_mock()
+            runner._sync_batch_across_dp = MagicMock(
+                return_value=(
+                    False,
+                    torch.tensor([agreed_size, agreed_size]),
+                    CUDAGraphMode.PIECEWISE.value,
+                    StagedSFARouteAction.STAGED,
+                )
+            )
+            with (
+                self.subTest(agreed_size=agreed_size),
+                patch.object(model_runner_module, "enable_sp", return_value=False),
+            ):
+                _, descriptor, _, _, _ = (
+                    runner._determine_batch_execution_and_padding(
+                        num_tokens=1,
+                        num_reqs=1,
+                        num_scheduled_tokens_np=np.ones(1, dtype=np.int32),
+                        max_num_scheduled_tokens=1,
+                        use_cascade_attn=False,
+                        staged_sfa_route_action=StagedSFARouteAction.STAGED,
+                    )
+                )
+
+            self.assertEqual(descriptor.num_tokens, agreed_size)
+            self.assertEqual(
+                runner.cudagraph_dispatcher.dispatch.call_count,
+                expected_calls,
+            )
 
     def test_padded_non_q1_and_unsupported_batches_fall_back(self):
         runner = self._build_runner()
