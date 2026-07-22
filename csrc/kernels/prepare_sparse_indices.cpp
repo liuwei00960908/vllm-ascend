@@ -247,12 +247,18 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
     uint32_t needPacked,
     uint32_t clearInvalidRows)
 {
-    DSAPrepareSparseIndicesKernel op;
-    op.Init(topkIndices, splitBoundary, rowReqIndices, requestBlockTable,
-            selectedPacked, selectedCounts, targetSlots,
-            rowCount, rowWidth, requestCount, blockTableWidth, scratchCapacity,
-            bitmapWords, blockSize, needPacked, clearInvalidRows);
-    op.Process();
+    // This is a vector-only kernel. Mixed AIC/AIV launches execute the entry
+    // on both core types; letting AIC run the same in-place updates races with
+    // AIV and can overwrite a request's remapped indices.
+    if ASCEND_IS_AIV {
+        DSAPrepareSparseIndicesKernel op;
+        op.Init(topkIndices, splitBoundary, rowReqIndices, requestBlockTable,
+                selectedPacked, selectedCounts, targetSlots,
+                rowCount, rowWidth, requestCount, blockTableWidth,
+                scratchCapacity, bitmapWords, blockSize, needPacked,
+                clearInvalidRows);
+        op.Process();
+    }
 }
 
 namespace vllm_ascend {
