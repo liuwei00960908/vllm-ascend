@@ -16,7 +16,7 @@ template <AscendC::HardEvent event>
 __aicore__ inline void SyncPipeline()
 {
     const int32_t eventId = static_cast<int32_t>(
-        AscendC::GetTPipePtr()->FetchEventID(event));
+        GetTPipePtr()->FetchEventID(event));
     AscendC::SetFlag<event>(eventId);
     AscendC::WaitFlag<event>(eventId);
 }
