@@ -5,6 +5,15 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
     _prepare_sparse_indices_torch,
     prepare_sparse_indices,
 )
+from vllm_ascend.utils import enable_custom_op
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _load_dsa_union_operator():
+    if not enable_custom_op():
+        pytest.fail("vllm-ascend custom operators could not be loaded")
+    if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_"):
+        pytest.fail("vllm_ascend_C does not contain the DSA union operator")
 
 
 def _buffers(requests: int, capacity: int):
@@ -17,9 +26,6 @@ def _buffers(requests: int, capacity: int):
 
 @pytest.mark.parametrize("boundary", [0, 2, 4, 8])
 def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary):
-    if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_"):
-        pytest.fail("vllm_ascend_C must be rebuilt with the DSA union operator")
-
     topk_cpu = torch.tensor(
         [[0, 1, 2, 7], [1, 0, 3, 8]], dtype=torch.int32
     )
