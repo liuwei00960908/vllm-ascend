@@ -289,11 +289,11 @@ def _prepare_sfa_remap_boundary(
                 resolved_tokens = get_lmcache_sparse_cached_tokens(decode_request_ids)
                 cached_tokens_by_request = dict(zip(decode_request_indices, resolved_tokens, strict=True))
         else:
-            if len(cached_tokens) != len(seq_lens):
+            if len(cached_tokens) != len(decode_request_indices):
                 raise RuntimeError(
                     f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}"
                 )
-            cached_tokens_by_request = dict(enumerate(cached_tokens))
+            cached_tokens_by_request = dict(zip(decode_request_indices, cached_tokens, strict=True))
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
     for row_index, request_index_value in enumerate(row_req_indices_np):

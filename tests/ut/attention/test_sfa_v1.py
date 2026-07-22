@@ -891,6 +891,27 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(first.tolist(), [900])
         lookup.assert_not_called()
 
+    def test_remap_boundary_ignores_dp_padding_rows(self):
+        metadata = self._make_decode_metadata(batch_size=2)
+        metadata.prompt_lens_cpu_rows = [1000, 0]
+        metadata.decode_req_indices_cpu = [0, -1]
+        metadata.seq_lens_cpu = torch.tensor([1025, 0])
+
+        with patch.object(
+            sfa_v1,
+            "_decode_window_save_window_size",
+            return_value=256,
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                metadata,
+                ["req-0"],
+                is_dummy_run=False,
+                index_topk=4,
+                cached_tokens=(900,),
+            )
+
+        self.assertEqual(boundary.tolist(), [900, 0])
+
     def test_dummy_remap_boundary_ignores_empty_route_frontiers(self):
         metadata = self._make_decode_metadata()
 
