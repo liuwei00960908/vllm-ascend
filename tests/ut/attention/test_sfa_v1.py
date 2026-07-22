@@ -565,6 +565,16 @@ class TestStagedSFAGraphPoc(TestBase):
                 self._make_eligible_kv_cache(),
             )
 
+    def test_capture_reset_discards_cached_index_tensor(self):
+        impl = self._make_eligible_impl()
+        old_state = impl._staged_sfa_capture_state
+        impl._dsa_idx_cache_t = torch.empty(1)
+
+        impl.reset_staged_sfa_capture()
+
+        self.assertIsNot(impl._staged_sfa_capture_state, old_state)
+        self.assertIsNone(impl._dsa_idx_cache_t)
+
     def test_dummy_cache_initialization_grows_with_capture_key(self):
         impl = self._make_eligible_impl()
         kv_cache = tuple(torch.ones_like(cache) for cache in self._make_eligible_kv_cache(num_blocks=4))
@@ -946,6 +956,21 @@ class TestStagedSFAGraphPoc(TestBase):
                         metadata,
                     )
                     self.assertIsNone(reason)
+            with patch.object(
+                sfa_v1,
+                "staged_sfa_connector_supports_sparse_load",
+                return_value=False,
+            ):
+                reason = impl._cross_layer_ineligible_reason(
+                    torch.empty(1, 4, dtype=torch.bfloat16),
+                    self._make_eligible_kv_cache(dtype=torch.bfloat16),
+                    metadata,
+                )
+            self.assertEqual(
+                reason,
+                "the active connector does not support staged sparse "
+                "selective loads",
+            )
 
     def test_eligibility_accepts_exact_multi_request_q1_batch(self):
         batch_size = 4
@@ -1171,6 +1196,11 @@ class TestStagedSFAGraphPoc(TestBase):
                 "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
                 False,
             ),
+            patch.object(
+                sfa_v1,
+                "staged_sfa_connector_supports_sparse_load",
+                return_value=False,
+            ) as connector_support,
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4),
@@ -1179,6 +1209,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         self.assertIsNone(reason)
+        connector_support.assert_not_called()
 
 
 class TestAscendSFABackend(TestBase):

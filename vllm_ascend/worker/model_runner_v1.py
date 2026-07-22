@@ -31,7 +31,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -4360,6 +4362,9 @@ class NPUModelRunner(GPUModelRunner):
             wrapper: wrapper.graph_pool
             for wrapper in ACLGraphWrapper._all_instances
         }
+        saved_num_cudagraph_captured = (
+            compilation_counter.num_cudagraph_captured
+        )
         completed = False
         if self._profiling_cudagraph_memory:
             raise RuntimeError("ACL graph memory profiling is already active")
@@ -4376,10 +4381,17 @@ class NPUModelRunner(GPUModelRunner):
                 return result
         finally:
             self._profiling_cudagraph_memory = False
+            set_cudagraph_capturing_enabled(False)
             ACLGraphWrapper.clear_all_graphs()
             for wrapper, graph_pool in original_pools.items():
                 wrapper.graph_pool = graph_pool
             if not completed:
+                for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+                    key_set.clear()
+                self.cudagraph_dispatcher.keys_initialized = False
+                compilation_counter.num_cudagraph_captured = (
+                    saved_num_cudagraph_captured
+                )
                 self._cleanup_profiling_kv_cache()
             self._reset_staged_sfa_startup_capture()
 

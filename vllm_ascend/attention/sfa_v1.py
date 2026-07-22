@@ -1897,7 +1897,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "only exact, unpadded one-token-per-request decode batches are supported"
         if self.dsa_shrink_latent != 2:
             return "SHRINK_LATENT must be 2"
-        if not staged_sfa_connector_supports_sparse_load():
+        if (
+            not staged_dummy_run
+            and not staged_sfa_connector_supports_sparse_load()
+        ):
             return "the active connector does not support staged sparse selective loads"
         if self.enable_mlapo:
             return "MLAPO is enabled"
@@ -2222,6 +2225,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
+        self._dsa_idx_cache_t = None
 
     def seal_staged_sfa_capture(
         self,

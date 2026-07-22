@@ -930,9 +930,14 @@ NPU startup/resource/performance sign-off pending**.
 - **Done for R1:** bound configured and actual ACL graph entries, profile a
   temporary graph pool before final KV sizing, reserve the measured bytes plus
   a safety margin, clear the temporary graphs/cache state, and fail startup if
-  free memory cannot cover the reservation or real capture exceeds it. Temporary
-  KV caches skip only connector registration; legacy DSA offload, adapter-cache,
-  and HCCL-AIV configurations are rejected before this profiling lifecycle.
+  free memory cannot cover the reservation or real capture exceeds it. The
+  temporary cache and dummy capture are connector-independent because worker
+  connector creation follows memory sizing; connector capability validation and
+  registration run during real cache initialization. All static staged checks
+  remain active during profiling. Legacy DSA offload, adapter-cache, and HCCL-AIV
+  configurations are rejected before this profiling lifecycle. Cleanup also
+  clears cache-derived tensor references, temporary dispatcher keys, the capture
+  gate, and profiling counter state on failure.
 - The generic replay fence remains unchanged. Activating event-closed replay and
   removing synchronization stays in W8 until its event trace is signed.
 - **Done for R1:** full signatures are captured only during startup; release

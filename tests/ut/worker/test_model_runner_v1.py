@@ -1085,6 +1085,12 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
 
     def test_graph_memory_profile_cleans_up_after_failure(self):
         runner = self._build_runner()
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            cudagraph_keys={
+                CUDAGraphMode.PIECEWISE: {object()},
+            },
+            keys_initialized=True,
+        )
         with (
             patch.object(
                 model_runner_module,
@@ -1113,6 +1119,10 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
                 runner,
                 "_reset_staged_sfa_startup_capture",
             ) as reset,
+            patch.object(
+                model_runner_module,
+                "set_cudagraph_capturing_enabled",
+            ) as set_capture_enabled,
             self.assertRaisesRegex(RuntimeError, "profile failed"),
         ):
             runner.profile_cudagraph_memory()
@@ -1121,6 +1131,13 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         clear_graphs.assert_called_once_with()
         cleanup_cache.assert_called_once_with()
         reset.assert_called_once_with()
+        set_capture_enabled.assert_called_once_with(False)
+        self.assertFalse(runner.cudagraph_dispatcher.keys_initialized)
+        self.assertFalse(
+            runner.cudagraph_dispatcher.cudagraph_keys[
+                CUDAGraphMode.PIECEWISE
+            ]
+        )
 
     def test_kv_cache_reinitialization_after_capture_is_rejected(self):
         runner = self._build_runner()
