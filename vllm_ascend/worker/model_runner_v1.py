@@ -3244,7 +3244,10 @@ class NPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     "The staged SFA graph path requires sparse attention."
                 )
-            if not staged_sfa_connector_supports_sparse_load():
+            if (
+                not self._profiling_cudagraph_memory
+                and not staged_sfa_connector_supports_sparse_load()
+            ):
                 raise ValueError(
                     "The staged SFA graph path requires an LMCache connector "
                     "that advertises layerwise batched sparse selective loads, "

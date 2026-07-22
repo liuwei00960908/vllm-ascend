@@ -659,6 +659,7 @@ class TestSFALayerwiseGraphModeCompatibility(unittest.TestCase):
     def _build_runner(mode, *, use_sparse=True):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.use_sparse = use_sparse
+        runner._profiling_cudagraph_memory = False
         runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
         return runner
 
@@ -736,6 +737,26 @@ class TestSFALayerwiseGraphModeCompatibility(unittest.TestCase):
                 model_runner_module,
                 "staged_sfa_connector_supports_sparse_load",
                 return_value=True,
+            ),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+    def test_profiling_defers_connector_capability_validation(self):
+        runner = self._build_runner(CUDAGraphMode.PIECEWISE)
+        runner.vllm_config = object()
+        runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+        runner._profiling_cudagraph_memory = True
+
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "staged_sfa_connector_supports_sparse_load",
+                return_value=False,
             ),
         ):
             runner._validate_sfa_layerwise_connector_cudagraph_mode()
