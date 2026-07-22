@@ -59,7 +59,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_meta(
     at::Tensor &selected_packed,
     at::Tensor &selected_counts,
     at::Tensor &target_slots,
-    at::Tensor &hash_workspace,
+    at::Tensor &bitmap_workspace,
     int64_t block_size,
     bool need_packed,
     bool clear_invalid_rows)
@@ -70,7 +70,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_meta(
     (void)request_block_table;
     (void)selected_packed;
     (void)target_slots;
-    (void)hash_workspace;
+    (void)bitmap_workspace;
     (void)block_size;
     (void)need_packed;
     (void)clear_invalid_rows;

@@ -7,16 +7,14 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 )
 
 
-def _buffers(requests: int, capacity: int):
-    hash_capacity = 1
-    while hash_capacity < 2 * capacity:
-        hash_capacity *= 2
+def _buffers(requests: int, capacity: int, max_model_len: int = 32):
+    bitmap_words = (max_model_len + 31) // 32
     return (
         torch.empty((requests, capacity), dtype=torch.int32, device="npu"),
         torch.empty(requests, dtype=torch.int32, device="npu"),
         torch.empty((requests, capacity), dtype=torch.long, device="npu"),
         torch.empty(
-            (requests, hash_capacity), dtype=torch.int32, device="npu"
+            (requests, 2 * bitmap_words), dtype=torch.int32, device="npu"
         ),
     )
 
@@ -49,7 +47,7 @@ def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
-        hash_workspace=buffers[3],
+        bitmap_workspace=buffers[3],
         block_size=2,
     )
 
@@ -86,7 +84,7 @@ def test_two_requests_are_deduplicated_independently():
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
-        hash_workspace=buffers[3],
+        bitmap_workspace=buffers[3],
         block_size=2,
     )
     assert torch.equal(actual.cpu(), expected)
@@ -94,3 +92,35 @@ def test_two_requests_are_deduplicated_independently():
     for req, count in enumerate(counts.tolist()):
         assert torch.equal(actual_packed[req, :count].cpu(), packed[req, :count])
         assert torch.equal(actual_targets[req, :count].cpu(), targets[req, :count])
+
+
+def test_bitmap_union_assigns_sorted_position_ranks():
+    topk_cpu = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
+    row_req_cpu = torch.tensor([0, 0], dtype=torch.int32)
+    table_cpu = torch.tensor([[20, 21]], dtype=torch.int32)
+    expected, packed, counts, targets = _prepare_sparse_indices_torch(
+        topk_cpu,
+        torch.tensor([4, 4], dtype=torch.int32),
+        row_req_indices=row_req_cpu,
+        request_block_table=table_cpu,
+        block_size=2,
+    )
+    buffers = _buffers(1, 4)
+    actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
+        topk_cpu.npu(),
+        torch.tensor([4, 4], dtype=torch.int32, device="npu"),
+        row_req_indices=row_req_cpu.npu(),
+        request_block_table=table_cpu.npu(),
+        selected_packed=buffers[0],
+        selected_counts=buffers[1],
+        target_slot_mapping=buffers[2],
+        bitmap_workspace=buffers[3],
+        block_size=2,
+    )
+
+    assert packed[0, :3].tolist() == [1, 2, 3]
+    assert expected.tolist() == [[2, 0], [1, 2]]
+    assert torch.equal(actual.cpu(), expected)
+    assert torch.equal(actual_counts.cpu(), counts)
+    assert torch.equal(actual_packed[0, :3].cpu(), packed[0, :3])
+    assert torch.equal(actual_targets[0, :3].cpu(), targets[0, :3])

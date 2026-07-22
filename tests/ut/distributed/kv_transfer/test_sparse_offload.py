@@ -508,7 +508,7 @@ class TestPrepareSparseIndices:
                 selected_packed=None,
                 selected_counts=None,
                 target_slot_mapping=None,
-                hash_workspace=None,
+                bitmap_workspace=None,
                 block_size=64,
             )
 

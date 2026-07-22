@@ -3,8 +3,9 @@
 Decode reads the latent through two disjoint index spaces resolved by the SAME
 per-request block table:
 
-  * LMCache-selected positions (< cache boundary) -> request-level stable-union
-    scratch rows [0..n_unique), shared by all MTP rows for that request;
+  * LMCache-selected positions (< cache boundary) -> request-level bitmap union
+    scratch rows [0..n_unique), ordered by absolute token position and shared
+    by all MTP rows for that request;
   * live-cache positions (>= cache boundary) -> kept ABSOLUTE, read in
     place from their tail blocks. No copy, no [retrieve|decode] assembly.
 
@@ -27,7 +28,7 @@ def _prepare_sparse_indices_torch(
     scratch_base: torch.Tensor | None = None,
     valid_row_indices: torch.Tensor | None = None,
 ):
-    """Request-level stable-union reference, retained only as a test oracle."""
+    """Request-level sorted bitmap-union reference used as a test oracle."""
     orig_shape = topk_indices.shape
     sel = topk_indices.reshape(orig_shape[0], -1)
     if request_block_table is None:
@@ -71,7 +72,20 @@ def _prepare_sparse_indices_torch(
     )
     new_indices = sel.clone()
     for req in range(request_count):
-        inverse: dict[int, int] = {}
+        selected_tokens = sorted(
+            {
+                int(sel[row, col])
+                for row in range(sel.shape[0])
+                if int(row_req_indices[row]) == req
+                for col in range(sel.shape[1])
+                if 0 <= int(sel[row, col]) < int(split_boundary[row])
+            }
+        )
+        inverse = {token: slot for slot, token in enumerate(selected_tokens)}
+        for token, slot in inverse.items():
+            packed[req, slot] = token
+            block_id = int(request_block_table[req, slot // block_size])
+            targets[req, slot] = block_id * block_size + slot % block_size
         for row in range(sel.shape[0]):
             if int(row_req_indices[row]) != req:
                 continue
@@ -79,16 +93,7 @@ def _prepare_sparse_indices_torch(
             for col in range(sel.shape[1]):
                 token = int(sel[row, col])
                 if 0 <= token < boundary:
-                    slot = inverse.get(token)
-                    if slot is None:
-                        slot = len(inverse)
-                        inverse[token] = slot
-                        packed[req, slot] = token
-                        block_id = int(request_block_table[req, slot // block_size])
-                        targets[req, slot] = (
-                            block_id * block_size + slot % block_size
-                        )
-                    new_indices[row, col] = slot
+                    new_indices[row, col] = inverse[token]
         counts[req] = len(inverse)
     if clear_invalid_rows:
         new_indices[row_req_indices[: sel.shape[0]] < 0] = 0
@@ -108,7 +113,7 @@ def prepare_sparse_indices(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
     target_slot_mapping: torch.Tensor,
-    hash_workspace: torch.Tensor,
+    bitmap_workspace: torch.Tensor,
     block_size: int,
     need_packed: bool = True,
     clear_invalid_rows: bool = False,
@@ -163,7 +168,7 @@ def prepare_sparse_indices(
         selected_packed,
         selected_counts,
         target_slot_mapping,
-        hash_workspace,
+        bitmap_workspace,
         block_size,
         need_packed,
         clear_invalid_rows,

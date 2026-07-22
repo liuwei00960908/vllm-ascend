@@ -22,16 +22,21 @@ def _measure(fn, warmup: int, iterations: int) -> float:
     return (time.perf_counter() - started) * 1000 / iterations
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=4)
+    parser.add_argument("--requests", type=int, default=2)
+    parser.add_argument("--mtp-rows", type=int, default=2)
     parser.add_argument("--topk", type=int, default=2048)
-    parser.add_argument("--decode-rows", type=int, default=4)
+    parser.add_argument("--max-model-len", type=int, default=170000)
+    parser.add_argument("--boundary", type=int, default=131584)
+    parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=1000)
     args = parser.parse_args()
-    if not 0 < args.decode_rows <= args.rows:
-        parser.error("--decode-rows must be in [1, --rows]")
+    if min(args.requests, args.mtp_rows, args.topk, args.max_model_len) <= 0:
+        parser.error("requests, mtp-rows, topk and max-model-len must be positive")
+    if not 0 <= args.boundary <= args.max_model_len:
+        parser.error("boundary must be in [0, max-model-len]")
 
     enable_custom_op()
     try:
@@ -44,80 +49,101 @@ def main():
         ) from exc
 
     device = torch.device("npu")
+    rows = args.requests * args.mtp_rows
+    scratch_capacity = args.mtp_rows * args.topk
     topk = torch.randint(
-        -1,
-        131646,
-        (args.rows, 1, args.topk),
+        0,
+        args.max_model_len,
+        (rows, args.topk),
         dtype=torch.int32,
         device=device,
     )
-    split_boundary = torch.zeros(args.rows, dtype=torch.int32, device=device)
-    split_boundary[: args.decode_rows] = 131614
-    valid_rows = torch.arange(args.decode_rows, dtype=torch.int32, device=device)
-    row_req_indices = torch.full(
-        (args.rows,), -1, dtype=torch.int32, device=device
+    split_boundary = torch.full(
+        (rows,), args.boundary, dtype=torch.int32, device=device
     )
-    row_req_indices[: args.decode_rows] = torch.arange(
-        args.decode_rows, dtype=torch.int32, device=device
+    row_req_indices = torch.arange(
+        args.requests, dtype=torch.int32, device=device
+    ).repeat_interleave(args.mtp_rows)
+    block_table_width = (
+        args.max_model_len + args.block_size - 1
+    ) // args.block_size
+    request_block_table = torch.arange(
+        args.requests * block_table_width,
+        dtype=torch.int32,
+        device=device,
+    ).view(args.requests, block_table_width)
+    selected = torch.empty(
+        (args.requests, scratch_capacity), dtype=torch.int32, device=device
     )
-    scratch_base = torch.zeros(args.rows, dtype=torch.int32, device=device)
-    scratch_base[: args.decode_rows] = torch.arange(args.decode_rows, dtype=torch.int32, device=device) * args.topk
+    counts = torch.empty(args.requests, dtype=torch.int32, device=device)
+    targets = torch.empty(
+        (args.requests, scratch_capacity), dtype=torch.long, device=device
+    )
+    bitmap_words = (
+        block_table_width * args.block_size + 31
+    ) // 32
+    bitmap_workspace = torch.empty(
+        (args.requests, 2 * bitmap_words), dtype=torch.int32, device=device
+    )
 
-    expected_topk, expected_packed = _prepare_sparse_indices_torch(
-        topk.clone(),
-        split_boundary,
-        scratch_base=scratch_base,
-        valid_row_indices=valid_rows,
-        row_req_indices=row_req_indices,
+    expected = _prepare_sparse_indices_torch(
+        topk.cpu(),
+        split_boundary.cpu(),
+        row_req_indices=row_req_indices.cpu(),
+        request_block_table=request_block_table.cpu(),
+        block_size=args.block_size,
     )
     actual_topk = topk.clone()
-    actual_packed = fused_op(
+    fused_op(
         actual_topk,
         split_boundary,
-        valid_rows,
-        scratch_base,
-        True,
         row_req_indices,
+        request_block_table,
+        selected,
+        counts,
+        targets,
+        bitmap_workspace,
+        args.block_size,
+        True,
+        False,
     )
     torch.npu.synchronize()
-    if not torch.equal(actual_topk, expected_topk):
-        raise AssertionError("fused topk_indices differ from the Torch reference")
-    if not torch.equal(actual_packed, expected_packed):
-        raise AssertionError("fused selected_packed differs from the Torch reference")
+    expected_topk, expected_selected, expected_counts, expected_targets = expected
+    if not torch.equal(actual_topk.cpu(), expected_topk):
+        raise AssertionError("bitmap remap differs from the Torch reference")
+    if not torch.equal(counts.cpu(), expected_counts):
+        raise AssertionError("bitmap union counts differ from the Torch reference")
+    for req, count in enumerate(expected_counts.tolist()):
+        if not torch.equal(selected[req, :count].cpu(), expected_selected[req, :count]):
+            raise AssertionError("bitmap union payload differs from the Torch reference")
+        if not torch.equal(targets[req, :count].cpu(), expected_targets[req, :count]):
+            raise AssertionError("bitmap target slots differ from the Torch reference")
 
-    fused_topk = topk.clone()
+    fused_topk = torch.empty_like(topk)
 
-    def fused():
-        # Re-remapping is stable after the first iteration and keeps the same
-        # selected count, so an input clone does not pollute each measurement.
+    def fused() -> None:
+        # The operator remaps in place, so reset the fixed input every iteration.
+        fused_topk.copy_(topk)
         fused_op(
             fused_topk,
             split_boundary,
-            valid_rows,
-            scratch_base,
-            True,
             row_req_indices,
-        )
-
-    def torch_reference():
-        _prepare_sparse_indices_torch(
-            topk,
-            split_boundary,
-            scratch_base=scratch_base,
-            valid_row_indices=valid_rows,
-            row_req_indices=row_req_indices,
+            request_block_table,
+            selected,
+            counts,
+            targets,
+            bitmap_workspace,
+            args.block_size,
+            True,
+            False,
         )
 
     fused_ms = _measure(fused, args.warmup, args.iterations)
-    torch_reference_ms = _measure(torch_reference, args.warmup, args.iterations)
     print(
-        f"shape=({args.rows}, 1, {args.topk}) "
-        f"decode_rows={args.decode_rows} "
-        f"padding_rows={args.rows - args.decode_rows} "
-        "exact_match=True "
-        f"fused_ms={fused_ms:.6f} "
-        f"torch_reference_ms={torch_reference_ms:.6f} "
-        f"speedup={torch_reference_ms / fused_ms:.2f}x"
+        f"requests={args.requests} mtp_rows={args.mtp_rows} topk={args.topk} "
+        f"max_model_len={args.max_model_len} boundary={args.boundary} "
+        f"workspace_kib={bitmap_workspace.numel() * 4 / 1024:.1f} "
+        f"exact_match=True fused_with_input_copy_ms={fused_ms:.6f}"
     )
 
 
