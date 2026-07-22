@@ -110,7 +110,7 @@ are still required before the batched path is qualified:
 - a scheduler step containing both prefill and decode currently disables outer
   replay for the whole step and uses native SFA. Only its decode request rows
   may require sparse frontiers; the trial-exposed filtering fix is implemented
-  in the worktree and awaits an NPU rerun;
+  in the current code and awaits an NPU rerun;
 - other unsupported steps run the existing native SFA path with outer replay
   disabled before model forward;
 - startup rejects missing SFA layers, producer events, stable save state, or an
@@ -123,7 +123,12 @@ the earlier two-wrapper and native baselines. On the eight-layer TP2 test model,
 steady throughput for exact batches 1/2/4 is 56/94/144 tok/s with LMCache and
 72/124/184 tok/s with `start_load_kv`/`wait_for_layer_load` bypassed. The nearly
 identical batch scaling places most sub-linear scaling outside LMCache, while
-the stable 22-24% LMCache gap remains an optimization opportunity. Runtime
+the stable 22-24% LMCache gap remains an optimization opportunity. The
+`f7038e2f` decode-path cleanup reproduced the same 56/94/144 tok/s checkpoint:
+W2 sealing remains startup-only, while release replay avoids unconditional
+profiler scopes, repeated connector-capability/layout work, replay logging, and
+no-op profiling calls. The generic ACL replay fence and actual LMCache
+wait/save/event operations remain unchanged. Runtime
 proof of exact batch-2/4 replay, the precise `N + 1` cross-layer trace, failure
 behavior, resource bounds, and the production ownership plan remain open. The
 nested-wrapper implementation has been removed from this branch; its earlier
@@ -144,7 +149,8 @@ whole R1 production gate is complete.
 | Fake/native custom-op bridge layout mismatch during large startup profile | **DONE** | The bridge now has one contiguous fixed-capacity ABI based on the largest configured exact key; startup succeeds after the fix |
 | Exact batched LMCache row routing and per-key startup completeness | **DONE in code/unit/startup** | Exact request order is covered by focused tests and every configured key is checked for every local SFA layer |
 | Exact TP2 batch throughput checkpoint | **DONE** | On the eight-layer model, batches 1/2/4 reach 56/94/144 tok/s with LMCache and 72/124/184 tok/s with LMCache loading bypassed; normal and bypass scaling are nearly identical |
-| Mixed prefill/decode native sparse-frontier lookup | **IMPLEMENTED; NPU RERUN PENDING** | The worktree queries frontiers only for request indices referenced by decode rows; rerun the concurrent smoke before closing |
+| Decode critical-path host cleanup | **DONE at TP2 on the eight-layer model** | `f7038e2f` restores the established 56/94/144 tok/s baseline without changing connector waits, saves, events, or ACL replay synchronization; TP8/full-model requalification remains |
+| Mixed prefill/decode native sparse-frontier lookup | **IMPLEMENTED; NPU RERUN PENDING** | The current code queries frontiers only for request indices referenced by decode rows; rerun the concurrent smoke before closing |
 | Exact batch-2/4 runtime replay qualification | **OPEN** | Throughput from concurrent clients does not prove that every steady step was pure decode or identify the exact replay key |
 | Cross-layer island and event topology | **OPEN** | Capture an NPU trace proving the precise `N + 1` island plan, middle-island fusion, one eager retrieve per layer, and no nested wrappers |
 
@@ -159,8 +165,8 @@ whole R1 production gate is complete.
 | Mixed prefill/decode | Whole scheduler step uses safe-native SFA; decode-only frontier filtering is implemented and awaits NPU rerun | R1 must qualify this native route; optional native-prefill/staged-decode row partition belongs to R5 |
 | Compact-scratch LMCache native path | Available for many rows | Classify precisely when it is safe; never assume it is always a fallback |
 | Legacy manager/free-paged/adapter | Rejected by staged path | Stay eager until their existing connector lifecycle and event behavior are independently qualified |
-| TP | TP2 singleton startup/performance works and startup checks every local layer/key; collective failure admission is not complete | Restore rank-consistent startup/admission verdicts and TP1/2/8 gates |
-| DP | Staged configuration rejected | Common structural bucket, rank-local masks, empty-rank handling in R4 |
+| TP | TP2 exact-Q1 startup, batching, prefix reuse, deterministic output, startup checks for every local layer/key, and the post-W2 critical-path cleanup pass; TP8 passed before the final cleanup | Requalify the exact current commit on TP8; treat immediate convergence of an asymmetric connector exception as deferred availability hardening rather than a decode-path requirement |
+| DP | Internal DP route/capacity agreement, fixed-capacity padding, real-row-only LMCache payloads, and connector-free empty-rank dummy execution are implemented; external-launcher DP remains rejected | Qualify DP2/DP4 alone and with TP, including uneven and empty ranks, fallback/fatal agreement, prefix reuse, and long decode |
 | PP/multiple virtual engines | No capture namespace/lifecycle contract | Isolate cache epochs and in-flight slots or reject in R1-R3 |
 | LoRA, CP/o-proj TP, C8, MLAPO, prefetch | Rejected in layer eligibility | Centralize the rejection before capture and enable individually in R5 |
 | Ubatch/cascade | Runner rejects | Preserve rejection until state is invocation-safe |
@@ -175,14 +181,14 @@ connector API without a demonstrated correctness need.
 
 | ID | Current evidence | Risk | Required outcome |
 | --- | --- | --- | --- |
-| P0.0 cross-layer compiler contract | Pre/retrieve/post decomposition and mock FX partitioning pass; singleton TP2 serving shows a large TPOT gain over both baselines | Throughput proves the route is useful but not the exact device partition; the precise middle-island topology has not been signed from an NPU trace | Prove an NPU island contains `Graph B(i) -> layer tail(i) -> Graph A(i+1)`, with nominal `N + 1` islands, one eager retrieve per layer, and no nested wrappers |
-| P0.1 atomic dispatch | The runner authorizes configured exact-Q1 keys before model forward, W2 seals every configured key/layer, and authorized layers raise instead of falling back | Rank-local route metadata can still disagree before bootstrap, and vLLM does not converge rank-local connector failures before the next collective-bearing island | One TP admission verdict before bootstrap, plus a TP completion verdict only after connector gaps that lack a protocol-guaranteed uniform result |
+| P0.0 cross-layer compiler contract | Pre/retrieve/post decomposition, mock FX partitioning, exact `N + 1` startup entry sealing, deterministic output, and TP2 throughput pass | Detailed device attribution of the middle island is not yet profiled | Done for R1 functional admission; keep exact population/callback tests. Detailed `Graph B(i) -> tail(i) -> Graph A(i+1)` trace attribution is P2.5/W8 evidence |
+| P0.1 atomic dispatch | vLLM broadcasts one scheduler input to every TP worker; the runner deterministically authorizes configured exact-Q1 keys before connector entry, W2 seals every configured key/layer, and authorized layers raise instead of falling back | A future staged change could accidentally make route selection depend on rank-local mutable state | Keep the route a pure decision over broadcast scheduler data and startup-static state; require a reproduced divergence before adding a hot-path TP verdict |
 | P0.2 fallback safety | Unsupported and mixed-phase steps enter native execution with outer replay disabled. A concurrent trial exposed that frontier validation incorrectly included a prefill-only request; the decode-row-only fix is implemented but not NPU-qualified | Another path labelled native may still lack required latent data or apply decode-only validation to unrelated rows | First close the mixed-phase NPU rerun, then classify every route as `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL` and prove the selected route has all required latent data |
-| P0.3 pre-mutation validation | W2 verifies the complete static island/key/layer population, producer event, stable save binding, and fixed-capacity bridge layout | Per-step frontiers and route eligibility are rank-local until bootstrap | Validate the existing route decision on every rank and agree on one staged/native/fatal verdict before the first wait/write |
+| P0.3 pre-mutation validation | W2 verifies the complete static island/key/layer population, producer event, stable save binding, and fixed-capacity bridge layout; the runner applies its final route before the connector context starts | A staged refactor could move a fallible decision after bootstrap | Keep every staged/native/fatal decision before the first wait/write and cover the decision matrix without adding redundant TP coordination |
 | P0.4 store-before-free | Decode-window release already waits for `completed_decode_window_saves`, but required latent/index groups and TP-owner aggregation are not yet fault-qualified | The only resident copy could be freed after an incomplete or rank-asymmetric save | Prove the existing completion path covers every required group/owner and frees only acknowledged aligned bundles; strengthen its implementation only where a failing test demonstrates a gap |
-| P0.5 retrieval readiness | Strict misses and incomplete transfer masks can surface only when a layer generator resumes; exact top-k rows do not exist until Graph A | A post-selection load can fail after index/cache side effects | Fault-test the current `start_load_kv`/`wait_for_layer_load` path before mutation and after Graph A; converge TP ranks and fail the engine after post-mutation failure, and extend the connector contract only if the existing lifecycle cannot express a correct result |
-| P0.6 connector lifecycle failures | The production connector lifecycle and implicit `current_layer` cursor work on the qualified success path; exception, retry, cancellation, preemption, and rank-asymmetric behavior are not yet fully exercised | An unhandled failure could double-advance or strand connector state | Prove exactly-once callback progress and cleanup through the existing connector contract; prefer local guards/finalization, and require a reproduced correctness failure before proposing any shared API change |
-| P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | The event chain is not NPU-trace-qualified, while retaining generic fences can cap TPOT and jitter | Prove producer/load/following-island ordering, then remove only synchronization demonstrated redundant by the closed event chain |
+| P0.5 retrieval readiness | Strict misses and incomplete transfer masks can surface only when a layer generator resumes; exact top-k rows do not exist until Graph A | A post-selection load can fail after index/cache side effects | Fault-test the current `start_load_kv`/`wait_for_layer_load` path before mutation and after Graph A; keep post-mutation failure locally fatal, and extend the connector contract only if the existing lifecycle cannot express a correct result |
+| P0.6 connector lifecycle failures | The production connector lifecycle and implicit `current_layer` cursor work on the qualified success path; local exception, retry, cancellation, and preemption paths have focused coverage | An unhandled local failure could double-advance or strand connector state | Prove exactly-once callback progress and cleanup through the existing connector contract; prefer local guards/finalization, and require a reproduced correctness failure before proposing any shared API change |
+| P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | Retained fences protect R1 but can cap TPOT and jitter | Keep the existing fence for R1. Trace the producer/load/following-island chain and remove synchronization only as measured P2.5/W8 optimization |
 | P0.8 stable ownership | Outer PIECEWISE wrappers own the cross-layer graph storage, and startup retains per-layer cache/event bindings, but the namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Island registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
 | P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
 | P0.10 qualification evidence | TP2 startup, deterministic output, prefix hit, decode save, repeat stability, singleton TPOT improvement, and batch-1/2/4 throughput checkpoints pass. Focused batch routing/startup tests pass, but client concurrency has not proven pure-decode key-2/4 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide smaller-key replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
@@ -196,6 +202,9 @@ connector API without a demonstrated correctness need.
 | P1.8 runtime key observability | Startup logs/counters establish captured keys, but the smoke client cannot prove which key a live scheduler step admitted and replayed | Qualification and operations can confuse a captured key with a used key or a safe-native mixed step | Expose low-cardinality per-key admission/replay/fallback counters and include them in smoke assertions |
 | P2.2 vLLM-owned remap frontier | The current path obtains the committed frontier from bound LMCache metadata through `_get_connector_metadata` | This is connector-specific coupling and may complicate upstream review, but no runtime defect has been demonstrated for the pinned version pair | Optional cleanup: retain the remap boundary but derive it from the latent range vLLM actually released. Do not add a connector API solely for encapsulation or refactor resistance |
 | P2.3 batch throughput efficiency | TP2 eight-layer throughput is 56/94/144 tok/s for batches 1/2/4 and 72/124/184 tok/s with LMCache loading bypassed. Normal/bypass ratios stay near 76-78%, so LMCache does not introduce a new batch-4 scaling collapse | Absolute LMCache cost remains material, while SFA/indexer, LM head, TP collectives, graph fences, or host work may limit aggregate scaling | After core feature support, attribute steady-step time by layer count and subsystem, then optimize only measured bottlenecks without weakening correctness, fallback, or the connector contract |
+| P2.4 asymmetric TP connector-failure containment | vLLM clears connector metadata and the staged path logs/re-raises local callback errors, but vLLM does not immediately publish a non-output-rank failure to every peer before the next collective-bearing island | A rare asymmetric callback failure can stall peers until the bounded execute timeout and engine restart | Defer strict containment because any exact solution requires a per-split rendezvous. Revisit only for a demonstrated availability/SLA need; prefer an LMCache-internal acknowledgement protocol and require a signed TPOT gate before enabling any success-path coordination |
+| P2.5 compiled-island trace and fence optimization | Startup seals exact island/key counts and functional/throughput trials pass | Host/device attribution and the necessity of retained generic replay fences are not fully measured | In W8, capture one representative cross-layer trace, attribute middle-island composition and event ordering, then remove only synchronization proven redundant without changing correctness |
+| P2.6 decode-window save producer join | A 256-token save boundary currently drains latent/index NPU-to-CPU transfers before reporting `completed_decode_window_saves`; the active owner synchronizes the store stream per layer and processes request/group finalization largely serially. `DECODE_WINDOW_RELEASE` is emitted afterward and frees only the acknowledged blocks | Aligned save windows produce burst TPOT/throughput regressions that grow with request, group, and layer count even though steady decode is fast | In W8, first attribute boundary time from LMCache store submission through the final fence. If confirmed, keep the change LMCache-internal: enqueue transfers with explicit buffer/event ownership, defer CPU-object publication, join once per save batch, then report completion so the existing store-before-free ordering and public connector API remain unchanged |
 
 ## Target ownership model
 
@@ -296,46 +305,46 @@ reinitialization, virtual-engine recreation, operator workspace relocation, or
 supported connector software/configuration change creates a new cache epoch and invalidates old
 entries.
 
-## Staged TP admission and failure boundary
+## Staged admission and failure boundary
 
 vLLM already owns model-forward execution, PIECEWISE island/split ordering, the
-connector context manager, exception cleanup, and no-forward handling. R1 must
-not duplicate those facilities with a runner-side graph executor or finalizer.
-The staged path adds only the TP coordination that vLLM does not provide around
-rank-local eligibility and connector callbacks:
+connector context manager, exception cleanup, no-forward handling, and broadcast
+of one scheduler input to all TP workers. R1 must not duplicate those facilities
+with a runner-side graph executor, finalizer, or success-path consensus protocol.
+The staged path makes one deterministic local route decision before entering the
+existing connector lifecycle:
 
 ```text
 LOCAL_ROUTE_DECISION
-  -> TP_ROUTE_VERDICT               # before connector/cache mutation
   -> EXISTING_VLLM_CONNECTOR_CONTEXT
   -> BOOTSTRAP_INDEX_WAIT            # first staged side effect
-  -> UNIFORM_RESULT_OR_TP_VERDICT
   -> EXISTING_COMPILED_MODEL_FORWARD # PIECEWISE owns island/split order
        retrieve callback(i)
-         -> UNIFORM_RESULT_OR_TP_VERDICT
        ...
   -> EXISTING_VLLM_FINALIZATION
 ```
 
 Required rules:
 
-1. W2 owns static island/key/layer validation. W3 does not rescan graph storage
-   or construct a second all-layer execution plan on the hot path.
-2. The existing per-step route decision is reduced to one TP-consistent
-   `STAGED`, `SAFE_NATIVE`, `RECOMPUTE`, or `FATAL` verdict before bootstrap.
+1. W2 owns static island/key/layer validation. The hot path does not rescan graph
+   storage or construct a second all-layer execution plan.
+2. The existing per-step route remains a pure decision over broadcast scheduler
+   data and startup-static state, producing `STAGED`, `SAFE_NATIVE`, `RECOMPUTE`,
+   or `FATAL` before bootstrap.
 3. Bootstrap and each eager retrieve callback execute exactly once through the
-   current layer/connector path. If the connector does not guarantee a uniform
-   TP result, all ranks publish callback success/failure before any rank enters
-   the following collective-bearing graph island.
-4. Before bootstrap, the agreed verdict may select a proven safe route. At or
-   after bootstrap, failure is fatal for the current engine instance: do not
-   fall back, retry the connector cursor, quarantine-and-continue, or reuse
+   current layer/connector path. A local callback error is logged and re-raised;
+   sequential exception propagation prevents later local islands from launching.
+4. At or after bootstrap, failure is fatal for the current engine instance: do
+   not fall back, retry the connector cursor, quarantine-and-continue, or reuse
    partially written cache state.
 5. Existing vLLM exception propagation and connector-context cleanup remain the
-   only finalizer. W3 must not add another bind/start/wait/clear lifecycle.
-6. Existing generic PIECEWISE replay synchronization remains the R1 completion
+   only finalizer. Add no second bind/start/wait/clear lifecycle.
+6. Immediate cross-rank convergence of an asymmetric connector failure is P2.4.
+   R1 uses a bounded execute timeout and supervised engine restart rather than
+   adding one TP rendezvous per retrieve split.
+7. Existing generic PIECEWISE replay synchronization remains the R1 completion
    handoff. Removing it or adding event-closed slot reuse belongs to W8 after
-   trace proof, not W3.
+   trace proof.
 
 ## Existing connector contract and API-change threshold
 
@@ -374,9 +383,9 @@ can represent the needed value.
 The final selective payload must preserve candidate-row order and may contain
 duplicate request IDs. For every valid row, `selected_tokens[i]`,
 `request_ids[i]`, `target_slot_mapping[i]`, and the valid mask describe the same
-row. A short transfer or source disappearance after Graph A is a failure that
-requires a TP-consistent fatal result for R1; it is not a native fallback or an
-in-process recovery opportunity.
+row. A short transfer or source disappearance after Graph A is locally fatal for
+R1; it is not a native fallback or an in-process recovery opportunity. Immediate
+cross-rank failure convergence remains P2.4.
 
 ### Store-before-free and retrieval readiness
 
@@ -437,7 +446,7 @@ owned output tensor and does not allocate a semantically different result.
 Full pointer/shape/stride/storage/dtype/device checks are valuable during
 capture and sampled debug operation, but are too expensive and too late as the
 primary hot-path safety mechanism. Release mode relies on the W2 sealed
-registry/arena epoch and W3's TP-consistent route admission. Sampled
+registry/arena epoch and the runner's pre-mutation route decision. Sampled
 signature/canary drift is fatal for the R1 engine instance; in-process
 quarantine is optional later lifecycle work. Startup proof must include
 numerical reference data, not only terminal canaries.
@@ -784,30 +793,27 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
 
 ### Immediate execution order after the current trial
 
-1. Rerun the concurrent smoke with the decode-row-only frontier fix. Close the
-   mixed-phase native-route issue only if both the prefill and decode requests
-   complete, the decode row still uses the native sparse path correctly, and no
-   prefill-only frontier is requested.
-2. Add per-key runtime admission/replay/fallback evidence, then drive a
-   phase-aligned pure-decode size-2 step. Prove output parity, LMCache row
-   identity, key-2 replay, and the `1 -> 2 -> 1` transition. Client-side request
-   synchronization alone is not sufficient evidence.
-3. Capture the cross-layer NPU profile for one qualified key and sign the
-   `N + 1` island, middle-island fusion, eager retrieve, and event-ordering
-   assertions.
-4. Continue W1 tightening and fault qualification before adding padded Q1,
-   MTP, DP, or hybrid mixed-phase replay. Do not change the shared LMCache-vLLM
-   API unless a reproduced correctness failure cannot be repaired within the
-   existing lifecycle.
-5. Keep performance regression gates active throughout feature work, but defer
-   discretionary throughput optimization until the core padded-Q1, MTP, and
-   serving-parallelism feature packages are stable. Execute W8 before expanding
-   into the lower-priority optional-mode matrix.
+1. Requalify the exact current commit on TP8/full layers. Combine this with the
+   completed TP2 evidence, including the `f7038e2f` no-regression checkpoint:
+   exact startup entry counts on every rank, deterministic output, prefix
+   miss/hit, decode save/release, `1 -> B -> 1`, bounded memory, and no TPOT
+   regression.
+2. Close W4's exact-Q1 functional evidence bundle without adding route or
+   connector consensus to the decode path. Keep the existing LMCache-vLLM API
+   unless a reproduced correctness failure cannot be repaired internally.
+3. Implement and qualify the core feature packages in order: W5 padded Q1,
+   W6 fixed-width MTP, then W7 serving parallelism and lifecycle ownership.
+4. Keep performance regression gates active throughout feature work, then run
+   W8 profiling and measured optimization before the lower-priority optional-mode
+   matrix. Detailed island/event traces remain evidence work in W8.
+5. Revisit P2.4 asymmetric TP connector-failure containment only if production
+   availability data shows that bounded execute timeout plus engine restart is
+   insufficient. Any success-path synchronization must pass a signed TPOT gate.
 
 ### W0: prove the cross-layer partition and capture contract
 
-Status: **implementation and singleton functional/performance checkpoint
-complete; trace exit still open**.
+Status: **implementation and functional/performance checkpoint complete;
+detailed device attribution is deferred to W8**.
 
 - **Done:** add a narrowly gated staged decomposition in `ops/mla.py`: graph-safe pre,
   eager retrieve, and graph-safe post. Make selected rows, destinations,
@@ -828,23 +834,21 @@ complete; trace exit still open**.
 - **Done:** add a CPU/mock FX partition test proving that two adjacent layers produce
   `pre(0) | retrieve(0) | post(0)+tail(0)+pre(1) | retrieve(1) | post(1)` and
   that retrieval remains eager and mutation-ordered.
-- **Functional/performance trial done; trace open:** on NPU, the current
+- **Functional/performance trial done; detailed trace deferred:** on NPU, the current
   eight-layer test model and singleton exact-Q1 key have
-  passed startup, output, LMCache, and TPOT trials. The remaining W0 proof is to
-  assert nominal `local_sfa_layers + 1` outer graph islands, zero nested staged
-  entries, one retrieve call per layer, stable addresses, and a middle island
-  containing `Graph B(i)`, the layer tail, and `Graph A(i+1)`.
-- **Implemented; trace/fault proof open:** invoke `latent-load(i)` and
+  passed startup, output, LMCache, and TPOT trials. W2 now seals nominal
+  `local_sfa_layers + 1` outer graph islands, zero nested staged entries, and
+  stable per-key bindings. W8 owns detailed attribution of the middle island.
+- **Implemented; detailed trace deferred:** invoke `latent-load(i)` and
   `index-load(i+1)` through the existing connector
-  callbacks in one split and prove exact cursor progression. Do not change the
-  connector API for this spike.
+  callbacks in one split with exact cursor progression. Do not change the
+  connector API; detailed timing is W8 and asymmetric failure is P2.4.
 
-Exit: deterministic token/logit/KV/top-k parity matches the current executor;
-the partition and profiler trace match the intended islands on TP2; warm replay
-does not execute connector callbacks inside a graph or recapture; prefill,
-dense prefix hit/TTFT behavior, decode save, and pre-admitted native fallback
-remain unchanged. If any exit condition fails, stop and document the concrete
-compiler/operator/connector constraint before doing production ownership work.
+Exit: deterministic output and cache behavior match the current executor; exact
+outer-island population is sealed; warm replay does not execute connector
+callbacks inside a graph or recapture; prefill, dense prefix hit/TTFT behavior,
+decode save, and pre-admitted native fallback remain unchanged. Detailed
+partition/event attribution is P2.5/W8 rather than a hot-path implementation gate.
 
 ### W1: freeze support behavior and qualify the existing connector lifecycle
 
@@ -859,9 +863,9 @@ mixed-phase replay is an R5 feature and is not part of W1.
 - Fault-test store completion across every required layer/group and TP owner,
   including `save_only_first_rank`, and verify that only acknowledged aligned
   block bundles are released.
-- Inject sparse source miss/partial transfer, timeout, exception, cancel,
-  preemption, retry, and rank-asymmetric failure around bootstrap, each
-  combined retrieve split, and each following island.
+- Inject local sparse source miss/partial transfer, timeout, exception, cancel,
+  preemption, and retry around bootstrap and combined retrieve splits. Immediate
+  cross-rank convergence of an asymmetric callback failure is P2.4.
 - **Done:** make partial batched load setup and cancellation close every published
   layerwise generator, release sparse request state/pins, and leave the next step
   reusable. The success path adds no device synchronization or tensor transfer.
@@ -884,18 +888,16 @@ demonstrates a correctness failure that cannot be fixed through the existing
 lifecycle. Removing `_get_connector_metadata` and deriving the remap frontier
 from vLLM-owned released-range state is optional P2.2 cleanup, not W1 exit work.
 
-Implementation exit: every rejection has a tested action; mocked faults prove
-store-before-free and exactly-once cleanup for setup, group finalization, final
-store fencing, event submission/record/wait, cancellation, and retry. Release
-sign-off still runs these paths under TP2/TP8, including a rank-asymmetric fault
-and a normal request immediately afterward. W3 adds consensus only at final
-route admission and connector gaps without a protocol-guaranteed uniform
-result; it must not add verdicts around ordinary graph islands or finalization.
+Implementation exit: every rejection has a tested action; mocked local faults
+prove store-before-free and exactly-once cleanup for setup, group finalization,
+final store fencing, event submission/record/wait, cancellation, and retry.
+Release sign-off runs the unchanged success path under TP2/TP8. P2.4 owns any
+future strict asymmetric-failure protocol and its performance qualification.
 
 ### W2: capture binding registry and resource accounting
 
-Status: **R1 static-ownership implementation complete; ordered-topology and
-NPU startup/resource/performance sign-off pending**.
+Status: **R1 static ownership and TP2 startup/runtime validation complete;
+TP8 full-model sign-off on the exact current commit remains**.
 
 - **Done for R1:** dispatch ACL graph entries by the existing full
   `StagedSFAGraphKey`; generic graph paths retain their legacy
@@ -931,54 +933,54 @@ NPU startup/resource/performance sign-off pending**.
 - **Done for R1:** full signatures are captured and sealed only during startup;
   release replay relies on those sealed ACL entries and vLLM's existing worker
   lifecycle rather than hot tensor scans or parallel readiness state.
+- **Done and TP2-qualified:** the release-path audit keeps W2 population,
+  binding, and layout checks out of replay. Sparse payload structure is checked
+  once per shared step metadata, and profiler markers are constructed only
+  while profiling is active. Required route admission, connector operations,
+  stream events, and the generic replay fence are retained.
 
 Exit: code validates the exact outer-island population, key set, and per-layer
 bindings before connector entry and keeps the current restart-required lifecycle
-bounded. Sign off W2 after the ordered topology trace and two-pass startup plus
-`1 -> B -> 1` reruns show no stale-address, memory, output, or TPOT regression on
-TP2 and TP8. Dynamic lifecycle and fence removal remain explicitly
-unsupported/deferred rather than silently claimed by R1.
+bounded. Sign off W2 when `1 -> B -> 1` shows no stale-address, memory, output,
+or TPOT regression on TP2 and TP8. Repeated startup and detailed ordered-topology
+traces are reliability/performance evidence in W8, not additional runtime guards.
+Dynamic lifecycle and fence removal remain explicitly unsupported/deferred.
 
-### W3: TP-consistent staged admission and connector-gap failure containment
+### W3: asymmetric TP connector-failure containment
 
-Scope: add only the coordination missing from vLLM. Reuse the current
-`StagedSFARouteDecision`, `ForwardContext`, `_model_forward`, PIECEWISE
-dispatcher, layer callbacks, connector context manager, and exception cleanup.
-vLLM cleans up a local connector exception but supplies neither a TP-wide route
-verdict nor a TP-wide completion result for `wait_for_layer_load`; those are the
-only W3 implementation gaps.
+Status: **deferred P2.4 availability hardening; not an R1 or feature dependency**.
 
-- Reduce each rank's existing route decision to one TP-consistent action before
-  entering bootstrap. A disagreement must select an agreed safe-native action
-  only when every rank proves it safe; otherwise it is fatal.
-- Wrap the existing bootstrap index wait and combined retrieve callback with
-  one shared completion helper. Use a TP verdict only when the connector does
-  not guarantee a uniform result, and complete that verdict before the next
-  collective-bearing island.
-- Treat the current callback result as rank-local unless the pinned
-  implementation is qualified to guarantee uniform TP completion. Recording
-  that qualification is staged-integration policy, not a new connector API.
-- Preserve exactly-once callback/cursor progress. Catch a local callback error
-  only long enough to publish the failure verdict, then re-raise on every rank.
-- Retain the existing rule that an authorized layer cannot fall back. Any error
-  at or after bootstrap is fatal to the engine instance, preventing partial
-  cache reuse without inventing in-process recovery.
-- Add no runner-side island executor, hot-path graph rescan, connector API,
-  connector finalizer, no-forward path, graph completion event, or ordinary
-  island verdict.
+The audit found only one guarantee missing from current vLLM: a callback failure
+on a non-output TP rank is not necessarily published to every peer before the
+next collective-bearing island. The other previously proposed W3 behaviors are
+already owned by existing code:
 
-Exit: TP2/TP8 injected disagreement before bootstrap selects one common action;
-an injected one-rank bootstrap/retrieve failure is observed by all ranks before
-the following collective-bearing island; the connector callback/cursor and
-vLLM cleanup each run exactly once; and the unchanged success path has no
-material TPOT regression. Depends on W1 and W2.
+- vLLM broadcasts one scheduler input to all TP workers and owns the connector
+  context, exception unwinding, metadata cleanup, and model-forward lifecycle;
+- the staged runner makes its deterministic route decision before connector
+  entry and bootstrap;
+- connector waits log and re-raise local errors, sequential control flow stops
+  later local islands, and an authorized staged step never falls back.
+
+Do not add a per-step route collective or a per-layer callback verdict to the R1
+decode path. Strict asymmetric containment necessarily adds a rendezvous before
+every following collective-bearing island and can impair TPOT, especially across
+the full 78-layer TP8 target. R1 therefore treats such a failure as fail-stop,
+using a validated finite execute timeout and supervised engine restart.
+
+Reopen W3 only when production availability evidence shows that this recovery
+boundary is insufficient. Prefer an LMCache-internal acknowledgement on the
+existing rank-0/passive protocol over a public connector API or 78 HCCL verdicts.
+Any proposal must prove one-rank failure convergence, exactly-once connector
+cleanup, bounded timeout behavior, and no material TPOT regression before it can
+be enabled.
 
 ### W4: R1 cross-layer exact-Q1 NPU qualification and rollout
 
 - Run the complete numerical/boundary/cache/TP/lifecycle matrix against both
   the archived two-wrapper commit and the valid native LMCache route.
-- Automate partition/operator/event assertions and performance gates, including
-  graph-island cardinality and zero nested staged wrappers.
+- Automate numerical, boundary, cache, TP, graph-cardinality, zero-nested-wrapper,
+  and performance gates. Detailed operator/event timeline attribution is P2.5/W8.
 - For every configured exact size, prove a phase-aligned pure-decode replay,
   request-row identity through LMCache, numerical parity, and key transitions
   including `1 -> B -> 1`; include mixed arrival/decode steps as safe-native
@@ -991,13 +993,15 @@ the release owner signs the evidence bundle.
 
 ### W5: padded Q1 buckets
 
-- Add fixed-capacity persistent row metadata, safe blocks/slots, active masks,
-  connector filtering, and Graph-B output masking.
+- Fixed-capacity Q1 padding is implemented for internal DP: vLLM-owned padded
+  rows keep safe block/slot metadata, Graph A masks inactive sparse rows, and
+  the split callback sends only compact real rows to LMCache.
 - Choose buckets from resource budget and workload distribution.
 - Prove all real sizes and row reorder/condense transitions within each bucket.
 
 Exit: ordinary sizes through `max_num_seqs` use bounded keys and inactive rows
-cannot mutate/read/save request data. Depends on W2-W3.
+cannot mutate/read/save request data. Depends on W2 and W4 qualification; the
+deferred W3 availability protocol is not a feature dependency.
 
 ### W6: fixed-width MTP target decode
 
@@ -1011,10 +1015,15 @@ parity under churn and boundary cases. Depends on W5 row-capacity machinery.
 
 ### W7: DP, PP/virtual engines, and overlap
 
-- Implement DP bucket agreement and empty-rank execution.
+- Internal DP bucket/route agreement and empty-rank execution are implemented
+  through the existing vLLM DP collective and dummy-run path; qualify DP2/DP4
+  and keep external-launcher DP rejected until its rank/LMCache ownership is
+  defined.
 - Namespace/invalidate per PP stage and virtual engine.
 - Add in-flight slots or enforce and test serialization.
-- Extend memory/stream budget and fault consensus to combined parallelism.
+- Extend memory/stream budgets and the documented fail-stop policy to combined
+  parallelism. Strict per-split asymmetric-failure consensus remains P2.4 unless
+  independently justified and performance-qualified.
 
 Exit: DP2/DP4, PP2/VE2, and qualified TP combinations sustain heterogeneous
 loads without hangs, row leakage, cursor drift, or stale capture. Depends on
@@ -1028,6 +1037,10 @@ W5-W7 feature breadth, higher priority than optional-mode expansion**.
 - Preserve no-profiler batch-1/2/4 baselines with and without LMCache loading;
   report step time plus throughput/TTFT/TPOT p50, p90, and p99 rather than only
   peak aggregate throughput.
+- Use `f7038e2f` and its TP2 eight-layer 56/94/144 tok/s result as the accepted
+  host-path baseline. Do not reintroduce unconditional per-layer profiler
+  ranges, connector-capability discovery, payload-layout validation, replay
+  logging, or no-op instrumentation on the success path.
 - Attribute the batch-dependent step-time slope with short profiles and a
   1/4/8-layer sweep. Separate SFA index selection, sparse attention, projections,
   LM head/logits/sampling, TP collectives, outer-island replay/fences, scheduler
@@ -1036,6 +1049,12 @@ W5-W7 feature breadth, higher priority than optional-mode expansion**.
   serialization bottleneck, not as proof that its absolute 22-24% gap is
   irreducible. Optimize connector submission or transfer only when the profile
   identifies it on the critical path.
+- Measure decode-window boundary steps separately from ordinary decode. Correlate
+  per-request/group LMCache store time with TPOT and distinguish transfer/fence
+  time from the later scheduler block release. If per-layer producer fences are
+  material, enqueue the independent NPU-to-CPU saves, retain every source,
+  destination, staging buffer, and completion event through one batch join, and
+  publish/store the CPU objects only after that join.
 - Replace generic replay synchronization only after W1-W2 event, ownership, and
   failure proofs demonstrate that a narrower event dependency is correct.
 - Qualify every optimization on the full target layer count and TP2/TP8; keep
@@ -1047,8 +1066,9 @@ W5-W7 feature breadth, higher priority than optional-mode expansion**.
 Exit: the signed workload meets its aggregate-throughput and TTFT/TPOT p50/p99
 targets on the full target model; traces account for the remaining batch-scaling
 loss, no correctness/feature matrix regresses, and every retained synchronization
-has a documented dependency purpose. Depends on W1-W4 and should follow stable
-W5-W7 feature behavior.
+has a documented dependency purpose. Depends on W1-W2 and W4, and should follow
+stable W5-W7 feature behavior. W3 is evaluated afterward only if its availability
+benefit justifies a measured success-path cost.
 
 ### W9: optional execution modes
 
@@ -1121,7 +1141,8 @@ Axes include:
 - decode-window save and `save_only_first_rank` behavior;
 - arrival, finish, cancel, preempt, recompute, recalc-last, and load failure at
   every layer phase;
-- TP-rank-asymmetric index/latent timeout and store-commit failure;
+- TP-rank-asymmetric index/latent timeout and store-commit failure when P2.4 is
+  reopened; this does not block the R1 success-path matrix;
 - fp16/bf16 and every allowlisted model/operator/CANN/torch-npu fingerprint;
 - TP1/2/8, then DP2/4, PP/VE, and combined qualified topologies;
 - MTP widths and partial-acceptance patterns when W6 is enabled.
@@ -1156,7 +1177,11 @@ Axes include:
   and every expected mixed-phase fallback has a typed reason;
 - throughput and TPOT improve for the workload/buckets that justify the feature;
 - TTFT/TPOT p50 and p99 have no unapproved regression from index waits, event
-  hand-off, plan building, or first-use synchronization;
+  hand-off, plan building, first-use synchronization, or aligned decode-window
+  saves;
+- decode-window boundaries at 255/256/257 and aligned multi-request boundaries
+  preserve exact store-before-free behavior while keeping the measured save
+  burst within the signed TPOT/p99 budget;
 - host launch count, outer-island count, and eager retrieve gaps match the trace
   budget.
 
@@ -1166,8 +1191,9 @@ duration must be fixed before W4 begins and stored with the evidence. A claim of
 
 ## Rollout
 
-1. Land W0-W3 behind `off`/`strict`; run CI and qualification without serving
-   user traffic.
+1. Land W0-W2 behind `off`/`strict` and complete W4 qualification without W3
+   success-path coordination; run CI and qualification without serving user
+   traffic.
 2. Use sampled `verify` on non-production qualification traffic. The eager
    reference is side-effect-free, connector saves are deferred, and any parity
    mismatch aborts/recomputes rather than continuing with mutated live cache.
@@ -1184,10 +1210,10 @@ duration must be fixed before W4 begins and stored with the evidence. A claim of
 An enabled structural key is production-ready only when all statements are
 true:
 
-1. The existing runner route receives one final TP admission verdict before any
-   connector wait/cache mutation, and connector operations without a
-   protocol-guaranteed uniform result receive a TP completion verdict before
-   the next collective-bearing island.
+1. The existing runner makes one deterministic final route decision over
+   broadcast scheduler data and startup-static state before any connector
+   wait/cache mutation. Local post-bootstrap failure is fatal; immediate
+   cross-rank convergence remains deferred P2.4 availability hardening.
 2. Every graph input/output and implicit dependency has stable owned lifetime
    under a versioned namespace and cache epoch.
 3. Existing connector progress, store completion, and stream/event ordering are
