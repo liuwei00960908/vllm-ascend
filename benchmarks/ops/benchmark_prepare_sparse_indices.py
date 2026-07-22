@@ -37,6 +37,8 @@ def main() -> None:
         parser.error("requests, mtp-rows, topk and max-model-len must be positive")
     if not 0 <= args.boundary <= args.max_model_len:
         parser.error("boundary must be in [0, max-model-len]")
+    if args.topk % 16:
+        parser.error("topk must be a multiple of 16 for cacheline isolation")
 
     enable_custom_op()
     try:
@@ -75,7 +77,7 @@ def main() -> None:
     selected = torch.empty(
         (args.requests, scratch_capacity), dtype=torch.int32, device=device
     )
-    counts = torch.empty(args.requests, dtype=torch.int32, device=device)
+    counts = torch.empty((args.requests, 16), dtype=torch.int32, device=device)
     targets = torch.empty(
         (args.requests, scratch_capacity), dtype=torch.long, device=device
     )
@@ -103,7 +105,7 @@ def main() -> None:
     expected_topk, expected_selected, expected_counts, expected_targets = expected
     if not torch.equal(actual_topk.cpu(), expected_topk):
         raise AssertionError("bitmap remap differs from the Torch reference")
-    if not torch.equal(counts.cpu(), expected_counts):
+    if not torch.equal(counts[:, 0].cpu(), expected_counts):
         raise AssertionError("bitmap union counts differ from the Torch reference")
     for req, count in enumerate(expected_counts.tolist()):
         if not torch.equal(selected[req, :count].cpu(), expected_selected[req, :count]):

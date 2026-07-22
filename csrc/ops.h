@@ -52,6 +52,7 @@ namespace vllm_ascend {
     uint32_t request_count,
     uint32_t block_table_width,
     uint32_t scratch_capacity,
+    uint32_t selected_count_stride,
     uint32_t bitmap_words,
     uint32_t block_size,
     bool need_packed,

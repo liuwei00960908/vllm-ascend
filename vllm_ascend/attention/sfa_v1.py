@@ -363,8 +363,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            # One 64-byte row per request prevents different AIVs from
+            # updating counts in the same cacheline.
             self._dsa_selected_counts = torch.empty(
-                max_num_reqs, dtype=torch.int32, device=device
+                (max_num_reqs, 16), dtype=torch.int32, device=device
             )
             self._dsa_target_slots = torch.empty(
                 (max_num_reqs, self.scratch_capacity),

@@ -19,18 +19,30 @@ def _load_dsa_union_operator():
 def _buffers(requests: int, capacity: int):
     return (
         torch.empty((requests, capacity), dtype=torch.int32, device="npu"),
-        torch.empty(requests, dtype=torch.int32, device="npu"),
+        torch.empty((requests, 16), dtype=torch.int32, device="npu"),
         torch.empty((requests, capacity), dtype=torch.long, device="npu"),
     )
 
 
+def _aligned_rows(values):
+    result = torch.full((len(values), 16), -1, dtype=torch.int32)
+    for row, entries in enumerate(values):
+        result[row, :len(entries)] = torch.tensor(entries, dtype=torch.int32)
+    return result
+
+
+def _aligned_tables(values):
+    result = torch.zeros((len(values), 16), dtype=torch.int32)
+    for row, entries in enumerate(values):
+        result[row, :len(entries)] = torch.tensor(entries, dtype=torch.int32)
+    return result
+
+
 @pytest.mark.parametrize("boundary", [0, 2, 4, 8])
 def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary):
-    topk_cpu = torch.tensor(
-        [[0, 1, 2, 7], [1, 0, 3, 8]], dtype=torch.int32
-    )
+    topk_cpu = _aligned_rows([[0, 1, 2, 7], [1, 0, 3, 8]])
     row_req_cpu = torch.tensor([0, 0], dtype=torch.int32)
-    table_cpu = torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.int32)
+    table_cpu = _aligned_tables([[10, 11, 12, 13, 14, 15]])
     expected, packed, counts, targets = _prepare_sparse_indices_torch(
         topk_cpu,
         torch.tensor([boundary, boundary], dtype=torch.int32),
@@ -40,7 +52,7 @@ def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary
     )
 
     actual = topk_cpu.npu()
-    buffers = _buffers(1, 8)
+    buffers = _buffers(1, 32)
     actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
         actual,
         torch.tensor([boundary, boundary], dtype=torch.int32, device="npu"),
@@ -60,14 +72,12 @@ def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary
 
 
 def test_two_requests_are_deduplicated_independently():
-    topk_cpu = torch.tensor(
-        [[1, 2, 9, 10], [2, 3, 10, 11], [1, 4, 12, 13]],
-        dtype=torch.int32,
+    topk_cpu = _aligned_rows(
+        [[1, 2, 9, 10], [2, 3, 10, 11], [1, 4, 12, 13]]
     )
     row_req_cpu = torch.tensor([0, 0, 1], dtype=torch.int32)
-    table_cpu = torch.tensor(
-        [[20, 21, 22, 23, 24, 25], [30, 31, 32, 33, 34, 35]],
-        dtype=torch.int32,
+    table_cpu = _aligned_tables(
+        [[20, 21, 22, 23, 24, 25], [30, 31, 32, 33, 34, 35]]
     )
     expected, packed, counts, targets = _prepare_sparse_indices_torch(
         topk_cpu,
@@ -76,7 +86,7 @@ def test_two_requests_are_deduplicated_independently():
         request_block_table=table_cpu,
         block_size=2,
     )
-    buffers = _buffers(2, 8)
+    buffers = _buffers(2, 32)
     actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
         topk_cpu.npu(),
         torch.tensor([4, 4, 5], dtype=torch.int32, device="npu"),
@@ -95,9 +105,9 @@ def test_two_requests_are_deduplicated_independently():
 
 
 def test_bitmap_union_assigns_sorted_position_ranks():
-    topk_cpu = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
+    topk_cpu = _aligned_rows([[3, 1], [2, 3]])
     row_req_cpu = torch.tensor([0, 0], dtype=torch.int32)
-    table_cpu = torch.tensor([[20, 21]], dtype=torch.int32)
+    table_cpu = _aligned_tables([[20, 21]])
     expected, packed, counts, targets = _prepare_sparse_indices_torch(
         topk_cpu,
         torch.tensor([4, 4], dtype=torch.int32),
@@ -105,7 +115,7 @@ def test_bitmap_union_assigns_sorted_position_ranks():
         request_block_table=table_cpu,
         block_size=2,
     )
-    buffers = _buffers(1, 4)
+    buffers = _buffers(1, 32)
     actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
         topk_cpu.npu(),
         torch.tensor([4, 4], dtype=torch.int32, device="npu"),
@@ -118,7 +128,7 @@ def test_bitmap_union_assigns_sorted_position_ranks():
     )
 
     assert packed[0, :3].tolist() == [1, 2, 3]
-    assert expected.tolist() == [[2, 0], [1, 2]]
+    assert expected[:, :2].tolist() == [[2, 0], [1, 2]]
     assert torch.equal(actual.cpu(), expected)
     assert torch.equal(actual_counts.cpu(), counts)
     assert torch.equal(actual_packed[0, :3].cpu(), packed[0, :3])

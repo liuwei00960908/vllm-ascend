@@ -168,6 +168,6 @@ def prepare_sparse_indices(
     return (
         topk_indices,
         selected_packed if need_packed else None,
-        selected_counts if need_packed else None,
+        selected_counts[:, 0] if need_packed else None,
         target_slot_mapping if need_packed else None,
     )

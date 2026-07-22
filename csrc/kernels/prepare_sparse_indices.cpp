@@ -36,6 +36,7 @@ public:
         uint32_t requestCount,
         uint32_t blockTableWidth,
         uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
         uint32_t bitmapWords,
         uint32_t blockSize,
         uint32_t needPacked,
@@ -46,6 +47,7 @@ public:
         requestCount_ = requestCount;
         blockTableWidth_ = blockTableWidth;
         scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
         bitmapWords_ = bitmapWords;
         bufferWords_ = ((bitmapWords + 7) / 8) * 8;
         blockSize_ = blockSize;
@@ -60,7 +62,9 @@ public:
         selectedPacked_.SetGlobalBuffer(
             selectedPacked,
             static_cast<uint64_t>(requestCount) * scratchCapacity);
-        selectedCounts_.SetGlobalBuffer(selectedCounts, requestCount);
+        selectedCounts_.SetGlobalBuffer(
+            selectedCounts,
+            static_cast<uint64_t>(requestCount) * selectedCountStride);
         targetSlots_.SetGlobalBuffer(
             targetSlots,
             static_cast<uint64_t>(requestCount) * scratchCapacity);
@@ -83,7 +87,8 @@ public:
             }
         }
         if (!hasPositiveBoundary) {
-            selectedCounts_.SetValue(req, 0);
+            selectedCounts_.SetValue(
+                static_cast<uint64_t>(req) * selectedCountStride_, 0);
             if (req == 0 && clearInvalidRows_) {
                 ClearInvalidRows();
             }
@@ -174,7 +179,8 @@ public:
             }
         }
         selectedCounts_.SetValue(
-            req, needPacked_ ? static_cast<int32_t>(uniqueCount) : 0);
+            static_cast<uint64_t>(req) * selectedCountStride_,
+            needPacked_ ? static_cast<int32_t>(uniqueCount) : 0);
 
         if (req == 0 && clearInvalidRows_) {
             ClearInvalidRows();
@@ -220,6 +226,7 @@ private:
     uint32_t requestCount_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
     uint32_t bitmapWords_ = 0;
     uint32_t bufferWords_ = 0;
     uint32_t blockSize_ = 0;
@@ -242,6 +249,7 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
     uint32_t requestCount,
     uint32_t blockTableWidth,
     uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
     uint32_t bitmapWords,
     uint32_t blockSize,
     uint32_t needPacked,
@@ -255,7 +263,7 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_kernel(
         op.Init(topkIndices, splitBoundary, rowReqIndices, requestBlockTable,
                 selectedPacked, selectedCounts, targetSlots,
                 rowCount, rowWidth, requestCount, blockTableWidth,
-                scratchCapacity, bitmapWords, blockSize, needPacked,
+                scratchCapacity, selectedCountStride, bitmapWords, blockSize, needPacked,
                 clearInvalidRows);
         op.Process();
     }
@@ -269,6 +277,7 @@ void dsa_prepare_sparse_indices_impl(
     void* selectedCounts, void* targetSlots,
     uint32_t rowCount, uint32_t rowWidth, uint32_t requestCount,
     uint32_t blockTableWidth, uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
     uint32_t bitmapWords, uint32_t blockSize, bool needPacked,
     bool clearInvalidRows)
 {
@@ -280,7 +289,8 @@ void dsa_prepare_sparse_indices_impl(
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(selectedCounts),
         static_cast<int64_t*>(targetSlots), rowCount, rowWidth,
-        requestCount, blockTableWidth, scratchCapacity, bitmapWords,
+        requestCount, blockTableWidth, scratchCapacity, selectedCountStride,
+        bitmapWords,
         blockSize, needPacked, clearInvalidRows);
 }
 

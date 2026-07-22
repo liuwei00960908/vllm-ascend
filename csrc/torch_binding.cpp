@@ -431,11 +431,18 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
                     row_req_indices.numel() >= row_count,
                 "split_boundary and row_req_indices must cover every row");
     TORCH_CHECK(selected_packed.size(0) == request_count &&
-                    selected_counts.numel() == request_count,
+                    selected_counts.dim() == 2 &&
+                    selected_counts.size(0) == request_count &&
+                    selected_counts.size(1) >= 16 &&
+                    selected_counts.size(1) % 16 == 0,
                 "preallocated payload rows must match request block-table rows");
     TORCH_CHECK(block_size > 0 && row_width > 0 && row_width <= 4096,
                 "block_size and sparse row width must be supported and positive");
+    TORCH_CHECK(row_width % 16 == 0,
+                "sparse row width must be a multiple of 16 int32 values so "
+                "different request cores never update the same 64-byte cacheline");
     const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t selected_count_stride = selected_counts.size(1);
     TORCH_CHECK(scratch_capacity >= row_width,
                 "selected payload width must cover one sparse row");
     const int64_t bitmap_words =
@@ -458,7 +465,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     cmd.SetCustomHandler([
         stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
         counts_ptr, slots_ptr, row_count, row_width, request_count,
-        block_table_width, scratch_capacity, bitmap_words, block_size,
+        block_table_width, scratch_capacity, selected_count_stride,
+        bitmap_words, block_size,
         need_packed, clear_invalid_rows]() -> int {
         dsa_prepare_sparse_indices_impl(
             stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
@@ -468,6 +476,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(block_table_width),
             static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(selected_count_stride),
             static_cast<uint32_t>(bitmap_words),
             static_cast<uint32_t>(block_size), need_packed,
             clear_invalid_rows);
