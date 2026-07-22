@@ -1976,7 +1976,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             or int(attn_metadata.indexer_block_table.shape[0]) != batch_size
         ):
             return "the native block-table row count does not match the graph key"
-        if not attn_metadata.need_sparse_lmcache_payload:
+        if (
+            not staged_dummy_run
+            and not attn_metadata.need_sparse_lmcache_payload
+        ):
             return "the v1 sparse LMCache payload path is unavailable"
         if not attn_metadata.decode_valid_rows_all:
             return "not every exact-Q1 row is in the compact LMCache payload"

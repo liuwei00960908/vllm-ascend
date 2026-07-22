@@ -956,6 +956,17 @@ class TestStagedSFAGraphPoc(TestBase):
                         metadata,
                     )
                     self.assertIsNone(reason)
+            metadata.need_sparse_lmcache_payload = False
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(dtype=torch.bfloat16),
+                metadata,
+            )
+            self.assertEqual(
+                reason,
+                "the v1 sparse LMCache payload path is unavailable",
+            )
+            metadata.need_sparse_lmcache_payload = True
             with patch.object(
                 sfa_v1,
                 "staged_sfa_connector_supports_sparse_load",
@@ -1167,6 +1178,7 @@ class TestStagedSFAGraphPoc(TestBase):
     def test_eligibility_accepts_explicit_eager_dummy_warmup(self):
         impl = self._make_eligible_impl()
         metadata = self._make_decode_metadata()
+        metadata.need_sparse_lmcache_payload = False
         forward_context = MagicMock()
         forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
         forward_context.capturing = False
