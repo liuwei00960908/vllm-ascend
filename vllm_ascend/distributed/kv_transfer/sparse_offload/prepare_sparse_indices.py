@@ -3,10 +3,12 @@
 Decode reads the latent through two disjoint index spaces resolved by the SAME
 per-request block table:
 
-  * LMCache-selected positions (< cache boundary) -> compact scratch rows [0..n_ret)
-    (the request's first ceil(k/block_size) latent blocks, filled by LMCache);
-  * live-cache positions (>= cache boundary >= k) -> kept ABSOLUTE, read in
+  * LMCache-selected positions (< cache boundary) -> request-level stable-union
+    scratch rows [0..n_unique), shared by all MTP rows for that request;
+  * live-cache positions (>= cache boundary) -> kept ABSOLUTE, read in
     place from their tail blocks. No copy, no [retrieve|decode] assembly.
+
+A zero boundary selects nothing from LMCache and leaves every index absolute.
 
 Everything is fixed-shape tensor math: no D2H sync, graph-mode friendly.
 """
@@ -116,10 +118,10 @@ def prepare_sparse_indices(
     Args:
         topk_indices: [bs, 1, k] (or [bs, k]) absolute token positions selected
             by the indexer; negative entries are padding.
-        split_boundary: [bs] cache split boundary per decode request. In the original
-            mode this is the prompt length; decode-window mode passes the
-            current window start. Callers must ensure boundary >= k for every
-            row (else scratch rows would alias live-cache positions).
+        split_boundary: [bs] cache split boundary per decode request. Zero
+            means the whole prefix is resident in NPU cache. A positive value
+            is the LMCache-committed frontier; selected positions below it are
+            remapped through the request-level union scratch prefix.
         need_packed: whether to build the LMCache selected-token payload.
         scratch_base: [bs] compact scratch base per row. This lets MTP
             rows for the same request use disjoint compact scratch ranges.

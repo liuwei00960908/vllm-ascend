@@ -21,7 +21,7 @@ def _buffers(requests: int, capacity: int):
     )
 
 
-@pytest.mark.parametrize("boundary", [2, 4, 8])
+@pytest.mark.parametrize("boundary", [0, 2, 4, 8])
 def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary):
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_"):
         pytest.fail("vllm_ascend_C must be rebuilt with the DSA union operator")

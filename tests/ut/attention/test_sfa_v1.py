@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -14,6 +15,42 @@ if 'torch_npu._inductor' not in sys.modules:
 import vllm_ascend.attention.sfa_v1 as sfa_v1
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.utils import enable_dsa_cp
+
+
+def test_sparse_boundary_prefers_explicit_committed_end():
+    from vllm_ascend.attention import utils as attention_utils
+
+    metadata = SimpleNamespace(
+        requests=[
+            SimpleNamespace(
+                req_id="resident",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=3072,
+                    dsa_committed_end=0,
+                ),
+            ),
+            SimpleNamespace(
+                req_id="offloaded",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=8192,
+                    dsa_committed_end=8192,
+                ),
+            ),
+        ]
+    )
+    connector = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        assert attention_utils.get_lmcache_sparse_cached_tokens(
+            ["resident", "offloaded"]
+        ) == [0, 8192]
 
 
 class TestLMCacheSparseWaitSync(TestBase):

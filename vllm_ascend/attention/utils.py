@@ -344,7 +344,9 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
             cached_by_req[getattr(request, "req_id", "")] = 0
         else:
             cached_by_req[getattr(request, "req_id", "")] = int(
-                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
+                getattr(load_spec, "dsa_committed_end", None)
+                if getattr(load_spec, "dsa_committed_end", None) is not None
+                else getattr(load_spec, "lmcache_cached_tokens", 0)
             )
 
     if not cached_by_req:
