@@ -85,6 +85,12 @@ public:
         AscendC::LocalTensor<int32_t> prefix =
             prefixBuffer_.Get<int32_t>();
         AscendC::Duplicate(bitmap, static_cast<int32_t>(0), bufferWords_);
+        // Duplicate runs on the vector pipeline, while the bitmap below is
+        // updated through scalar GetValue/SetValue accesses.  Wait for the
+        // clear to finish before the scalar pipeline starts modifying it;
+        // otherwise the delayed clear can erase request-union bits.
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::PipeSync<AscendC::HardEvent::V_S>();
         const uint64_t packedOffset =
             static_cast<uint64_t>(req) * scratchCapacity_;
 
