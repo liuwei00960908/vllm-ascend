@@ -255,13 +255,20 @@ class ACLGraphWrapper:
             )
 
         # In async scheduling or multi-threaded (MT) scenarios, input updates
-        # for iteration i can race with graph replay for iteration i-1.
-        # Synchronous staged PIECEWISE replay instead uses one in-flight step
-        # and explicit stream/event ordering around each LMCache split.
-        stream_ordered_staged_replay = (
+        # for iteration i can race with graph replay for iteration i-1. The
+        # first staged island retains that boundary fence; later islands in
+        # this forward use the explicit stream/event ordering around LMCache.
+        staged_piecewise_replay = (
             staged_graph_key is not None
             and self.runtime_mode == CUDAGraphMode.PIECEWISE
-            and self.vllm_config.scheduler_config.async_scheduling is False
+        )
+        async_scheduling = self.vllm_config.scheduler_config.async_scheduling
+        stream_ordered_staged_replay = staged_piecewise_replay and (
+            async_scheduling is False
+            or (
+                async_scheduling is True
+                and getattr(forward_context, "staged_sfa_replay_fenced", False)
+            )
         )
         # If we do not in main model and in full-graph mode when using merge-eagle-graph,
         # we do not need to synchronize.
@@ -280,6 +287,8 @@ class ACLGraphWrapper:
             )
         ):
             torch.npu.current_stream().synchronize()
+            if staged_piecewise_replay and async_scheduling is True:
+                forward_context.staged_sfa_replay_fenced = True
         entry.aclgraph.replay()
         return entry.output
 
