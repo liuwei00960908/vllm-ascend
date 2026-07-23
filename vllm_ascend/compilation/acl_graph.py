@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Hashable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -55,10 +56,12 @@ class ACLGraphWrapper:
     runtime inputs into that buffers for replay. We assume implementing them
     is done outside of the wrapper. That is because we do not make any
     assumption on the dynamic shape (batch size) of the runtime inputs, as a
-    trade-off for staying orthogonal to compilation logic. Nevertheless,
-    tracing and checking the input addresses to be consistent during replay is
-    guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
+    trade-off for staying orthogonal to compilation logic. Input addresses are
+    recorded for every capture; the wrapper's automatic replay assertion is
+    enabled when VLLM_LOGGING_LEVEL == "DEBUG".
     """
+
+    _all_instances: weakref.WeakSet["ACLGraphWrapper"] = weakref.WeakSet()
 
     def __init__(
         self,
@@ -66,10 +69,15 @@ class ACLGraphWrapper:
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
         cudagraph_options: CUDAGraphOptions | None = None,
+        synchronize_before_replay: bool = True,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
+        # Generic wrappers keep the historical host fence because their input
+        # buffers can be updated by async scheduling. Narrow staged wrappers
+        # may opt out when their same-stream/event ordering is explicit.
+        self.synchronize_before_replay = synchronize_before_replay
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
@@ -80,13 +88,69 @@ class ACLGraphWrapper:
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
         self.graph_pool = current_platform.get_global_graph_pool()
+        self._all_instances.add(self)
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
-        # the entries for different batch descriptors that we need to capture
-        # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        # Staged paths use their full structural key; generic paths keep the
+        # legacy batch descriptor.
+        self.concrete_aclgraph_entries: dict[Hashable, ACLGraphEntry] = {}
+
+    @classmethod
+    def clear_all_graphs(cls) -> None:
+        """Clear captured graphs from all ACLGraphWrapper instances."""
+        for wrapper in list(cls._all_instances):
+            wrapper.clear_graphs()
+
+    def clear_graphs(self) -> None:
+        self.concrete_aclgraph_entries.clear()
+
+    @classmethod
+    def seal_staged_entries(
+        cls,
+        keys: tuple[Hashable, ...],
+        expected_islands: int,
+    ) -> int:
+        """Validate every captured island before live staged admission."""
+        expected = set(keys)
+        if not expected or expected_islands <= 0:
+            raise RuntimeError("staged ACL graph plan is empty")
+        key_type = type(keys[0])
+        wrappers = [
+            wrapper
+            for wrapper in cls._all_instances
+            if any(
+                isinstance(key, key_type)
+                for key in wrapper.concrete_aclgraph_entries
+            )
+        ]
+        if len(wrappers) != expected_islands:
+            raise RuntimeError(
+                "staged ACL graph island count is incomplete: "
+                f"expected={expected_islands}, captured={len(wrappers)}"
+            )
+        for wrapper in wrappers:
+            actual = set(wrapper.concrete_aclgraph_entries)
+            missing = expected - actual
+            unexpected = actual - expected
+            incomplete = tuple(
+                key
+                for key, entry in wrapper.concrete_aclgraph_entries.items()
+                if key in expected
+                and (
+                    entry.aclgraph is None
+                    or entry.input_addresses is None
+                )
+            )
+            if missing or unexpected or incomplete:
+                raise RuntimeError(
+                    "staged ACL graph island is incomplete: "
+                    f"missing={tuple(missing)}, "
+                    f"unexpected={tuple(unexpected)}, "
+                    f"incomplete={incomplete}"
+                )
+        return sum(len(wrapper.concrete_aclgraph_entries) for wrapper in wrappers)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -116,11 +180,14 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+        dispatch_key: Hashable = (
+            getattr(forward_context, "staged_sfa_graph_key", None)
+            or batch_descriptor
+        )
+        if dispatch_key not in self.concrete_aclgraph_entries:
+            self.concrete_aclgraph_entries[dispatch_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[dispatch_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -128,7 +195,7 @@ class ACLGraphWrapper:
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
+                logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, dispatch_key)
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
@@ -189,7 +256,6 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -202,7 +268,11 @@ class ACLGraphWrapper:
             if self.vllm_config.speculative_config
             else False
         )
-        if self.runtime_mode != CUDAGraphMode.FULL or not _EXTRA_CTX.is_draft_model or not use_eagle:
+        if self.synchronize_before_replay and (
+            self.runtime_mode != CUDAGraphMode.FULL
+            or not _EXTRA_CTX.is_draft_model
+            or not use_eagle
+        ):
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
         return entry.output
@@ -273,6 +343,13 @@ def get_graph_params():
 
 
 _draft_graph_params: GraphParams | None = None
+
+
+def reset_graph_params() -> None:
+    """Discard graph parameters owned by a completed profiling lifecycle."""
+    global _graph_params, _draft_graph_params
+    _graph_params = None
+    _draft_graph_params = None
 
 
 def set_draft_graph_params(aclgraph_capture_sizes: list[int]):

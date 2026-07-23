@@ -24,6 +24,7 @@ import functools
 import math
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from threading import Lock
@@ -63,6 +64,69 @@ _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
+_MAX_ACL_GRAPH_ENTRIES = 1800
+_ACL_COMMUNICATION_STREAM_RESERVE = 40
+
+
+class StagedSFARouteAction(str, Enum):
+    STAGED = "staged"
+    SAFE_NATIVE = "safe_native"
+    RECOMPUTE = "recompute"
+    FATAL = "fatal"
+
+
+class StagedSFAConfigReason(str, Enum):
+    DSA_UNBUNDLE = "dsa_unbundle"
+    DSA_TWO_GROUPS = "dsa_two_groups"
+    SHRINK_LATENT = "shrink_latent"
+    CUDAGRAPH_MODE = "cudagraph_mode"
+    MODEL_NOT_MLA = "model_not_mla"
+    INDEX_TOPK_MISSING = "index_topk_missing"
+    CONNECTOR_MISSING = "connector_missing"
+    SPECULATIVE_DECODE = "speculative_decode"
+    LORA = "lora"
+    DATA_PARALLEL = "data_parallel"
+    PIPELINE_PARALLEL = "pipeline_parallel"
+    CONTEXT_PARALLEL = "context_parallel"
+    LEGACY_DSA_OFFLOAD = "legacy_dsa_offload"
+    ADAPTER_CACHE = "adapter_cache"
+    HCCL_AIV = "hccl_aiv"
+
+
+class StagedSFARouteReason(str, Enum):
+    ELIGIBLE = "eligible"
+    NOT_CONFIGURED = "not_configured"
+    RUNTIME_MODE = "runtime_mode"
+    RUNTIME_PARALLELISM = "runtime_parallelism"
+    SPECULATIVE_DECODE = "speculative_decode"
+    LORA = "lora"
+    NOT_DECODE = "not_decode"
+    UBATCH = "ubatch"
+    CASCADE = "cascade"
+    UNSUPPORTED_BATCH = "unsupported_batch"
+    PADDED_BATCH = "padded_batch"
+    NON_Q1 = "non_q1"
+    SHORT_PROMPT = "short_prompt"
+    BATCH_DESCRIPTOR = "batch_descriptor"
+    INVALID_REQUEST_IDS = "invalid_request_ids"
+    DENSE_PREFIX_HIT = "dense_prefix_hit"
+    MIXED_CONNECTOR_LOAD = "mixed_connector_load"
+    MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
+    SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
+    FRONTIER_TOO_SHORT = "frontier_too_short"
+    FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
+    DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class StagedSFARouteDecision:
+    action: StagedSFARouteAction
+    reason: StagedSFARouteReason
+    graph_key: Any = None
+    frontiers: tuple[int, ...] = ()
+
+
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
@@ -453,6 +517,169 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
     vllm_config.compilation_config.post_init_cudagraph_sizes()
 
 
+def staged_sfa_graph_configuration_reasons(
+    vllm_config: VllmConfig,
+) -> tuple[StagedSFAConfigReason, ...]:
+    """Return typed reasons an explicitly requested staged graph is invalid."""
+    from vllm.config import CUDAGraphMode
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    reasons: list[StagedSFAConfigReason] = []
+    if not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE:
+        reasons.append(StagedSFAConfigReason.DSA_UNBUNDLE)
+    if not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
+        reasons.append(StagedSFAConfigReason.DSA_TWO_GROUPS)
+    if envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2:
+        reasons.append(StagedSFAConfigReason.SHRINK_LATENT)
+    if (
+        getattr(
+            getattr(vllm_config, "compilation_config", None),
+            "cudagraph_mode",
+            None,
+        )
+        != CUDAGraphMode.PIECEWISE
+    ):
+        reasons.append(StagedSFAConfigReason.CUDAGRAPH_MODE)
+    if not bool(getattr(model_config, "use_mla", False)):
+        reasons.append(StagedSFAConfigReason.MODEL_NOT_MLA)
+    if hf_text_config is None or not hasattr(hf_text_config, "index_topk"):
+        reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        reasons.append(StagedSFAConfigReason.CONNECTOR_MISSING)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    speculative_method = getattr(speculative_config, "method", "mtp")
+    if (
+        speculative_config is not None
+        and speculative_method is not None
+        and "mtp" not in str(speculative_method).lower()
+    ):
+        reasons.append(StagedSFAConfigReason.SPECULATIVE_DECODE)
+    if getattr(vllm_config, "lora_config", None) is not None:
+        reasons.append(StagedSFAConfigReason.LORA)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    # Internal DP keeps LMCache worker identity TP-local. External launcher
+    # exposes a DP-global rank/world and needs separate ownership qualification.
+    if (
+        isinstance(data_parallel_size, int)
+        and data_parallel_size != 1
+        and getattr(
+            parallel_config,
+            "distributed_executor_backend",
+            None,
+        )
+        == "external_launcher"
+    ):
+        reasons.append(StagedSFAConfigReason.DATA_PARALLEL)
+    pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+    if isinstance(pipeline_parallel_size, int) and pipeline_parallel_size != 1:
+        reasons.append(StagedSFAConfigReason.PIPELINE_PARALLEL)
+    prefill_context_parallel_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+    decode_context_parallel_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+    if any(
+        isinstance(size, int) and size != 1 for size in (prefill_context_parallel_size, decode_context_parallel_size)
+    ):
+        reasons.append(StagedSFAConfigReason.CONTEXT_PARALLEL)
+    if envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD:
+        reasons.append(StagedSFAConfigReason.LEGACY_DSA_OFFLOAD)
+    if envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE:
+        reasons.append(StagedSFAConfigReason.ADAPTER_CACHE)
+    if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
+        reasons.append(StagedSFAConfigReason.HCCL_AIV)
+    return tuple(reasons)
+
+
+_STAGED_SFA_CONFIG_MESSAGES = {
+    StagedSFAConfigReason.DSA_UNBUNDLE: "VLLM_ASCEND_DSA_UNBUNDLE must be 1",
+    StagedSFAConfigReason.DSA_TWO_GROUPS: "VLLM_ASCEND_DSA_TWO_GROUPS must be 1",
+    StagedSFAConfigReason.SHRINK_LATENT: "VLLM_ASCEND_DSA_SHRINK_LATENT must be 2",
+    StagedSFAConfigReason.CUDAGRAPH_MODE: "cudagraph_mode must be PIECEWISE",
+    StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA/SFA",
+    StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must expose index_topk",
+    StagedSFAConfigReason.CONNECTOR_MISSING: "a KV transfer connector must be configured",
+    StagedSFAConfigReason.SPECULATIVE_DECODE: "only fixed-width MTP speculative decoding is supported",
+    StagedSFAConfigReason.LORA: "LoRA is not implemented",
+    StagedSFAConfigReason.DATA_PARALLEL: "external-launcher data parallel staged graphs are not implemented",
+    StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline parallel staged graphs are not implemented",
+    StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallel staged graphs are not implemented",
+    StagedSFAConfigReason.LEGACY_DSA_OFFLOAD: "legacy DSA latent offload is not supported by staged graphs",
+    StagedSFAConfigReason.ADAPTER_CACHE: "the DSA adapter cache is not supported by staged graphs",
+    StagedSFAConfigReason.HCCL_AIV: "HCCL AIV resource accounting is not qualified for staged graphs",
+}
+
+
+def staged_sfa_graph_configuration_errors(
+    vllm_config: VllmConfig,
+) -> tuple[str, ...]:
+    """Render typed staged-SFA configuration reasons for user-facing errors."""
+    return tuple(_STAGED_SFA_CONFIG_MESSAGES[reason] for reason in staged_sfa_graph_configuration_reasons(vllm_config))
+
+
+def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
+    """Whether this config can instantiate the staged SFA graph POC.
+
+    Keep resource budgeting, startup capture, and the attention implementation
+    on one predicate. Merely exporting the experimental flag must not shrink
+    unrelated models' graph-size or KV-cache budgets.
+    """
+    return bool(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH and not staged_sfa_graph_configuration_reasons(vllm_config))
+
+
+def staged_sfa_graph_capture_sizes(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    """Return configured fixed-layout cross-layer token capacities."""
+    if not staged_sfa_graph_configured(vllm_config):
+        return ()
+
+    raw_sizes = str(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES)
+    try:
+        sizes = tuple(sorted({int(value.strip()) for value in raw_sizes.split(",") if value.strip()}))
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must be a comma-separated list of positive integers."
+        ) from exc
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError("VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain positive integers.")
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    speculative_tokens = getattr(
+        speculative_config,
+        "num_speculative_tokens",
+        0,
+    )
+    query_width = 1 + (
+        speculative_tokens if isinstance(speculative_tokens, int) else 0
+    )
+    max_requests = getattr(scheduler_config, "max_num_seqs", None)
+    max_tokens = getattr(
+        scheduler_config,
+        "max_num_batched_tokens",
+        None,
+    )
+    oversized = [
+        size
+        for size in sizes
+        if (
+            isinstance(max_requests, int)
+            and max_requests > 0
+            and size > max_requests
+        )
+        or (
+            isinstance(max_tokens, int)
+            and max_tokens > 0
+            and size * query_width > max_tokens
+        )
+    ]
+    if oversized:
+        raise ValueError(
+            "Staged SFA request capture sizes exceed scheduler capacity "
+            f"for query_width={query_width}: {oversized}."
+        )
+    return tuple(size * query_width for size in sizes)
+
+
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
     # NOTE: Currently, we can only capture 1800 graphs at most,
@@ -461,7 +688,7 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     # as a buffer.
     # Maximum number of graphs that can be captured by ACL Graph
     # TODO: Find out whether we need to solve allreduce function
-    MAX_CAPTURE_SIZE = 1800
+    max_capture_size = _MAX_ACL_GRAPH_ENTRIES
 
     # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
     CP_ADDITIONAL_STREAM_NUM = 100
@@ -503,6 +730,35 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         ]
     )
 
+    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
+    staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
+    if staged_sfa_graph_active:
+        entry_limit = (
+            max_capture_size
+            - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE
+        ) // (1 + num_comm_groups * 2)
+        required_entries = len(staged_sfa_sizes) * resources_per_graph
+        if required_entries > entry_limit:
+            raise ValueError(
+                "Staged SFA capture requires "
+                f"{required_entries} outer graph entries for "
+                f"{len(staged_sfa_sizes)} keys, exceeding the "
+                f"device quota {entry_limit}. Reduce "
+                "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES."
+            )
+        update_cudagraph_capture_sizes(
+            vllm_config,
+            list(staged_sfa_sizes),
+        )
+        logger.info(
+            "Restricted ACL graph batch sizes to cross-layer staged SFA "
+            "keys %s (%d/%d graph entries)",
+            list(staged_sfa_sizes),
+            required_entries,
+            entry_limit,
+        )
+        return
+
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
         # TODO: Find out whether we need to take into account the pp_size
         parallel_factor = (
@@ -516,20 +772,20 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         else:
             # When AIV mode is enabled, the allreduce operator of the dense
             # layer model will occupy additional streams, which are buffered here.
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - parallel_factor * resources_per_graph
+            max_capture_size = max_capture_size - parallel_factor * resources_per_graph
 
         # Calculate maximum supported batch sizes considering model architecture on the A2 Hardware Device
         # Assume the following case:
         # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
         # According to the formula, max_num_batch_sizes = math.floor(1920 / (48 + 1) / 2) = 19
-        max_num_batch_sizes = math.floor(MAX_CAPTURE_SIZE / resources_per_graph / parallel_factor)
+        max_num_batch_sizes = math.floor(max_capture_size / resources_per_graph / parallel_factor)
         logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
     else:
         # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
         if parallel_config.prefill_context_parallel_size > 1:
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
+            max_capture_size -= CP_ADDITIONAL_STREAM_NUM
         if parallel_config.decode_context_parallel_size > 1:
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
+            max_capture_size -= CP_ADDITIONAL_STREAM_NUM
 
         # The above describes an empirical formula applicable to the A2 hardware.
         # Under this configuration, HCCL employs the FFTS+ method for execution unfolding,
@@ -544,7 +800,9 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
         # According to the formula, max_num_batch_sizes = math.floor((1920 - 1 * 40) / (48 + 1) / (1 + 1 * 2)) = 12
         max_num_batch_sizes = math.floor(
-            (MAX_CAPTURE_SIZE - num_comm_groups * 40) / resources_per_graph / (1 + num_comm_groups * 2)
+            (max_capture_size - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE)
+            / resources_per_graph
+            / (1 + num_comm_groups * 2)
         )
         logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
         logger.warning(
@@ -577,8 +835,8 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             ),
         )
     else:
-        # No adjustment needed
-        compilation_config.cudagraph_capture_sizes = original_sizes
+        # No adjustment needed.
+        update_cudagraph_capture_sizes(vllm_config, original_sizes)
         logger.info(
             "No adjustment needed for ACL graph batch sizes: %s model (layers: %d) with %d sizes",
             arch_name,

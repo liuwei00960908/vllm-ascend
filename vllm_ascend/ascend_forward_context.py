@@ -1,5 +1,6 @@
 import math
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -12,6 +13,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import (
     AscendDeviceType,
+    StagedSFARouteDecision,
     enable_sp,
     flashcomm2_enable,
     get_ascend_device_type,
@@ -28,6 +30,83 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+
+
+class StagedSFAQueryProfile(str, Enum):
+    """Structural query layouts that require distinct staged SFA graphs."""
+
+    DECODE_Q1 = "decode_q1"
+    SPEC_FIXED = "spec_fixed"
+
+
+@dataclass(frozen=True)
+class StagedSFAGraphKey:
+    """Shape/topology key for a staged SFA outer-graph plan.
+
+    Actual token/request counts and sequence lengths are dynamic buffer
+    contents. Capacities and query topology are structural and must never
+    collapse onto the same outer graph entry.
+    """
+
+    token_capacity: int
+    request_capacity: int
+    query_profile: StagedSFAQueryProfile
+    max_query_len: int
+
+    def __post_init__(self) -> None:
+        if self.token_capacity <= 0 or self.request_capacity <= 0 or self.max_query_len <= 0:
+            raise ValueError("Staged SFA graph capacities must be positive.")
+        if self.query_profile == StagedSFAQueryProfile.DECODE_Q1:
+            if (
+                self.max_query_len != 1
+                or self.token_capacity != self.request_capacity
+            ):
+                raise ValueError(
+                    "DECODE_Q1 requires equal token/request capacity and "
+                    "max_query_len=1."
+                )
+        elif (
+            self.max_query_len <= 1
+            or self.token_capacity
+            != self.request_capacity * self.max_query_len
+        ):
+            raise ValueError(
+                "SPEC_FIXED requires token_capacity == request_capacity * "
+                "max_query_len with max_query_len > 1."
+            )
+
+    @classmethod
+    def exact_q1(cls, size: int) -> "StagedSFAGraphKey":
+        """Construct an equal token/request-capacity Q=1 key."""
+        return cls(
+            token_capacity=size,
+            request_capacity=size,
+            query_profile=StagedSFAQueryProfile.DECODE_Q1,
+            max_query_len=1,
+        )
+
+    @classmethod
+    def fixed_spec(
+        cls,
+        request_capacity: int,
+        query_width: int,
+    ) -> "StagedSFAGraphKey":
+        """Construct a fixed-width speculative-decode graph key."""
+        if query_width <= 1:
+            raise ValueError("SPEC_FIXED query_width must be greater than one.")
+        return cls(
+            token_capacity=request_capacity * query_width,
+            request_capacity=request_capacity,
+            query_profile=StagedSFAQueryProfile.SPEC_FIXED,
+            max_query_len=query_width,
+        )
+
+    def to_legacy_batch_descriptor(self) -> BatchDescriptor:
+        """Adapt the structural key to normalized PIECEWISE dispatch."""
+        return BatchDescriptor(num_tokens=self.token_capacity)
+
+
+STAGED_SFA_SINGLETON_GRAPH_KEY = StagedSFAGraphKey.exact_q1(1)
 
 
 @contextmanager
@@ -53,6 +132,9 @@ def set_ascend_forward_context(
     mtp_dw_diag_req_ids=None,
     mtp_dw_diag_post_commit_req_ids=None,
     mtp_dw_deep_diag_req_ids=None,
+    staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_route: StagedSFARouteDecision | None = None,
+    staged_sfa_graph_key: StagedSFAGraphKey | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -87,6 +169,12 @@ def set_ascend_forward_context(
                 mtp_dw_diag_post_commit_req_ids
             )
             forward_context.mtp_dw_deep_diag_req_ids = mtp_dw_deep_diag_req_ids
+        # True only for the explicit one-token eager warmup / graph-capture
+        # passes used by the staged SFA proof of concept. Connector generators
+        # and save hooks must not advance during either dummy pass.
+        forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
+        forward_context.staged_sfa_route = staged_sfa_route
+        forward_context.staged_sfa_graph_key = staged_sfa_graph_key
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

@@ -149,8 +149,7 @@ def prepare_sparse_indices(
         fused_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_
     except AttributeError as exc:
         raise RuntimeError(
-            "vllm_ascend_C does not expose npu_dsa_prepare_sparse_indices_; "
-            "rebuild the custom-op extension"
+            "vllm_ascend_C does not expose npu_dsa_prepare_sparse_indices_; rebuild the custom-op extension"
         ) from exc
 
     fused_op(

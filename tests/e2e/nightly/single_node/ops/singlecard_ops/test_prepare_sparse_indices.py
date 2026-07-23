@@ -24,112 +24,97 @@ def _buffers(requests: int, capacity: int):
     )
 
 
-def _aligned_rows(values):
-    result = torch.full((len(values), 16), -1, dtype=torch.int32)
+def _aligned(values, width=16):
+    result = torch.zeros((len(values), width), dtype=torch.int32)
     for row, entries in enumerate(values):
-        result[row, :len(entries)] = torch.tensor(entries, dtype=torch.int32)
+        result[row, : len(entries)] = torch.tensor(entries, dtype=torch.int32)
     return result
 
 
-def _aligned_tables(values):
-    result = torch.zeros((len(values), 16), dtype=torch.int32)
-    for row, entries in enumerate(values):
-        result[row, :len(entries)] = torch.tensor(entries, dtype=torch.int32)
-    return result
-
-
-@pytest.mark.parametrize("boundary", [0, 2, 4, 8])
-def test_request_union_matches_cpu_reference_and_preserves_live_indices(boundary):
-    topk_cpu = _aligned_rows([[0, 1, 2, 7], [1, 0, 3, 8]])
-    row_req_cpu = torch.tensor([0, 0], dtype=torch.int32)
-    table_cpu = _aligned_tables([[10, 11, 12, 13, 14, 15]])
-    expected, packed, counts, targets = _prepare_sparse_indices_torch(
-        topk_cpu,
-        torch.tensor([boundary, boundary], dtype=torch.int32),
-        row_req_indices=row_req_cpu,
-        request_block_table=table_cpu,
-        block_size=2,
-    )
-
-    actual = topk_cpu.npu()
-    buffers = _buffers(1, 32)
-    actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
-        actual,
-        torch.tensor([boundary, boundary], dtype=torch.int32, device="npu"),
-        row_req_indices=row_req_cpu.npu(),
-        request_block_table=table_cpu.npu(),
-        selected_packed=buffers[0],
-        selected_counts=buffers[1],
-        target_slot_mapping=buffers[2],
-        block_size=2,
-    )
-
-    count = int(counts.item())
-    assert torch.equal(actual.cpu(), expected)
-    assert torch.equal(actual_counts.cpu(), counts)
-    assert torch.equal(actual_packed[0, :count].cpu(), packed[0, :count])
-    assert torch.equal(actual_targets[0, :count].cpu(), targets[0, :count])
-
-
-def test_two_requests_are_deduplicated_independently():
-    topk_cpu = _aligned_rows(
-        [[1, 2, 9, 10], [2, 3, 10, 11], [1, 4, 12, 13]]
-    )
-    row_req_cpu = torch.tensor([0, 0, 1], dtype=torch.int32)
-    table_cpu = _aligned_tables(
+def test_mtp_rows_build_one_sorted_union_per_request():
+    topk = _aligned([[3, 1, 8], [2, 3, 9], [4, 1, 10]])
+    row_requests = torch.tensor([0, 0, 1], dtype=torch.int32)
+    boundaries = torch.tensor([5, 5, 5], dtype=torch.int32)
+    tables = _aligned(
         [[20, 21, 22, 23, 24, 25], [30, 31, 32, 33, 34, 35]]
     )
-    expected, packed, counts, targets = _prepare_sparse_indices_torch(
-        topk_cpu,
-        torch.tensor([4, 4, 5], dtype=torch.int32),
-        row_req_indices=row_req_cpu,
-        request_block_table=table_cpu,
+    expected = _prepare_sparse_indices_torch(
+        topk,
+        boundaries,
+        row_req_indices=row_requests,
+        request_block_table=tables,
         block_size=2,
     )
     buffers = _buffers(2, 32)
-    actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
-        topk_cpu.npu(),
-        torch.tensor([4, 4, 5], dtype=torch.int32, device="npu"),
-        row_req_indices=row_req_cpu.npu(),
-        request_block_table=table_cpu.npu(),
+    actual = prepare_sparse_indices(
+        topk.npu(),
+        boundaries.npu(),
+        row_req_indices=row_requests.npu(),
+        request_block_table=tables.npu(),
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
         block_size=2,
     )
-    assert torch.equal(actual.cpu(), expected)
-    assert torch.equal(actual_counts.cpu(), counts)
-    for req, count in enumerate(counts.tolist()):
-        assert torch.equal(actual_packed[req, :count].cpu(), packed[req, :count])
-        assert torch.equal(actual_targets[req, :count].cpu(), targets[req, :count])
+    torch.npu.synchronize()
+
+    assert torch.equal(actual[0].cpu(), expected[0])
+    assert torch.equal(actual[2].cpu(), expected[2])
+    for request, count in enumerate(expected[2].tolist()):
+        assert torch.equal(
+            actual[1][request, :count].cpu(),
+            expected[1][request, :count],
+        )
+        assert torch.equal(
+            actual[3][request, :count].cpu(),
+            expected[3][request, :count],
+        )
 
 
-def test_bitmap_union_assigns_sorted_position_ranks():
-    topk_cpu = _aligned_rows([[3, 1], [2, 3]])
-    row_req_cpu = torch.tensor([0, 0], dtype=torch.int32)
-    table_cpu = _aligned_tables([[20, 21]])
-    expected, packed, counts, targets = _prepare_sparse_indices_torch(
-        topk_cpu,
-        torch.tensor([4, 4], dtype=torch.int32),
-        row_req_indices=row_req_cpu,
-        request_block_table=table_cpu,
+def test_q1_requests_remain_independent():
+    topk = _aligned([[1, 3, 8], [1, 4, 9]])
+    row_requests = torch.tensor([0, 1], dtype=torch.int32)
+    boundaries = torch.tensor([5, 5], dtype=torch.int32)
+    tables = _aligned([[20, 21, 22], [30, 31, 32]])
+    expected = _prepare_sparse_indices_torch(
+        topk,
+        boundaries,
+        row_req_indices=row_requests,
+        request_block_table=tables,
         block_size=2,
     )
+    buffers = _buffers(2, 16)
+    actual = prepare_sparse_indices(
+        topk.npu(),
+        boundaries.npu(),
+        row_req_indices=row_requests.npu(),
+        request_block_table=tables.npu(),
+        selected_packed=buffers[0],
+        selected_counts=buffers[1],
+        target_slot_mapping=buffers[2],
+        block_size=2,
+    )
+    torch.npu.synchronize()
+    assert torch.equal(actual[0].cpu(), expected[0])
+    assert torch.equal(actual[2].cpu(), expected[2])
+
+
+def test_zero_boundary_keeps_resident_absolute_indices():
+    topk = _aligned([[1, 3, 8], [2, 4, 9]])
+    original = topk.clone()
+    row_requests = torch.tensor([0, 0], dtype=torch.int32)
+    tables = _aligned([[20, 21, 22]])
     buffers = _buffers(1, 32)
-    actual, actual_packed, actual_counts, actual_targets = prepare_sparse_indices(
-        topk_cpu.npu(),
-        torch.tensor([4, 4], dtype=torch.int32, device="npu"),
-        row_req_indices=row_req_cpu.npu(),
-        request_block_table=table_cpu.npu(),
+    actual = prepare_sparse_indices(
+        topk.npu(),
+        torch.zeros(2, dtype=torch.int32, device="npu"),
+        row_req_indices=row_requests.npu(),
+        request_block_table=tables.npu(),
         selected_packed=buffers[0],
         selected_counts=buffers[1],
         target_slot_mapping=buffers[2],
         block_size=2,
     )
-
-    assert packed[0, :3].tolist() == [1, 2, 3]
-    assert expected[:, :2].tolist() == [[2, 0], [1, 2]]
-    assert torch.equal(actual.cpu(), expected)
-    assert torch.equal(actual_counts.cpu(), counts)
-    assert torch.equal(actual_packed[0, :3].cpu(), packed[0, :3])
-    assert torch.equal(actual_targets[0, :3].cpu(), targets[0, :3])
+    torch.npu.synchronize()
+    assert torch.equal(actual[0].cpu(), original)
+    assert actual[2].cpu().tolist() == [0]

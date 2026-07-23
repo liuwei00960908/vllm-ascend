@@ -111,53 +111,39 @@ env_variables: dict[str, Callable[[], Any]] = {
     # latent KV is offloaded to LMCache and only the indexer-selected top-k tokens
     # are gathered back per decode step, while the indexer-key cache stays resident.
     # Only effective for DSA / sparse-attention (SFA backend) models. Default off.
-    "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))
-    ),
+    "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))),
     # DSA latent offload staging gate (bring-up). 0 (Stage 1/2): keep the paged latent
     # write so the offload path can be compared against native sparse attention.
     # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode
     # store) to actually free NPU memory. Default 0. Only effective with the offload
     # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/INTEGRATION.md).
-    "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))
-    ),
+    "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))),
     # DSA latent offload parity check (bring-up). When 1, the SFA decode path runs both
     # the scratch-gather and the native paged sparse attention and logs/asserts their
     # outputs match. Use during Step 2 of bring-up; disable in production (it doubles
     # the attention cost). Default 0.
-    "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))
-    ),
+    "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))),
     # DSA un-bundle (proper route P1). When 1, the SFA KV cache is split into TWO
     # vLLM-managed KV cache groups: the MLA latent (k_nope+k_pe) and the indexer key,
     # instead of the bundled 3-tuple. This is the prerequisite for freeing the latent
     # blocks after prefill (P2) in a graph-compatible way. Default 0 (bundled path).
-    "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))
-    ),
+    "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))),
     # DSA Step A: latent and indexer become two REAL KV cache groups with separate
     # block tables and per-group block pools (the vLLM fork gates its side on the
     # same variable, read as a raw env there). Requires VLLM_ASCEND_DSA_UNBUNDLE=1
     # and --no-enable-prefix-caching. Prerequisite for freeing latent blocks at
     # end of prefill (DSA latent offload P2). Default 0.
-    "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))
-    ),
+    "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))),
     # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
     # vLLM owns one physical bundle allocator while exposing two logical block
     # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent
     # and indexer layers with one raw tensor laid out as
     # [all k_nope pages][all k_pe pages].
-    "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))
-    ),
+    "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))),
     # Debug/compat switch: disable DSA indexer LMCache/index-offload hooks.
     # When enabled, unbundled indexer 1-tuple caches stay resident and are not
     # registered with LMCache connectors that cannot permute 1-tuple KV entries.
-    "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0"))
-    ),
+    "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0"))),
     # DSA Step B staging. Requires TWO_GROUPS=1 + the LMCache connector.
     # 1 (B2): decode reads prefill-selected latent from the compact scratch
     #   (request's first ceil(k/block_size) latent blocks, filled by LMCache);
@@ -165,44 +151,43 @@ env_variables: dict[str, Callable[[], Any]] = {
     #   blocks are NOT freed yet — outputs must match the resident path.
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
-    "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
+    "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
+    # decode is captured across layers, with selective LMCache retrieval as
+    # the eager split operation.
+    # Unsupported live batch shapes keep using the existing eager SFA forward;
+    # incompatible model/runtime features fail fast during startup capture so
+    # an explicitly requested POC cannot silently remain inactive.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
+    # capacity. Defaults to singleton capture; not sensitive.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
+        "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
+        "1",
     ),
     # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
     # default from max_num_seqs. The pool holds prefill latent during prefill (freed
     # after) + decode latent, sized far below full-context. Tune up for long prompts.
-    "VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS", "0")
-    ),
+    "VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS", "0")),
     # Storage device for the in-memory reference offload backend (the LMCache stand-in
     # used until the real adapter lands). "npu" keeps latent in device memory (no
     # memory relief, correctness-only); "cpu" stages latent in host RAM, simulating
     # an off-NPU LMCache — pair with Stage 2 to actually free NPU memory. Default npu.
-    "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": lambda: os.getenv(
-        "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "npu"
-    ),
+    "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": lambda: os.getenv("VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "npu"),
     # Adapter-backed DSA latent hot cache (bring-up; default OFF). When on, decode
     # retrieves selected latent from an on-NPU pool (KVCacheAdapter) read in place by
     # the sparse-attn kernel, instead of the scratch-gather offload-manager path.
-    "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", "0"))
-    ),
+    "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", "0"))),
     # Adapter pool headroom over the per-step working set (>=1; larger -> more
     # cross-step reuse and more NPU memory). See adapter_cache.py sizing notes.
-    "VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO": lambda: float(
-        os.getenv("VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO", "1.5")
-    ),
+    "VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO": lambda: float(os.getenv("VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO", "1.5")),
     # Concurrency the adapter pool is sized for without thrash (0 -> max_num_seqs).
-    "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(
-        os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")
-    ),
+    "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")),
     # Back the adapter latent pool with LMCache (host KV store) instead of the
     # in-memory reference backend. Default OFF: the in-memory backend keeps the CPU
     # parity path and a no-LMCache A/B baseline. On -> evicted pool blocks spill to
     # LMCache and misses reload from it (see adapter_cache.build_adapter_cache).
-    "VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND", "0"))
-    ),
+    "VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND", "0"))),
     # DSA/LMCache trace logging. Default OFF because tensor summaries can force
     # NPU->CPU synchronization on the decode hot path.
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
@@ -223,9 +208,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.
-    "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(
-        os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")
-    ),
+    "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
 }
 
 # end-env-vars-definition

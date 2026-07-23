@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+
+import subprocess
+import sys
+import urllib.error
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tools import staged_sfa_graph_smoke as smoke
+
+
+class _StreamingResponse:
+    def __init__(self, chunks: int):
+        event = b'data: {"choices": [{"text": "token"}]}\n'
+        self._lines = [event] * chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def _decode_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        base_url="http://127.0.0.1:9000",
+        model="model",
+        prompt_words=1,
+        max_tokens=4,
+        request_timeout=5,
+        skip_profile=False,
+        profile_after_chunks=1,
+        profile_chunks=1,
+        profile_control_timeout=5,
+    )
+
+
+def test_stop_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _StreamingResponse(chunks=2),
+    )
+    actions = []
+
+    def profile_control(base_url, action, timeout):
+        actions.append(action)
+        if action == "stop":
+            raise urllib.error.URLError("response lost")
+
+    monkeypatch.setattr(smoke, "profile_control", profile_control)
+
+    with pytest.raises(urllib.error.URLError, match="response lost"):
+        smoke.run_streaming_decode(_decode_args())
+
+    assert actions == ["start", "stop"]
+
+
+def test_start_failure_still_gets_one_cleanup_stop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _StreamingResponse(chunks=1),
+    )
+    actions = []
+
+    def profile_control(base_url, action, timeout):
+        actions.append(action)
+        if action == "start":
+            raise urllib.error.URLError("response lost")
+
+    monkeypatch.setattr(smoke, "profile_control", profile_control)
+
+    with pytest.raises(urllib.error.URLError, match="response lost"):
+        smoke.run_streaming_decode(_decode_args())
+
+    assert actions == ["start", "stop"]
+
+
+def test_concurrent_decode_starts_two_distinct_equal_length_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    args = _decode_args()
+    args.concurrency = 2
+    args.skip_profile = True
+    prompts = []
+
+    def urlopen(request, **kwargs):
+        prompts.append(smoke.json.loads(request.data)["prompt"])
+        return _StreamingResponse(chunks=2)
+
+    monkeypatch.setattr(smoke.urllib.request, "urlopen", urlopen)
+
+    assert smoke.run_streaming_decodes(args) == [2, 2]
+    assert len(set(prompts)) == 2
+    assert {len(prompt.split()) for prompt in prompts} == {args.prompt_words}
+
+
+def test_concurrent_profile_has_one_controller(monkeypatch: pytest.MonkeyPatch):
+    args = _decode_args()
+    args.concurrency = 2
+    progress = {}
+    snapshots = []
+
+    class Response(_StreamingResponse):
+        def __init__(self, prompt):
+            super().__init__(chunks=2)
+            self.prompt = prompt
+
+        def __iter__(self):
+            for chunk, line in enumerate(self._lines, start=1):
+                progress[self.prompt] = chunk
+                yield line
+
+    def urlopen(request, **kwargs):
+        prompt = smoke.json.loads(request.data)["prompt"]
+        return Response(prompt)
+
+    def profile_control(base_url, action, timeout):
+        snapshots.append((action, sorted(progress.values())))
+
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        urlopen,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "profile_control",
+        profile_control,
+    )
+
+    assert smoke.run_streaming_decodes(args) == [2, 2]
+    assert snapshots == [("start", [1, 1]), ("stop", [2, 2])]
+
+
+def test_concurrent_profile_start_failure_has_one_cleanup_stop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    args = _decode_args()
+    args.concurrency = 2
+    actions = []
+
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _StreamingResponse(chunks=2),
+    )
+
+    def profile_control(base_url, action, timeout):
+        actions.append(action)
+        if action == "start":
+            raise urllib.error.URLError("response lost")
+
+    monkeypatch.setattr(smoke, "profile_control", profile_control)
+
+    with pytest.raises((urllib.error.URLError, smoke.SmokeFailure)):
+        smoke.run_streaming_decodes(args)
+
+    assert actions == ["start", "stop"]
+
+
+def test_offline_analysis_runs_in_bounded_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr(smoke.subprocess, "run", run)
+    profile_dir = Path("/profiles/tp8")
+
+    smoke.analyse_profile_data(profile_dir, expected_ranks=8, timeout=17)
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[0] == sys.executable
+    assert command[1] == "-c"
+    assert "torch_npu.profiler.profiler import analyse" in command[2]
+    assert command[3:] == [str(profile_dir), "8"]
+    assert "max_process_number=int(sys.argv[2])" in command[2]
+    assert kwargs == {"check": True, "timeout": 17}
+
+
+def test_offline_analysis_timeout_is_a_smoke_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(smoke.subprocess, "run", run)
+
+    with pytest.raises(smoke.SmokeFailure, match="did not finish within 3s"):
+        smoke.analyse_profile_data(Path("/profiles/tp8"), expected_ranks=8, timeout=3)
+
+
+def test_frontend_profiler_is_rejected_before_collection(tmp_path: Path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "Torch profiler enabled. AsyncLLM CPU traces will be collected under /profiles\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="ignore_frontend=true"):
+        smoke.require_worker_only_profiling(server_log)
+
+
+def _write_server_log(tmp_path: Path, *, expected_keys: int):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        smoke._STARTUP_CROSS_LAYER_COMPLETE + f" for 2 local SFA layers and {expected_keys} keys",
+        encoding="utf-8",
+    )
+    return server_log
+
+
+def test_server_log_accepts_cross_layer_capture(tmp_path: Path):
+    server_log = _write_server_log(
+        tmp_path,
+        expected_keys=1,
+    )
+
+    assert smoke.check_server_log(server_log) == 2
+
+
+def test_server_log_requires_configured_key_count(tmp_path: Path):
+    server_log = _write_server_log(tmp_path, expected_keys=2)
+
+    with pytest.raises(smoke.SmokeFailure, match="captured 2.*expected 3"):
+        smoke.check_server_log(server_log, required_keys=3)
+
+
+def test_server_log_rejects_cross_layer_capture_failure(tmp_path: Path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "[SFA cross-layer graph] no local SFA layers were captured",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        smoke.SmokeFailure,
+        match="no local SFA layers",
+    ):
+        smoke.check_server_log(server_log)
+
+
+def test_trace_rejects_legacy_per_layer_graph_ranges(tmp_path: Path):
+    trace = tmp_path / "trace_view.json"
+    trace.write_text(
+        " ".join(smoke._TRACE_MARKERS + (smoke._ACL_REPLAY_APIS[0], smoke._LEGACY_GRAPH_MARKERS[0])),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="legacy per-layer graph ranges"):
+        smoke.check_traces([trace], expected_ranks=1)

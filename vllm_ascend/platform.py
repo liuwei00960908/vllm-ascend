@@ -44,6 +44,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     is_moe_model,
     refresh_block_size,
+    staged_sfa_graph_configured,
     update_aclgraph_sizes,
     update_cudagraph_capture_sizes,
     is_310p,
@@ -372,18 +373,19 @@ class NPUPlatform(Platform):
                 "When enabling VLLM_COMPILE aclgraph, please make sure compilation_config.mode == "
                 "CompilationMode.VLLM_COMPILE and compilation_config.cudagraph_mode == CUDAGraphMode.VLLM_COMPILE"
             )
+            cross_layer_sfa = staged_sfa_graph_configured(vllm_config)
+            if cross_layer_sfa:
+                # Keep retrieve as an eager FX subgraph so its neighboring
+                # regions become cross-layer ACL graphs.
+                compilation_config.use_inductor_graph_partition = False
             compilation_config.set_splitting_ops_for_v1(
                 all2all_backend=vllm_config.parallel_config.all2all_backend,
                 data_parallel_size=vllm_config.parallel_config.data_parallel_size,
             )
             compilation_config.use_inductor = False
-            # NOTE: Theoretically, we should also add vllm::mla_forward in the attention ops.
-            # Since the process is created in the spawn mode, the value of the class attribute
-            # attention ops transmitted is still the one before modification, so it has not been modified.
-            # This will cause in scenarios where both piecewise and splitting ops are configured simultaneously,
-            # If splitting ops does not contain the vllm::mla forward value, this configuration issue will
-            # not be detected in advance assert.
-            compilation_config.splitting_ops.extend(["vllm::mla_forward"])
+            mla_split_op = "vllm::sfa_lmcache_retrieve" if cross_layer_sfa else "vllm::mla_forward"
+            if mla_split_op not in compilation_config.splitting_ops:
+                compilation_config.splitting_ops.append(mla_split_op)
             update_aclgraph_sizes(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         elif (
