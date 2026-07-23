@@ -205,6 +205,70 @@ class TestACLGraphWrapper(TestBase):
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_only_synchronous_staged_replay_skips_host_synchronization(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        self.mock_vllm_config.speculative_config = None
+        staged_key = StagedSFAGraphKey.exact_q1(1)
+
+        for name, graph_key, async_scheduling, expect_sync in (
+            ("staged_sync", staged_key, False, False),
+            ("staged_async", staged_key, True, True),
+            ("staged_unresolved", staged_key, None, True),
+            ("generic_sync", None, False, True),
+        ):
+            with self.subTest(name=name):
+                self.mock_vllm_config.scheduler_config.async_scheduling = (
+                    async_scheduling
+                )
+                wrapper = ACLGraphWrapper(
+                    runnable=self.mock_runnable,
+                    vllm_config=self.mock_vllm_config,
+                    runtime_mode=CUDAGraphMode.PIECEWISE,
+                    cudagraph_options=self.mock_cudagraph_options,
+                )
+                dispatch_key = graph_key or self.mock_batch_descriptor
+                graph = MagicMock()
+                captured_output = object()
+                wrapper.concrete_aclgraph_entries[dispatch_key] = ACLGraphEntry(
+                    batch_descriptor=self.mock_batch_descriptor,
+                    aclgraph=graph,
+                    output=captured_output,
+                )
+                self.mock_forward_context.cudagraph_runtime_mode = (
+                    CUDAGraphMode.PIECEWISE
+                )
+                self.mock_forward_context.staged_sfa_graph_key = graph_key
+                stream = MagicMock()
+
+                with (
+                    patch(
+                        'vllm_ascend.compilation.acl_graph.get_forward_context',
+                        return_value=self.mock_forward_context,
+                    ),
+                    patch.object(
+                        torch.npu,
+                        'current_stream',
+                        return_value=stream,
+                    ),
+                ):
+                    result = wrapper()
+
+                self.assertIs(result, captured_output)
+                if expect_sync:
+                    stream.synchronize.assert_called_once_with()
+                else:
+                    stream.synchronize.assert_not_called()
+                graph.replay.assert_called_once_with()
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
     def test_staged_structural_keys_do_not_alias(
         self,
         mock_envs,

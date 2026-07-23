@@ -180,10 +180,8 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        dispatch_key: Hashable = (
-            getattr(forward_context, "staged_sfa_graph_key", None)
-            or batch_descriptor
-        )
+        staged_graph_key = getattr(forward_context, "staged_sfa_graph_key", None)
+        dispatch_key: Hashable = staged_graph_key or batch_descriptor
         if dispatch_key not in self.concrete_aclgraph_entries:
             self.concrete_aclgraph_entries[dispatch_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
@@ -256,11 +254,15 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        # In async scheduling or multi-threaded (MT) scenarios, it is possible that
-        # the CPU's record event (from update_attn_params) for the iteration i completes
-        # before the grph replay of iteration i-1.
-        # To ensure proper ordering, we must call synchronize here before replaying,
-        # so that update_attn_params only executes after the previous graph replay has fully completed.
+        # In async scheduling or multi-threaded (MT) scenarios, input updates
+        # for iteration i can race with graph replay for iteration i-1.
+        # Synchronous staged PIECEWISE replay instead uses one in-flight step
+        # and explicit stream/event ordering around each LMCache split.
+        stream_ordered_staged_replay = (
+            staged_graph_key is not None
+            and self.runtime_mode == CUDAGraphMode.PIECEWISE
+            and self.vllm_config.scheduler_config.async_scheduling is False
+        )
         # If we do not in main model and in full-graph mode when using merge-eagle-graph,
         # we do not need to synchronize.
         use_eagle = (
@@ -268,10 +270,14 @@ class ACLGraphWrapper:
             if self.vllm_config.speculative_config
             else False
         )
-        if self.synchronize_before_replay and (
-            self.runtime_mode != CUDAGraphMode.FULL
-            or not _EXTRA_CTX.is_draft_model
-            or not use_eagle
+        if (
+            self.synchronize_before_replay
+            and not stream_ordered_staged_replay
+            and (
+                self.runtime_mode != CUDAGraphMode.FULL
+                or not _EXTRA_CTX.is_draft_model
+                or not use_eagle
+            )
         ):
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
