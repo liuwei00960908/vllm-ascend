@@ -277,6 +277,16 @@ def _mla_runtime_state(layer_name: str):
     return layer.mla_attn.impl, layer.mla_attn.layer_name, layer.mla_attn.kv_cache[virtual_engine], attn_metadata
 
 
+StagedSFABridge = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
 def sfa_forward_pre(
     hidden_states: torch.Tensor,
     need_gather_q_kv: bool,
@@ -289,17 +299,15 @@ def sfa_forward_pre(
     token_capacity: int,
     request_capacity: int,
     scratch_capacity: int,
-) -> list[torch.Tensor]:
+) -> StagedSFABridge:
     impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
-    return list(
-        impl.cross_layer_graph_pre(
-            attn_layer_name,
-            hidden_states,
-            kv_cache,
-            attn_metadata,
-            need_gather_q_kv,
-            output,
-        )
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
     )
 
 
@@ -315,8 +323,8 @@ def sfa_forward_pre_fake(
     token_capacity: int,
     request_capacity: int,
     scratch_capacity: int,
-) -> list[torch.Tensor]:
-    return [
+) -> StagedSFABridge:
+    return (
         hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
         hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
         torch.empty(
@@ -339,7 +347,7 @@ def sfa_forward_pre_fake(
             dtype=torch.long,
             device=hidden_states.device,
         ),
-    ]
+    )
 
 
 def sfa_lmcache_retrieve(

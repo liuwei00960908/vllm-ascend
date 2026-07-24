@@ -60,7 +60,8 @@ class TestIndexerWrapper(TestBase):
             32,
         )
 
-        self.assertIsInstance(outputs, list)
+        self.assertIsInstance(outputs, tuple)
+        self.assertEqual(len(outputs), 6)
         self.assertEqual(
             [tuple(output.shape) for output in outputs],
             [
