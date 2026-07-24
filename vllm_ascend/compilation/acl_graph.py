@@ -188,21 +188,6 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[dispatch_key]
 
         if entry.aclgraph is None:
-            logger.info(
-                "[SFA_CAPTURE_DIAG] island_capture_begin wrapper=%s "
-                "runtime_mode=%s staged_graph_key=%r dispatch_key=%r "
-                "batch_descriptor=%r tensor_inputs=%s",
-                type(self.runnable).__name__,
-                aclgraph_runtime_mode.name,
-                staged_graph_key,
-                dispatch_key,
-                batch_descriptor,
-                tuple(
-                    (tuple(value.shape), value.data_ptr())
-                    for value in args
-                    if isinstance(value, torch.Tensor)
-                ),
-            )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -252,13 +237,6 @@ class ACLGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.aclgraph = aclgraph
-            logger.info(
-                "[SFA_CAPTURE_DIAG] island_capture_done wrapper=%s "
-                "staged_graph_key=%r dispatch_key=%r",
-                type(self.runnable).__name__,
-                staged_graph_key,
-                dispatch_key,
-            )
 
             compilation_counter.num_cudagraph_captured += 1
 

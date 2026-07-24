@@ -2811,67 +2811,28 @@ class NPUModelRunner(GPUModelRunner):
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
-        common_fields = (
-            f"mode={cudagraph_runtime_mode.name} allow_eager={allow_eager} "
-            f"is_profile={is_profile} active_loras={num_active_loras} "
-            f"dp_route={getattr(dp_route_action, 'value', dp_route_action)} "
-            f"query_width={query_width} unpadded={num_tokens_unpadded} "
-            f"padded={num_tokens_padded} num_reqs={num_reqs} "
-            f"scheduled={np.asarray(num_scheduled_tokens).reshape(-1).tolist()} "
-            f"batch_descriptor={batch_descriptor!r} "
-            f"capture_sizes={self._staged_sfa_graph_capture_sizes}"
-        )
-        rejection = None
-        if not self._staged_sfa_graph_capture_sizes:
-            rejection = "no_capture_sizes"
-        elif is_profile:
-            rejection = "profile_run"
-        elif cudagraph_runtime_mode not in (
-            CUDAGraphMode.NONE,
-            CUDAGraphMode.PIECEWISE,
+        if (
+            not self._staged_sfa_graph_capture_sizes
+            or is_profile
+            or cudagraph_runtime_mode
+            not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
+            or (
+                cudagraph_runtime_mode == CUDAGraphMode.NONE
+                and not allow_eager
+            )
+            or num_active_loras != 0
+            or dp_route_action != StagedSFARouteAction.STAGED
         ):
-            rejection = "runtime_mode"
-        elif (
-            cudagraph_runtime_mode == CUDAGraphMode.NONE
-            and not allow_eager
-        ):
-            rejection = "eager_not_authorized"
-        elif num_active_loras != 0:
-            rejection = "active_lora"
-        elif dp_route_action != StagedSFARouteAction.STAGED:
-            rejection = "dp_route_not_staged"
-        if rejection is not None:
-            if dp_route_action == StagedSFARouteAction.STAGED:
-                logger.info(
-                    "[SFA_CAPTURE_DIAG] dummy_admission accepted=False "
-                    "reason=%s %s",
-                    rejection,
-                    common_fields,
-                )
             return None
 
         batch_size = int(num_tokens_padded)
-        expected_descriptor = BatchDescriptor(num_tokens=batch_size)
-        if batch_size not in self._staged_sfa_graph_capture_sizes:
-            rejection = "padded_size_not_configured"
-        elif batch_descriptor != expected_descriptor:
-            rejection = (
-                "batch_descriptor_mismatch "
-                f"expected={expected_descriptor!r}"
-            )
-        elif num_tokens_unpadded <= 0:
-            rejection = "empty_batch"
-        elif num_tokens_unpadded != num_reqs * query_width:
-            rejection = "unpadded_tokens_not_fixed_width"
-        elif num_reqs * query_width > batch_size:
-            rejection = "request_width_exceeds_padding"
-        if rejection is not None:
-            logger.info(
-                "[SFA_CAPTURE_DIAG] dummy_admission accepted=False "
-                "reason=%s %s",
-                rejection,
-                common_fields,
-            )
+        if (
+            batch_size not in self._staged_sfa_graph_capture_sizes
+            or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
+            or num_tokens_unpadded <= 0
+            or num_tokens_unpadded != num_reqs * query_width
+            or num_reqs * query_width > batch_size
+        ):
             return None
 
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
@@ -2879,19 +2840,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduled.shape != (num_reqs,)
             or not np.all(scheduled == query_width)
         ):
-            logger.info(
-                "[SFA_CAPTURE_DIAG] dummy_admission accepted=False "
-                "reason=scheduled_width_mismatch %s",
-                common_fields,
-            )
             return None
-        logger.info(
-            "[SFA_CAPTURE_DIAG] dummy_admission accepted=True "
-            "token_capacity=%d request_capacity=%d %s",
-            batch_size,
-            num_reqs,
-            common_fields,
-        )
         return batch_size
 
     def _staged_sfa_local_route(
@@ -3396,17 +3345,6 @@ class NPUModelRunner(GPUModelRunner):
             dp_route_action=dp_route_action,
         )
         staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
-        if dummy_route_action is not None:
-            logger.info(
-                "[SFA_CAPTURE_DIAG] dummy_context_candidate "
-                "route=%s admitted=%s token_capacity=%s mode_before_fallback=%s "
-                "batch_descriptor=%r",
-                dummy_route_action.value,
-                staged_sfa_graph_dummy_run,
-                staged_sfa_dummy_batch_size,
-                cudagraph_runtime_mode.name,
-                batch_desc,
-            )
         if (
             dummy_route_action is not None
             and not staged_sfa_graph_dummy_run
@@ -3605,18 +3543,6 @@ class NPUModelRunner(GPUModelRunner):
                         staged_sfa_dummy_batch_size // self.decode_threshold,
                         self.decode_threshold,
                     )
-                )
-            if dummy_route_action is not None:
-                logger.info(
-                    "[SFA_CAPTURE_DIAG] forward_context_install "
-                    "dummy=%s graph_key=%r mode=%s attn_state=%s "
-                    "token_rows=%d request_rows=%d",
-                    staged_sfa_graph_dummy_run,
-                    staged_dummy_key,
-                    cudagraph_runtime_mode.name,
-                    self.attn_state,
-                    num_tokens_padded,
-                    num_reqs_padded,
                 )
             with set_ascend_forward_context(
                 attn_metadata,
@@ -4834,18 +4760,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def _reset_staged_sfa_startup_capture(self) -> None:
         """Discard staged state before the one real startup capture."""
-        collected = self._collect_staged_sfa_impls()
-        logger.info(
-            "[SFA_CAPTURE_DIAG] startup_capture_reset layers=%s "
-            "cached_runner_impls=%s",
-            tuple(name for name, _ in collected),
-            tuple(
-                name
-                for name, _ in getattr(self, "_staged_sfa_impls", ())
-            ),
-        )
         self._staged_sfa_impls = ()
-        for _layer_name, impl in collected:
+        for _layer_name, impl in self._collect_staged_sfa_impls():
             impl.reset_staged_sfa_capture()
 
 
@@ -4913,14 +4829,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 )
                 for size in capture_sizes
-            )
-            logger.info(
-                "[SFA_CAPTURE_DIAG] capture_seal_begin query_width=%d "
-                "capture_sizes=%s graph_keys=%s layers=%s",
-                query_width,
-                capture_sizes,
-                graph_keys,
-                tuple(name for name, _ in self._staged_sfa_impls),
             )
             for layer_name, impl in self._staged_sfa_impls:
                 try:
