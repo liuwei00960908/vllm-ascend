@@ -4762,16 +4762,41 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "[SFA cross-layer graph] no local SFA layers were captured"
                 )
+            query_width = 1 + int(
+                getattr(
+                    self.vllm_config.speculative_config,
+                    "num_speculative_tokens",
+                    0,
+                )
+            )
+            runtime_query_width = int(
+                getattr(self, "decode_threshold", query_width)
+            )
+            if runtime_query_width != query_width:
+                raise RuntimeError(
+                    "[SFA cross-layer graph] configured and runtime query "
+                    "widths differ: "
+                    f"configured={query_width}, runtime={runtime_query_width}"
+                )
+            capture_sizes = staged_sfa_graph_capture_sizes(self.vllm_config)
+            if query_width > 1 and any(
+                size % query_width for size in capture_sizes
+            ):
+                raise RuntimeError(
+                    "[SFA cross-layer graph] fixed-width MTP capture sizes "
+                    f"must be divisible by query_width={query_width}: "
+                    f"sizes={capture_sizes}"
+                )
             graph_keys = tuple(
                 (
                     StagedSFAGraphKey.exact_q1(size)
-                    if self.decode_threshold == 1
+                    if query_width == 1
                     else StagedSFAGraphKey.fixed_spec(
-                        size // self.decode_threshold,
-                        self.decode_threshold,
+                        size // query_width,
+                        query_width,
                     )
                 )
-                for size in staged_sfa_graph_capture_sizes(self.vllm_config)
+                for size in capture_sizes
             )
             for layer_name, impl in self._staged_sfa_impls:
                 try:
