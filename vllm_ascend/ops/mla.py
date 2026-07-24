@@ -289,15 +289,17 @@ def sfa_forward_pre(
     token_capacity: int,
     request_capacity: int,
     scratch_capacity: int,
-) -> tuple[torch.Tensor, ...]:
+) -> list[torch.Tensor]:
     impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
-    return impl.cross_layer_graph_pre(
-        attn_layer_name,
-        hidden_states,
-        kv_cache,
-        attn_metadata,
-        need_gather_q_kv,
-        output,
+    return list(
+        impl.cross_layer_graph_pre(
+            attn_layer_name,
+            hidden_states,
+            kv_cache,
+            attn_metadata,
+            need_gather_q_kv,
+            output,
+        )
     )
 
 
@@ -313,8 +315,8 @@ def sfa_forward_pre_fake(
     token_capacity: int,
     request_capacity: int,
     scratch_capacity: int,
-) -> tuple[torch.Tensor, ...]:
-    return (
+) -> list[torch.Tensor]:
+    return [
         hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
         hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
         torch.empty(
@@ -337,7 +339,7 @@ def sfa_forward_pre_fake(
             dtype=torch.long,
             device=hidden_states.device,
         ),
-    )
+    ]
 
 
 def sfa_lmcache_retrieve(
