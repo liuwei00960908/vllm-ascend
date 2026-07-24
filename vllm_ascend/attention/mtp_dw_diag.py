@@ -20,6 +20,27 @@ def diagnostic_values_to_list(
     return list(values)
 
 
+def scheduled_decode_requests(
+    request_ids: Iterable[Any],
+    scheduled_request_ids: Iterable[str],
+    num_computed_tokens: Iterable[int],
+    num_prompt_tokens: Iterable[int],
+) -> list[tuple[int, str]]:
+    """Return input-batch rows that are scheduled for decode in this step."""
+    scheduled = set(scheduled_request_ids)
+    computed = list(num_computed_tokens)
+    prompt = list(num_prompt_tokens)
+    result: list[tuple[int, str]] = []
+    for request_index, raw_request_id in enumerate(request_ids):
+        request_id = str(raw_request_id)
+        if request_id not in scheduled:
+            continue
+        if int(computed[request_index]) < int(prompt[request_index]):
+            continue
+        result.append((request_index, request_id))
+    return result
+
+
 def diagnostic_int_checksum(values: Iterable[int]) -> int:
     """Match LMCache-Ascend's stable checksum over the first 32 integers."""
     prefix = list(islice(values, _CHECKSUM_LIMIT))

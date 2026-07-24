@@ -316,6 +316,38 @@ def _update_dsa_split_boundary_in_place(
     return split_boundary
 
 
+def _resolve_sparse_cached_tokens_by_request(
+    attn_metadata: Any,
+    request_ids: Any,
+) -> list[int]:
+    """Resolve strict connector frontiers in the native request order."""
+    row_req_indices = attn_metadata.decode_req_indices_cpu
+    if row_req_indices is None:
+        raise RuntimeError("[SFA sparse remap] row/request mapping is unavailable.")
+    decode_request_indices = sorted(
+        {
+            int(request_index)
+            for request_index in row_req_indices
+            if int(request_index) >= 0
+        }
+    )
+    request_ids = list(request_ids) if request_ids is not None else []
+    if decode_request_indices and decode_request_indices[-1] >= len(request_ids):
+        raise RuntimeError(
+            "[SFA sparse remap] active request IDs do not cover all decode rows."
+        )
+    decode_request_ids = [
+        request_ids[request_index] for request_index in decode_request_indices
+    ]
+    resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
+    cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
+    for request_index, committed_end in zip(
+        decode_request_indices, resolved, strict=True
+    ):
+        cached_tokens[request_index] = int(committed_end)
+    return cached_tokens
+
+
 def _prepare_sfa_remap_boundary(
     attn_metadata: Any,
     request_ids: Any,
@@ -3104,8 +3136,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             ):
                 _split_boundary = _cached_split_boundary
             else:
-                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
-                    getattr(get_forward_context(), "dsa_req_ids", None)
+                _lmcache_cached_tokens = _resolve_sparse_cached_tokens_by_request(
+                    attn_metadata,
+                    attn_metadata.req_ids,
                 )
                 if _lmcache_cached_tokens is not None or _decode_window_size > 0:
                     _split_boundary = _update_dsa_split_boundary_in_place(

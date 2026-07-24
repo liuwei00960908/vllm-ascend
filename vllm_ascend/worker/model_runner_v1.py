@@ -101,6 +101,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
+    scheduled_decode_requests,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -1647,28 +1648,24 @@ class NPUModelRunner(GPUModelRunner):
             # first forward that can retrieve a new window also forces a remap
             # diagnostic for the same window.
             if diag_enabled and dsa_req_ids is not None:
-                committed_frontiers = get_lmcache_sparse_cached_tokens(
-                    dsa_req_ids
+                decode_requests = scheduled_decode_requests(
+                    dsa_req_ids,
+                    scheduler_output.num_scheduled_tokens,
+                    self.input_batch.num_computed_tokens_cpu,
+                    self.input_batch.num_prompt_tokens,
+                )
+                decode_req_ids = [
+                    req_id for _, req_id in decode_requests
+                ]
+                committed_frontiers = (
+                    get_lmcache_sparse_cached_tokens(decode_req_ids)
+                    if decode_req_ids
+                    else None
                 )
                 if committed_frontiers is not None:
-                    decode_req_ids: list[str] = []
-                    decode_committed_frontiers: list[int] = []
-                    for req_index, (raw_req_id, committed) in enumerate(
-                        zip(dsa_req_ids, committed_frontiers)
-                    ):
-                        req_id = str(raw_req_id)
-                        if req_id not in scheduler_output.num_scheduled_tokens:
-                            continue
-                        num_computed = int(
-                            self.input_batch.num_computed_tokens_cpu[req_index]
-                        )
-                        num_prompt = int(
-                            self.input_batch.num_prompt_tokens[req_index]
-                        )
-                        if num_computed < num_prompt:
-                            continue
-                        decode_req_ids.append(req_id)
-                        decode_committed_frontiers.append(int(committed))
+                    decode_committed_frontiers = [
+                        int(committed) for committed in committed_frontiers
+                    ]
                     if decode_req_ids:
                         if previous_frontiers is None:
                             previous_frontiers = {}

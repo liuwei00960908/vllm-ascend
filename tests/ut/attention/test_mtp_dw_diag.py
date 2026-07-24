@@ -8,9 +8,19 @@ from vllm_ascend.attention.mtp_dw_diag import (
     diagnostic_values_to_list,
     logical_to_physical_slots,
     post_commit_sample_requests,
+    scheduled_decode_requests,
     scratch_live_slot_aliases,
     scratch_target_safety,
 )
+
+
+def test_scheduled_decode_requests_excludes_unscheduled_and_prefill() -> None:
+    assert scheduled_decode_requests(
+        ["decode", "unscheduled", "prefill"],
+        {"decode", "prefill"},
+        [512, 768, 255],
+        [512, 512, 256],
+    ) == [(0, "decode")]
 
 
 def test_diagnostic_values_to_list_handles_none_tensor_and_numpy() -> None:

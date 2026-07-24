@@ -1205,6 +1205,23 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertEqual(boundary.tolist(), [90, 0])
         lookup.assert_called_once_with(["decode-req"])
 
+    def test_native_frontiers_are_aligned_after_filtering_prefill(self):
+        metadata = self._make_decode_metadata(batch_size=2)
+        metadata.decode_req_indices_cpu = [0, -1]
+
+        with patch.object(
+            sfa_v1,
+            "get_lmcache_sparse_cached_tokens",
+            return_value=[90],
+        ) as lookup:
+            cached_tokens = sfa_v1._resolve_sparse_cached_tokens_by_request(
+                metadata,
+                ["decode-req", "prefill-req"],
+            )
+
+        self.assertEqual(cached_tokens, [90, 0])
+        lookup.assert_called_once_with(["decode-req"])
+
     def test_remap_boundary_uses_unique_request_ids_for_mtp_rows(self):
         metadata = self._make_decode_metadata()
         metadata.prompt_lens_cpu_rows = [100, 100, 200, 200]
