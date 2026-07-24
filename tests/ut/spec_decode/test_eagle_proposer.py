@@ -212,6 +212,38 @@ class TestEagleProposerInitialization(TestBase):
             expected_max_num_tokens = proposer.max_num_tokens
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 2048))
 
+    def test_staged_mtp_graph_overrides_legacy_draft_enforce_eager(
+        self,
+    ):
+        self.vllm_config.speculative_config.method = "mtp"
+        self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
+        self.vllm_config.speculative_config.enforce_eager = True
+        self.vllm_config.scheduler_config.async_scheduling = False
+        self.runner._use_aclgraph.return_value = True
+        self.runner.cudagraph_batch_sizes = [2, 4]
+
+        with (
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer."
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer."
+                "staged_sfa_graph_capture_sizes",
+                return_value=(2, 4),
+            ),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            proposer = AscendEagleProposer(
+                vllm_config=self.vllm_config,
+                device=self.device,
+                runner=self.runner,
+            )
+
+        self.assertTrue(proposer.use_cuda_graph)
+        self.assertTrue(proposer.use_staged_mtp_draft_graph)
+
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):
     def setUp(self):

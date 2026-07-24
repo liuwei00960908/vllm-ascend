@@ -158,7 +158,14 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             self.tp_group_context = nullcontext()
 
-        self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+        staged_mtp_graph_requested = (
+            self.method == "mtp"
+            and staged_sfa_graph_configured(vllm_config)
+        )
+        self.use_cuda_graph = self.runner._use_aclgraph() and (
+            not self.speculative_config.enforce_eager
+            or staged_mtp_graph_requested
+        )
         if self.method == "mtp":
             self.use_cuda_graph = (
                 self.use_cuda_graph
@@ -183,19 +190,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 (size // query_width for size in capture_sizes),
                 default=0,
             )
-            missing_draft_sizes = tuple(
-                size // query_width
-                for size in capture_sizes
-                if size // query_width
-                not in self.runner.cudagraph_batch_sizes
-            )
-            if missing_draft_sizes:
-                raise ValueError(
-                    "staged MTP draft FULL graph capacities are absent "
-                    "from cudagraph_capture_sizes: "
-                    f"missing={missing_draft_sizes}. Add every target "
-                    "request capacity to cudagraph_capture_sizes."
-                )
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()

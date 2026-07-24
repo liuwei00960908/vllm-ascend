@@ -4749,7 +4749,19 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_aclgraph:
             set_graph_params(self.cudagraph_batch_sizes)
             if self.speculative_config:
-                set_draft_graph_params(self.cudagraph_batch_sizes)
+                draft_graph_sizes = set(self.cudagraph_batch_sizes)
+                if staged_sfa_graph_configured(self.vllm_config):
+                    query_width = (
+                        1
+                        + self.speculative_config.num_speculative_tokens
+                    )
+                    draft_graph_sizes.update(
+                        size // query_width
+                        for size in staged_sfa_graph_capture_sizes(
+                            self.vllm_config
+                        )
+                    )
+                set_draft_graph_params(sorted(draft_graph_sizes))
 
 
 
