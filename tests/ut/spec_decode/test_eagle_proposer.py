@@ -1,5 +1,6 @@
-from unittest.mock import MagicMock, patch
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -7,7 +8,10 @@ from vllm.config import CacheConfig, CompilationMode, CUDAGraphMode, VllmConfig,
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.spec_decode.eagle_proposer import (
+    AscendEagleProposer,
+    SpecDecodeBaseProposer,
+)
 
 
 class TestEagleProposerInitialization(TestBase):
@@ -87,6 +91,76 @@ class TestEagleProposerInitialization(TestBase):
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 4096))
             self.assertEqual(proposer.arange.shape, (expected_max_num_tokens,))
 
+    def test_staged_mtp_metadata_arenas_have_stable_distinct_addresses(
+        self,
+    ):
+        proposer = SpecDecodeBaseProposer.__new__(
+            SpecDecodeBaseProposer
+        )
+        proposer.use_staged_mtp_draft_graph = True
+        proposer._staged_mtp_max_request_capacity = 4
+        proposer._staged_mtp_arena_capacity = 0
+        proposer._staged_mtp_metadata_arenas = []
+        proposer.num_speculative_tokens = 2
+        proposer.device = torch.device("cpu")
+        proposer.runner = MagicMock(pin_memory=False)
+        proposer.arange = torch.arange(16, dtype=torch.int32)
+        proposer.arange_cpu = torch.arange(16, dtype=torch.int32)
+        source = SimpleNamespace(
+            query_start_loc=torch.arange(3, dtype=torch.int32),
+            query_start_loc_cpu=torch.arange(3, dtype=torch.int32),
+            seq_lens=torch.tensor([8, 9], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 9], dtype=torch.int32),
+            num_computed_tokens_cpu=torch.tensor(
+                [7, 8], dtype=torch.int32
+            ),
+            block_table_tensor=torch.tensor(
+                [[10, 11], [12, 13], [20, 21], [22, 23]],
+                dtype=torch.int32,
+            ),
+            positions=torch.tensor([7, 8], dtype=torch.int32),
+        )
+
+        step0 = proposer._bind_staged_mtp_metadata_arena(
+            source,
+            draft_step=0,
+            capacity=4,
+            actual_reqs=2,
+        )
+        step0_ptr = step0.block_table_tensor.data_ptr()
+        step1 = proposer._bind_staged_mtp_metadata_arena(
+            step0,
+            draft_step=1,
+            capacity=4,
+            actual_reqs=2,
+        )
+        step0_again = proposer._bind_staged_mtp_metadata_arena(
+            source,
+            draft_step=0,
+            capacity=4,
+            actual_reqs=2,
+        )
+
+        self.assertEqual(
+            step0_again.block_table_tensor.data_ptr(),
+            step0_ptr,
+        )
+        self.assertNotEqual(
+            step0.block_table_tensor.data_ptr(),
+            step1.block_table_tensor.data_ptr(),
+        )
+        self.assertTrue(
+            torch.equal(
+                step0.block_table_tensor,
+                source.block_table_tensor,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                step0.query_start_loc,
+                torch.arange(5, dtype=torch.int32),
+            )
+        )
     def test_initialization_eagle3_enforce_eager(self):
         self.vllm_config.speculative_config.method = "eagle3"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048

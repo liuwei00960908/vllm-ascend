@@ -314,6 +314,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    staged_sfa_graph_key: StagedSFAGraphKey | None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1157,6 +1158,7 @@ class NPUModelRunner(GPUModelRunner):
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
+        target_staged_sfa_graph_key: StagedSFAGraphKey | None = None,
     ) -> list[list[int]] | None:
         if not self.drafter:
             # Speculative decoding is not enabled.
@@ -1286,6 +1288,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output=scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                target_staged_sfa_graph_key=target_staged_sfa_graph_key,
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
@@ -1783,6 +1786,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                staged_sfa_graph_key,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -1826,6 +1830,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            staged_sfa_graph_key,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1863,6 +1868,7 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
                 sample_hidden_states,
                 batch_desc,
+                staged_sfa_graph_key,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3581,16 +3587,51 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter:
+                draft_num_tokens = num_tokens_padded
+                draft_num_reqs = num_reqs_padded
+                draft_runtime_mode = cudagraph_runtime_mode
+                draft_batch_descriptor = batch_desc
+                staged_mtp_draft_graph = bool(
+                    staged_dummy_key is not None
+                    and getattr(
+                        self.drafter,
+                        "use_staged_mtp_draft_graph",
+                        False,
+                    )
+                )
+                if staged_mtp_draft_graph:
+                    draft_num_tokens = staged_dummy_key.request_capacity
+                    draft_num_reqs = staged_dummy_key.request_capacity
+                    draft_batch_descriptor = BatchDescriptor(
+                        num_tokens=draft_num_tokens,
+                    )
+                    draft_runtime_mode = (
+                        CUDAGraphMode.FULL
+                        if cudagraph_runtime_mode
+                        == CUDAGraphMode.PIECEWISE
+                        else CUDAGraphMode.NONE
+                    )
                 self.drafter.dummy_run(
-                    num_tokens=num_tokens_padded,
+                    num_tokens=draft_num_tokens,
                     with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
+                    num_reqs=draft_num_reqs,
                     num_tokens_across_dp=num_tokens_across_dp,
-                    aclgraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
+                    aclgraph_runtime_mode=draft_runtime_mode,
+                    batch_descriptor=draft_batch_descriptor,
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    **(
+                        {
+                            "staged_mtp_draft_graph":
+                            staged_mtp_draft_graph,
+                        }
+                        if hasattr(
+                            self.drafter,
+                            "use_staged_mtp_draft_graph",
+                        )
+                        else {}
+                    ),
                 )
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
@@ -4842,12 +4883,31 @@ class NPUModelRunner(GPUModelRunner):
                 graph_keys,
                 len(self._staged_sfa_impls) + 1,
             )
+            draft_graph_count = 0
+            if (
+                getattr(self, "drafter", None) is not None
+                and getattr(
+                    self.drafter,
+                    "use_staged_mtp_draft_graph",
+                    False,
+                )
+            ):
+                draft_graph_count = (
+                    self.drafter.seal_staged_mtp_draft_graphs(
+                        tuple(
+                            graph_key.request_capacity
+                            for graph_key in graph_keys
+                        )
+                    )
+                )
             logger.info(
                 "[SFA cross-layer graph] captured retrieve-split outer graphs "
-                "for %d local SFA layers and %d keys; entries=%d",
+                "for %d local SFA layers and %d keys; entries=%d, "
+                "draft_full_graphs=%d",
                 len(self._staged_sfa_impls),
                 len(graph_keys),
                 graph_entry_count,
+                draft_graph_count,
             )
         return graph_memory_bytes
 

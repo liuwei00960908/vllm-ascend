@@ -1236,6 +1236,11 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
     def test_capture_model_preserves_result_and_validates_cross_layer_warmup(self):
         runner = self._build_runner()
         calls = []
+        draft_seal = MagicMock(return_value=2)
+        runner.drafter = SimpleNamespace(
+            use_staged_mtp_draft_graph=True,
+            seal_staged_mtp_draft_graphs=draft_seal,
+        )
         impl = SimpleNamespace(
             seal_staged_sfa_capture=MagicMock(),
         )
@@ -1288,6 +1293,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         )
         impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
         seal_entries.assert_called_once_with(graph_keys, 2)
+        draft_seal.assert_called_once_with((1, 2))
 
     def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
         runner = self._build_runner()
