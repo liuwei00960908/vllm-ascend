@@ -768,6 +768,7 @@ class AscendSFAMetadata:
     split_boundary: torch.Tensor | None = None
     decode_split_boundary_cpu: Any = None
     decode_split_boundary_cpu_tensor: torch.Tensor | None = None
+    decode_split_boundary: torch.Tensor | None = None
     decode_scratch_base: torch.Tensor | None = None
     decode_scratch_base_compact: torch.Tensor | None = None
     decode_scratch_base_cpu: Any = None

@@ -37,6 +37,11 @@ from vllm_ascend.utils import (
 )
 
 
+def test_sfa_metadata_declares_cached_decode_split_boundary() -> None:
+    field = AscendSFAMetadata.__dataclass_fields__["decode_split_boundary"]
+    assert field.default is None
+
+
 def test_sparse_boundary_updates_preallocated_storage_in_place():
     boundary_cpu = torch.tensor([9, 9, 19, 0], dtype=torch.int32)
     boundary = torch.empty(4, dtype=torch.int32)
