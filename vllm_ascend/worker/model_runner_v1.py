@@ -148,6 +148,7 @@ from vllm_ascend.utils import (
     is_drafter_moe_model,
     is_moe_model,
     lmhead_tp_enable,
+    parse_layer_idx,
     set_weight_prefetch_method,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configuration_errors,
@@ -4777,10 +4778,15 @@ class NPUModelRunner(GPUModelRunner):
 
 
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
-        """Return each local staged SFA implementation exactly once."""
+        """Return each target-model staged SFA implementation exactly once."""
         attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,
+        )
+        target_layer_count = getattr(
+            self.vllm_config.model_config.hf_text_config,
+            "num_hidden_layers",
+            None,
         )
         staged_impls: dict[int, tuple[str, Any]] = {}
         for layer_name, attn_layer in attn_layers.items():
@@ -4791,9 +4797,29 @@ class NPUModelRunner(GPUModelRunner):
                 False,
             ):
                 continue
+            canonical_name = getattr(
+                attn_layer,
+                "layer_name",
+                layer_name,
+            )
+            layer_index = parse_layer_idx(canonical_name)
+            if (
+                isinstance(target_layer_count, int)
+                and layer_index is not None
+                and layer_index >= target_layer_count
+            ):
+                logger.info(
+                    "[SFA cross-layer graph] excluding non-target attention "
+                    "from the target capture registry: layer=%s index=%d "
+                    "target_layers=%d",
+                    canonical_name,
+                    layer_index,
+                    target_layer_count,
+                )
+                continue
             staged_impls.setdefault(
                 id(impl),
-                (getattr(attn_layer, "layer_name", layer_name), impl),
+                (canonical_name, impl),
             )
         return tuple(staged_impls.values())
 

@@ -1280,6 +1280,35 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
         seal_entries.assert_called_once_with(graph_keys, 2)
 
+    def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
+        runner = self._build_runner()
+        runner.vllm_config.model_config.hf_text_config.num_hidden_layers = 78
+        target_impl = SimpleNamespace(enable_staged_sfa_graph=True)
+        draft_impl = SimpleNamespace(enable_staged_sfa_graph=True)
+        target_layer = SimpleNamespace(
+            impl=target_impl,
+            layer_name="model.layers.77.self_attn.attn",
+        )
+        draft_layer = SimpleNamespace(
+            impl=draft_impl,
+            layer_name="model.layers.78.self_attn.attn",
+        )
+
+        with patch.object(
+            model_runner_module,
+            "get_layers_from_vllm_config",
+            return_value={
+                target_layer.layer_name: target_layer,
+                draft_layer.layer_name: draft_layer,
+            },
+        ):
+            collected = runner._collect_staged_sfa_impls()
+
+        self.assertEqual(
+            collected,
+            ((target_layer.layer_name, target_impl),),
+        )
+
     def test_capture_model_rejects_a_missing_configured_key(self):
         runner = self._build_runner()
         impl = SimpleNamespace(
