@@ -204,6 +204,26 @@ class _StagedSFACaptureState:
         expected = frozenset(expected_keys)
         missing = expected.difference(self.bindings)
         unexpected = self.bindings.keys() - expected
+        logger.info(
+            "[SFA_CAPTURE_DIAG] layer_state_seal expected=%s actual=%s "
+            "missing=%s unexpected=%s producer_event=%s remap_boundary=%s "
+            "runtime=%s initialized_cache_capacity=%d",
+            tuple(expected_keys),
+            tuple(self.bindings),
+            tuple(missing),
+            tuple(unexpected),
+            self.producer_event is not None,
+            (
+                None
+                if self.remap_boundary is None
+                else (
+                    tuple(self.remap_boundary.shape),
+                    self.remap_boundary.data_ptr(),
+                )
+            ),
+            self.runtime is not None,
+            self.initialized_cache_capacity,
+        )
         if (
             self.producer_event is None
             or self.remap_boundary is None
@@ -2489,6 +2509,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         return self._ensure_staged_sfa_bridge_buffers(hidden_states)
 
     def reset_staged_sfa_capture(self) -> None:
+        previous = getattr(self, "_staged_sfa_capture_state", None)
+        logger.info(
+            "[SFA_CAPTURE_DIAG] layer_state_reset previous_bindings=%s "
+            "producer_event=%s remap_boundary=%s runtime=%s",
+            (
+                ()
+                if previous is None
+                else tuple(previous.bindings)
+            ),
+            previous is not None and previous.producer_event is not None,
+            previous is not None and previous.remap_boundary is not None,
+            previous is not None and previous.runtime is not None,
+        )
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
         self._staged_sfa_bridge_buffers = None
@@ -2601,7 +2634,36 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
+        graph_key = getattr(context, "staged_sfa_graph_key", None)
+        is_dummy = bool(
+            getattr(context, "staged_sfa_graph_dummy_run", False)
+        )
+        runtime_mode = getattr(
+            context,
+            "cudagraph_runtime_mode",
+            CUDAGraphMode.NONE,
+        )
+        if is_dummy or graph_key is not None:
+            logger.info(
+                "[SFA_CAPTURE_DIAG] pre_enter layer=%s graph_key=%r "
+                "dummy=%s mode=%s attn_metadata=%s hidden_shape=%s "
+                "route=%r existing_bindings=%s",
+                layer_name,
+                graph_key,
+                is_dummy,
+                runtime_mode.name,
+                attn_metadata is not None,
+                tuple(hidden_states.shape),
+                getattr(context, "staged_sfa_route", None),
+                tuple(self._staged_sfa_capture_state.bindings),
+            )
         if attn_metadata is None:
+            if is_dummy or graph_key is not None:
+                logger.info(
+                    "[SFA_CAPTURE_DIAG] pre_exit_without_registration "
+                    "layer=%s reason=missing_attention_metadata",
+                    layer_name,
+                )
             self.forward(
                 layer_name,
                 hidden_states,
@@ -2612,8 +2674,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             return self._cross_layer_empty_outputs(hidden_states)
         kv_cache, index_layer_name, index_enabled = self._cross_layer_kv_cache(layer_name, kv_cache)
-        graph_key = getattr(context, "staged_sfa_graph_key", None)
         if graph_key is None:
+            if is_dummy:
+                logger.info(
+                    "[SFA_CAPTURE_DIAG] pre_exit_without_registration "
+                    "layer=%s reason=missing_graph_key mode=%s",
+                    layer_name,
+                    runtime_mode.name,
+                )
             self.forward(
                 layer_name,
                 hidden_states,
@@ -2632,7 +2700,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"[SFA cross-layer graph] runner-authorized key became ineligible in {layer_name}: {reason}"
             )
 
-        is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
@@ -2720,7 +2787,48 @@ class AscendSFAImpl(MLAAttentionImpl):
             index_enabled,
         )
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            logger.info(
+                "[SFA_CAPTURE_DIAG] layer_binding_register_begin "
+                "layer=%s graph_key=%r bridge=%s kv_cache=%s "
+                "remap_boundary=%s producer_event=%s",
+                layer_name,
+                graph_key,
+                tuple(
+                    (tuple(tensor.shape), tensor.data_ptr())
+                    for tensor in outputs
+                ),
+                tuple(
+                    (tuple(tensor.shape), tensor.data_ptr())
+                    for tensor in kv_cache
+                ),
+                (
+                    None
+                    if state.remap_boundary is None
+                    else (
+                        tuple(state.remap_boundary.shape),
+                        state.remap_boundary.data_ptr(),
+                    )
+                ),
+                state.producer_event is not None,
+            )
             state.register(graph_key, outputs, kv_cache)
+            logger.info(
+                "[SFA_CAPTURE_DIAG] layer_binding_register_done "
+                "layer=%s graph_key=%r bindings=%s",
+                layer_name,
+                graph_key,
+                tuple(state.bindings),
+            )
+        elif is_dummy or graph_key is not None:
+            logger.info(
+                "[SFA_CAPTURE_DIAG] pre_exit_without_registration "
+                "layer=%s reason=register_condition_false graph_key=%r "
+                "dummy=%s mode=%s",
+                layer_name,
+                graph_key,
+                is_dummy,
+                runtime_mode.name,
+            )
         return outputs
 
     def cross_layer_lmcache_retrieve(
