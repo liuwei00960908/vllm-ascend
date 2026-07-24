@@ -166,6 +166,15 @@ class TestStagedSFAGraphKey(unittest.TestCase):
         self.assertEqual(key.max_query_len, 3)
         self.assertEqual(key.query_profile, StagedSFAQueryProfile.SPEC_FIXED)
 
+    def test_mtp_fia_padding_uses_request_not_token_capacity(self):
+        key = StagedSFAGraphKey.fixed_spec(1, 2)
+        batch_desc = BatchDescriptor(num_tokens=2)
+
+        self.assertEqual(
+            NPUModelRunner._fia_request_capacity(key, batch_desc),
+            1,
+        )
+
     def test_fixed_spec_rejects_q1_width(self):
         with self.assertRaises(ValueError):
             StagedSFAGraphKey.fixed_spec(4, 1)

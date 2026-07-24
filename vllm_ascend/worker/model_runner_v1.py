@@ -742,6 +742,16 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    @staticmethod
+    def _fia_request_capacity(
+        staged_sfa_graph_key: StagedSFAGraphKey | None,
+        batch_desc: BatchDescriptor,
+    ) -> int | None:
+        """Return the request, rather than token, capacity for FIA padding."""
+        if staged_sfa_graph_key is not None:
+            return staged_sfa_graph_key.request_capacity
+        return batch_desc.num_reqs
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1483,10 +1493,9 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs_padded,
                         num_reqs,
                         cudagraph_mode,
-                        (
-                            num_tokens_padded
-                            if staged_sfa_graph_key is not None
-                            else batch_desc.num_reqs
+                        self._fia_request_capacity(
+                            staged_sfa_graph_key,
+                            batch_desc,
                         ),
                     )
                     if enable_sp() and num_tokens_padded == num_tokens_unpadded:
