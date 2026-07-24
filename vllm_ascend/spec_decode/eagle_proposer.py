@@ -162,28 +162,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.method == "mtp"
             and staged_sfa_graph_configured(vllm_config)
         )
-        runner_uses_aclgraph = self.runner._use_aclgraph()
-        if staged_mtp_graph_requested:
-            blockers = []
-            if not runner_uses_aclgraph:
-                blockers.append("runner ACL graph support is disabled")
-            if self.use_async_scheduling:
-                blockers.append("async scheduling is enabled")
-            if self.speculative_config.disable_padded_drafter_batch:
-                blockers.append("padded drafter batches are disabled")
-            if blockers:
-                raise RuntimeError(
-                    "staged MTP draft graph was requested but cannot be "
-                    f"enabled: {', '.join(blockers)}; "
-                    f"method={self.method}, "
-                    f"draft_enforce_eager="
-                    f"{self.speculative_config.enforce_eager}, "
-                    f"runner_uses_aclgraph={runner_uses_aclgraph}, "
-                    f"async_scheduling={self.use_async_scheduling}, "
-                    "disable_padded_drafter_batch="
-                    f"{self.speculative_config.disable_padded_drafter_batch}"
-                )
-        self.use_cuda_graph = runner_uses_aclgraph and (
+        self.use_cuda_graph = self.runner._use_aclgraph() and (
             not self.speculative_config.enforce_eager
             or staged_mtp_graph_requested
         )

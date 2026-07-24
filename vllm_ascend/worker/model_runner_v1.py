@@ -4896,36 +4896,6 @@ class NPUModelRunner(GPUModelRunner):
                 len(self._staged_sfa_impls) + 1,
             )
             draft_graph_count = 0
-            staged_mtp_requested = (
-                self.speculative_config is not None
-                and self.speculative_config.method == "mtp"
-            )
-            if staged_mtp_requested and (
-                getattr(self, "drafter", None) is None
-                or not getattr(
-                    self.drafter,
-                    "use_staged_mtp_draft_graph",
-                    False,
-                )
-            ):
-                drafter = getattr(self, "drafter", None)
-                raise RuntimeError(
-                    "staged MTP target graphs were captured but the draft "
-                    "FULL graph path is disabled: "
-                    f"drafter_type="
-                    f"{type(drafter).__name__ if drafter else None}, "
-                    f"method={self.speculative_config.method}, "
-                    f"draft_use_cuda_graph="
-                    f"{getattr(drafter, 'use_cuda_graph', None)}, "
-                    "draft_use_staged_mtp_graph="
-                    f"{getattr(drafter, 'use_staged_mtp_draft_graph', None)}, "
-                    f"draft_enforce_eager="
-                    f"{self.speculative_config.enforce_eager}, "
-                    f"async_scheduling="
-                    f"{self.scheduler_config.async_scheduling}, "
-                    "disable_padded_drafter_batch="
-                    f"{self.speculative_config.disable_padded_drafter_batch}"
-                )
             if (
                 getattr(self, "drafter", None) is not None
                 and getattr(
