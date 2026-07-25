@@ -222,7 +222,6 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     return {masked_input, mask};
 }
 
-#if 0
 at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -341,7 +340,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_prepare_sparse_indices_");
+    cmd.Name("npu_dsa_prepare_sparse_indices_legacy_");
     cmd.SetCustomHandler([
         stream,
         topk_ptr,
@@ -356,7 +355,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
         core_count,
         need_packed,
         clear_invalid_rows]() -> int {
-        dsa_prepare_sparse_indices_impl(
+        dsa_prepare_sparse_indices_legacy_impl(
             stream,
             topk_ptr,
             split_boundary_ptr,
@@ -375,8 +374,6 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     cmd.Run();
     return selected_packed;
 }
-
-#endif
 
 at::Tensor npu_dsa_prepare_sparse_indices_(
     at::Tensor &topk_indices,
@@ -999,6 +996,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_prepare_sparse_indices_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_prepare_sparse_indices_);
+    ops.def(
+        "npu_dsa_prepare_sparse_indices_legacy_(Tensor(a!) topk_indices, "
+        "Tensor split_boundary, Tensor valid_rows, Tensor scratch_base, "
+        "bool need_packed, Tensor? row_req_indices=None) -> Tensor");
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_legacy_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_prepare_sparse_indices_legacy_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
