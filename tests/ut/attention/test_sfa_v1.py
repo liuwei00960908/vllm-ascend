@@ -220,6 +220,23 @@ class TestDSASparsePadding(TestBase):
 
 
 class TestLMCacheSparseFrontier(TestBase):
+    @staticmethod
+    def _remap_frontiers(metadata: object, request_ids: list[str]) -> list[int]:
+        connector = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+        with (
+            patch.object(
+                attention_utils,
+                "staged_sfa_connector_supports_sparse_load",
+                return_value=True,
+            ),
+            patch.object(
+                attention_utils,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            return attention_utils.get_lmcache_sparse_cached_tokens(request_ids)
+
     def test_invalid_or_duplicate_request_identity_fails_closed(self):
         sparse = SimpleNamespace(
             req_id="req-0",
@@ -315,6 +332,10 @@ class TestLMCacheSparseFrontier(TestBase):
             attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
             (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
         )
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["req-0"]),
+            [0],
+        )
         metadata.requests[0].is_sparse_decode = True
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
@@ -379,6 +400,35 @@ class TestLMCacheSparseFrontier(TestBase):
                 ["dense", "sparse"],
             ),
             (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()),
+        )
+
+    def test_native_remap_frontiers_preserve_dense_sparse_request_order(
+        self,
+    ) -> None:
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="sparse",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8192,
+                        dsa_committed_end=7936,
+                    ),
+                ),
+                SimpleNamespace(
+                    req_id="dense",
+                    is_sparse_decode=False,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=120000,
+                    ),
+                ),
+            ]
+        )
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["dense", "sparse"]),
+            [0, 7936],
         )
 
     def test_sparse_wait_forwards_existing_payload_event(self):
