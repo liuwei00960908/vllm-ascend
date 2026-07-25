@@ -108,6 +108,20 @@ class TestDSASparsePadding(TestBase):
         self.assertEqual(torch.count_nonzero(result[2:]).item(), 0)
 
 
+class TestDSACompactScratchRoute(TestBase):
+    def test_safe_native_route_skips_compact_scratch(self):
+        route = StagedSFARouteDecision(
+            StagedSFARouteAction.SAFE_NATIVE,
+            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+        )
+
+        self.assertFalse(sfa_v1._can_use_dsa_compact_scratch(route))
+
+    def test_staged_or_unconfigured_route_allows_compact_scratch(self):
+        self.assertTrue(sfa_v1._can_use_dsa_compact_scratch(_staged_route()))
+        self.assertTrue(sfa_v1._can_use_dsa_compact_scratch(None))
+
+
 class TestLMCacheSparseFrontier(TestBase):
     def test_invalid_or_duplicate_request_identity_fails_closed(self):
         sparse = SimpleNamespace(

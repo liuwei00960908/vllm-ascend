@@ -99,6 +99,11 @@ _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
 
 
+def _can_use_dsa_compact_scratch(staged_sfa_route: Any) -> bool:
+    """Keep legacy sparse paths enabled when staged routing is not configured."""
+    return staged_sfa_route is None or staged_sfa_route.action == StagedSFARouteAction.STAGED
+
+
 def _staged_sfa_profile_scope(name: str):
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
@@ -2768,7 +2773,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         # block table. Decode-window mode uses current_window_start as the
         # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
-        if self.dsa_shrink_latent and attn_metadata.prompt_lens is not None and attn_metadata.num_decode_tokens > 0:
+        _forward_context = get_forward_context()
+        if (
+            self.dsa_shrink_latent
+            and _can_use_dsa_compact_scratch(
+                getattr(_forward_context, "staged_sfa_route", None)
+            )
+            and attn_metadata.prompt_lens is not None
+            and attn_metadata.num_decode_tokens > 0
+        ):
             # _remap_boundary is per row. Decode rows carry prompt_len by
             # default; decode-window mode replaces it with current_window_start.
             # Prefill/padding rows carry 0 and stay untouched, so this also
@@ -2788,7 +2801,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             _scratch_base = _scratch_base[:_topk_rows]
             if _scratch_base.device != topk_indices.device:
                 _scratch_base = _scratch_base.to(device=topk_indices.device)
-            _forward_context = get_forward_context()
             _boundary_request_ids = attn_metadata.req_ids
             if _boundary_request_ids is None:
                 _boundary_request_ids = getattr(
