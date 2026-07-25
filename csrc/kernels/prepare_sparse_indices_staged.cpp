@@ -42,36 +42,44 @@ public:
     {
         rowCount_ = rowCount;
         rowWidth_ = rowWidth;
-        total_ = rowCount * rowWidth;
+        requestCount_ = rowCount / 2;
+        requestWidth_ = 2 * rowWidth;
         maxTokens_ = maxTokens;
         bitmapWords_ = (maxTokens + 31) / 32;
         bufferWords_ = ((bitmapWords_ + 7) / 8) * 8;
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
-        rowPacked_.SetGlobalBuffer(rowPacked, total_);
-        selectedPacked_.SetGlobalBuffer(selectedPacked, total_);
-        localToUnion_.SetGlobalBuffer(localToUnion, total_);
-        selectedCount_.SetGlobalBuffer(selectedCount, 1);
+        rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
+        selectedPacked_.SetGlobalBuffer(
+            selectedPacked, requestCount_ * requestWidth_);
+        localToUnion_.SetGlobalBuffer(localToUnion, rowCount * rowWidth);
+        selectedCount_.SetGlobalBuffer(selectedCount, requestCount_);
         requestBlockTable_.SetGlobalBuffer(
-            requestBlockTable, blockTableWidth);
-        targetSlots_.SetGlobalBuffer(targetSlots, total_);
+            requestBlockTable, requestCount_ * blockTableWidth);
+        targetSlots_.SetGlobalBuffer(
+            targetSlots, requestCount_ * requestWidth_);
         pipe_.InitBuffer(bitmapBuf_, bufferWords_ * sizeof(int32_t));
         pipe_.InitBuffer(prefixBuf_, bufferWords_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
     {
-        if (AscendC::GetBlockIdx() != 0) {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
             return;
         }
+        const uint64_t rowOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
+        const uint64_t outputOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
         auto bitmap = bitmapBuf_.Get<int32_t>();
         auto prefix = prefixBuf_.Get<int32_t>();
         AscendC::Duplicate(bitmap, static_cast<int32_t>(0), bufferWords_);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_S>();
 
-        for (uint32_t i = 0; i < total_; ++i) {
-            const int32_t token = rowPacked_.GetValue(i);
+        for (uint32_t i = 0; i < requestWidth_; ++i) {
+            const int32_t token = rowPacked_.GetValue(rowOffset + i);
             if (token < 0 || token >= static_cast<int32_t>(maxTokens_)) {
                 continue;
             }
@@ -90,17 +98,18 @@ public:
                 static_cast<uint32_t>(bitmap.GetValue(word)));
         }
 
-        for (uint32_t i = 0; i < total_; ++i) {
+        for (uint32_t i = 0; i < requestWidth_; ++i) {
             const uint32_t token =
-                static_cast<uint32_t>(rowPacked_.GetValue(i));
+                static_cast<uint32_t>(rowPacked_.GetValue(rowOffset + i));
             const uint32_t word = token >> 5;
             const uint32_t bit = token & 31;
             const uint32_t rank = Rank(bitmap, prefix, word, bit);
-            localToUnion_.SetValue(i, static_cast<int32_t>(rank));
+            localToUnion_.SetValue(
+                rowOffset + i, static_cast<int32_t>(rank));
             // Duplicate tokens overwrite the same values at the same rank.
-            WriteUnion(rank, static_cast<int32_t>(token));
+            WriteUnion(request, outputOffset, rank, static_cast<int32_t>(token));
         }
-        selectedCount_.SetValue(0, static_cast<int32_t>(count));
+        selectedCount_.SetValue(request, static_cast<int32_t>(count));
     }
 
 private:
@@ -128,15 +137,21 @@ private:
                 static_cast<uint32_t>(bitmap.GetValue(word)) & lower);
     }
 
-    __aicore__ inline void WriteUnion(uint32_t rank, int32_t token)
+    __aicore__ inline void WriteUnion(
+        uint32_t request,
+        uint64_t outputOffset,
+        uint32_t rank,
+        int32_t token)
     {
-        selectedPacked_.SetValue(rank, token);
+        selectedPacked_.SetValue(outputOffset + rank, token);
         const uint32_t logicalBlock = rank / blockSize_;
         const uint32_t blockOffset = rank % blockSize_;
         const int32_t physicalBlock =
-            requestBlockTable_.GetValue(logicalBlock);
+            requestBlockTable_.GetValue(
+                static_cast<uint64_t>(request) * blockTableWidth_
+                + logicalBlock);
         targetSlots_.SetValue(
-            rank,
+            outputOffset + rank,
             static_cast<int64_t>(physicalBlock) * blockSize_
                 + blockOffset);
     }
@@ -152,7 +167,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> prefixBuf_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
-    uint32_t total_ = 0;
+    uint32_t requestCount_ = 0;
+    uint32_t requestWidth_ = 0;
     uint32_t maxTokens_ = 0;
     uint32_t bitmapWords_ = 0;
     uint32_t bufferWords_ = 0;
@@ -176,41 +192,51 @@ public:
     {
         rowCount_ = rowCount;
         rowWidth_ = rowWidth;
-        total_ = rowCount * rowWidth;
+        requestCount_ = rowCount / 2;
+        requestWidth_ = 2 * rowWidth;
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
-        rowPacked_.SetGlobalBuffer(rowPacked, total_);
-        selectedPacked_.SetGlobalBuffer(selectedPacked, total_);
-        localToUnion_.SetGlobalBuffer(localToUnion, total_);
-        selectedCount_.SetGlobalBuffer(selectedCount, 1);
+        rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
+        selectedPacked_.SetGlobalBuffer(
+            selectedPacked, requestCount_ * requestWidth_);
+        localToUnion_.SetGlobalBuffer(localToUnion, rowCount * rowWidth);
+        selectedCount_.SetGlobalBuffer(selectedCount, requestCount_);
         requestBlockTable_.SetGlobalBuffer(
-            requestBlockTable, blockTableWidth);
-        targetSlots_.SetGlobalBuffer(targetSlots, total_);
+            requestBlockTable, requestCount_ * blockTableWidth);
+        targetSlots_.SetGlobalBuffer(
+            targetSlots, requestCount_ * requestWidth_);
         pipe_.InitBuffer(
-            sortSrcBuf_, total_ * kPairWidth * sizeof(float));
+            sortSrcBuf_, requestWidth_ * kPairWidth * sizeof(float));
         pipe_.InitBuffer(
-            sortTmpBuf_, total_ * kPairWidth * sizeof(float));
-        pipe_.InitBuffer(sortInputBuf_, total_ * sizeof(int32_t));
+            sortTmpBuf_, requestWidth_ * kPairWidth * sizeof(float));
+        pipe_.InitBuffer(
+            sortInputBuf_, requestWidth_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
     {
-        if (AscendC::GetBlockIdx() != 0) {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
             return;
         }
+        const uint64_t rowOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
+        const uint64_t outputOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
         auto src = sortSrcBuf_.Get<float>();
         auto tmp = sortTmpBuf_.Get<float>();
         auto input = sortInputBuf_.Get<int32_t>();
         auto srcInt = src.ReinterpretCast<int32_t>();
-        AscendC::DataCopy(input, rowPacked_, total_);
+        AscendC::DataCopy(
+            input, rowPacked_[rowOffset], requestWidth_);
         Sync<AscendC::HardEvent::MTE2_V>();
         AscendC::Cast(
-            src, input, AscendC::RoundMode::CAST_NONE, total_);
-        AscendC::Muls(src, src, -1.0F, total_);
+            src, input, AscendC::RoundMode::CAST_NONE, requestWidth_);
+        AscendC::Muls(src, src, -1.0F, requestWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_S>();
-        for (uint32_t i = 0; i < total_; ++i) {
-            srcInt.SetValue(total_ + i, static_cast<int32_t>(i));
+        for (uint32_t i = 0; i < requestWidth_; ++i) {
+            srcInt.SetValue(requestWidth_ + i, static_cast<int32_t>(i));
         }
         Sync<AscendC::HardEvent::S_V>();
         SortAll(src, tmp);
@@ -219,20 +245,20 @@ public:
         auto sortedInt = src.ReinterpretCast<int32_t>();
         int32_t previous = -1;
         uint32_t rank = 0;
-        for (uint32_t i = 0; i < total_; ++i) {
+        for (uint32_t i = 0; i < requestWidth_; ++i) {
             const int32_t token =
                 -static_cast<int32_t>(src.GetValue(kPairWidth * i));
             const uint32_t original = static_cast<uint32_t>(
                 sortedInt.GetValue(kPairWidth * i + 1));
             if (i == 0 || token != previous) {
-                WriteUnion(rank, token);
+                WriteUnion(request, outputOffset, rank, token);
                 previous = token;
                 ++rank;
             }
             localToUnion_.SetValue(
-                original, static_cast<int32_t>(rank - 1));
+                rowOffset + original, static_cast<int32_t>(rank - 1));
         }
-        selectedCount_.SetValue(0, static_cast<int32_t>(rank));
+        selectedCount_.SetValue(request, static_cast<int32_t>(rank));
     }
 
 private:
@@ -240,11 +266,11 @@ private:
         AscendC::LocalTensor<float>& src,
         AscendC::LocalTensor<float>& tmp)
     {
-        const uint32_t repeats = total_ / kSortGroup;
+        const uint32_t repeats = requestWidth_ / kSortGroup;
         AscendC::Sort32(
             tmp,
             src,
-            src[total_].ReinterpretCast<uint32_t>(),
+            src[requestWidth_].ReinterpretCast<uint32_t>(),
             repeats);
         AscendC::PipeBarrier<PIPE_V>();
         uint32_t groups = repeats;
@@ -282,20 +308,26 @@ private:
         }
         if (pass % 2 == 0) {
             AscendC::DataCopy(
-                src, tmp, total_ * kPairWidth);
+                src, tmp, requestWidth_ * kPairWidth);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
-    __aicore__ inline void WriteUnion(uint32_t rank, int32_t token)
+    __aicore__ inline void WriteUnion(
+        uint32_t request,
+        uint64_t outputOffset,
+        uint32_t rank,
+        int32_t token)
     {
-        selectedPacked_.SetValue(rank, token);
+        selectedPacked_.SetValue(outputOffset + rank, token);
         const uint32_t logicalBlock = rank / blockSize_;
         const uint32_t blockOffset = rank % blockSize_;
         const int32_t physicalBlock =
-            requestBlockTable_.GetValue(logicalBlock);
+            requestBlockTable_.GetValue(
+                static_cast<uint64_t>(request) * blockTableWidth_
+                + logicalBlock);
         targetSlots_.SetValue(
-            rank,
+            outputOffset + rank,
             static_cast<int64_t>(physicalBlock) * blockSize_
                 + blockOffset);
     }
@@ -312,7 +344,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> sortInputBuf_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
-    uint32_t total_ = 0;
+    uint32_t requestCount_ = 0;
+    uint32_t requestWidth_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t blockSize_ = 0;
 };
@@ -470,7 +503,7 @@ void dsa_staged_bitmap_union_impl(
     void* targetSlots, uint32_t rowCount, uint32_t rowWidth,
     uint32_t maxTokens, uint32_t blockTableWidth, uint32_t blockSize)
 {
-    dsa_staged_bitmap_union_kernel<<<1, nullptr, stream>>>(
+    dsa_staged_bitmap_union_kernel<<<rowCount / 2, nullptr, stream>>>(
         static_cast<int32_t*>(rowPacked),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),
@@ -486,7 +519,7 @@ void dsa_staged_sort_union_impl(
     void* targetSlots, uint32_t rowCount, uint32_t rowWidth,
     uint32_t blockTableWidth, uint32_t blockSize)
 {
-    dsa_staged_sort_union_kernel<<<1, nullptr, stream>>>(
+    dsa_staged_sort_union_kernel<<<rowCount / 2, nullptr, stream>>>(
         static_cast<int32_t*>(rowPacked),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),

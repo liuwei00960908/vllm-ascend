@@ -9,14 +9,17 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 from vllm_ascend.utils import enable_custom_op
 
 
-def _two_rows_with_half_overlap(topk: int, device: str) -> torch.Tensor:
+def _mtp_rows_with_half_overlap(
+    topk: int, request_batch: int, device: str
+) -> torch.Tensor:
     if topk % 2:
         raise ValueError("topk must be even for an exact 0.5 row overlap")
     shared = torch.arange(topk // 2, dtype=torch.int32, device=device)
     unique = torch.arange(topk // 2, topk + topk // 2, dtype=torch.int32, device=device)
     first = torch.cat((shared, unique[: topk // 2]))
     second = torch.cat((shared, unique[topk // 2 :]))
-    return torch.stack((first, second)).unsqueeze(1)
+    request_rows = torch.stack((first, second))
+    return request_rows.repeat(request_batch, 1).unsqueeze(1)
 
 
 def _measure_npu_ms(run, reset, warmups: int, iterations: int) -> list[float]:
@@ -118,7 +121,9 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     remap_op = torch.ops._C_ascend.npu_dsa_staged_remap_rows_
     copy_rows_op = torch.ops._C_ascend.npu_dsa_staged_copy_rows_
 
-    source = _two_rows_with_half_overlap(topk, "npu")
+    request_batch = 4
+    row_count = 2 * request_batch
+    source = _mtp_rows_with_half_overlap(topk, request_batch, "npu")
     legacy_values = source.clone()
     union_values = source.clone()
     no_union_values = source.clone()
@@ -126,25 +131,48 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     bitmap_values = source.clone()
     sort_values = source.clone()
     max_tokens = 131072
-    boundaries = torch.full((2,), max_tokens, dtype=torch.int32, device="npu")
-    row_requests = torch.zeros(2, dtype=torch.int32, device="npu")
+    boundaries = torch.full(
+        (row_count,), max_tokens, dtype=torch.int32, device="npu"
+    )
+    row_requests = torch.arange(
+        request_batch, dtype=torch.int32, device="npu"
+    ).repeat_interleave(2)
 
     # The pre-union operator assigns each row its own compact scratch range.
-    valid_rows = torch.arange(2, dtype=torch.int32, device="npu")
-    scratch_base = torch.arange(2, dtype=torch.int32, device="npu") * topk
-    local_scratch_base = torch.zeros(2, dtype=torch.int32, device="npu")
+    valid_rows = torch.arange(row_count, dtype=torch.int32, device="npu")
+    scratch_base = (
+        torch.arange(row_count, dtype=torch.int32, device="npu") * topk
+    )
+    local_scratch_base = torch.zeros(
+        row_count, dtype=torch.int32, device="npu"
+    )
 
     block_size = 128
     capacity = 2 * topk
-    block_table = torch.arange(max_tokens // block_size, dtype=torch.int32, device="npu").unsqueeze(0)
-    selected = torch.empty((1, capacity), dtype=torch.int32, device="npu")
-    counts = torch.empty((1, 16), dtype=torch.int32, device="npu")
-    targets = torch.empty((1, capacity), dtype=torch.long, device="npu")
+    blocks_per_request = max_tokens // block_size
+    block_table = torch.arange(
+        request_batch * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_batch, blocks_per_request)
+    selected = torch.empty(
+        (request_batch, capacity), dtype=torch.int32, device="npu"
+    )
+    counts = torch.empty(
+        (request_batch, 16), dtype=torch.int32, device="npu"
+    )
+    targets = torch.empty(
+        (request_batch, capacity), dtype=torch.long, device="npu"
+    )
     bitmap_buffers = (
-        torch.empty((1, capacity), dtype=torch.int32, device="npu"),
-        torch.empty((2, topk), dtype=torch.int32, device="npu"),
-        torch.empty(1, dtype=torch.int32, device="npu"),
-        torch.empty((1, capacity), dtype=torch.long, device="npu"),
+        torch.empty(
+            (request_batch, capacity), dtype=torch.int32, device="npu"
+        ),
+        torch.empty((row_count, topk), dtype=torch.int32, device="npu"),
+        torch.empty(request_batch, dtype=torch.int32, device="npu"),
+        torch.empty(
+            (request_batch, capacity), dtype=torch.long, device="npu"
+        ),
     )
     sort_buffers = tuple(torch.empty_like(item) for item in bitmap_buffers)
 
@@ -186,20 +214,21 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     torch.npu.synchronize()
     expected_local_indices = torch.arange(
         topk, dtype=torch.int32, device="npu"
-    ).expand(2, 1, -1)
+    ).expand(row_count, 1, -1)
     if not torch.equal(no_union_result.cpu(), expected_local_indices.cpu()):
         raise AssertionError("staged no-union remapped rows are incorrect")
     expected_count = 3 * topk // 2
-    if bitmap_result[2].cpu().tolist() != [expected_count]:
+    expected_counts = [expected_count] * request_batch
+    if bitmap_result[2].cpu().tolist() != expected_counts:
         raise AssertionError("bitmap staged union count is incorrect")
-    if sort_result[2].cpu().tolist() != [expected_count]:
+    if sort_result[2].cpu().tolist() != expected_counts:
         raise AssertionError("sort staged union count is incorrect")
     if not torch.equal(bitmap_result[0].cpu(), sort_result[0].cpu()):
         raise AssertionError("bitmap and sort remapped rows differ")
     for index in (1, 3):
         if not torch.equal(
-            bitmap_result[index][0, :expected_count].cpu(),
-            sort_result[index][0, :expected_count].cpu(),
+            bitmap_result[index][:, :expected_count].cpu(),
+            sort_result[index][:, :expected_count].cpu(),
         ):
             raise AssertionError("bitmap and sort staged payloads differ")
 

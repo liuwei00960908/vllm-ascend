@@ -411,20 +411,24 @@ at::Tensor npu_dsa_staged_union_(
                 "all staged-union tensors must be contiguous");
     TORCH_CHECK(row_packed.dim() == 2 &&
                     request_block_table.dim() == 2 &&
-                    request_block_table.size(0) == 1,
-                "benchmark staged union requires [rows,k] and one request");
+                    request_block_table.size(0) > 0,
+                "benchmark staged union requires [rows,k] and requests");
     const int64_t row_count = row_packed.size(0);
     const int64_t row_width = row_packed.size(1);
+    const int64_t request_count = row_count / 2;
     const int64_t total = row_count * row_width;
-    TORCH_CHECK(row_count == 2 && row_width == 2048,
-                "benchmark staged union currently requires [2, 2048]");
+    TORCH_CHECK(row_count > 0 && row_count % 2 == 0 &&
+                    row_width == 2048 &&
+                    request_block_table.size(0) == request_count,
+                "benchmark staged union requires two [2048] rows per request");
     TORCH_CHECK(selected_packed.numel() >= total &&
                     local_to_union.numel() >= total &&
-                    selected_count.numel() >= 1 &&
+                    selected_count.numel() >= request_count &&
                     target_slots.numel() >= total,
                 "staged-union output buffers are too small");
     TORCH_CHECK(block_size > 0 &&
-                    request_block_table.size(1) * block_size >= total,
+                    request_block_table.size(1) * block_size >=
+                        2 * row_width,
                 "request block table is too short");
     TORCH_CHECK(max_tokens > 0 && max_tokens % 32 == 0,
                 "max_tokens must be a positive multiple of 32");
