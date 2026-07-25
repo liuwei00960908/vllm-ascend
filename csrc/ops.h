@@ -85,6 +85,7 @@ namespace vllm_ascend {
     uint32_t row_width,
     uint32_t max_tokens,
     uint32_t block_table_width,
+    uint32_t selected_count_stride,
     uint32_t block_size);
 
   extern void dsa_staged_sort_union_impl(
@@ -98,6 +99,7 @@ namespace vllm_ascend {
     uint32_t row_count,
     uint32_t row_width,
     uint32_t block_table_width,
+    uint32_t selected_count_stride,
     uint32_t block_size);
 
   extern void dsa_staged_remap_rows_impl(

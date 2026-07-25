@@ -417,6 +417,8 @@ at::Tensor npu_dsa_staged_union_(
     const int64_t row_width = row_packed.size(1);
     const int64_t request_count = row_count / 2;
     const int64_t total = row_count * row_width;
+    const int64_t selected_count_stride =
+        selected_count.numel() / request_count;
     TORCH_CHECK(row_count > 0 && row_count % 2 == 0 &&
                     row_width == 2048 &&
                     request_block_table.size(0) == request_count,
@@ -426,6 +428,9 @@ at::Tensor npu_dsa_staged_union_(
                     selected_count.numel() >= request_count &&
                     target_slots.numel() >= total,
                 "staged-union output buffers are too small");
+    TORCH_CHECK(request_count == 1 || selected_count_stride >= 8,
+                "batched staged union requires each selected-count row to "
+                "occupy at least one 32-byte transaction");
     TORCH_CHECK(block_size > 0 &&
                     request_block_table.size(1) * block_size >=
                         2 * row_width,
@@ -448,7 +453,7 @@ at::Tensor npu_dsa_staged_union_(
     cmd.SetCustomHandler([
         stream, row_ptr, packed_ptr, map_ptr, count_ptr, table_ptr,
         slots_ptr, row_count, row_width, max_tokens, table_width,
-        block_size, use_sort]() -> int {
+        selected_count_stride, block_size, use_sort]() -> int {
         if (use_sort) {
             dsa_staged_sort_union_impl(
                 stream, row_ptr, packed_ptr, map_ptr, count_ptr,
@@ -456,6 +461,7 @@ at::Tensor npu_dsa_staged_union_(
                 static_cast<uint32_t>(row_count),
                 static_cast<uint32_t>(row_width),
                 static_cast<uint32_t>(table_width),
+                static_cast<uint32_t>(selected_count_stride),
                 static_cast<uint32_t>(block_size));
         } else {
             dsa_staged_bitmap_union_impl(
@@ -465,6 +471,7 @@ at::Tensor npu_dsa_staged_union_(
                 static_cast<uint32_t>(row_width),
                 static_cast<uint32_t>(max_tokens),
                 static_cast<uint32_t>(table_width),
+                static_cast<uint32_t>(selected_count_stride),
                 static_cast<uint32_t>(block_size));
         }
         return 0;

@@ -169,7 +169,9 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             (request_batch, capacity), dtype=torch.int32, device="npu"
         ),
         torch.empty((row_count, topk), dtype=torch.int32, device="npu"),
-        torch.empty(request_batch, dtype=torch.int32, device="npu"),
+        torch.empty(
+            (request_batch, 16), dtype=torch.int32, device="npu"
+        ),
         torch.empty(
             (request_batch, capacity), dtype=torch.long, device="npu"
         ),
@@ -219,9 +221,9 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         raise AssertionError("staged no-union remapped rows are incorrect")
     expected_count = 3 * topk // 2
     expected_counts = [expected_count] * request_batch
-    if bitmap_result[2].cpu().tolist() != expected_counts:
+    if bitmap_result[2][:, 0].cpu().tolist() != expected_counts:
         raise AssertionError("bitmap staged union count is incorrect")
-    if sort_result[2].cpu().tolist() != expected_counts:
+    if sort_result[2][:, 0].cpu().tolist() != expected_counts:
         raise AssertionError("sort staged union count is incorrect")
     if not torch.equal(bitmap_result[0].cpu(), sort_result[0].cpu()):
         raise AssertionError("bitmap and sort remapped rows differ")

@@ -38,6 +38,7 @@ public:
         uint32_t rowWidth,
         uint32_t maxTokens,
         uint32_t blockTableWidth,
+        uint32_t selectedCountStride,
         uint32_t blockSize)
     {
         rowCount_ = rowCount;
@@ -48,12 +49,14 @@ public:
         bitmapWords_ = (maxTokens + 31) / 32;
         bufferWords_ = ((bitmapWords_ + 7) / 8) * 8;
         blockTableWidth_ = blockTableWidth;
+        selectedCountStride_ = selectedCountStride;
         blockSize_ = blockSize;
         rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
         localToUnion_.SetGlobalBuffer(localToUnion, rowCount * rowWidth);
-        selectedCount_.SetGlobalBuffer(selectedCount, requestCount_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount, requestCount_ * selectedCountStride_);
         requestBlockTable_.SetGlobalBuffer(
             requestBlockTable, requestCount_ * blockTableWidth);
         targetSlots_.SetGlobalBuffer(
@@ -109,7 +112,8 @@ public:
             // Duplicate tokens overwrite the same values at the same rank.
             WriteUnion(request, outputOffset, rank, static_cast<int32_t>(token));
         }
-        selectedCount_.SetValue(request, static_cast<int32_t>(count));
+        selectedCount_.SetValue(
+            request * selectedCountStride_, static_cast<int32_t>(count));
     }
 
 private:
@@ -173,6 +177,7 @@ private:
     uint32_t bitmapWords_ = 0;
     uint32_t bufferWords_ = 0;
     uint32_t blockTableWidth_ = 0;
+    uint32_t selectedCountStride_ = 0;
     uint32_t blockSize_ = 0;
 };
 
@@ -188,6 +193,7 @@ public:
         uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t blockTableWidth,
+        uint32_t selectedCountStride,
         uint32_t blockSize)
     {
         rowCount_ = rowCount;
@@ -195,12 +201,14 @@ public:
         requestCount_ = rowCount / 2;
         requestWidth_ = 2 * rowWidth;
         blockTableWidth_ = blockTableWidth;
+        selectedCountStride_ = selectedCountStride;
         blockSize_ = blockSize;
         rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
         localToUnion_.SetGlobalBuffer(localToUnion, rowCount * rowWidth);
-        selectedCount_.SetGlobalBuffer(selectedCount, requestCount_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount, requestCount_ * selectedCountStride_);
         requestBlockTable_.SetGlobalBuffer(
             requestBlockTable, requestCount_ * blockTableWidth);
         targetSlots_.SetGlobalBuffer(
@@ -258,7 +266,8 @@ public:
             localToUnion_.SetValue(
                 rowOffset + original, static_cast<int32_t>(rank - 1));
         }
-        selectedCount_.SetValue(request, static_cast<int32_t>(rank));
+        selectedCount_.SetValue(
+            request * selectedCountStride_, static_cast<int32_t>(rank));
     }
 
 private:
@@ -347,6 +356,7 @@ private:
     uint32_t requestCount_ = 0;
     uint32_t requestWidth_ = 0;
     uint32_t blockTableWidth_ = 0;
+    uint32_t selectedCountStride_ = 0;
     uint32_t blockSize_ = 0;
 };
 
@@ -422,13 +432,14 @@ extern "C" __global__ __aicore__ void dsa_staged_bitmap_union_kernel(
     uint32_t rowWidth,
     uint32_t maxTokens,
     uint32_t blockTableWidth,
+    uint32_t selectedCountStride,
     uint32_t blockSize)
 {
     if ASCEND_IS_AIV {
         DSAStagedBitmapUnionKernel op;
         op.Init(rowPacked, selectedPacked, localToUnion, selectedCount,
                 requestBlockTable, targetSlots, rowCount, rowWidth,
-                maxTokens, blockTableWidth, blockSize);
+                maxTokens, blockTableWidth, selectedCountStride, blockSize);
         op.Process();
     }
 }
@@ -443,13 +454,14 @@ extern "C" __global__ __aicore__ void dsa_staged_sort_union_kernel(
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t blockTableWidth,
+    uint32_t selectedCountStride,
     uint32_t blockSize)
 {
     if ASCEND_IS_AIV {
         DSAStagedSortUnionKernel op;
         op.Init(rowPacked, selectedPacked, localToUnion, selectedCount,
                 requestBlockTable, targetSlots, rowCount, rowWidth,
-                blockTableWidth, blockSize);
+                blockTableWidth, selectedCountStride, blockSize);
         op.Process();
     }
 }
@@ -501,7 +513,8 @@ void dsa_staged_bitmap_union_impl(
     void* stream, void* rowPacked, void* selectedPacked,
     void* localToUnion, void* selectedCount, void* requestBlockTable,
     void* targetSlots, uint32_t rowCount, uint32_t rowWidth,
-    uint32_t maxTokens, uint32_t blockTableWidth, uint32_t blockSize)
+    uint32_t maxTokens, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize)
 {
     dsa_staged_bitmap_union_kernel<<<rowCount / 2, nullptr, stream>>>(
         static_cast<int32_t*>(rowPacked),
@@ -510,14 +523,16 @@ void dsa_staged_bitmap_union_impl(
         static_cast<int32_t*>(selectedCount),
         static_cast<int32_t*>(requestBlockTable),
         static_cast<int64_t*>(targetSlots),
-        rowCount, rowWidth, maxTokens, blockTableWidth, blockSize);
+        rowCount, rowWidth, maxTokens, blockTableWidth,
+        selectedCountStride, blockSize);
 }
 
 void dsa_staged_sort_union_impl(
     void* stream, void* rowPacked, void* selectedPacked,
     void* localToUnion, void* selectedCount, void* requestBlockTable,
     void* targetSlots, uint32_t rowCount, uint32_t rowWidth,
-    uint32_t blockTableWidth, uint32_t blockSize)
+    uint32_t blockTableWidth, uint32_t selectedCountStride,
+    uint32_t blockSize)
 {
     dsa_staged_sort_union_kernel<<<rowCount / 2, nullptr, stream>>>(
         static_cast<int32_t*>(rowPacked),
@@ -526,7 +541,8 @@ void dsa_staged_sort_union_impl(
         static_cast<int32_t*>(selectedCount),
         static_cast<int32_t*>(requestBlockTable),
         static_cast<int64_t*>(targetSlots),
-        rowCount, rowWidth, blockTableWidth, blockSize);
+        rowCount, rowWidth, blockTableWidth, selectedCountStride,
+        blockSize);
 }
 
 void dsa_staged_remap_rows_impl(
