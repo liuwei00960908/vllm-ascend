@@ -590,9 +590,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     route = runner._staged_sfa_local_route(**rejected)
                     self.assertEqual(
                         route.action,
-                        StagedSFARouteAction.FATAL
-                        if name in ("short_prompt", "short_frontier")
-                        else StagedSFARouteAction.SAFE_NATIVE,
+                        StagedSFARouteAction.SAFE_NATIVE,
                     )
                     if name == "dense_prefix_hit":
                         self.assertEqual(
@@ -608,6 +606,11 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         self.assertEqual(
                             route.reason,
                             StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+                        )
+                    elif name == "short_prompt":
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.SHORT_PROMPT,
                         )
                     elif name == "short_frontier":
                         self.assertEqual(

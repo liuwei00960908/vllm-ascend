@@ -2670,15 +2670,9 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
         if prompt_lens.shape != (batch_size,) or np.any(prompt_lens < index_topk):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                StagedSFARouteReason.SHORT_PROMPT,
-            )
+            return native(StagedSFARouteReason.SHORT_PROMPT)
         if any(frontier < index_topk for frontier in frontiers):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                StagedSFARouteReason.FRONTIER_TOO_SHORT,
-            )
+            return native(StagedSFARouteReason.FRONTIER_TOO_SHORT)
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
