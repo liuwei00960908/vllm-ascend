@@ -375,6 +375,138 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     return selected_packed;
 }
 
+at::Tensor npu_dsa_staged_union_(
+    const at::Tensor &row_packed,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t max_tokens,
+    bool use_sort)
+{
+    TORCH_CHECK(row_packed.is_privateuseone(),
+                "row_packed must be on an NPU device");
+    const auto device = row_packed.device();
+    TORCH_CHECK(selected_packed.device() == device &&
+                    local_to_union.device() == device &&
+                    selected_count.device() == device &&
+                    request_block_table.device() == device &&
+                    target_slots.device() == device,
+                "all staged-union tensors must share one NPU device");
+    TORCH_CHECK(row_packed.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    local_to_union.scalar_type() == at::kInt &&
+                    selected_count.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong,
+                "staged-union indices must be int32 and slots int64");
+    TORCH_CHECK(row_packed.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    local_to_union.is_contiguous() &&
+                    selected_count.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    target_slots.is_contiguous(),
+                "all staged-union tensors must be contiguous");
+    TORCH_CHECK(row_packed.dim() == 2 &&
+                    request_block_table.dim() == 2 &&
+                    request_block_table.size(0) == 1,
+                "benchmark staged union requires [rows,k] and one request");
+    const int64_t row_count = row_packed.size(0);
+    const int64_t row_width = row_packed.size(1);
+    const int64_t total = row_count * row_width;
+    TORCH_CHECK(row_count == 2 && row_width == 2048,
+                "benchmark staged union currently requires [2, 2048]");
+    TORCH_CHECK(selected_packed.numel() >= total &&
+                    local_to_union.numel() >= total &&
+                    selected_count.numel() >= 1 &&
+                    target_slots.numel() >= total,
+                "staged-union output buffers are too small");
+    TORCH_CHECK(block_size > 0 &&
+                    request_block_table.size(1) * block_size >= total,
+                "request block table is too short");
+    TORCH_CHECK(max_tokens > 0 && max_tokens % 32 == 0,
+                "max_tokens must be a positive multiple of 32");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* row_ptr = row_packed.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* map_ptr = local_to_union.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    const int64_t table_width = request_block_table.size(1);
+    at_npu::native::OpCommand cmd;
+    cmd.Name(use_sort ? "npu_dsa_staged_sort_union_"
+                      : "npu_dsa_staged_bitmap_union_");
+    cmd.SetCustomHandler([
+        stream, row_ptr, packed_ptr, map_ptr, count_ptr, table_ptr,
+        slots_ptr, row_count, row_width, max_tokens, table_width,
+        block_size, use_sort]() -> int {
+        if (use_sort) {
+            dsa_staged_sort_union_impl(
+                stream, row_ptr, packed_ptr, map_ptr, count_ptr,
+                table_ptr, slots_ptr,
+                static_cast<uint32_t>(row_count),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(table_width),
+                static_cast<uint32_t>(block_size));
+        } else {
+            dsa_staged_bitmap_union_impl(
+                stream, row_ptr, packed_ptr, map_ptr, count_ptr,
+                table_ptr, slots_ptr,
+                static_cast<uint32_t>(row_count),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(max_tokens),
+                static_cast<uint32_t>(table_width),
+                static_cast<uint32_t>(block_size));
+        }
+        return 0;
+    });
+    cmd.Run();
+    return selected_count;
+}
+
+at::Tensor npu_dsa_staged_remap_rows_(
+    at::Tensor &local_indices,
+    const at::Tensor &local_to_union)
+{
+    TORCH_CHECK(local_indices.is_privateuseone() &&
+                    local_to_union.device() == local_indices.device(),
+                "staged remap tensors must share one NPU device");
+    TORCH_CHECK(local_indices.scalar_type() == at::kInt &&
+                    local_to_union.scalar_type() == at::kInt &&
+                    local_indices.is_contiguous() &&
+                    local_to_union.is_contiguous(),
+                "staged remap tensors must be contiguous int32");
+    TORCH_CHECK(local_indices.dim() == 2 ||
+                    (local_indices.dim() == 3 &&
+                     local_indices.size(1) == 1),
+                "local_indices must be [rows,k] or [rows,1,k]");
+    const int64_t rows = local_indices.size(0);
+    const int64_t width = local_indices.numel() / rows;
+    TORCH_CHECK(local_to_union.numel() >= rows * width,
+                "local_to_union is too small");
+    const c10_npu::OptionalNPUGuard npu_guard(local_indices.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* indices_ptr = local_indices.data_ptr();
+    void* map_ptr = local_to_union.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_staged_remap_rows_");
+    cmd.SetCustomHandler([
+        stream, indices_ptr, map_ptr, rows, width]() -> int {
+        dsa_staged_remap_rows_impl(
+            stream, indices_ptr, map_ptr,
+            static_cast<uint32_t>(rows),
+            static_cast<uint32_t>(width));
+        return 0;
+    });
+    cmd.Run();
+    return local_indices;
+}
+
 at::Tensor npu_dsa_prepare_sparse_indices_(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1004,6 +1136,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_prepare_sparse_indices_legacy_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_prepare_sparse_indices_legacy_);
+    ops.def(
+        "npu_dsa_staged_union_(Tensor row_packed, "
+        "Tensor(a!) selected_packed, Tensor(b!) local_to_union, "
+        "Tensor(c!) selected_count, Tensor request_block_table, "
+        "Tensor(d!) target_slots, int block_size, int max_tokens, "
+        "bool use_sort) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_staged_union_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_union_);
+    ops.def(
+        "npu_dsa_staged_remap_rows_(Tensor(a!) local_indices, "
+        "Tensor local_to_union) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_staged_remap_rows_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_remap_rows_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);

@@ -72,6 +72,40 @@ namespace vllm_ascend {
     uint32_t core_count,
     bool need_packed,
     bool clear_invalid_rows);
+
+  extern void dsa_staged_bitmap_union_impl(
+    void* stream,
+    void* row_packed,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t max_tokens,
+    uint32_t block_table_width,
+    uint32_t block_size);
+
+  extern void dsa_staged_sort_union_impl(
+    void* stream,
+    void* row_packed,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t block_table_width,
+    uint32_t block_size);
+
+  extern void dsa_staged_remap_rows_impl(
+    void* stream,
+    void* local_indices,
+    void* local_to_union,
+    uint32_t row_count,
+    uint32_t row_width);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {
