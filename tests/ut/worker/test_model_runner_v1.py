@@ -556,6 +556,18 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         ]
                     ),
                 },
+                "sparse_load_unavailable": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=True,
+                                load_spec=SimpleNamespace(can_load=False),
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                },
                 "short_frontier": {
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
@@ -591,6 +603,11 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         self.assertEqual(
                             route.reason,
                             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                        )
+                    elif name == "sparse_load_unavailable":
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
                         )
                     elif name == "short_frontier":
                         self.assertEqual(

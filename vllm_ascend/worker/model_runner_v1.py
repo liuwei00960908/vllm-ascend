@@ -2654,6 +2654,9 @@ class NPUModelRunner(GPUModelRunner):
         if metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            # A fresh decode has no committed decode-window KV to retrieve yet.
+            # Run native attention until LMCache publishes a sparse frontier.
+            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
         ):
             return native(metadata_reason)
         if metadata_reason != StagedSFARouteReason.ELIGIBLE:
