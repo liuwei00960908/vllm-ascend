@@ -434,6 +434,34 @@ extern "C" __global__ __aicore__ void dsa_staged_remap_rows_kernel(
     }
 }
 
+extern "C" __global__ __aicore__ void dsa_staged_copy_rows_kernel(
+    __gm__ int32_t* output,
+    __gm__ int32_t* localIndices,
+    uint32_t rowCount,
+    uint32_t rowWidth)
+{
+    if ASCEND_IS_AIV {
+        const uint32_t row = AscendC::GetBlockIdx();
+        if (row >= rowCount) {
+            return;
+        }
+        AscendC::TPipe pipe;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> rowBuf;
+        pipe.InitBuffer(rowBuf, rowWidth * sizeof(int32_t));
+        auto rowLocal = rowBuf.Get<int32_t>();
+        AscendC::GlobalTensor<int32_t> outputGm;
+        AscendC::GlobalTensor<int32_t> localIndicesGm;
+        const uint64_t total =
+            static_cast<uint64_t>(rowCount) * rowWidth;
+        outputGm.SetGlobalBuffer(output, total);
+        localIndicesGm.SetGlobalBuffer(localIndices, total);
+        const uint64_t offset = static_cast<uint64_t>(row) * rowWidth;
+        AscendC::DataCopy(rowLocal, localIndicesGm[offset], rowWidth);
+        Sync<AscendC::HardEvent::MTE2_MTE3>();
+        AscendC::DataCopy(outputGm[offset], rowLocal, rowWidth);
+    }
+}
+
 namespace vllm_ascend {
 
 void dsa_staged_bitmap_union_impl(
@@ -475,6 +503,15 @@ void dsa_staged_remap_rows_impl(
     dsa_staged_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
         static_cast<int32_t*>(localIndices),
         static_cast<int32_t*>(localToUnion), rowCount, rowWidth);
+}
+
+void dsa_staged_copy_rows_impl(
+    void* stream, void* output, void* localIndices,
+    uint32_t rowCount, uint32_t rowWidth)
+{
+    dsa_staged_copy_rows_kernel<<<rowCount, nullptr, stream>>>(
+        static_cast<int32_t*>(output),
+        static_cast<int32_t*>(localIndices), rowCount, rowWidth);
 }
 
 }  // namespace vllm_ascend

@@ -51,6 +51,7 @@ def _staged_runner(
     values,
     boundaries,
     valid_rows,
+    local_scratch_base,
     row_requests,
     request_block_table,
     selected_packed,
@@ -65,7 +66,7 @@ def _staged_runner(
         values,
         boundaries,
         valid_rows,
-        torch.zeros_like(boundaries),
+        local_scratch_base,
         True,
         row_requests,
     )
@@ -84,6 +85,29 @@ def _staged_runner(
     return values, selected_packed, selected_count, target_slots
 
 
+def _staged_no_union_runner(
+    *,
+    legacy_op,
+    copy_rows_op,
+    values,
+    local_indices,
+    boundaries,
+    valid_rows,
+    local_scratch_base,
+    row_requests,
+):
+    legacy_op(
+        local_indices,
+        boundaries,
+        valid_rows,
+        local_scratch_base,
+        True,
+        row_requests,
+    )
+    copy_rows_op(values, local_indices)
+    return values
+
+
 def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     if topk != 2048:
         raise ValueError("the experimental staged kernels currently require --topk 2048")
@@ -92,10 +116,13 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
     remap_op = torch.ops._C_ascend.npu_dsa_staged_remap_rows_
+    copy_rows_op = torch.ops._C_ascend.npu_dsa_staged_copy_rows_
 
     source = _two_rows_with_half_overlap(topk, "npu")
     legacy_values = source.clone()
     union_values = source.clone()
+    no_union_values = source.clone()
+    no_union_local_indices = source.clone()
     bitmap_values = source.clone()
     sort_values = source.clone()
     max_tokens = 131072
@@ -105,6 +132,7 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     # The pre-union operator assigns each row its own compact scratch range.
     valid_rows = torch.arange(2, dtype=torch.int32, device="npu")
     scratch_base = torch.arange(2, dtype=torch.int32, device="npu") * topk
+    local_scratch_base = torch.zeros(2, dtype=torch.int32, device="npu")
 
     block_size = 128
     capacity = 2 * topk
@@ -128,6 +156,7 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             values=values,
             boundaries=boundaries,
             valid_rows=valid_rows,
+            local_scratch_base=local_scratch_base,
             row_requests=row_requests,
             request_block_table=block_table,
             selected_packed=buffers[0],
@@ -139,9 +168,27 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             use_sort=use_sort,
         )
 
+    def staged_no_union():
+        return _staged_no_union_runner(
+            legacy_op=legacy_op,
+            copy_rows_op=copy_rows_op,
+            values=no_union_values,
+            local_indices=no_union_local_indices,
+            boundaries=boundaries,
+            valid_rows=valid_rows,
+            local_scratch_base=local_scratch_base,
+            row_requests=row_requests,
+        )
+
+    no_union_result = staged_no_union()
     bitmap_result = staged(bitmap_values, bitmap_buffers, False)
     sort_result = staged(sort_values, sort_buffers, True)
     torch.npu.synchronize()
+    expected_local_indices = torch.arange(
+        topk, dtype=torch.int32, device="npu"
+    ).expand(2, 1, -1)
+    if not torch.equal(no_union_result.cpu(), expected_local_indices.cpu()):
+        raise AssertionError("staged no-union remapped rows are incorrect")
     expected_count = 3 * topk // 2
     if bitmap_result[2].cpu().tolist() != [expected_count]:
         raise AssertionError("bitmap staged union count is incorrect")
@@ -184,6 +231,12 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         warmups,
         iterations,
     )
+    no_union_samples = _measure_npu_ms(
+        staged_no_union,
+        lambda: no_union_local_indices.copy_(source),
+        warmups,
+        iterations,
+    )
     bitmap_samples = _measure_npu_ms(
         lambda: staged(bitmap_values, bitmap_buffers, False),
         lambda: bitmap_values.copy_(source),
@@ -199,17 +252,30 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
+    no_union_mean = statistics.fmean(no_union_samples)
     bitmap_mean = statistics.fmean(bitmap_samples)
     sort_mean = statistics.fmean(sort_samples)
     _summary("pre-union", legacy_samples)
     _summary("fused-union", union_samples)
+    _summary("staged-no-union", no_union_samples)
     _summary("staged-bitmap", bitmap_samples)
     _summary("staged-sort", sort_samples)
     print(f"union overhead: {union_mean - legacy_mean:+.6f} ms ({(union_mean / legacy_mean - 1) * 100:+.2f}%)")
+    print(
+        "staged bitmap union cost: "
+        f"{bitmap_mean - no_union_mean:+.6f} ms "
+        f"({(bitmap_mean / no_union_mean - 1) * 100:+.2f}%)"
+    )
+    print(
+        "staged sort union cost: "
+        f"{sort_mean - no_union_mean:+.6f} ms "
+        f"({(sort_mean / no_union_mean - 1) * 100:+.2f}%)"
+    )
     fastest = min(
         (
             ("pre-union", legacy_mean),
             ("fused-union", union_mean),
+            ("staged-no-union", no_union_mean),
             ("staged-bitmap", bitmap_mean),
             ("staged-sort", sort_mean),
         ),

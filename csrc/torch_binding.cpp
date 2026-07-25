@@ -507,6 +507,42 @@ at::Tensor npu_dsa_staged_remap_rows_(
     return local_indices;
 }
 
+at::Tensor npu_dsa_staged_copy_rows_(
+    at::Tensor &output,
+    const at::Tensor &local_indices)
+{
+    TORCH_CHECK(output.is_privateuseone() &&
+                    local_indices.device() == output.device(),
+                "staged copy tensors must share one NPU device");
+    TORCH_CHECK(output.scalar_type() == at::kInt &&
+                    local_indices.scalar_type() == at::kInt &&
+                    output.is_contiguous() &&
+                    local_indices.is_contiguous(),
+                "staged copy tensors must be contiguous int32");
+    TORCH_CHECK(output.sizes() == local_indices.sizes(),
+                "staged copy tensors must have identical shapes");
+    TORCH_CHECK(output.dim() == 2 || output.dim() == 3,
+                "staged copy tensors must be [rows,k] or [rows,1,k]");
+    const int64_t rows = output.size(0);
+    const int64_t width = output.numel() / rows;
+    const c10_npu::OptionalNPUGuard npu_guard(output.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* output_ptr = output.data_ptr();
+    void* local_indices_ptr = local_indices.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_staged_copy_rows_");
+    cmd.SetCustomHandler([
+        stream, output_ptr, local_indices_ptr, rows, width]() -> int {
+        dsa_staged_copy_rows_impl(
+            stream, output_ptr, local_indices_ptr,
+            static_cast<uint32_t>(rows),
+            static_cast<uint32_t>(width));
+        return 0;
+    });
+    cmd.Run();
+    return output;
+}
+
 at::Tensor npu_dsa_prepare_sparse_indices_(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1153,6 +1189,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_staged_remap_rows_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_staged_remap_rows_);
+    ops.def(
+        "npu_dsa_staged_copy_rows_(Tensor(a!) output, "
+        "Tensor local_indices) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_staged_copy_rows_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_copy_rows_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);

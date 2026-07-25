@@ -106,6 +106,13 @@ namespace vllm_ascend {
     void* local_to_union,
     uint32_t row_count,
     uint32_t row_width);
+
+  extern void dsa_staged_copy_rows_impl(
+    void* stream,
+    void* output,
+    void* local_indices,
+    uint32_t row_count,
+    uint32_t row_width);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {
