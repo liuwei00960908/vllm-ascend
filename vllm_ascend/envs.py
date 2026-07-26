@@ -198,6 +198,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
     ),
+    # Keep this many completed decode-window saves pending before publishing
+    # them to the scheduler. The scheduler uses the published frontier for
+    # both the next DSA split boundary and saved-block release, so both lag
+    # together. Only active when LMCache decode-window save is enabled.
+    "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS": lambda: max(
+        int(
+            os.getenv(
+                "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS",
+                "0",
+            )
+        ),
+        0,
+    ),
     # Emit one CPU-synchronized, first-post-commit mapping diagnostic for the
     # SHRINK_LATENT=2 compact-scratch path. Requires MTP_DW_DIAG. Default off;
     # diagnostic only, with no inference fallback or output changes.

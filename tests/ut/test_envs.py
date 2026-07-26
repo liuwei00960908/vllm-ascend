@@ -14,6 +14,7 @@
 
 import inspect
 import os
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
@@ -60,3 +61,13 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_decode_window_save_commit_delay_windows(self):
+        name = "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 0)
+        with patch.dict(os.environ, {name: "3"}):
+            self.assertEqual(getattr(envs_ascend, name), 3)
+        with patch.dict(os.environ, {name: "-1"}):
+            self.assertEqual(getattr(envs_ascend, name), 0)
