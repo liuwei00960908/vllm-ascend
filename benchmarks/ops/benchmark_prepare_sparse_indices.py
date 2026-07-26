@@ -318,6 +318,7 @@ def main(
     sharded_sort_values = source.clone()
     sharded_vector_values = source.clone()
     sharded_vector_dedup_values = source.clone()
+    production_staged_values = source.clone()
     max_tokens = 131072
     boundaries = torch.full((row_count,), max_tokens, dtype=torch.int32, device="npu")
     source_max = (mtp + 1) * topk // 2 - 1
@@ -358,6 +359,9 @@ def main(
     sharded_sort_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_vector_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_vector_dedup_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
+    production_staged_buffers = tuple(
+        torch.empty_like(item) for item in hash_buffers
+    )
     shard_count = 1 << (mtp - 1).bit_length()
     sharded_sort_scratch = (
         torch.empty(
@@ -501,6 +505,26 @@ def main(
     sharded_sort_result = staged_sharded_sort()
     sharded_vector_result = staged_sharded_vector()
     sharded_vector_dedup_result = staged_sharded_vector_dedup()
+    production_staged_result = None
+    if mtp <= 2:
+        production_result = prepare_sparse_indices(
+            production_staged_values,
+            sharded_boundaries,
+            row_req_indices=row_requests,
+            request_block_table=block_table,
+            selected_packed=production_staged_buffers[0],
+            selected_counts=production_staged_buffers[2],
+            target_slot_mapping=production_staged_buffers[3],
+            block_size=block_size,
+            local_to_union_workspace=production_staged_buffers[1],
+            staged_mtp=mtp,
+        )
+        production_staged_result = (
+            production_result[0],
+            production_result[1],
+            production_staged_buffers[2],
+            production_result[3],
+        )
     sort_union_only_packed = None
     if pair_baselines:
         sort_union_only_packed = legacy_op(
@@ -587,6 +611,17 @@ def main(
         topk=topk,
         max_tokens=max_tokens,
     )
+    if production_staged_result is not None:
+        _validate_sharded_result(
+            label="production staged",
+            result=production_staged_result,
+            source=source,
+            boundary=sharded_boundary,
+            request_batch=request_batch,
+            mtp=mtp,
+            topk=topk,
+            max_tokens=max_tokens,
+        )
 
     legacy_samples = _measure_npu_ms(
         lambda: legacy_op(
@@ -687,6 +722,25 @@ def main(
         warmups,
         iterations,
     )
+    production_staged_samples = []
+    if mtp <= 2:
+        production_staged_samples = _measure_npu_ms(
+            lambda: prepare_sparse_indices(
+                production_staged_values,
+                sharded_boundaries,
+                row_req_indices=row_requests,
+                request_block_table=block_table,
+                selected_packed=production_staged_buffers[0],
+                selected_counts=production_staged_buffers[2],
+                target_slot_mapping=production_staged_buffers[3],
+                block_size=block_size,
+                local_to_union_workspace=production_staged_buffers[1],
+                staged_mtp=mtp,
+            ),
+            lambda: production_staged_values.copy_(source),
+            warmups,
+            iterations,
+        )
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
@@ -700,6 +754,12 @@ def main(
     _summary("sharded-sort", sharded_sort_samples)
     _summary("sharded-vector-map", sharded_vector_samples)
     _summary("sharded-vector-dedup", sharded_vector_dedup_samples)
+    production_staged_mean = None
+    if production_staged_samples:
+        production_staged_mean = statistics.fmean(
+            production_staged_samples
+        )
+        _summary("production-staged", production_staged_samples)
     native_unique_mean = None
     if native_unique_baseline:
         native_unique_mean = statistics.fmean(native_unique_samples)
@@ -754,6 +814,8 @@ def main(
         ("sharded-vector-map", sharded_vector_mean),
         ("sharded-vector-dedup", sharded_vector_dedup_mean),
     ]
+    if production_staged_mean is not None:
+        candidates.append(("production-staged", production_staged_mean))
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))
     if pair_baselines:

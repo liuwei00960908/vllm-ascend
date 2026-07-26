@@ -453,6 +453,53 @@ class TestLMCacheSparseFrontier(TestBase):
                 scratch_capacity=8,
             )
 
+    def test_fixed_staged_decode_layout_selects_q1_and_mtp2(self):
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 1, 2],
+                3,
+                3,
+                pure_decode=True,
+            ),
+            1,
+        )
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, 1, 1],
+                2,
+                4,
+                pure_decode=True,
+            ),
+            2,
+        )
+
+    def test_fixed_staged_decode_layout_falls_back_for_mixed_or_irregular(self):
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, -1, 1],
+                2,
+                3,
+                pure_decode=False,
+            )
+        )
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 1, 0, 1],
+                2,
+                4,
+                pure_decode=True,
+            )
+        )
+
+    def test_fixed_staged_decode_layout_rejects_mtp_above_two(self):
+        with self.assertRaisesRegex(RuntimeError, "got MTP=3"):
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, 0, 1, 1, 1],
+                2,
+                6,
+                pure_decode=True,
+            )
+
 
 class TestStagedSFAGraphPoc(TestBase):
     def setUp(self):
@@ -580,6 +627,9 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_target_slot_mapping = torch.empty(
             batch_size, 4, dtype=torch.long
         )
+        metadata.decode_union_mapping_workspace = torch.empty(
+            batch_size, 4, dtype=torch.int32
+        )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
         metadata.decode_remap_boundary = torch.empty(
@@ -701,7 +751,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
-            impl._cross_layer_pre_compute.call_args_list[1].args[-6],
+            impl._cross_layer_pre_compute.call_args_list[1].args[-7],
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
@@ -758,7 +808,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         args = impl._cross_layer_pre_compute.call_args.args
-        self.assertEqual(args[-5].tolist(), [0, 1, 2, 3])
+        self.assertEqual(args[-6].tolist(), [0, 1, 2, 3])
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -1453,6 +1503,9 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_target_slot_mapping = torch.empty(
             2, 8, dtype=torch.long
         )
+        metadata.decode_union_mapping_workspace = torch.empty(
+            2, 8, dtype=torch.int32
+        )
         graph_key = StagedSFAGraphKey.fixed_spec(2, 2)
         context = SimpleNamespace(
             cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
@@ -1951,6 +2004,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             first.decode_selected_tokens.data_ptr(),
             first.decode_selected_counts.data_ptr(),
             first.decode_target_slot_mapping.data_ptr(),
+            first.decode_union_mapping_workspace.data_ptr(),
         )
         assert first.decode_req_indices.tolist() == [0, 0, 1, 1]
         assert first.decode_row_offsets.tolist() == [0, 1, 0, 1]
@@ -1972,6 +2026,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             second.decode_selected_tokens.data_ptr(),
             second.decode_selected_counts.data_ptr(),
             second.decode_target_slot_mapping.data_ptr(),
+            second.decode_union_mapping_workspace.data_ptr(),
         )
 
         assert second_addresses == addresses

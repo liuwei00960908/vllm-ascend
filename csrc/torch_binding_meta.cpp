@@ -75,6 +75,34 @@ at::Tensor npu_dsa_prepare_sparse_indices_meta(
     return selected_counts;
 }
 
+at::Tensor npu_dsa_prepare_sparse_indices_staged_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)row_req_indices;
+    (void)request_block_table;
+    (void)selected_packed;
+    (void)target_slots;
+    (void)local_to_union_workspace;
+    (void)block_size;
+    (void)mtp;
+    (void)need_packed;
+    (void)clear_invalid_rows;
+    return selected_counts;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -688,6 +716,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_prepare_sparse_indices_",
         &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_meta);
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_staged_",
+        &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_staged_meta);
     ops.impl(
         "npu_dsa_staged_sharded_union_",
         &vllm_ascend::meta::npu_dsa_staged_sharded_union_meta);

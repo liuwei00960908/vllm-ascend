@@ -74,6 +74,28 @@ namespace vllm_ascend {
     bool clear_invalid_rows,
     uint32_t packed_key_stride);
 
+  extern void dsa_prepare_sparse_indices_staged_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* request_block_table,
+    void* selected_packed,
+    void* selected_count,
+    void* target_slots,
+    void* local_to_union,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t scratch_capacity,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size,
+    uint32_t core_count,
+    bool need_packed,
+    bool clear_invalid_rows);
+
   extern void dsa_staged_hash_union_impl(
     void* stream,
     void* row_packed,

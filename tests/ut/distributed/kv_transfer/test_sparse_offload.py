@@ -524,6 +524,46 @@ class TestPrepareSparseIndices:
                 block_size=64,
             )
 
+    def test_public_staged_prepare_rejects_mtp_above_two_before_dispatch(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        with pytest.raises(RuntimeError, match="got MTP=3"):
+            prepare_sparse_indices(
+                torch.zeros((3, 2048), dtype=torch.int32),
+                torch.zeros(3, dtype=torch.int32),
+                row_req_indices=torch.zeros(3, dtype=torch.int32),
+                request_block_table=torch.zeros((1, 32), dtype=torch.int32),
+                selected_packed=torch.zeros((1, 6144), dtype=torch.int32),
+                selected_counts=torch.zeros((1, 16), dtype=torch.int32),
+                target_slot_mapping=torch.zeros((1, 6144), dtype=torch.long),
+                block_size=128,
+                staged_mtp=3,
+            )
+
+    def test_public_staged_prepare_requires_caller_owned_workspace(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        with pytest.raises(ValueError, match="local_to_union_workspace"):
+            prepare_sparse_indices(
+                torch.zeros((2, 2048), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+                row_req_indices=torch.zeros(2, dtype=torch.int32),
+                request_block_table=torch.zeros((1, 32), dtype=torch.int32),
+                selected_packed=torch.zeros((1, 4096), dtype=torch.int32),
+                selected_counts=torch.zeros((1, 16), dtype=torch.int32),
+                target_slot_mapping=torch.zeros((1, 4096), dtype=torch.long),
+                block_size=128,
+                staged_mtp=2,
+            )
+
     def test_mtp_request_union_deduplicates_without_touching_live_indices(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
             _prepare_sparse_indices_torch as prepare_sparse_indices,

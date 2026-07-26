@@ -14,6 +14,13 @@ def _load_dsa_union_operator():
         pytest.fail("vllm-ascend custom operators could not be loaded")
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_"):
         pytest.fail("vllm_ascend_C does not contain the DSA union operator")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_prepare_sparse_indices_staged_",
+    ):
+        pytest.fail(
+            "vllm_ascend_C does not contain the production staged DSA operator"
+        )
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_legacy_"):
         pytest.fail("vllm_ascend_C does not contain the pre-union DSA operator")
     if not hasattr(torch.ops._C_ascend, "npu_dsa_staged_unique_finalize_"):
@@ -45,6 +52,76 @@ def _aligned(values, width=16):
     for row, entries in enumerate(values):
         result[row, : len(entries)] = torch.tensor(entries, dtype=torch.int32)
     return result
+
+
+def _run_production_staged(
+    source: torch.Tensor,
+    boundaries: torch.Tensor,
+    request_count: int,
+    mtp: int,
+    *,
+    capture_graph: bool = False,
+):
+    row_width = source.numel() // source.shape[0]
+    capacity = mtp * row_width
+    block_size = 128
+    table_width = capacity // block_size
+    values = source.npu()
+    boundaries_npu = boundaries.npu()
+    row_requests = torch.arange(
+        request_count,
+        dtype=torch.int32,
+        device="npu",
+    ).repeat_interleave(mtp)
+    selected, counts, targets = _buffers(request_count, capacity)
+    mapping = torch.empty_like(selected)
+    block_table = torch.arange(
+        request_count * table_width,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, table_width)
+    addresses = tuple(
+        tensor.data_ptr()
+        for tensor in (values, selected, counts, targets, mapping)
+    )
+
+    def invoke():
+        torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_(
+            values,
+            boundaries_npu,
+            row_requests,
+            block_table,
+            selected,
+            counts,
+            targets,
+            mapping,
+            block_size,
+            mtp,
+            True,
+            True,
+        )
+
+    if capture_graph:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            invoke()
+        values.copy_(source.npu())
+        boundaries_npu.copy_(boundaries.npu())
+        graph.replay()
+    else:
+        invoke()
+    torch.npu.synchronize()
+    assert addresses == tuple(
+        tensor.data_ptr()
+        for tensor in (values, selected, counts, targets, mapping)
+    )
+    return (
+        values.cpu(),
+        selected.cpu(),
+        counts[:, 0].cpu(),
+        targets.cpu(),
+        block_table.cpu(),
+    )
 
 
 def _run_vector_sharded_union(
@@ -771,3 +848,221 @@ def test_zero_boundary_keeps_resident_absolute_indices():
     torch.npu.synchronize()
     assert torch.equal(actual[0].cpu(), original)
     assert actual[2].cpu().tolist() == [0]
+
+
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
+    capture_graph,
+):
+    request_count = 2
+    mtp = 2
+    topk = 2048
+    rows = []
+    boundaries = []
+    for request in range(request_count):
+        base = request * 8192
+        first = torch.roll(
+            torch.arange(base, base + topk, dtype=torch.int32),
+            137,
+        )
+        second = torch.roll(
+            torch.arange(base + 1024, base + 1024 + topk, dtype=torch.int32),
+            293,
+        )
+        first[0] = -1
+        second[1] = -1
+        rows.extend((first, second))
+        boundaries.extend(
+            (
+                int(first.max()) - 100,
+                int(second.max()) - 100,
+            )
+        )
+    source = torch.stack(rows).unsqueeze(1)
+    boundary_tensor = torch.tensor(boundaries, dtype=torch.int32)
+    row_requests = torch.arange(
+        request_count,
+        dtype=torch.int32,
+    ).repeat_interleave(mtp)
+    table_width = mtp * topk // 128
+    block_table = torch.arange(
+        request_count * table_width,
+        dtype=torch.int32,
+    ).reshape(request_count, table_width)
+    expected = _prepare_sparse_indices_torch(
+        source,
+        boundary_tensor,
+        row_req_indices=row_requests,
+        request_block_table=block_table,
+        block_size=128,
+    )
+
+    actual = _run_production_staged(
+        source,
+        boundary_tensor,
+        request_count,
+        mtp,
+        capture_graph=capture_graph,
+    )
+
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[2], expected[2])
+    for request, count in enumerate(expected[2].tolist()):
+        assert torch.equal(
+            actual[1][request, :count],
+            expected[1][request, :count],
+        )
+        assert torch.equal(
+            actual[3][request, :count],
+            expected[3][request, :count],
+        )
+
+
+def test_production_staged_mtp1_skips_union_and_preserves_source_order():
+    request_count = 2
+    topk = 2048
+    rows = torch.stack(
+        (
+            torch.roll(torch.arange(topk, dtype=torch.int32), 197),
+            torch.roll(
+                torch.arange(4096, 4096 + topk, dtype=torch.int32),
+                331,
+            ),
+        )
+    ).unsqueeze(1)
+    boundaries = torch.tensor(
+        [int(row.max()) - 100 for row in rows.reshape(request_count, topk)],
+        dtype=torch.int32,
+    )
+    actual = _run_production_staged(
+        rows,
+        boundaries,
+        request_count,
+        1,
+    )
+
+    expected_remapped = rows.reshape(request_count, topk).clone()
+    expected_selected = []
+    for request in range(request_count):
+        row = rows[request].reshape(-1)
+        mask = (row >= 0) & (row < boundaries[request])
+        selected = row[mask]
+        expected_selected.append(selected)
+        expected_remapped[request, mask] = torch.arange(
+            selected.numel(),
+            dtype=torch.int32,
+        )
+        count = selected.numel()
+        assert actual[2][request].item() == count
+        assert torch.equal(actual[1][request, :count], selected)
+        logical = torch.arange(count, dtype=torch.long)
+        physical = actual[4][request].to(torch.long)
+        expected_targets = (
+            physical[logical // 128] * 128 + logical % 128
+        )
+        assert torch.equal(actual[3][request, :count], expected_targets)
+    assert torch.equal(
+        actual[0].reshape(request_count, topk),
+        expected_remapped,
+    )
+
+
+def test_production_staged_graph_padding_rows_are_zeroed():
+    topk = 2048
+    source = torch.stack(
+        (
+            torch.arange(topk, dtype=torch.int32),
+            torch.arange(topk, dtype=torch.int32) + 4096,
+        )
+    ).unsqueeze(1)
+    values = source.npu()
+    boundaries = torch.tensor(
+        [topk - 100, 0],
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.tensor([0, -1], dtype=torch.int32, device="npu")
+    selected, counts, targets = _buffers(2, topk)
+    mapping = torch.empty_like(selected)
+    block_table = torch.arange(
+        2 * (topk // 128),
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(2, topk // 128)
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_(
+            values,
+            boundaries,
+            row_requests,
+            block_table,
+            selected,
+            counts,
+            targets,
+            mapping,
+            128,
+            1,
+            True,
+            True,
+        )
+    values.copy_(source.npu())
+    graph.replay()
+    torch.npu.synchronize()
+
+    assert torch.count_nonzero(values[1]).item() == 0
+    assert counts[1, 0].item() == 0
+
+
+def test_production_staged_remaps_without_building_optional_payload():
+    topk = 2048
+    source = torch.stack(
+        (
+            torch.arange(topk, dtype=torch.int32),
+            torch.arange(1024, 1024 + topk, dtype=torch.int32),
+        )
+    ).unsqueeze(1)
+    boundaries = torch.tensor(
+        [topk - 100, 1024 + topk - 100],
+        dtype=torch.int32,
+    )
+    expected = _prepare_sparse_indices_torch(
+        source,
+        boundaries,
+        row_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+        request_block_table=torch.arange(32, dtype=torch.int32).reshape(
+            1, 32
+        ),
+        block_size=128,
+        need_packed=False,
+    )
+    selected, counts, targets = _buffers(1, 2 * topk)
+    targets.fill_(-7)
+    workspace = torch.empty_like(selected)
+    actual = prepare_sparse_indices(
+        source.npu(),
+        boundaries.npu(),
+        row_req_indices=torch.tensor(
+            [0, 0],
+            dtype=torch.int32,
+            device="npu",
+        ),
+        request_block_table=torch.arange(
+            32,
+            dtype=torch.int32,
+            device="npu",
+        ).reshape(1, 32),
+        selected_packed=selected,
+        selected_counts=counts,
+        target_slot_mapping=targets,
+        block_size=128,
+        need_packed=False,
+        local_to_union_workspace=workspace,
+        staged_mtp=2,
+    )
+    torch.npu.synchronize()
+
+    assert torch.equal(actual[0].cpu(), expected[0])
+    assert actual[1:] == (None, None, None)
+    assert counts[0, 0].item() == 0
+    assert torch.all(targets == -7)

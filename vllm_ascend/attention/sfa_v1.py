@@ -495,6 +495,54 @@ def _validate_dsa_scratch_capacity(
             )
 
 
+def _fixed_staged_decode_mtp(
+    row_req_indices: Any,
+    request_count: int,
+    row_count: int,
+    *,
+    pure_decode: bool,
+) -> int | None:
+    """Return the MTP for the request-major staged layout, else fall back."""
+    if (
+        not pure_decode
+        or request_count <= 0
+        or row_req_indices is None
+    ):
+        return None
+    request_rows = np.asarray(row_req_indices, dtype=np.int64).reshape(-1)
+    if request_rows.size < row_count:
+        return None
+    request_rows = request_rows[:row_count]
+    valid_rows = request_rows[request_rows >= 0]
+    if valid_rows.size:
+        if np.any(valid_rows >= request_count):
+            return None
+        counts = np.bincount(valid_rows, minlength=request_count)
+        max_mtp = int(counts.max(initial=0))
+        if max_mtp > 2:
+            raise RuntimeError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={max_mtp}"
+            )
+    if row_count % request_count:
+        return None
+    mtp = row_count // request_count
+    if mtp not in (1, 2):
+        if mtp > 2:
+            raise RuntimeError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={mtp}"
+            )
+        return None
+    expected = np.repeat(
+        np.arange(request_count, dtype=np.int64),
+        mtp,
+    )
+    if not np.array_equal(request_rows, expected):
+        return None
+    return mtp
+
+
 def _prepare_dsa_sparse_lmcache_payload(
     attn_metadata: Any,
     selected_packed: torch.Tensor,
@@ -776,6 +824,7 @@ class AscendSFAMetadata:
     decode_target_slot_mapping: torch.Tensor | None = None
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
+    decode_union_mapping_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
@@ -828,6 +877,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
+        if self.dsa_shrink_latent and self.decode_threshold > 2:
+            raise ValueError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={self.decode_threshold}"
+            )
         hf_config = self.model_config.hf_config
         hf_text_config = self.model_config.hf_text_config
         self.index_topk = int(
@@ -897,6 +951,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.long,
                 device=device,
             )
+            self._dsa_union_mapping = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
         else:
             self._dsa_max_num_rows = 0
             self._dsa_max_num_reqs = 0
@@ -917,6 +976,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_selected_tokens = None
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
+            self._dsa_union_mapping = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
@@ -1007,6 +1067,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_target_slot_mapping = None
         decode_selected_tokens = None
         decode_selected_counts = None
+        decode_union_mapping_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         decode_req_indices_cpu = None
@@ -1107,6 +1168,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 assert self._dsa_target_slots is not None
                 assert self._dsa_selected_tokens is not None
                 assert self._dsa_selected_counts is not None
+                assert self._dsa_union_mapping is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = list(req_ids[:num_reqs])
@@ -1115,6 +1177,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_target_slot_mapping = self._dsa_target_slots[:num_reqs]
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
+                decode_union_mapping_workspace = self._dsa_union_mapping[
+                    :num_reqs
+                ]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -1242,6 +1307,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_target_slot_mapping=decode_target_slot_mapping,
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
+            decode_union_mapping_workspace=decode_union_mapping_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
@@ -1373,6 +1439,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
         # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        if self.dsa_shrink_latent and self.decode_threshold > 2:
+            raise ValueError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={self.decode_threshold}"
+            )
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
@@ -2105,6 +2176,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if authorized_key is None or authorized_key.token_capacity != token_capacity:
             return "the runner did not authorize this staged SFA token capacity"
         graph_key = authorized_key
+        if graph_key.max_query_len > 2:
+            return "staged sparse-index preparation only supports MTP=1 or MTP=2"
         if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1:
             if graph_key.max_query_len != 1 or graph_key.request_capacity != token_capacity:
                 return "the Q1 staged SFA graph key is structurally invalid"
@@ -2261,6 +2334,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             or attn_metadata.decode_target_slot_mapping is None
             or int(attn_metadata.decode_target_slot_mapping.shape[0])
             != graph_key.request_capacity
+            or attn_metadata.decode_union_mapping_workspace is None
+            or int(attn_metadata.decode_union_mapping_workspace.shape[0])
+            != graph_key.request_capacity
+            or attn_metadata.decode_union_mapping_workspace.shape
+            != attn_metadata.decode_selected_tokens.shape
         ):
             return "the request-union remap buffers do not match the graph key"
 
@@ -2345,6 +2423,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
         target_slot_mapping: torch.Tensor,
+        local_to_union_workspace: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph."""
         assert self.fused_qkv_a_proj is not None
@@ -2414,6 +2493,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_size=self.block_size,
             need_packed=True,
             clear_invalid_rows=True,
+            local_to_union_workspace=local_to_union_workspace,
+            staged_mtp=int(topk_indices.shape[0])
+            // int(request_block_table.shape[0]),
         )
         assert selected_packed is not None
         assert selected_count_values is not None
@@ -2672,6 +2754,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed = attn_metadata.decode_selected_tokens
         selected_counts = attn_metadata.decode_selected_counts
         target_slots = attn_metadata.decode_target_slot_mapping
+        local_to_union_workspace = (
+            attn_metadata.decode_union_mapping_workspace
+        )
         if any(
             value is None
             for value in (
@@ -2679,6 +2764,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_packed,
                 selected_counts,
                 target_slots,
+                local_to_union_workspace,
             )
         ):
             raise RuntimeError("staged SFA request-union buffers are unavailable")
@@ -2700,6 +2786,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_packed,
             selected_counts,
             target_slots,
+            local_to_union_workspace,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -3166,6 +3253,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if _row_req_indices is None:
                 raise RuntimeError("DSA union remap requires row request indices")
             _selected_token_counts = attn_metadata.decode_selected_counts
+            _staged_mtp = _fixed_staged_decode_mtp(
+                attn_metadata.decode_req_indices_cpu,
+                int(attn_metadata.block_table.shape[0]),
+                _topk_rows,
+                pure_decode=_is_pure_decode,
+            )
             with _dsa_prof.section("prepare_sparse_indices"):
                 (
                     topk_indices,
@@ -3183,6 +3276,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     block_size=self.block_size,
                     need_packed=_need_packed,
                     clear_invalid_rows=_is_pure_decode,
+                    local_to_union_workspace=(
+                        attn_metadata.decode_union_mapping_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    staged_mtp=_staged_mtp,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None
