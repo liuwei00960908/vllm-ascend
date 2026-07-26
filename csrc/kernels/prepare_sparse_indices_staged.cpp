@@ -66,7 +66,8 @@ __aicore__ inline void CopyLocalToGlobalExact(
     }
     AscendC::GlobalTensor<int32_t> dstWords;
     dstWords.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int32_t*>(dst.GetPhyAddr()),
+        reinterpret_cast<__gm__ int32_t*>(
+            const_cast<__gm__ int64_t*>(dst.GetPhyAddr())),
         2 * count);
     CopyLocalToGlobalExact(
         dstWords, src.ReinterpretCast<int32_t>(), 2 * count);
