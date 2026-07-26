@@ -282,6 +282,168 @@ def _validate_sharded_result(
             raise AssertionError(f"{label} target slots are incorrect")
 
 
+def production_only_main(
+    topk: int = 2048,
+    mtp: int = 2,
+    iterations: int = 200,
+    warmups: int = 20,
+) -> None:
+    """Benchmark only the production staged sparse-index operator."""
+    if topk != 2048:
+        raise ValueError("the production staged operator requires --topk 2048")
+    if mtp not in (1, 2):
+        raise ValueError("the production staged operator supports only --mtp 1 or 2")
+    if not enable_custom_op():
+        raise RuntimeError("vllm-ascend custom operators could not be loaded")
+    try:
+        production_op = (
+            torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_
+        )
+    except AttributeError as exc:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the production staged operator; "
+            "rebuild the custom-op extension"
+        ) from exc
+
+    request_batch = 4
+    row_count = request_batch * mtp
+    source = _mtp_rows_with_half_overlap(
+        topk,
+        request_batch,
+        mtp,
+        "npu",
+    )
+    values = source.clone()
+    source_max = int(source.max().item())
+    split_boundary = source_max - 100
+    boundaries = torch.full(
+        (row_count,),
+        split_boundary,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.arange(
+        request_batch,
+        dtype=torch.int32,
+        device="npu",
+    ).repeat_interleave(mtp)
+
+    block_size = 128
+    max_tokens = 131072
+    capacity = mtp * topk
+    blocks_per_request = max_tokens // block_size
+    block_table = torch.arange(
+        request_batch * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_batch, blocks_per_request)
+    selected = torch.empty(
+        (request_batch, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    counts = torch.empty(
+        (request_batch, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
+    targets = torch.empty(
+        (request_batch, capacity),
+        dtype=torch.long,
+        device="npu",
+    )
+    local_to_union_workspace = torch.empty_like(selected)
+
+    def run() -> None:
+        production_op(
+            values,
+            boundaries,
+            row_requests,
+            block_table,
+            selected,
+            counts,
+            targets,
+            local_to_union_workspace,
+            block_size,
+            mtp,
+            True,
+            True,
+        )
+
+    # Correctness is checked once outside the timed section.
+    run()
+    torch.npu.synchronize()
+    expected_count = split_boundary
+    expected_counts = [expected_count] * request_batch
+    if counts[:, 0].cpu().tolist() != expected_counts:
+        raise AssertionError(
+            "production staged selected counts are incorrect: "
+            f"actual={counts[:, 0].cpu().tolist()}, "
+            f"expected={expected_counts}"
+        )
+    expected_selected = torch.arange(
+        expected_count,
+        dtype=torch.int32,
+    )
+    selected_cpu = selected.cpu()
+    targets_cpu = targets.cpu()
+    for request in range(request_batch):
+        if not torch.equal(
+            selected_cpu[request, :expected_count],
+            expected_selected,
+        ):
+            raise AssertionError(
+                f"request {request} production staged union is incorrect"
+            )
+        expected_targets = (
+            torch.arange(expected_count, dtype=torch.long)
+            + request * max_tokens
+        )
+        if not torch.equal(
+            targets_cpu[request, :expected_count],
+            expected_targets,
+        ):
+            raise AssertionError(
+                f"request {request} production staged targets are incorrect"
+            )
+
+    source_2d = source.reshape(row_count, topk)
+    remapped = values.reshape(row_count, topk)
+    selected_mask = (source_2d >= 0) & (source_2d < split_boundary)
+    safe_ranks = torch.where(
+        selected_mask,
+        remapped,
+        torch.zeros_like(remapped),
+    )
+    reconstructed_selected = torch.gather(
+        selected.repeat_interleave(mtp, dim=0),
+        1,
+        safe_ranks.to(torch.long),
+    )
+    reconstructed = torch.where(
+        selected_mask,
+        reconstructed_selected,
+        remapped,
+    )
+    if not torch.equal(reconstructed.cpu(), source_2d.cpu()):
+        raise AssertionError(
+            "production staged remapped rows do not reconstruct the input"
+        )
+
+    samples = _measure_npu_ms(
+        run,
+        lambda: values.copy_(source),
+        warmups,
+        iterations,
+    )
+    print(
+        "production-only benchmark: "
+        f"topk={topk}, MTP={mtp}, requests={request_batch}, "
+        f"split_boundary={split_boundary} (source max={source_max})"
+    )
+    _summary("production-staged", samples)
+
+
 def main(
     topk: int = 2048,
     mtp: int = 2,
@@ -835,5 +997,21 @@ if __name__ == "__main__":
     parser.add_argument("--mtp", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--warmups", type=int, default=20)
+    parser.add_argument(
+        "--production-only",
+        action="store_true",
+        help=(
+            "benchmark only npu_dsa_prepare_sparse_indices_staged_; "
+            "do not initialize or run experimental sharded paths"
+        ),
+    )
     args = parser.parse_args()
-    main(args.topk, args.mtp, args.iterations, args.warmups)
+    if args.production_only:
+        production_only_main(
+            args.topk,
+            args.mtp,
+            args.iterations,
+            args.warmups,
+        )
+    else:
+        main(args.topk, args.mtp, args.iterations, args.warmups)
