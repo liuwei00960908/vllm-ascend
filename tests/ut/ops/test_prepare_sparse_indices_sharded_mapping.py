@@ -242,6 +242,45 @@ def test_shard_completion_order_does_not_change_fixed_slot_finalize():
                 assert rank == token
 
 
+@pytest.mark.parametrize("mtp", range(1, 9))
+def test_position_owned_map_merges_local_ranks_with_shard_offsets(mtp):
+    shards = _shard_count(mtp)
+    rows = [[(position * 37 + row * 211) % (TOPK + mtp * 257) for position in range(TOPK)] for row in range(mtp)]
+    boundaries = [TOPK + 113 * row - 97 for row in range(mtp)]
+    packed, remapped, shard_unions, offsets = _reference_sharded_union(rows, boundaries)
+    request_width = mtp * TOPK
+    sentinel = -(request_width + 1)
+    shard_ranks = [{token: rank for rank, token in enumerate(tokens)} for tokens in shard_unions]
+    dense_local_maps = [[sentinel] * request_width for _ in range(shards)]
+
+    flat_position = 0
+    for row, boundary in zip(rows, boundaries):
+        for token in row:
+            if 0 <= token < boundary:
+                shard = token % shards
+                dense_local_maps[shard][flat_position] = shard_ranks[shard][token]
+            flat_position += 1
+
+    global_mapping = [sentinel] * request_width
+    for begin, end in _mapping_ranges(mtp):
+        for position in range(begin, end):
+            global_mapping[position] = max(
+                dense_local_maps[shard][position] + offsets[shard] for shard in range(shards)
+            )
+
+    flat_position = 0
+    for row, expected_row, boundary in zip(rows, remapped, boundaries):
+        for token, expected_rank in zip(row, expected_row):
+            rank = global_mapping[flat_position]
+            if 0 <= token < boundary:
+                assert rank == expected_rank
+                assert packed[rank] == token
+            else:
+                assert rank < 0
+                assert max(sentinel + offset for offset in offsets) < 0
+            flat_position += 1
+
+
 def test_split_boundary_is_row_local_and_excludes_equal_or_negative_tokens():
     rows = [
         [-4, 0, 1, 2, 5, 8],

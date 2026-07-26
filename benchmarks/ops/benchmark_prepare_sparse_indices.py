@@ -302,6 +302,7 @@ def main(
     unique_finalize_op = torch.ops._C_ascend.npu_dsa_staged_unique_finalize_
     sharded_union_op = torch.ops._C_ascend.npu_dsa_staged_sharded_union_
     sharded_vector_union_op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_union_
+    sharded_vector_dedup_op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_dedup_
 
     request_batch = 4
     row_count = mtp * request_batch
@@ -316,6 +317,7 @@ def main(
     native_unique_values = source.clone()
     sharded_sort_values = source.clone()
     sharded_vector_values = source.clone()
+    sharded_vector_dedup_values = source.clone()
     max_tokens = 131072
     boundaries = torch.full((row_count,), max_tokens, dtype=torch.int32, device="npu")
     source_max = (mtp + 1) * topk // 2 - 1
@@ -355,6 +357,7 @@ def main(
     native_unique_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_sort_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_vector_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
+    sharded_vector_dedup_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     shard_count = 1 << (mtp - 1).bit_length()
     sharded_sort_scratch = (
         torch.empty(
@@ -383,6 +386,7 @@ def main(
             device="npu",
         ),
     )
+    sharded_vector_dedup_scratch = tuple(torch.empty_like(item) for item in sharded_sort_scratch)
 
     def staged(values, buffers, use_sort):
         return _staged_runner(
@@ -468,6 +472,22 @@ def main(
             block_size=block_size,
         )
 
+    def staged_sharded_vector_dedup():
+        return _staged_sharded_sort_runner(
+            sharded_union_op=sharded_vector_dedup_op,
+            values=sharded_vector_dedup_values,
+            boundaries=sharded_boundaries,
+            request_block_table=block_table,
+            selected_packed=sharded_vector_dedup_buffers[0],
+            local_to_union=sharded_vector_dedup_buffers[1],
+            selected_count=sharded_vector_dedup_buffers[2],
+            target_slots=sharded_vector_dedup_buffers[3],
+            shard_packed=sharded_vector_dedup_scratch[0],
+            shard_mapping=sharded_vector_dedup_scratch[1],
+            shard_counts=sharded_vector_dedup_scratch[2],
+            block_size=block_size,
+        )
+
     pair_baselines = mtp == 2
     native_unique_baseline = mtp in (2, 3)
     if not pair_baselines:
@@ -480,6 +500,7 @@ def main(
     native_unique_result = staged_native_unique() if native_unique_baseline else None
     sharded_sort_result = staged_sharded_sort()
     sharded_vector_result = staged_sharded_vector()
+    sharded_vector_dedup_result = staged_sharded_vector_dedup()
     sort_union_only_packed = None
     if pair_baselines:
         sort_union_only_packed = legacy_op(
@@ -549,6 +570,16 @@ def main(
     _validate_sharded_result(
         label="sharded vector map",
         result=sharded_vector_result,
+        source=source,
+        boundary=sharded_boundary,
+        request_batch=request_batch,
+        mtp=mtp,
+        topk=topk,
+        max_tokens=max_tokens,
+    )
+    _validate_sharded_result(
+        label="sharded vector dedup",
+        result=sharded_vector_dedup_result,
         source=source,
         boundary=sharded_boundary,
         request_batch=request_batch,
@@ -650,17 +681,25 @@ def main(
         warmups,
         iterations,
     )
+    sharded_vector_dedup_samples = _measure_npu_ms(
+        staged_sharded_vector_dedup,
+        lambda: sharded_vector_dedup_values.copy_(source),
+        warmups,
+        iterations,
+    )
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
     no_union_mean = statistics.fmean(no_union_samples)
     sharded_sort_mean = statistics.fmean(sharded_sort_samples)
     sharded_vector_mean = statistics.fmean(sharded_vector_samples)
+    sharded_vector_dedup_mean = statistics.fmean(sharded_vector_dedup_samples)
     _summary("pre-union", legacy_samples)
     _summary("fused-union", union_samples)
     _summary("staged-no-union", no_union_samples)
     _summary("sharded-sort", sharded_sort_samples)
     _summary("sharded-vector-map", sharded_vector_samples)
+    _summary("sharded-vector-dedup", sharded_vector_dedup_samples)
     native_unique_mean = None
     if native_unique_baseline:
         native_unique_mean = statistics.fmean(native_unique_samples)
@@ -702,12 +741,18 @@ def main(
         f"{sharded_vector_mean - no_union_mean:+.6f} ms "
         f"({(sharded_vector_mean / no_union_mean - 1) * 100:+.2f}%)"
     )
+    print(
+        "sharded vector-dedup union cost: "
+        f"{sharded_vector_dedup_mean - no_union_mean:+.6f} ms "
+        f"({(sharded_vector_dedup_mean / no_union_mean - 1) * 100:+.2f}%)"
+    )
     candidates = [
         ("pre-union", legacy_mean),
         ("fused-union", union_mean),
         ("staged-no-union", no_union_mean),
         ("sharded-sort", sharded_sort_mean),
         ("sharded-vector-map", sharded_vector_mean),
+        ("sharded-vector-dedup", sharded_vector_dedup_mean),
     ]
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))

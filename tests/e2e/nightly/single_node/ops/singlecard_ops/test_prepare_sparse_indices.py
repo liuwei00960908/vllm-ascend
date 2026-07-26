@@ -25,6 +25,11 @@ def _load_dsa_union_operator():
         "npu_dsa_staged_sharded_vector_union_",
     ):
         pytest.fail("vllm_ascend_C does not contain the vector sharded union operator")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_staged_sharded_vector_dedup_",
+    ):
+        pytest.fail("vllm_ascend_C does not contain the vector-dedup operator")
 
 
 def _buffers(requests: int, capacity: int):
@@ -48,6 +53,7 @@ def _run_vector_sharded_union(
     request_count: int,
     *,
     capture_graph: bool = False,
+    use_position_map: bool = False,
 ):
     topk = source.shape[-1]
     row_count = source.shape[0]
@@ -80,15 +86,19 @@ def _run_vector_sharded_union(
         dtype=torch.int32,
         device="npu",
     )
-    shard_pairs = torch.empty(
-        (request_count, shard_count, 2 * topk),
-        dtype=torch.int32,
-        device="npu",
-    )
-    op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_union_
+    shard_pairs = None
+    if use_position_map:
+        op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_dedup_
+    else:
+        shard_pairs = torch.empty(
+            (request_count, shard_count, 2 * topk),
+            dtype=torch.int32,
+            device="npu",
+        )
+        op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_union_
 
     def invoke():
-        op(
+        common_args = (
             values,
             boundaries_npu,
             selected,
@@ -99,9 +109,11 @@ def _run_vector_sharded_union(
             shard_packed,
             shard_mapping,
             shard_counts,
-            shard_pairs,
-            block_size,
         )
+        if use_position_map:
+            op(*common_args, block_size)
+        else:
+            op(*common_args, shard_pairs, block_size)
 
     if capture_graph:
         graph = torch.npu.NPUGraph()
@@ -415,7 +427,12 @@ def test_sharded_union_tracks_mtp_depth(mtp):
 
 
 @pytest.mark.parametrize("mtp", range(1, 9))
-def test_vector_sharded_union_all_supported_mtp_depths(mtp):
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_all_supported_mtp_depths(mtp, use_position_map):
     topk = 2048
     request_count = 2
     shared = torch.arange(topk // 2, dtype=torch.int32)
@@ -439,7 +456,12 @@ def test_vector_sharded_union_all_supported_mtp_depths(mtp):
     boundary = source_max - 100
     boundaries = torch.full((request_count * mtp,), boundary, dtype=torch.int32)
 
-    result = _run_vector_sharded_union(source, boundaries, request_count)
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+    )
     _assert_vector_sharded_result(result, source, boundaries, request_count)
 
     shard_count = 1 << (mtp - 1).bit_length()
@@ -460,9 +482,23 @@ def test_vector_sharded_union_all_supported_mtp_depths(mtp):
             unique_total += unique_count
         assert unique_total == boundary
         assert occurrence_total == mtp * topk - 101
+        if use_position_map and mtp > 1:
+            expected_offsets = []
+            offset = 0
+            for shard in range(shard_count):
+                expected_offsets.append(offset)
+                offset += result["shard_counts"][request, shard, 0].item()
+            assert result["counts"][request, 1 : 1 + shard_count].tolist() == expected_offsets
 
 
-def test_vector_sharded_union_uses_each_rows_split_boundary():
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_uses_each_rows_split_boundary(
+    use_position_map,
+):
     topk = 2048
     mtp = 4
     request_count = 2
@@ -482,11 +518,23 @@ def test_vector_sharded_union_uses_each_rows_split_boundary():
     source = torch.stack(rows).unsqueeze(1)
     boundary_tensor = torch.tensor(boundaries, dtype=torch.int32)
 
-    result = _run_vector_sharded_union(source, boundary_tensor, request_count)
+    result = _run_vector_sharded_union(
+        source,
+        boundary_tensor,
+        request_count,
+        use_position_map=use_position_map,
+    )
     _assert_vector_sharded_result(result, source, boundary_tensor, request_count)
 
 
-def test_vector_sharded_union_mtp1_preserves_compacted_topk_order():
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_mtp1_preserves_compacted_topk_order(
+    use_position_map,
+):
     topk = 2048
     request_count = 2
     rows = []
@@ -497,7 +545,12 @@ def test_vector_sharded_union_mtp1_preserves_compacted_topk_order():
         rows.append(row)
     source = torch.stack(rows).unsqueeze(1)
 
-    result = _run_vector_sharded_union(source, boundaries, request_count)
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+    )
     _assert_vector_sharded_result(result, source, boundaries, request_count)
     for request in range(request_count):
         original = source[request].flatten()
@@ -512,7 +565,14 @@ def test_vector_sharded_union_mtp1_preserves_compacted_topk_order():
         assert result["shard_counts"][request, 0, 1].item() == count
 
 
-def test_vector_sharded_union_preserves_all_ignored_positions():
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_preserves_all_ignored_positions(
+    use_position_map,
+):
     topk = 2048
     mtp = 3
     request_count = 2
@@ -531,7 +591,12 @@ def test_vector_sharded_union_preserves_all_ignored_positions():
         dtype=torch.int32,
     )
 
-    result = _run_vector_sharded_union(source, boundaries, request_count)
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+    )
     _assert_vector_sharded_result(result, source, boundaries, request_count)
     assert result["counts"][:, 0].tolist() == [0, 0]
     assert torch.equal(
@@ -543,7 +608,12 @@ def test_vector_sharded_union_preserves_all_ignored_positions():
 
 
 @pytest.mark.parametrize("mtp", [1, 3, 8])
-def test_vector_sharded_union_supports_graph_replay(mtp):
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_supports_graph_replay(mtp, use_position_map):
     topk = 2048
     request_count = 2
     rows = torch.stack(
@@ -566,6 +636,7 @@ def test_vector_sharded_union_supports_graph_replay(mtp):
         boundaries,
         request_count,
         capture_graph=True,
+        use_position_map=use_position_map,
     )
     _assert_vector_sharded_result(result, source, boundaries, request_count)
 
