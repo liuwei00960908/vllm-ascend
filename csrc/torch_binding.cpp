@@ -442,9 +442,11 @@ at::Tensor npu_dsa_staged_union_(
                 "batched staged union requires each selected-count row to "
                 "occupy at least one 32-byte transaction");
     TORCH_CHECK(block_size > 0 &&
+                    (block_size & (block_size - 1)) == 0 &&
                     request_block_table.size(1) * block_size >=
                         2 * row_width,
-                "request block table is too short");
+                "block_size must be a positive power of two and the request "
+                "block table must cover both rows");
     TORCH_CHECK(max_tokens > 0 && max_tokens % 32 == 0,
                 "max_tokens must be a positive multiple of 32");
 
@@ -459,7 +461,7 @@ at::Tensor npu_dsa_staged_union_(
     const int64_t table_width = request_block_table.size(1);
     at_npu::native::OpCommand cmd;
     cmd.Name(use_sort ? "npu_dsa_staged_sort_union_"
-                      : "npu_dsa_staged_bitmap_union_");
+                      : "npu_dsa_staged_hash_union_");
     cmd.SetCustomHandler([
         stream, row_ptr, packed_ptr, map_ptr, count_ptr, table_ptr,
         slots_ptr, row_count, row_width, max_tokens, table_width,
@@ -474,7 +476,7 @@ at::Tensor npu_dsa_staged_union_(
                 static_cast<uint32_t>(selected_count_stride),
                 static_cast<uint32_t>(block_size));
         } else {
-            dsa_staged_bitmap_union_impl(
+            dsa_staged_hash_union_impl(
                 stream, row_ptr, packed_ptr, map_ptr, count_ptr,
                 table_ptr, slots_ptr,
                 static_cast<uint32_t>(row_count),

@@ -25,7 +25,7 @@ __aicore__ inline void Sync()
     AscendC::WaitFlag<event>(id);
 }
 
-class DSAStagedBitmapUnionKernel {
+class DSAStagedHashUnionKernel {
 public:
     __aicore__ inline void Init(
         __gm__ int32_t* rowPacked,
@@ -46,11 +46,22 @@ public:
         requestCount_ = rowCount / 2;
         requestWidth_ = 2 * rowWidth;
         maxTokens_ = maxTokens;
-        bitmapWords_ = (maxTokens + 31) / 32;
-        bufferWords_ = ((bitmapWords_ + 7) / 8) * 8;
+        hashCapacity_ = 2 * requestWidth_;
+        uint32_t capacityBits = 0;
+        uint32_t capacity = hashCapacity_;
+        while (capacity > 1) {
+            capacity >>= 1;
+            ++capacityBits;
+        }
+        hashShift_ = 32 - capacityBits;
         blockTableWidth_ = blockTableWidth;
         selectedCountStride_ = selectedCountStride;
         blockSize_ = blockSize;
+        uint32_t shiftedBlockSize = blockSize_;
+        while (shiftedBlockSize > 1) {
+            shiftedBlockSize >>= 1;
+            ++blockSizeShift_;
+        }
         rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
@@ -61,8 +72,18 @@ public:
             requestBlockTable, requestCount_ * blockTableWidth);
         targetSlots_.SetGlobalBuffer(
             targetSlots, requestCount_ * requestWidth_);
-        pipe_.InitBuffer(bitmapBuf_, bufferWords_ * sizeof(int32_t));
-        pipe_.InitBuffer(prefixBuf_, bufferWords_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            inputBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            hashBuf_, hashCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            unionBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            mappingBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            targetBuf_, requestWidth_ * sizeof(int64_t));
+        pipe_.InitBuffer(
+            blockTableBuf_, blockTableWidth_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
@@ -75,91 +96,115 @@ public:
             static_cast<uint64_t>(request) * requestWidth_;
         const uint64_t outputOffset =
             static_cast<uint64_t>(request) * requestWidth_;
-        auto bitmap = bitmapBuf_.Get<int32_t>();
-        auto prefix = prefixBuf_.Get<int32_t>();
-        AscendC::Duplicate(bitmap, static_cast<int32_t>(0), bufferWords_);
+        auto input = inputBuf_.Get<int32_t>();
+        auto hash = hashBuf_.Get<int32_t>();
+        auto unionLocal = unionBuf_.Get<int32_t>();
+        auto mapping = mappingBuf_.Get<int32_t>();
+        auto targets = targetBuf_.Get<int64_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
+        AscendC::DataCopy(
+            input, rowPacked_[rowOffset], requestWidth_);
+        AscendC::DataCopy(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableWidth_);
+        AscendC::Duplicate(hash, static_cast<int32_t>(-1), hashCapacity_);
         AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
 
+        uint32_t count = 0;
         for (uint32_t i = 0; i < requestWidth_; ++i) {
-            const int32_t token = rowPacked_.GetValue(rowOffset + i);
+            const int32_t token = input.GetValue(i);
             if (token < 0 || token >= static_cast<int32_t>(maxTokens_)) {
+                mapping.SetValue(i, static_cast<int32_t>(-1));
                 continue;
             }
-            const uint32_t word = static_cast<uint32_t>(token) >> 5;
-            const uint32_t bit = static_cast<uint32_t>(token) & 31;
-            const uint32_t value =
-                static_cast<uint32_t>(bitmap.GetValue(word));
-            bitmap.SetValue(
-                word, static_cast<int32_t>(value | (1U << bit)));
+            uint32_t bucket =
+                (static_cast<uint32_t>(token) * 2654435761U) >> hashShift_;
+            for (uint32_t probe = 0; probe < hashCapacity_; ++probe) {
+                const uint32_t slot =
+                    (bucket + probe) & (hashCapacity_ - 1);
+                const int32_t existing = hash.GetValue(slot);
+                if (existing < 0) {
+                    hash.SetValue(slot, static_cast<int32_t>(count));
+                    unionLocal.SetValue(count, token);
+                    mapping.SetValue(i, static_cast<int32_t>(count));
+                    ++count;
+                    break;
+                }
+                if (unionLocal.GetValue(
+                        static_cast<uint32_t>(existing)) == token) {
+                    mapping.SetValue(i, existing);
+                    break;
+                }
+            }
         }
 
-        uint32_t count = 0;
-        for (uint32_t word = 0; word < bitmapWords_; ++word) {
-            prefix.SetValue(word, static_cast<int32_t>(count));
-            count += Popcount(
-                static_cast<uint32_t>(bitmap.GetValue(word)));
-        }
+        Sync<AscendC::HardEvent::S_MTE3>();
+        AscendC::DataCopy(
+            selectedPacked_[outputOffset], unionLocal, count);
+        AscendC::DataCopy(
+            localToUnion_[rowOffset], mapping, requestWidth_);
+        Sync<AscendC::HardEvent::MTE3_V>();
+        Sync<AscendC::HardEvent::S_V>();
 
-        for (uint32_t i = 0; i < requestWidth_; ++i) {
-            const uint32_t token =
-                static_cast<uint32_t>(rowPacked_.GetValue(rowOffset + i));
-            const uint32_t word = token >> 5;
-            const uint32_t bit = token & 31;
-            const uint32_t rank = Rank(bitmap, prefix, word, bit);
-            localToUnion_.SetValue(
-                rowOffset + i, static_cast<int32_t>(rank));
-            // Duplicate tokens overwrite the same values at the same rank.
-            WriteUnion(request, outputOffset, rank, static_cast<int32_t>(token));
-        }
+        auto ranks = hash;
+        auto logicalBlocks = hash[requestWidth_];
+        auto physicalBlocks = input;
+        auto blockTableOffsets = mapping;
+        AscendC::CreateVecIndex(
+            ranks, static_cast<int32_t>(0), count);
+        AscendC::ShiftRight(
+            logicalBlocks,
+            ranks,
+            static_cast<int32_t>(blockSizeShift_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            blockTableOffsets,
+            logicalBlocks,
+            static_cast<int32_t>(sizeof(int32_t)),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            physicalBlocks,
+            blockTable,
+            blockTableOffsets.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            physicalBlocks,
+            physicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::Muls(
+            logicalBlocks,
+            logicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(ranks, ranks, logicalBlocks, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(
+            physicalBlocks, physicalBlocks, ranks, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            targets,
+            physicalBlocks,
+            AscendC::RoundMode::CAST_NONE,
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(
+            targetSlots_[outputOffset], targets, count);
         selectedCount_.SetValue(
             request * selectedCountStride_, static_cast<int32_t>(count));
     }
 
 private:
-    __aicore__ inline uint32_t Popcount(uint32_t value) const
-    {
-        value -= (value >> 1) & 0x55555555U;
-        value = (value & 0x33333333U)
-            + ((value >> 2) & 0x33333333U);
-        value = (value + (value >> 4)) & 0x0F0F0F0FU;
-        value += value >> 8;
-        value += value >> 16;
-        return value & 0x3FU;
-    }
-
-    __aicore__ inline uint32_t Rank(
-        const AscendC::LocalTensor<int32_t>& bitmap,
-        const AscendC::LocalTensor<int32_t>& prefix,
-        uint32_t word,
-        uint32_t bit) const
-    {
-        const uint32_t lower =
-            bit == 0 ? 0 : ((1U << bit) - 1);
-        return static_cast<uint32_t>(prefix.GetValue(word))
-            + Popcount(
-                static_cast<uint32_t>(bitmap.GetValue(word)) & lower);
-    }
-
-    __aicore__ inline void WriteUnion(
-        uint32_t request,
-        uint64_t outputOffset,
-        uint32_t rank,
-        int32_t token)
-    {
-        selectedPacked_.SetValue(outputOffset + rank, token);
-        const uint32_t logicalBlock = rank / blockSize_;
-        const uint32_t blockOffset = rank % blockSize_;
-        const int32_t physicalBlock =
-            requestBlockTable_.GetValue(
-                static_cast<uint64_t>(request) * blockTableWidth_
-                + logicalBlock);
-        targetSlots_.SetValue(
-            outputOffset + rank,
-            static_cast<int64_t>(physicalBlock) * blockSize_
-                + blockOffset);
-    }
-
     AscendC::GlobalTensor<int32_t> rowPacked_;
     AscendC::GlobalTensor<int32_t> selectedPacked_;
     AscendC::GlobalTensor<int32_t> localToUnion_;
@@ -167,18 +212,23 @@ private:
     AscendC::GlobalTensor<int32_t> requestBlockTable_;
     AscendC::GlobalTensor<int64_t> targetSlots_;
     AscendC::TPipe pipe_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> bitmapBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> prefixBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> hashBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> unionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mappingBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t requestCount_ = 0;
     uint32_t requestWidth_ = 0;
     uint32_t maxTokens_ = 0;
-    uint32_t bitmapWords_ = 0;
-    uint32_t bufferWords_ = 0;
+    uint32_t hashCapacity_ = 0;
+    uint32_t hashShift_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t selectedCountStride_ = 0;
     uint32_t blockSize_ = 0;
+    uint32_t blockSizeShift_ = 0;
 };
 
 class DSAStagedSortUnionKernel {
@@ -203,6 +253,11 @@ public:
         blockTableWidth_ = blockTableWidth;
         selectedCountStride_ = selectedCountStride;
         blockSize_ = blockSize;
+        uint32_t shiftedBlockSize = blockSize_;
+        while (shiftedBlockSize > 1) {
+            shiftedBlockSize >>= 1;
+            ++blockSizeShift_;
+        }
         rowPacked_.SetGlobalBuffer(rowPacked, rowCount * rowWidth);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
@@ -219,6 +274,14 @@ public:
             sortTmpBuf_, requestWidth_ * kPairWidth * sizeof(float));
         pipe_.InitBuffer(
             sortInputBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            unionBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            mappingBuf_, requestWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            targetBuf_, requestWidth_ * sizeof(int64_t));
+        pipe_.InitBuffer(
+            blockTableBuf_, blockTableWidth_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
@@ -234,19 +297,26 @@ public:
         auto src = sortSrcBuf_.Get<float>();
         auto tmp = sortTmpBuf_.Get<float>();
         auto input = sortInputBuf_.Get<int32_t>();
+        auto unionLocal = unionBuf_.Get<int32_t>();
+        auto mapping = mappingBuf_.Get<int32_t>();
+        auto targets = targetBuf_.Get<int64_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
         auto srcInt = src.ReinterpretCast<int32_t>();
         AscendC::DataCopy(
             input, rowPacked_[rowOffset], requestWidth_);
+        AscendC::DataCopy(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableWidth_);
         Sync<AscendC::HardEvent::MTE2_V>();
         AscendC::Cast(
             src, input, AscendC::RoundMode::CAST_NONE, requestWidth_);
         AscendC::Muls(src, src, -1.0F, requestWidth_);
         AscendC::PipeBarrier<PIPE_V>();
-        Sync<AscendC::HardEvent::V_S>();
-        for (uint32_t i = 0; i < requestWidth_; ++i) {
-            srcInt.SetValue(requestWidth_ + i, static_cast<int32_t>(i));
-        }
-        Sync<AscendC::HardEvent::S_V>();
+        AscendC::CreateVecIndex(
+            srcInt[requestWidth_], static_cast<int32_t>(0), requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
         SortAll(src, tmp);
         Sync<AscendC::HardEvent::V_S>();
 
@@ -259,13 +329,70 @@ public:
             const uint32_t original = static_cast<uint32_t>(
                 sortedInt.GetValue(kPairWidth * i + 1));
             if (i == 0 || token != previous) {
-                WriteUnion(request, outputOffset, rank, token);
+                unionLocal.SetValue(rank, token);
                 previous = token;
                 ++rank;
             }
-            localToUnion_.SetValue(
-                rowOffset + original, static_cast<int32_t>(rank - 1));
+            mapping.SetValue(original, static_cast<int32_t>(rank - 1));
         }
+
+        Sync<AscendC::HardEvent::S_V>();
+        auto ranks = src.ReinterpretCast<int32_t>();
+        auto logicalBlocks = ranks[requestWidth_];
+        auto physicalBlocks = tmp.ReinterpretCast<int32_t>();
+        auto blockTableOffsets = physicalBlocks[requestWidth_];
+        AscendC::CreateVecIndex(
+            ranks, static_cast<int32_t>(0), rank);
+        AscendC::ShiftRight(
+            logicalBlocks,
+            ranks,
+            static_cast<int32_t>(blockSizeShift_),
+            rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            blockTableOffsets,
+            logicalBlocks,
+            static_cast<int32_t>(sizeof(int32_t)),
+            rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            physicalBlocks,
+            blockTable,
+            blockTableOffsets.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            physicalBlocks,
+            physicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            rank);
+        AscendC::Muls(
+            logicalBlocks,
+            logicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(ranks, ranks, logicalBlocks, rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(
+            physicalBlocks, physicalBlocks, ranks, rank);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            targets,
+            physicalBlocks,
+            AscendC::RoundMode::CAST_NONE,
+            rank);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        Sync<AscendC::HardEvent::S_MTE3>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(
+            selectedPacked_[outputOffset], unionLocal, rank);
+        AscendC::DataCopy(
+            localToUnion_[rowOffset], mapping, requestWidth_);
+        AscendC::DataCopy(
+            targetSlots_[outputOffset], targets, rank);
         selectedCount_.SetValue(
             request * selectedCountStride_, static_cast<int32_t>(rank));
     }
@@ -322,25 +449,6 @@ private:
         }
     }
 
-    __aicore__ inline void WriteUnion(
-        uint32_t request,
-        uint64_t outputOffset,
-        uint32_t rank,
-        int32_t token)
-    {
-        selectedPacked_.SetValue(outputOffset + rank, token);
-        const uint32_t logicalBlock = rank / blockSize_;
-        const uint32_t blockOffset = rank % blockSize_;
-        const int32_t physicalBlock =
-            requestBlockTable_.GetValue(
-                static_cast<uint64_t>(request) * blockTableWidth_
-                + logicalBlock);
-        targetSlots_.SetValue(
-            outputOffset + rank,
-            static_cast<int64_t>(physicalBlock) * blockSize_
-                + blockOffset);
-    }
-
     AscendC::GlobalTensor<int32_t> rowPacked_;
     AscendC::GlobalTensor<int32_t> selectedPacked_;
     AscendC::GlobalTensor<int32_t> localToUnion_;
@@ -351,6 +459,10 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> sortSrcBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> sortTmpBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> sortInputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> unionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mappingBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t requestCount_ = 0;
@@ -358,6 +470,7 @@ private:
     uint32_t blockTableWidth_ = 0;
     uint32_t selectedCountStride_ = 0;
     uint32_t blockSize_ = 0;
+    uint32_t blockSizeShift_ = 0;
 };
 
 class DSAStagedRemapRowsKernel {
@@ -656,7 +769,7 @@ private:
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void dsa_staged_bitmap_union_kernel(
+extern "C" __global__ __aicore__ void dsa_staged_hash_union_kernel(
     __gm__ int32_t* rowPacked,
     __gm__ int32_t* selectedPacked,
     __gm__ int32_t* localToUnion,
@@ -671,7 +784,7 @@ extern "C" __global__ __aicore__ void dsa_staged_bitmap_union_kernel(
     uint32_t blockSize)
 {
     if ASCEND_IS_AIV {
-        DSAStagedBitmapUnionKernel op;
+        DSAStagedHashUnionKernel op;
         op.Init(rowPacked, selectedPacked, localToUnion, selectedCount,
                 requestBlockTable, targetSlots, rowCount, rowWidth,
                 maxTokens, blockTableWidth, selectedCountStride, blockSize);
@@ -776,14 +889,14 @@ extern "C" __global__ __aicore__ void dsa_staged_copy_rows_kernel(
 
 namespace vllm_ascend {
 
-void dsa_staged_bitmap_union_impl(
+void dsa_staged_hash_union_impl(
     void* stream, void* rowPacked, void* selectedPacked,
     void* localToUnion, void* selectedCount, void* requestBlockTable,
     void* targetSlots, uint32_t rowCount, uint32_t rowWidth,
     uint32_t maxTokens, uint32_t blockTableWidth,
     uint32_t selectedCountStride, uint32_t blockSize)
 {
-    dsa_staged_bitmap_union_kernel<<<rowCount / 2, nullptr, stream>>>(
+    dsa_staged_hash_union_kernel<<<rowCount / 2, nullptr, stream>>>(
         static_cast<int32_t*>(rowPacked),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),

@@ -74,7 +74,7 @@ namespace vllm_ascend {
     bool clear_invalid_rows,
     uint32_t packed_key_stride);
 
-  extern void dsa_staged_bitmap_union_impl(
+  extern void dsa_staged_hash_union_impl(
     void* stream,
     void* row_packed,
     void* selected_packed,
