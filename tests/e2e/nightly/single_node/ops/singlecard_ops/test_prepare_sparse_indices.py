@@ -18,6 +18,13 @@ def _load_dsa_union_operator():
         pytest.fail("vllm_ascend_C does not contain the pre-union DSA operator")
     if not hasattr(torch.ops._C_ascend, "npu_dsa_staged_unique_finalize_"):
         pytest.fail("vllm_ascend_C does not contain the unique finalize operator")
+    if not hasattr(torch.ops._C_ascend, "npu_dsa_staged_sharded_union_"):
+        pytest.fail("vllm_ascend_C does not contain the sharded union operator")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_staged_sharded_vector_union_",
+    ):
+        pytest.fail("vllm_ascend_C does not contain the vector sharded union operator")
 
 
 def _buffers(requests: int, capacity: int):
@@ -33,6 +40,143 @@ def _aligned(values, width=16):
     for row, entries in enumerate(values):
         result[row, : len(entries)] = torch.tensor(entries, dtype=torch.int32)
     return result
+
+
+def _run_vector_sharded_union(
+    source: torch.Tensor,
+    boundaries: torch.Tensor,
+    request_count: int,
+    *,
+    capture_graph: bool = False,
+):
+    topk = source.shape[-1]
+    row_count = source.shape[0]
+    mtp = row_count // request_count
+    capacity = mtp * topk
+    shard_count = 1 << (mtp - 1).bit_length()
+    block_size = 128
+    max_tokens = 131072
+    values = source.npu()
+    boundaries_npu = boundaries.npu()
+    selected, counts, targets = _buffers(request_count, capacity)
+    local_to_union = torch.empty((row_count, topk), dtype=torch.int32, device="npu")
+    block_table = torch.arange(
+        request_count * max_tokens // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, max_tokens // block_size)
+    shard_packed = torch.empty(
+        (request_count, shard_count, topk),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty(
+        (request_count, shard_count, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_counts = torch.empty(
+        (request_count, shard_count, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_pairs = torch.empty(
+        (request_count, shard_count, 2 * topk),
+        dtype=torch.int32,
+        device="npu",
+    )
+    op = torch.ops._C_ascend.npu_dsa_staged_sharded_vector_union_
+
+    def invoke():
+        op(
+            values,
+            boundaries_npu,
+            selected,
+            local_to_union,
+            counts,
+            block_table,
+            targets,
+            shard_packed,
+            shard_mapping,
+            shard_counts,
+            shard_pairs,
+            block_size,
+        )
+
+    if capture_graph:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            invoke()
+        values.copy_(source.npu())
+        graph.replay()
+    else:
+        invoke()
+    torch.npu.synchronize()
+    return {
+        "values": values.cpu(),
+        "selected": selected.cpu(),
+        "counts": counts.cpu(),
+        "targets": targets.cpu(),
+        "local_to_union": local_to_union.cpu(),
+        "shard_packed": shard_packed.cpu(),
+        "shard_counts": shard_counts.cpu(),
+    }
+
+
+def _assert_vector_sharded_result(
+    result,
+    source: torch.Tensor,
+    boundaries: torch.Tensor,
+    request_count: int,
+):
+    row_count, _, topk = source.shape
+    mtp = row_count // request_count
+    capacity = mtp * topk
+    remapped = result["values"].reshape(row_count, topk)
+    local_to_union = result["local_to_union"].reshape(row_count, topk)
+    for request in range(request_count):
+        first_row = request * mtp
+        expected_tokens = set()
+        for local_row in range(mtp):
+            row = first_row + local_row
+            boundary = int(boundaries[row])
+            for token in source[row].flatten().tolist():
+                if 0 <= token < boundary:
+                    expected_tokens.add(token)
+        count = result["counts"][request, 0].item()
+        assert count == len(expected_tokens)
+        actual_tokens = result["selected"][request, :count].tolist()
+        assert len(actual_tokens) == len(set(actual_tokens))
+        assert set(actual_tokens) == expected_tokens
+        assert torch.equal(
+            result["targets"][request, :count],
+            torch.arange(count, dtype=torch.long) + request * 131072,
+        )
+
+        for local_row in range(mtp):
+            row = first_row + local_row
+            boundary = int(boundaries[row])
+            original = source[row].flatten()
+            selected_mask = (original >= 0) & (original < boundary)
+            ranks = remapped[row]
+            assert torch.equal(
+                ranks[selected_mask],
+                local_to_union[row][selected_mask],
+            )
+            assert torch.equal(
+                remapped[row][~selected_mask],
+                original[~selected_mask],
+            )
+            if selected_mask.any():
+                reconstructed = result["selected"][request, ranks[selected_mask].to(torch.long)]
+                assert torch.equal(
+                    reconstructed,
+                    original[selected_mask],
+                )
+                assert torch.all(ranks[selected_mask] >= 0)
+                assert torch.all(ranks[selected_mask] < count)
+            assert torch.all(local_to_union[row][~selected_mask] < 0)
+        assert count <= capacity
 
 
 def test_pre_union_and_union_ops_with_half_overlapping_mtp_rows():
@@ -89,9 +233,7 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
     row_count = 2 * request_count
     max_tokens = 131072
     shared = torch.arange(topk // 2, dtype=torch.int32)
-    unique = torch.arange(
-        topk // 2, topk + topk // 2, dtype=torch.int32
-    )
+    unique = torch.arange(topk // 2, topk + topk // 2, dtype=torch.int32)
     request_rows = torch.stack(
         (
             torch.cat((shared, unique[: topk // 2])),
@@ -100,16 +242,10 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
     )
     source = request_rows.repeat(request_count, 1).unsqueeze(1).npu()
     values = source.clone()
-    row_requests = torch.arange(
-        request_count, dtype=torch.int32, device="npu"
-    ).repeat_interleave(2)
-    boundaries = torch.full(
-        (row_count,), max_tokens, dtype=torch.int32, device="npu"
-    )
+    row_requests = torch.arange(request_count, dtype=torch.int32, device="npu").repeat_interleave(2)
+    boundaries = torch.full((row_count,), max_tokens, dtype=torch.int32, device="npu")
     valid_rows = torch.arange(row_count, dtype=torch.int32, device="npu")
-    scratch_base = torch.zeros(
-        row_count, dtype=torch.int32, device="npu"
-    )
+    scratch_base = torch.zeros(row_count, dtype=torch.int32, device="npu")
     block_size = 128
     capacity = 2 * topk
     block_table = torch.arange(
@@ -118,9 +254,7 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
         device="npu",
     ).reshape(request_count, capacity // block_size)
     selected, counts, targets = _buffers(request_count, capacity)
-    local_to_union = torch.empty(
-        (row_count, topk), dtype=torch.int32, device="npu"
-    )
+    local_to_union = torch.empty((row_count, topk), dtype=torch.int32, device="npu")
 
     packed_keys = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_(
         values,
@@ -148,9 +282,7 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
         block_size,
         max_tokens,
     )
-    torch.ops._C_ascend.npu_dsa_staged_remap_rows_(
-        values, local_to_union
-    )
+    torch.ops._C_ascend.npu_dsa_staged_remap_rows_(values, local_to_union)
     torch.npu.synchronize()
 
     expected_count = 3 * topk // 2
@@ -163,17 +295,279 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
         )
         assert torch.equal(
             targets[request, :expected_count].cpu(),
-            torch.arange(expected_count, dtype=torch.long)
-            + request * capacity,
+            torch.arange(expected_count, dtype=torch.long) + request * capacity,
         )
     reconstructed = torch.gather(
         selected.repeat_interleave(2, dim=0),
         1,
         values.reshape(row_count, topk).to(torch.long),
     )
-    assert torch.equal(
-        reconstructed.cpu(), source.reshape(row_count, topk).cpu()
+    assert torch.equal(reconstructed.cpu(), source.reshape(row_count, topk).cpu())
+
+
+@pytest.mark.parametrize("mtp", [1, 2, 3, 4])
+def test_sharded_union_tracks_mtp_depth(mtp):
+    topk = 2048
+    request_count = 2
+    row_count = request_count * mtp
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        tuple(
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        )
     )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1).npu()
+    values = source.clone()
+    source_max = (mtp + 1) * topk // 2 - 1
+    boundary = source_max - 100
+    boundaries = torch.full((row_count,), boundary, dtype=torch.int32, device="npu")
+    capacity = mtp * topk
+    block_size = 128
+    block_table = torch.arange(
+        request_count * 131072 // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, 131072 // block_size)
+    selected, counts, targets = _buffers(request_count, capacity)
+    local_to_union = torch.empty((row_count, topk), dtype=torch.int32, device="npu")
+    shard_count = 1 << (mtp - 1).bit_length()
+    shard_packed = torch.empty(
+        (request_count, shard_count, topk),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty(
+        (request_count, shard_count, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_counts = torch.empty(
+        (request_count, shard_count, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
+
+    torch.ops._C_ascend.npu_dsa_staged_sharded_union_(
+        values,
+        boundaries,
+        selected,
+        local_to_union,
+        counts,
+        block_table,
+        targets,
+        shard_packed,
+        shard_mapping,
+        shard_counts,
+        block_size,
+    )
+    torch.npu.synchronize()
+
+    expected_count = boundary
+    assert counts[:, 0].cpu().tolist() == [expected_count] * request_count
+    selected_mask = source.reshape(row_count, topk) < boundary
+    remapped = values.reshape(row_count, topk)
+    safe_indices = torch.where(selected_mask, remapped, torch.zeros_like(remapped))
+    selected_reconstructed = torch.gather(
+        selected.repeat_interleave(mtp, dim=0),
+        1,
+        safe_indices.to(torch.long),
+    )
+    reconstructed = torch.where(
+        selected_mask,
+        selected_reconstructed,
+        remapped,
+    )
+    assert torch.equal(reconstructed.cpu(), source.reshape(row_count, topk).cpu())
+    expected_tokens = set(range(expected_count))
+    for request in range(request_count):
+        assert set(selected[request, :expected_count].cpu().tolist()) == expected_tokens
+    if mtp == 3:
+        values.copy_(source)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            torch.ops._C_ascend.npu_dsa_staged_sharded_union_(
+                values,
+                boundaries,
+                selected,
+                local_to_union,
+                counts,
+                block_table,
+                targets,
+                shard_packed,
+                shard_mapping,
+                shard_counts,
+                block_size,
+            )
+        values.copy_(source)
+        graph.replay()
+        torch.npu.synchronize()
+        assert counts[:, 0].cpu().tolist() == [expected_count] * request_count
+
+
+@pytest.mark.parametrize("mtp", range(1, 9))
+def test_vector_sharded_union_all_supported_mtp_depths(mtp):
+    topk = 2048
+    request_count = 2
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        tuple(
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        )
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1)
+    source_max = (mtp + 1) * topk // 2 - 1
+    boundary = source_max - 100
+    boundaries = torch.full((request_count * mtp,), boundary, dtype=torch.int32)
+
+    result = _run_vector_sharded_union(source, boundaries, request_count)
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
+
+    shard_count = 1 << (mtp - 1).bit_length()
+    for request in range(request_count):
+        occurrence_total = 0
+        unique_total = 0
+        for shard in range(shard_count):
+            unique_count = result["shard_counts"][request, shard, 0].item()
+            occurrence_count = result["shard_counts"][request, shard, 1].item()
+            assert 0 <= unique_count <= occurrence_count <= topk
+            shard_tokens = result["shard_packed"][request, shard, :unique_count]
+            assert torch.equal(
+                shard_tokens,
+                torch.sort(shard_tokens).values,
+            )
+            assert all(token % shard_count == shard for token in shard_tokens.tolist())
+            occurrence_total += occurrence_count
+            unique_total += unique_count
+        assert unique_total == boundary
+        assert occurrence_total == mtp * topk - 101
+
+
+def test_vector_sharded_union_uses_each_rows_split_boundary():
+    topk = 2048
+    mtp = 4
+    request_count = 2
+    rows = []
+    boundaries = []
+    for request in range(request_count):
+        for local_row in range(mtp):
+            row = torch.arange(
+                local_row * 512,
+                local_row * 512 + topk,
+                dtype=torch.int32,
+            )
+            row = torch.roll(row, 137 * (local_row + 1))
+            row[0] = -1 - request * mtp - local_row
+            rows.append(row)
+            boundaries.append(650 + request * 200 + local_row * 425)
+    source = torch.stack(rows).unsqueeze(1)
+    boundary_tensor = torch.tensor(boundaries, dtype=torch.int32)
+
+    result = _run_vector_sharded_union(source, boundary_tensor, request_count)
+    _assert_vector_sharded_result(result, source, boundary_tensor, request_count)
+
+
+def test_vector_sharded_union_mtp1_preserves_compacted_topk_order():
+    topk = 2048
+    request_count = 2
+    rows = []
+    boundaries = torch.tensor([1400, 1900], dtype=torch.int32)
+    for request in range(request_count):
+        row = torch.arange(topk, dtype=torch.int32)
+        row = torch.roll(row, 317 * (request + 1))
+        rows.append(row)
+    source = torch.stack(rows).unsqueeze(1)
+
+    result = _run_vector_sharded_union(source, boundaries, request_count)
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
+    for request in range(request_count):
+        original = source[request].flatten()
+        expected = original[original < boundaries[request]]
+        count = result["counts"][request, 0].item()
+        assert count == expected.numel()
+        assert torch.equal(
+            result["selected"][request, :count],
+            expected,
+        )
+        assert result["shard_counts"][request, 0, 0].item() == count
+        assert result["shard_counts"][request, 0, 1].item() == count
+
+
+def test_vector_sharded_union_preserves_all_ignored_positions():
+    topk = 2048
+    mtp = 3
+    request_count = 2
+    rows = torch.stack(
+        tuple(
+            torch.roll(
+                torch.arange(topk, dtype=torch.int32) + row * topk,
+                211 * (row + 1),
+            )
+            for row in range(mtp)
+        )
+    )
+    source = rows.repeat(request_count, 1).unsqueeze(1)
+    boundaries = torch.tensor(
+        [0, -1, 0, -7, 0, -3],
+        dtype=torch.int32,
+    )
+
+    result = _run_vector_sharded_union(source, boundaries, request_count)
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
+    assert result["counts"][:, 0].tolist() == [0, 0]
+    assert torch.equal(
+        result["values"].reshape_as(source),
+        source,
+    )
+    assert torch.all(result["local_to_union"] < 0)
+    assert torch.all(result["shard_counts"][:, :, :2] == 0)
+
+
+@pytest.mark.parametrize("mtp", [1, 3, 8])
+def test_vector_sharded_union_supports_graph_replay(mtp):
+    topk = 2048
+    request_count = 2
+    rows = torch.stack(
+        tuple(
+            torch.roll(
+                torch.arange(topk, dtype=torch.int32) + row * 256,
+                97 * (row + 1),
+            )
+            for row in range(mtp)
+        )
+    )
+    source = rows.repeat(request_count, 1).unsqueeze(1)
+    boundaries = torch.tensor(
+        [1200 + 100 * (row % mtp) for row in range(request_count * mtp)],
+        dtype=torch.int32,
+    )
+
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        capture_graph=True,
+    )
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
 
 
 def test_mtp_rows_build_one_sorted_union_per_request():

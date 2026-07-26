@@ -103,6 +103,49 @@ namespace vllm_ascend {
     uint32_t selected_count_stride,
     uint32_t block_size);
 
+  extern void dsa_staged_sharded_sort_union_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t shard_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_sharded_vector_union_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    void* shard_pairs,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t shard_count_stride,
+    uint32_t block_size);
+
   extern void dsa_staged_remap_rows_impl(
     void* stream,
     void* local_indices,

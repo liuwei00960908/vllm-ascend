@@ -492,6 +492,342 @@ at::Tensor npu_dsa_staged_union_(
     return selected_count;
 }
 
+at::Tensor npu_dsa_staged_sharded_union_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    int64_t block_size)
+{
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    const auto device = topk_indices.device();
+    TORCH_CHECK(split_boundary.device() == device &&
+                    selected_packed.device() == device &&
+                    local_to_union.device() == device &&
+                    selected_count.device() == device &&
+                    request_block_table.device() == device &&
+                    target_slots.device() == device &&
+                    shard_packed.device() == device &&
+                    shard_mapping.device() == device &&
+                    shard_counts.device() == device,
+                "all sharded-union tensors must share one NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    split_boundary.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    local_to_union.scalar_type() == at::kInt &&
+                    selected_count.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong &&
+                    shard_packed.scalar_type() == at::kInt &&
+                    shard_mapping.scalar_type() == at::kInt &&
+                    shard_counts.scalar_type() == at::kInt,
+                "sharded-union indices must be int32 and slots int64");
+    TORCH_CHECK(topk_indices.is_contiguous() &&
+                    split_boundary.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    local_to_union.is_contiguous() &&
+                    selected_count.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    target_slots.is_contiguous() &&
+                    shard_packed.is_contiguous() &&
+                    shard_mapping.is_contiguous() &&
+                    shard_counts.is_contiguous(),
+                "all sharded-union tensors must be contiguous");
+    TORCH_CHECK((topk_indices.dim() == 2 ||
+                    (topk_indices.dim() == 3 &&
+                     topk_indices.size(1) == 1)) &&
+                    split_boundary.dim() == 1 &&
+                    selected_packed.dim() == 2 &&
+                    local_to_union.dim() == 2 &&
+                    selected_count.dim() == 2 &&
+                    request_block_table.dim() == 2 &&
+                    target_slots.dim() == 2 &&
+                    shard_packed.dim() == 3 &&
+                    shard_mapping.dim() == 3 &&
+                    shard_counts.dim() == 3,
+                "invalid sharded-union tensor ranks");
+    const int64_t row_count = topk_indices.size(0);
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_count = selected_packed.size(0);
+    TORCH_CHECK(row_count > 0 && request_count > 0 &&
+                    row_count % request_count == 0,
+                "sharded union requires a uniform MTP depth");
+    const int64_t rows_per_request = row_count / request_count;
+    TORCH_CHECK(rows_per_request > 0 && rows_per_request <= 8,
+                "benchmark sharded union supports MTP depths from 1 to 8");
+    int64_t shard_count = 1;
+    while (shard_count < rows_per_request) {
+        shard_count <<= 1;
+    }
+    const int64_t request_width = rows_per_request * row_width;
+    const int64_t selected_count_stride =
+        selected_count.numel() / request_count;
+    const int64_t shard_count_stride =
+        shard_counts.numel() / (shard_count * request_count);
+    TORCH_CHECK(row_width == 2048 &&
+                    split_boundary.numel() >= row_count &&
+                    request_block_table.size(0) == request_count,
+                "benchmark sharded union requires [2048] MTP rows");
+    TORCH_CHECK(selected_packed.numel() >= row_count * row_width &&
+                    local_to_union.numel() >= row_count * row_width &&
+                    selected_count.numel() >= request_count &&
+                    target_slots.numel() >= row_count * row_width,
+                "sharded-union output buffers are too small");
+    TORCH_CHECK(shard_packed.size(0) == request_count &&
+                    shard_packed.size(1) == shard_count &&
+                    shard_packed.size(2) == row_width &&
+                    shard_mapping.size(0) == request_count &&
+                    shard_mapping.size(1) == shard_count &&
+                    shard_mapping.size(2) == request_width &&
+                    shard_counts.size(0) == request_count &&
+                    shard_counts.size(1) == shard_count &&
+                    shard_count_stride >= 16,
+                "invalid sharded-union scratch buffer shapes");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(selected_packed.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(local_to_union.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(target_slots.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_packed.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_mapping.data_ptr()) % 256 == 0,
+        "sharded-union vector outputs must start at a 256-byte-aligned "
+        "address");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(selected_count.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_counts.data_ptr()) % 64 == 0,
+        "sharded-union scalar-count outputs must start at a 64-byte-aligned "
+        "address");
+    TORCH_CHECK(request_count == 1 || selected_count_stride >= 16,
+                "batched sharded union requires one 64-byte cacheline per "
+                "selected-count row");
+    TORCH_CHECK(block_size > 0 &&
+                    (block_size & (block_size - 1)) == 0 &&
+                    request_block_table.size(1) * block_size >=
+                        request_width,
+                "block table must cover the sharded union output");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* boundary_ptr = split_boundary.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* map_ptr = local_to_union.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    void* shard_packed_ptr = shard_packed.data_ptr();
+    void* shard_mapping_ptr = shard_mapping.data_ptr();
+    void* shard_counts_ptr = shard_counts.data_ptr();
+    const int64_t table_width = request_block_table.size(1);
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_staged_sharded_union_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, boundary_ptr, packed_ptr, map_ptr, count_ptr, table_ptr,
+        slots_ptr, shard_packed_ptr, shard_mapping_ptr, shard_counts_ptr,
+        request_count, rows_per_request, row_width, shard_count,
+        table_width, selected_count_stride, shard_count_stride,
+        block_size]() -> int {
+        dsa_staged_sharded_sort_union_impl(
+            stream, topk_ptr, boundary_ptr, packed_ptr, map_ptr, count_ptr, table_ptr,
+            slots_ptr, shard_packed_ptr, shard_mapping_ptr,
+            shard_counts_ptr, static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(table_width),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(block_size));
+        return 0;
+    });
+    cmd.Run();
+    return selected_count;
+}
+
+at::Tensor npu_dsa_staged_sharded_vector_union_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    at::Tensor &shard_pairs,
+    int64_t block_size)
+{
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    const auto device = topk_indices.device();
+    TORCH_CHECK(split_boundary.device() == device &&
+                    selected_packed.device() == device &&
+                    local_to_union.device() == device &&
+                    selected_count.device() == device &&
+                    request_block_table.device() == device &&
+                    target_slots.device() == device &&
+                    shard_packed.device() == device &&
+                    shard_mapping.device() == device &&
+                    shard_counts.device() == device &&
+                    shard_pairs.device() == device,
+                "all vector sharded-union tensors must share one NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    split_boundary.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    local_to_union.scalar_type() == at::kInt &&
+                    selected_count.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong &&
+                    shard_packed.scalar_type() == at::kInt &&
+                    shard_mapping.scalar_type() == at::kInt &&
+                    shard_counts.scalar_type() == at::kInt &&
+                    shard_pairs.scalar_type() == at::kInt,
+                "vector sharded-union indices must be int32 and slots int64");
+    TORCH_CHECK(topk_indices.is_contiguous() &&
+                    split_boundary.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    local_to_union.is_contiguous() &&
+                    selected_count.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    target_slots.is_contiguous() &&
+                    shard_packed.is_contiguous() &&
+                    shard_mapping.is_contiguous() &&
+                    shard_counts.is_contiguous() &&
+                    shard_pairs.is_contiguous(),
+                "all vector sharded-union tensors must be contiguous");
+    TORCH_CHECK((topk_indices.dim() == 2 ||
+                    (topk_indices.dim() == 3 &&
+                     topk_indices.size(1) == 1)) &&
+                    split_boundary.dim() == 1 &&
+                    selected_packed.dim() == 2 &&
+                    local_to_union.dim() == 2 &&
+                    selected_count.dim() == 2 &&
+                    request_block_table.dim() == 2 &&
+                    target_slots.dim() == 2 &&
+                    shard_packed.dim() == 3 &&
+                    shard_mapping.dim() == 3 &&
+                    shard_counts.dim() == 3 &&
+                    shard_pairs.dim() == 3,
+                "invalid vector sharded-union tensor ranks");
+    const int64_t row_count = topk_indices.size(0);
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_count = selected_packed.size(0);
+    TORCH_CHECK(row_count > 0 && request_count > 0 &&
+                    row_count % request_count == 0,
+                "vector sharded union requires a uniform MTP depth");
+    const int64_t rows_per_request = row_count / request_count;
+    TORCH_CHECK(rows_per_request > 0 && rows_per_request <= 8,
+                "vector sharded union supports MTP depths from 1 to 8");
+    int64_t shard_count = 1;
+    while (shard_count < rows_per_request) {
+        shard_count <<= 1;
+    }
+    const int64_t request_width = rows_per_request * row_width;
+    const int64_t mapping_parts = shard_count;
+    const int64_t mapping_part_width = request_width / mapping_parts;
+    const int64_t selected_count_stride =
+        selected_count.numel() / request_count;
+    const int64_t shard_count_stride =
+        shard_counts.numel() / (shard_count * request_count);
+    TORCH_CHECK(row_width == 2048 &&
+                    split_boundary.numel() >= row_count &&
+                    request_block_table.size(0) == request_count,
+                "vector sharded union requires [2048] MTP rows");
+    TORCH_CHECK(selected_packed.numel() >= row_count * row_width &&
+                    local_to_union.numel() >= row_count * row_width &&
+                    selected_count.numel() >= request_count &&
+                    target_slots.numel() >= row_count * row_width,
+                "vector sharded-union output buffers are too small");
+    TORCH_CHECK(shard_packed.size(0) == request_count &&
+                    shard_packed.size(1) == shard_count &&
+                    shard_packed.size(2) == row_width &&
+                    shard_mapping.size(0) == request_count &&
+                    shard_mapping.size(1) == shard_count &&
+                    shard_mapping.size(2) == request_width &&
+                    shard_counts.size(0) == request_count &&
+                    shard_counts.size(1) == shard_count &&
+                    shard_count_stride >= 16 &&
+                    shard_pairs.size(0) == request_count &&
+                    shard_pairs.size(1) == shard_count &&
+                    shard_pairs.size(2) == 2 * row_width,
+                "invalid vector sharded-union scratch buffer shapes");
+    TORCH_CHECK(mapping_part_width <= row_width &&
+                    mapping_part_width % 64 == 0,
+                "parallel mapping parts must own complete 256-byte "
+                "destination transactions");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(selected_packed.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(local_to_union.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(target_slots.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_packed.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_mapping.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_pairs.data_ptr()) % 256 == 0,
+        "vector sharded-union vector outputs must start at a 256-byte-aligned "
+        "address");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(selected_count.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(shard_counts.data_ptr()) % 64 == 0,
+        "vector sharded-union scalar counts must start at a 64-byte-aligned "
+        "address");
+    TORCH_CHECK(request_count == 1 || selected_count_stride >= 16,
+                "batched vector sharded union requires one 64-byte cacheline "
+                "per selected-count row");
+    TORCH_CHECK(block_size > 0 &&
+                    (block_size & (block_size - 1)) == 0 &&
+                    request_block_table.size(1) * block_size >=
+                        request_width,
+                "block table must cover the vector sharded union output");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* boundary_ptr = split_boundary.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* map_ptr = local_to_union.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    void* shard_packed_ptr = shard_packed.data_ptr();
+    void* shard_mapping_ptr = shard_mapping.data_ptr();
+    void* shard_counts_ptr = shard_counts.data_ptr();
+    void* shard_pairs_ptr = shard_pairs.data_ptr();
+    const int64_t table_width = request_block_table.size(1);
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_staged_sharded_vector_union_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, boundary_ptr, packed_ptr, map_ptr, count_ptr,
+        table_ptr, slots_ptr, shard_packed_ptr, shard_mapping_ptr,
+        shard_counts_ptr, shard_pairs_ptr, request_count,
+        rows_per_request, row_width, shard_count, table_width,
+        selected_count_stride, shard_count_stride,
+        block_size]() -> int {
+        dsa_staged_sharded_vector_union_impl(
+            stream, topk_ptr, boundary_ptr, packed_ptr, map_ptr,
+            count_ptr, table_ptr, slots_ptr, shard_packed_ptr,
+            shard_mapping_ptr, shard_counts_ptr, shard_pairs_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(table_width),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(block_size));
+        return 0;
+    });
+    cmd.Run();
+    return selected_count;
+}
+
 at::Tensor npu_dsa_staged_remap_rows_(
     at::Tensor &local_indices,
     const at::Tensor &local_to_union)
@@ -1324,6 +1660,30 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_staged_union_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_staged_union_);
+    ops.def(
+        "npu_dsa_staged_sharded_union_(Tensor(a!) topk_indices, "
+        "Tensor split_boundary, Tensor(b!) selected_packed, "
+        "Tensor(c!) local_to_union, "
+        "Tensor(d!) selected_count, Tensor request_block_table, "
+        "Tensor(e!) target_slots, Tensor(f!) shard_packed, "
+        "Tensor(g!) shard_mapping, Tensor(h!) shard_counts, "
+        "int block_size) -> Tensor(d!)");
+    ops.impl(
+        "npu_dsa_staged_sharded_union_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_sharded_union_);
+    ops.def(
+        "npu_dsa_staged_sharded_vector_union_(Tensor(a!) topk_indices, "
+        "Tensor split_boundary, Tensor(b!) selected_packed, "
+        "Tensor(c!) local_to_union, "
+        "Tensor(d!) selected_count, Tensor request_block_table, "
+        "Tensor(e!) target_slots, Tensor(f!) shard_packed, "
+        "Tensor(g!) shard_mapping, Tensor(h!) shard_counts, "
+        "Tensor(i!) shard_pairs, int block_size) -> Tensor(d!)");
+    ops.impl(
+        "npu_dsa_staged_sharded_vector_union_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_sharded_vector_union_);
     ops.def(
         "npu_dsa_staged_remap_rows_(Tensor(a!) local_indices, "
         "Tensor local_to_union) -> Tensor(a!)");
