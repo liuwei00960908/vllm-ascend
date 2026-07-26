@@ -1190,8 +1190,12 @@ public:
             AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
             shardWidth_);
         AscendC::PipeBarrier<PIPE_V>();
-        const uint32_t uniqueCount = static_cast<uint32_t>(
+        // The AICore compiler rejects a direct float-to-unsigned conversion.
+        // PrefixSum is bounded by shardWidth_, so convert through int32_t.
+        const int32_t signedUniqueCount = static_cast<int32_t>(
             PrefixSum(flags, prefix, compactIndices.ReinterpretCast<float>()));
+        const uint32_t uniqueCount =
+            static_cast<uint32_t>(signedUniqueCount);
 
         // Every occurrence receives its shard-local rank. GatherMask emits
         // only the head token for the shard union.
