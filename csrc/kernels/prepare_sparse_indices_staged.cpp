@@ -419,6 +419,241 @@ private:
     uint32_t rowWidth_ = 0;
 };
 
+class DSAStagedUniqueFinalizeKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* uniqueKeys,
+        __gm__ int32_t* inverseWords,
+        __gm__ int32_t* rowReqIndices,
+        __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* localToUnion,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* requestBlockTable,
+        __gm__ int32_t* targetSlotWords,
+        uint32_t uniqueCount,
+        uint32_t rowCount,
+        uint32_t rowWidth,
+        uint32_t requestCount,
+        uint32_t scratchCapacity,
+        uint32_t blockTableWidth,
+        uint32_t selectedCountStride,
+        uint32_t blockSize,
+        uint32_t blockSizeShift,
+        uint32_t packedKeyStride)
+    {
+        uniqueCount_ = uniqueCount;
+        rowCount_ = rowCount;
+        rowWidth_ = rowWidth;
+        requestCount_ = requestCount;
+        scratchCapacity_ = scratchCapacity;
+        blockTableWidth_ = blockTableWidth;
+        selectedCountStride_ = selectedCountStride;
+        blockSize_ = blockSize;
+        blockSizeShift_ = blockSizeShift;
+        packedKeyStride_ = packedKeyStride;
+        uniqueKeys_.SetGlobalBuffer(uniqueKeys, uniqueCount);
+        inverseWords_.SetGlobalBuffer(
+            inverseWords,
+            2 * static_cast<uint64_t>(rowCount) * rowWidth);
+        rowReqIndices_.SetGlobalBuffer(rowReqIndices, rowCount);
+        selectedPacked_.SetGlobalBuffer(
+            selectedPacked,
+            static_cast<uint64_t>(requestCount) * scratchCapacity);
+        localToUnion_.SetGlobalBuffer(
+            localToUnion,
+            static_cast<uint64_t>(rowCount) * rowWidth);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount) * selectedCountStride);
+        requestBlockTable_.SetGlobalBuffer(
+            requestBlockTable,
+            static_cast<uint64_t>(requestCount) * blockTableWidth);
+        targetSlotWords_.SetGlobalBuffer(
+            targetSlotWords,
+            2 * static_cast<uint64_t>(requestCount) * scratchCapacity);
+        pipe_.InitBuffer(keyBuf_, scratchCapacity * sizeof(int32_t));
+        pipe_.InitBuffer(work0Buf_, scratchCapacity * sizeof(int32_t));
+        pipe_.InitBuffer(work1Buf_, scratchCapacity * sizeof(int32_t));
+        pipe_.InitBuffer(
+            physicalBlockBuf_, scratchCapacity * sizeof(int32_t));
+        pipe_.InitBuffer(
+            targetBuf_, scratchCapacity * sizeof(int64_t));
+        pipe_.InitBuffer(
+            blockTableBuf_, blockTableWidth * sizeof(int32_t));
+        pipe_.InitBuffer(inverseBuf_, rowWidth * sizeof(int64_t));
+        pipe_.InitBuffer(mapBuf_, rowWidth * sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t block = AscendC::GetBlockIdx();
+        if (block < requestCount_) {
+            FinalizeRequest(block);
+            return;
+        }
+        const uint32_t row = block - requestCount_;
+        if (row < rowCount_) {
+            FinalizeRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t LowerBound(int32_t key) const
+    {
+        uint32_t first = 0;
+        uint32_t last = uniqueCount_;
+        while (first < last) {
+            const uint32_t middle = first + (last - first) / 2;
+            if (uniqueKeys_.GetValue(middle) < key) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        return first;
+    }
+
+    __aicore__ inline void FinalizeRequest(uint32_t request)
+    {
+        const int32_t keyBase =
+            static_cast<int32_t>(request * packedKeyStride_);
+        const uint32_t begin = LowerBound(keyBase);
+        const uint32_t end = LowerBound(
+            keyBase + static_cast<int32_t>(packedKeyStride_));
+        const uint32_t count = end - begin;
+        const uint64_t outputOffset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+
+        auto keys = keyBuf_.Get<int32_t>();
+        auto ranks = work0Buf_.Get<int32_t>();
+        auto logicalBlocks = work1Buf_.Get<int32_t>();
+        auto physicalBlocks = physicalBlockBuf_.Get<int32_t>();
+        auto targets = targetBuf_.Get<int64_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
+        AscendC::DataCopy(keys, uniqueKeys_[begin], count);
+        AscendC::DataCopy(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableWidth_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Adds(keys, keys, -keyBase, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(selectedPacked_[outputOffset], keys, count);
+
+        AscendC::CreateVecIndex(
+            ranks, static_cast<int32_t>(0), count);
+        AscendC::ShiftRight(
+            logicalBlocks,
+            ranks,
+            static_cast<int32_t>(blockSizeShift_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::MTE3_V>();
+        AscendC::Muls(
+            keys,
+            logicalBlocks,
+            static_cast<int32_t>(sizeof(int32_t)),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            physicalBlocks,
+            blockTable,
+            keys.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            physicalBlocks,
+            physicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::Muls(
+            logicalBlocks,
+            logicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(ranks, ranks, logicalBlocks, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(
+            physicalBlocks, physicalBlocks, ranks, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            targets,
+            physicalBlocks,
+            AscendC::RoundMode::CAST_NONE,
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(
+            targetSlotWords_[2 * outputOffset],
+            targets.ReinterpretCast<int32_t>(),
+            2 * count);
+        selectedCount_.SetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_,
+            static_cast<int32_t>(count));
+    }
+
+    __aicore__ inline void FinalizeRow(uint32_t row)
+    {
+        const int32_t request = rowReqIndices_.GetValue(row);
+        const uint32_t begin = LowerBound(
+            request * static_cast<int32_t>(packedKeyStride_));
+        const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
+        auto inverseWords = inverseBuf_.Get<int32_t>();
+        auto mapping = mapBuf_.Get<int32_t>();
+        AscendC::DataCopy(
+            inverseWords,
+            inverseWords_[2 * rowOffset],
+            2 * rowWidth_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Cast(
+            mapping,
+            inverseWords.ReinterpretCast<int64_t>(),
+            AscendC::RoundMode::CAST_NONE,
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(
+            mapping,
+            mapping,
+            -static_cast<int32_t>(begin),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(localToUnion_[rowOffset], mapping, rowWidth_);
+    }
+
+    AscendC::GlobalTensor<int32_t> uniqueKeys_;
+    AscendC::GlobalTensor<int32_t> inverseWords_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
+    AscendC::GlobalTensor<int32_t> selectedPacked_;
+    AscendC::GlobalTensor<int32_t> localToUnion_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> requestBlockTable_;
+    AscendC::GlobalTensor<int32_t> targetSlotWords_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> keyBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> work0Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> work1Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> physicalBlockBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inverseBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mapBuf_;
+    uint32_t uniqueCount_ = 0;
+    uint32_t rowCount_ = 0;
+    uint32_t rowWidth_ = 0;
+    uint32_t requestCount_ = 0;
+    uint32_t scratchCapacity_ = 0;
+    uint32_t blockTableWidth_ = 0;
+    uint32_t selectedCountStride_ = 0;
+    uint32_t blockSize_ = 0;
+    uint32_t blockSizeShift_ = 0;
+    uint32_t packedKeyStride_ = 0;
+};
+
 }  // namespace
 
 extern "C" __global__ __aicore__ void dsa_staged_bitmap_union_kernel(
@@ -475,6 +710,38 @@ extern "C" __global__ __aicore__ void dsa_staged_remap_rows_kernel(
     if ASCEND_IS_AIV {
         DSAStagedRemapRowsKernel op;
         op.Init(localIndices, localToUnion, rowCount, rowWidth);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void dsa_staged_unique_finalize_kernel(
+    __gm__ int32_t* uniqueKeys,
+    __gm__ int32_t* inverseWords,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* localToUnion,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* targetSlotWords,
+    uint32_t uniqueCount,
+    uint32_t rowCount,
+    uint32_t rowWidth,
+    uint32_t requestCount,
+    uint32_t scratchCapacity,
+    uint32_t blockTableWidth,
+    uint32_t selectedCountStride,
+    uint32_t blockSize,
+    uint32_t blockSizeShift,
+    uint32_t packedKeyStride)
+{
+    if ASCEND_IS_AIV {
+        DSAStagedUniqueFinalizeKernel op;
+        op.Init(
+            uniqueKeys, inverseWords, rowReqIndices, selectedPacked,
+            localToUnion, selectedCount, requestBlockTable, targetSlotWords,
+            uniqueCount, rowCount, rowWidth, requestCount,
+            scratchCapacity, blockTableWidth, selectedCountStride,
+            blockSize, blockSizeShift, packedKeyStride);
         op.Process();
     }
 }
@@ -552,6 +819,30 @@ void dsa_staged_remap_rows_impl(
     dsa_staged_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
         static_cast<int32_t*>(localIndices),
         static_cast<int32_t*>(localToUnion), rowCount, rowWidth);
+}
+
+void dsa_staged_unique_finalize_impl(
+    void* stream, void* uniqueKeys, void* inverse, void* rowReqIndices,
+    void* selectedPacked, void* localToUnion, void* selectedCount,
+    void* requestBlockTable, void* targetSlots, uint32_t uniqueCount,
+    uint32_t rowCount, uint32_t rowWidth, uint32_t requestCount,
+    uint32_t scratchCapacity, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize,
+    uint32_t blockSizeShift,
+    uint32_t packedKeyStride)
+{
+    dsa_staged_unique_finalize_kernel<<<requestCount + rowCount, nullptr, stream>>>(
+        static_cast<int32_t*>(uniqueKeys),
+        static_cast<int32_t*>(inverse),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(targetSlots),
+        uniqueCount, rowCount, rowWidth, requestCount, scratchCapacity,
+        blockTableWidth, selectedCountStride, blockSize, blockSizeShift,
+        packedKeyStride);
 }
 
 void dsa_staged_copy_rows_impl(

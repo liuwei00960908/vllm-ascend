@@ -40,7 +40,8 @@ public:
         uint32_t validRowCount,
         uint32_t coreCount,
         uint32_t needPacked,
-        uint32_t clearInvalidRows)
+        uint32_t clearInvalidRows,
+        uint32_t packedKeyStride)
     {
         rowCount_ = rowCount;
         rowWidth_ = rowWidth;
@@ -48,6 +49,7 @@ public:
         coreCount_ = coreCount;
         needPacked_ = needPacked != 0;
         clearInvalidRows_ = clearInvalidRows != 0;
+        packedKeyStride_ = packedKeyStride;
 
         topkIndicesGm_.SetGlobalBuffer(topkIndices);
         splitBoundaryGm_.SetGlobalBuffer(splitBoundary);
@@ -58,7 +60,7 @@ public:
                 selectedPacked,
                 static_cast<uint64_t>(validRowCount) * rowWidth);
         }
-        if (clearInvalidRows_) {
+        if (clearInvalidRows_ || packedKeyStride_ != 0) {
             rowReqIndicesGm_.SetGlobalBuffer(rowReqIndices, rowCount);
         }
 
@@ -184,6 +186,15 @@ private:
                 gatherParams,
                 selectedCount);
             PipeBarrier<PIPE_V>();
+            if (packedKeyStride_ != 0) {
+                const int32_t request = rowReqIndicesGm_.GetValue(sourceRow);
+                Adds(
+                    packed,
+                    packed,
+                    request * static_cast<int32_t>(packedKeyStride_),
+                    rowWidth_);
+                PipeBarrier<PIPE_V>();
+            }
         }
 
         // CumSum supports float on A2/A3. Its input is only a 0/1 selection
@@ -313,6 +324,7 @@ private:
     uint32_t coreCount_ = 0;
     bool needPacked_ = false;
     bool clearInvalidRows_ = false;
+    uint32_t packedKeyStride_ = 0;
 };
 
 }  // namespace
@@ -329,7 +341,8 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_legacy_kernel(
     uint32_t validRowCount,
     uint32_t coreCount,
     uint32_t needPacked,
-    uint32_t clearInvalidRows)
+    uint32_t clearInvalidRows,
+    uint32_t packedKeyStride)
 {
     DSAPrepareSparseIndicesLegacyKernel op;
     op.Init(
@@ -344,7 +357,8 @@ extern "C" __global__ __aicore__ void dsa_prepare_sparse_indices_legacy_kernel(
         validRowCount,
         coreCount,
         needPacked,
-        clearInvalidRows);
+        clearInvalidRows,
+        packedKeyStride);
     op.Process();
 }
 
@@ -363,7 +377,8 @@ void dsa_prepare_sparse_indices_legacy_impl(
     uint32_t validRowCount,
     uint32_t coreCount,
     bool needPacked,
-    bool clearInvalidRows)
+    bool clearInvalidRows,
+    uint32_t packedKeyStride)
 {
     dsa_prepare_sparse_indices_legacy_kernel<<<coreCount, nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -377,7 +392,8 @@ void dsa_prepare_sparse_indices_legacy_impl(
         validRowCount,
         coreCount,
         needPacked ? 1U : 0U,
-        clearInvalidRows ? 1U : 0U);
+        clearInvalidRows ? 1U : 0U,
+        packedKeyStride);
 }
 
 }  // namespace vllm_ascend

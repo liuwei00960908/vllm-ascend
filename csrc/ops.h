@@ -71,7 +71,8 @@ namespace vllm_ascend {
     uint32_t valid_row_count,
     uint32_t core_count,
     bool need_packed,
-    bool clear_invalid_rows);
+    bool clear_invalid_rows,
+    uint32_t packed_key_stride);
 
   extern void dsa_staged_bitmap_union_impl(
     void* stream,
@@ -108,6 +109,27 @@ namespace vllm_ascend {
     void* local_to_union,
     uint32_t row_count,
     uint32_t row_width);
+
+  extern void dsa_staged_unique_finalize_impl(
+    void* stream,
+    void* unique_keys,
+    void* inverse,
+    void* row_req_indices,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t unique_count,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t scratch_capacity,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size,
+    uint32_t block_size_shift,
+    uint32_t packed_key_stride);
 
   extern void dsa_staged_copy_rows_impl(
     void* stream,

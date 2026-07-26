@@ -16,6 +16,8 @@ def _load_dsa_union_operator():
         pytest.fail("vllm_ascend_C does not contain the DSA union operator")
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_legacy_"):
         pytest.fail("vllm_ascend_C does not contain the pre-union DSA operator")
+    if not hasattr(torch.ops._C_ascend, "npu_dsa_staged_unique_finalize_"):
+        pytest.fail("vllm_ascend_C does not contain the unique finalize operator")
 
 
 def _buffers(requests: int, capacity: int):
@@ -78,6 +80,99 @@ def test_pre_union_and_union_ops_with_half_overlapping_mtp_rows():
     assert torch.equal(
         union_result[0][0, :, : topk // 2].cpu(),
         union_result[0][1, :, : topk // 2].cpu(),
+    )
+
+
+def test_four_stage_native_unique_with_batched_mtp_rows():
+    topk = 2048
+    request_count = 4
+    row_count = 2 * request_count
+    max_tokens = 131072
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    unique = torch.arange(
+        topk // 2, topk + topk // 2, dtype=torch.int32
+    )
+    request_rows = torch.stack(
+        (
+            torch.cat((shared, unique[: topk // 2])),
+            torch.cat((shared, unique[topk // 2 :])),
+        )
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1).npu()
+    values = source.clone()
+    row_requests = torch.arange(
+        request_count, dtype=torch.int32, device="npu"
+    ).repeat_interleave(2)
+    boundaries = torch.full(
+        (row_count,), max_tokens, dtype=torch.int32, device="npu"
+    )
+    valid_rows = torch.arange(row_count, dtype=torch.int32, device="npu")
+    scratch_base = torch.zeros(
+        row_count, dtype=torch.int32, device="npu"
+    )
+    block_size = 128
+    capacity = 2 * topk
+    block_table = torch.arange(
+        request_count * capacity // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, capacity // block_size)
+    selected, counts, targets = _buffers(request_count, capacity)
+    local_to_union = torch.empty(
+        (row_count, topk), dtype=torch.int32, device="npu"
+    )
+
+    packed_keys = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_(
+        values,
+        boundaries,
+        valid_rows,
+        scratch_base,
+        True,
+        row_requests,
+        max_tokens,
+    )
+    unique_keys, inverse = torch.unique(
+        packed_keys.reshape(-1),
+        sorted=True,
+        return_inverse=True,
+    )
+    torch.ops._C_ascend.npu_dsa_staged_unique_finalize_(
+        unique_keys,
+        inverse,
+        row_requests,
+        selected,
+        local_to_union,
+        counts,
+        block_table,
+        targets,
+        block_size,
+        max_tokens,
+    )
+    torch.ops._C_ascend.npu_dsa_staged_remap_rows_(
+        values, local_to_union
+    )
+    torch.npu.synchronize()
+
+    expected_count = 3 * topk // 2
+    assert counts[:, 0].cpu().tolist() == [expected_count] * request_count
+    expected_selected = torch.arange(expected_count, dtype=torch.int32)
+    for request in range(request_count):
+        assert torch.equal(
+            selected[request, :expected_count].cpu(),
+            expected_selected,
+        )
+        assert torch.equal(
+            targets[request, :expected_count].cpu(),
+            torch.arange(expected_count, dtype=torch.long)
+            + request * capacity,
+        )
+    reconstructed = torch.gather(
+        selected.repeat_interleave(2, dim=0),
+        1,
+        values.reshape(row_count, topk).to(torch.long),
+    )
+    assert torch.equal(
+        reconstructed.cpu(), source.reshape(row_count, topk).cpu()
     )
 
 

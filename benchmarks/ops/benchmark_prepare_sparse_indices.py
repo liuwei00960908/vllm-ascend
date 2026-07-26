@@ -111,6 +111,54 @@ def _staged_no_union_runner(
     return values
 
 
+def _staged_native_unique_runner(
+    *,
+    legacy_op,
+    finalize_op,
+    remap_op,
+    values,
+    boundaries,
+    valid_rows,
+    local_scratch_base,
+    row_requests,
+    request_block_table,
+    selected_packed,
+    local_to_union,
+    selected_count,
+    target_slots,
+    block_size,
+    packed_key_stride,
+):
+    packed_keys = legacy_op(
+        values,
+        boundaries,
+        valid_rows,
+        local_scratch_base,
+        True,
+        row_requests,
+        packed_key_stride,
+    )
+    unique_keys, inverse = torch.unique(
+        packed_keys.reshape(-1),
+        sorted=True,
+        return_inverse=True,
+    )
+    finalize_op(
+        unique_keys,
+        inverse,
+        row_requests,
+        selected_packed,
+        local_to_union,
+        selected_count,
+        request_block_table,
+        target_slots,
+        block_size,
+        packed_key_stride,
+    )
+    remap_op(values, local_to_union)
+    return values, selected_packed, selected_count, target_slots
+
+
 def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     if topk != 2048:
         raise ValueError("the experimental staged kernels currently require --topk 2048")
@@ -120,6 +168,9 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
     remap_op = torch.ops._C_ascend.npu_dsa_staged_remap_rows_
     copy_rows_op = torch.ops._C_ascend.npu_dsa_staged_copy_rows_
+    unique_finalize_op = (
+        torch.ops._C_ascend.npu_dsa_staged_unique_finalize_
+    )
 
     request_batch = 4
     row_count = 2 * request_batch
@@ -130,6 +181,7 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
     no_union_local_indices = source.clone()
     bitmap_values = source.clone()
     sort_values = source.clone()
+    native_unique_values = source.clone()
     max_tokens = 131072
     boundaries = torch.full(
         (row_count,), max_tokens, dtype=torch.int32, device="npu"
@@ -177,6 +229,9 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         ),
     )
     sort_buffers = tuple(torch.empty_like(item) for item in bitmap_buffers)
+    native_unique_buffers = tuple(
+        torch.empty_like(item) for item in bitmap_buffers
+    )
 
     def staged(values, buffers, use_sort):
         return _staged_runner(
@@ -210,9 +265,29 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             row_requests=row_requests,
         )
 
+    def staged_native_unique():
+        return _staged_native_unique_runner(
+            legacy_op=legacy_op,
+            finalize_op=unique_finalize_op,
+            remap_op=remap_op,
+            values=native_unique_values,
+            boundaries=boundaries,
+            valid_rows=valid_rows,
+            local_scratch_base=local_scratch_base,
+            row_requests=row_requests,
+            request_block_table=block_table,
+            selected_packed=native_unique_buffers[0],
+            local_to_union=native_unique_buffers[1],
+            selected_count=native_unique_buffers[2],
+            target_slots=native_unique_buffers[3],
+            block_size=block_size,
+            packed_key_stride=max_tokens,
+        )
+
     no_union_result = staged_no_union()
     bitmap_result = staged(bitmap_values, bitmap_buffers, False)
     sort_result = staged(sort_values, sort_buffers, True)
+    native_unique_result = staged_native_unique()
     torch.npu.synchronize()
     expected_local_indices = torch.arange(
         topk, dtype=torch.int32, device="npu"
@@ -225,6 +300,8 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         raise AssertionError("bitmap staged union count is incorrect")
     if sort_result[2][:, 0].cpu().tolist() != expected_counts:
         raise AssertionError("sort staged union count is incorrect")
+    if native_unique_result[2][:, 0].cpu().tolist() != expected_counts:
+        raise AssertionError("native unique staged union count is incorrect")
     if not torch.equal(bitmap_result[0].cpu(), sort_result[0].cpu()):
         raise AssertionError("bitmap and sort remapped rows differ")
     for index in (1, 3):
@@ -233,6 +310,19 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             sort_result[index][:, :expected_count].cpu(),
         ):
             raise AssertionError("bitmap and sort staged payloads differ")
+        if not torch.equal(
+            bitmap_result[index][:, :expected_count].cpu(),
+            native_unique_result[index][:, :expected_count].cpu(),
+        ):
+            raise AssertionError(
+                "bitmap and native unique staged payloads differ"
+            )
+    if not torch.equal(
+        bitmap_result[0].cpu(), native_unique_result[0].cpu()
+    ):
+        raise AssertionError(
+            "bitmap and native unique remapped rows differ"
+        )
 
     legacy_samples = _measure_npu_ms(
         lambda: legacy_op(
@@ -280,17 +370,25 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         warmups,
         iterations,
     )
+    native_unique_samples = _measure_npu_ms(
+        staged_native_unique,
+        lambda: native_unique_values.copy_(source),
+        warmups,
+        iterations,
+    )
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
     no_union_mean = statistics.fmean(no_union_samples)
     bitmap_mean = statistics.fmean(bitmap_samples)
     sort_mean = statistics.fmean(sort_samples)
+    native_unique_mean = statistics.fmean(native_unique_samples)
     _summary("pre-union", legacy_samples)
     _summary("fused-union", union_samples)
     _summary("staged-no-union", no_union_samples)
     _summary("staged-bitmap", bitmap_samples)
     _summary("staged-sort", sort_samples)
+    _summary("native-unique", native_unique_samples)
     print(f"union overhead: {union_mean - legacy_mean:+.6f} ms ({(union_mean / legacy_mean - 1) * 100:+.2f}%)")
     print(
         "staged bitmap union cost: "
@@ -302,6 +400,11 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
         f"{sort_mean - no_union_mean:+.6f} ms "
         f"({(sort_mean / no_union_mean - 1) * 100:+.2f}%)"
     )
+    print(
+        "native unique cost: "
+        f"{native_unique_mean - no_union_mean:+.6f} ms "
+        f"({(native_unique_mean / no_union_mean - 1) * 100:+.2f}%)"
+    )
     fastest = min(
         (
             ("pre-union", legacy_mean),
@@ -309,6 +412,7 @@ def main(topk: int = 2048, iterations: int = 200, warmups: int = 20) -> None:
             ("staged-no-union", no_union_mean),
             ("staged-bitmap", bitmap_mean),
             ("staged-sort", sort_mean),
+            ("native-unique", native_unique_mean),
         ),
         key=lambda item: item[1],
     )

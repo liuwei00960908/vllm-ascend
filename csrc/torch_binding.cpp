@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -228,7 +229,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
     const at::Tensor &valid_rows,
     const at::Tensor &scratch_base,
     bool need_packed,
-    const c10::optional<at::Tensor> &row_req_indices)
+    const c10::optional<at::Tensor> &row_req_indices,
+    int64_t packed_key_stride)
 {
     TORCH_CHECK(topk_indices.is_privateuseone(),
                 "topk_indices must be on an NPU device");
@@ -277,6 +279,12 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
                 "sparse-index preparation supports at most 4096 entries per row");
     TORCH_CHECK(row_width % 64 == 0,
                 "sparse-index row width must be a multiple of 64 int32 values");
+    TORCH_CHECK(packed_key_stride >= 0 &&
+                    packed_key_stride <= std::numeric_limits<int32_t>::max(),
+                "packed_key_stride must fit int32");
+    TORCH_CHECK(packed_key_stride == 0 ||
+                    (need_packed && row_req_indices.has_value()),
+                "packed key encoding requires packed output and row requests");
     TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 256 == 0,
         "topk_indices must start at a 256-byte-aligned address so adjacent "
@@ -354,7 +362,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
         valid_row_count,
         core_count,
         need_packed,
-        clear_invalid_rows]() -> int {
+        clear_invalid_rows,
+        packed_key_stride]() -> int {
         dsa_prepare_sparse_indices_legacy_impl(
             stream,
             topk_ptr,
@@ -368,7 +377,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_legacy_(
             static_cast<uint32_t>(valid_row_count),
             core_count,
             need_packed,
-            clear_invalid_rows);
+            clear_invalid_rows,
+            static_cast<uint32_t>(packed_key_stride));
         return 0;
     });
     cmd.Run();
@@ -516,6 +526,124 @@ at::Tensor npu_dsa_staged_remap_rows_(
     });
     cmd.Run();
     return local_indices;
+}
+
+at::Tensor npu_dsa_staged_unique_finalize_(
+    const at::Tensor &unique_keys,
+    const at::Tensor &inverse,
+    const at::Tensor &row_req_indices,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t packed_key_stride)
+{
+    TORCH_CHECK(unique_keys.is_privateuseone(),
+                "unique_keys must be on an NPU device");
+    const auto device = unique_keys.device();
+    TORCH_CHECK(inverse.device() == device &&
+                    row_req_indices.device() == device &&
+                    selected_packed.device() == device &&
+                    local_to_union.device() == device &&
+                    selected_count.device() == device &&
+                    request_block_table.device() == device &&
+                    target_slots.device() == device,
+                "all unique-finalize tensors must share one NPU device");
+    TORCH_CHECK(unique_keys.scalar_type() == at::kInt &&
+                    inverse.scalar_type() == at::kLong &&
+                    row_req_indices.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    local_to_union.scalar_type() == at::kInt &&
+                    selected_count.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong,
+                "unique finalize requires int32 keys/outputs and int64 inverse/slots");
+    TORCH_CHECK(unique_keys.is_contiguous() && inverse.is_contiguous() &&
+                    row_req_indices.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    local_to_union.is_contiguous() &&
+                    selected_count.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    target_slots.is_contiguous(),
+                "all unique-finalize tensors must be contiguous");
+    TORCH_CHECK(unique_keys.dim() == 1 && inverse.dim() == 1 &&
+                    row_req_indices.dim() == 1 &&
+                    selected_packed.dim() == 2 &&
+                    local_to_union.dim() == 2 &&
+                    selected_count.dim() == 2 &&
+                    request_block_table.dim() == 2 &&
+                    target_slots.dim() == 2,
+                "invalid unique-finalize tensor ranks");
+    const int64_t row_count = row_req_indices.numel();
+    const int64_t request_count = selected_packed.size(0);
+    const int64_t row_width = local_to_union.size(1);
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t selected_count_stride =
+        selected_count.numel() / request_count;
+    TORCH_CHECK(row_count > 0 && request_count > 0 &&
+                    row_width == 2048 &&
+                    inverse.numel() == row_count * row_width &&
+                    local_to_union.size(0) == row_count,
+                "unique finalize requires flattened inverse for [rows,2048]");
+    TORCH_CHECK(request_block_table.size(0) == request_count &&
+                    selected_count.size(0) == request_count &&
+                    target_slots.sizes() == selected_packed.sizes(),
+                "unique-finalize request buffers have inconsistent shapes");
+    TORCH_CHECK(scratch_capacity >= 2 * row_width &&
+                    block_size > 0 &&
+                    (block_size & (block_size - 1)) == 0 &&
+                    request_block_table.size(1) * block_size >=
+                        scratch_capacity,
+                "unique-finalize buffers require power-of-two block size");
+    TORCH_CHECK(request_count == 1 || selected_count_stride >= 8,
+                "batched unique finalize requires isolated count writes");
+    TORCH_CHECK(packed_key_stride > 0 &&
+                    request_count * packed_key_stride <=
+                        std::numeric_limits<int32_t>::max(),
+                "packed unique keys must fit int32");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* keys_ptr = unique_keys.data_ptr();
+    void* inverse_ptr = inverse.data_ptr();
+    void* requests_ptr = row_req_indices.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* map_ptr = local_to_union.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    const int64_t unique_count = unique_keys.numel();
+    const int64_t table_width = request_block_table.size(1);
+    const uint32_t block_size_shift = static_cast<uint32_t>(
+        __builtin_ctzll(static_cast<unsigned long long>(block_size)));
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_staged_unique_finalize_");
+    cmd.SetCustomHandler([
+        stream, keys_ptr, inverse_ptr, requests_ptr, packed_ptr, map_ptr,
+        count_ptr, table_ptr, slots_ptr, unique_count, row_count,
+        row_width, request_count, scratch_capacity, table_width,
+        selected_count_stride, block_size, block_size_shift,
+        packed_key_stride]() -> int {
+        dsa_staged_unique_finalize_impl(
+            stream, keys_ptr, inverse_ptr, requests_ptr, packed_ptr,
+            map_ptr, count_ptr, table_ptr, slots_ptr,
+            static_cast<uint32_t>(unique_count),
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(table_width),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(block_size),
+            block_size_shift,
+            static_cast<uint32_t>(packed_key_stride));
+        return 0;
+    });
+    cmd.Run();
+    return selected_count;
 }
 
 at::Tensor npu_dsa_staged_copy_rows_(
@@ -1178,7 +1306,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_dsa_prepare_sparse_indices_legacy_(Tensor(a!) topk_indices, "
         "Tensor split_boundary, Tensor valid_rows, Tensor scratch_base, "
-        "bool need_packed, Tensor? row_req_indices=None) -> Tensor");
+        "bool need_packed, Tensor? row_req_indices=None, "
+        "int packed_key_stride=0) -> Tensor");
     ops.impl(
         "npu_dsa_prepare_sparse_indices_legacy_",
         torch::kPrivateUse1,
@@ -1200,6 +1329,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_staged_remap_rows_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_staged_remap_rows_);
+    ops.def(
+        "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
+        "Tensor inverse, Tensor row_req_indices, "
+        "Tensor(a!) selected_packed, Tensor(b!) local_to_union, "
+        "Tensor(c!) selected_count, Tensor request_block_table, "
+        "Tensor(d!) target_slots, int block_size, "
+        "int packed_key_stride) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_staged_unique_finalize_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_staged_unique_finalize_);
     ops.def(
         "npu_dsa_staged_copy_rows_(Tensor(a!) output, "
         "Tensor local_indices) -> Tensor(a!)");
