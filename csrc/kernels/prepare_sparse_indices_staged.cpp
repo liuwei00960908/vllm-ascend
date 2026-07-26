@@ -19,6 +19,9 @@ constexpr uint32_t kCumSumTileWidth = 512;
 constexpr uint32_t kCumSumTransposeRows = 16;
 constexpr uint32_t kCumSumWorkspaceBytes =
     2 * kCumSumTransposeRows * kCumSumTileWidth * sizeof(float);
+constexpr uint32_t kDataBlockBytes = 32;
+constexpr uint32_t kInt32PerDataBlock =
+    kDataBlockBytes / sizeof(int32_t);
 constexpr AscendC::CumSumConfig kCumSumConfig{true, false, false};
 
 template <AscendC::HardEvent event>
@@ -28,6 +31,68 @@ __aicore__ inline void Sync()
         static_cast<int32_t>(GetTPipePtr()->FetchEventID(event));
     AscendC::SetFlag<event>(id);
     AscendC::WaitFlag<event>(id);
+}
+
+template <typename T>
+__aicore__ inline void CopyLocalToGlobalExact(
+    AscendC::GlobalTensor<T> dst,
+    AscendC::LocalTensor<T> src,
+    uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+    const uint32_t bytes = count * sizeof(T);
+    if ((bytes & (kDataBlockBytes - 1)) == 0) {
+        AscendC::DataCopy(dst, src, count);
+        return;
+    }
+    // The count-based DataCopy rounds an unaligned byte length down.
+    const AscendC::DataCopyParams params{
+        1,
+        static_cast<uint16_t>(bytes),
+        0,
+        0};
+    AscendC::DataCopyPad(dst, src, params);
+}
+
+__aicore__ inline void CopyLocalToGlobalExact(
+    AscendC::GlobalTensor<int64_t> dst,
+    AscendC::LocalTensor<int64_t> src,
+    uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+    AscendC::GlobalTensor<int32_t> dstWords;
+    dstWords.SetGlobalBuffer(
+        reinterpret_cast<__gm__ int32_t*>(dst.GetPhyAddr()),
+        2 * count);
+    CopyLocalToGlobalExact(
+        dstWords, src.ReinterpretCast<int32_t>(), 2 * count);
+}
+
+template <typename T>
+__aicore__ inline void CopyGlobalToLocalExact(
+    AscendC::LocalTensor<T> dst,
+    AscendC::GlobalTensor<T> src,
+    uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+    const uint32_t bytes = count * sizeof(T);
+    if ((bytes & (kDataBlockBytes - 1)) == 0) {
+        AscendC::DataCopy(dst, src, count);
+        return;
+    }
+    // DataCopyPad keeps the dynamic tail and pads only the local destination.
+    const AscendC::DataCopyParams params{
+        1,
+        static_cast<uint16_t>(bytes),
+        0,
+        0};
+    AscendC::DataCopyPad(dst, src, params, {});
 }
 
 class DSAStagedHashUnionKernel {
@@ -109,7 +174,7 @@ public:
         auto blockTable = blockTableBuf_.Get<int32_t>();
         AscendC::DataCopy(
             input, rowPacked_[rowOffset], requestWidth_);
-        AscendC::DataCopy(
+        CopyGlobalToLocalExact(
             blockTable,
             requestBlockTable_[
                 static_cast<uint64_t>(request) * blockTableWidth_],
@@ -148,7 +213,7 @@ public:
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             selectedPacked_[outputOffset], unionLocal, count);
         AscendC::DataCopy(
             localToUnion_[rowOffset], mapping, requestWidth_);
@@ -203,7 +268,7 @@ public:
             count);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             targetSlots_[outputOffset], targets, count);
         selectedCount_.SetValue(
             request * selectedCountStride_, static_cast<int32_t>(count));
@@ -309,7 +374,7 @@ public:
         auto srcInt = src.ReinterpretCast<int32_t>();
         AscendC::DataCopy(
             input, rowPacked_[rowOffset], requestWidth_);
-        AscendC::DataCopy(
+        CopyGlobalToLocalExact(
             blockTable,
             requestBlockTable_[
                 static_cast<uint64_t>(request) * blockTableWidth_],
@@ -392,11 +457,11 @@ public:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             selectedPacked_[outputOffset], unionLocal, rank);
         AscendC::DataCopy(
             localToUnion_[rowOffset], mapping, requestWidth_);
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             targetSlots_[outputOffset], targets, rank);
         selectedCount_.SetValue(
             request * selectedCountStride_, static_cast<int32_t>(rank));
@@ -591,6 +656,7 @@ public:
         gatherParams.src0RepeatStride = 8;
         gatherParams.src1RepeatStride = 8;
         uint32_t shardElements = 0;
+        uint32_t compactEnd = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
@@ -661,8 +727,13 @@ public:
 
             uint64_t tokenElements = 0;
             uint64_t indexElements = 0;
+            // GatherMask requires a 32-byte-aligned local destination. Sort
+            // sentinels already occupy any gap before this row's payload.
+            const uint32_t compactOffset =
+                (compactEnd + kInt32PerDataBlock - 1)
+                & ~(kInt32PerDataBlock - 1);
             AscendC::GatherMask(
-                compactTokens[shardElements],
+                compactTokens[compactOffset],
                 input,
                 selectedMask.ReinterpretCast<uint32_t>(),
                 true,
@@ -670,7 +741,7 @@ public:
                 gatherParams,
                 tokenElements);
             AscendC::GatherMask(
-                compactIndices[shardElements],
+                compactIndices[compactOffset],
                 indices,
                 selectedMask.ReinterpretCast<uint32_t>(),
                 true,
@@ -680,6 +751,8 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_S>();
             shardElements += static_cast<uint32_t>(tokenElements);
+            compactEnd =
+                compactOffset + static_cast<uint32_t>(tokenElements);
         }
 
         AscendC::Duplicate(
@@ -697,7 +770,7 @@ public:
             }
             Sync<AscendC::HardEvent::S_MTE3>();
             Sync<AscendC::HardEvent::V_MTE3>();
-            AscendC::DataCopy(
+            CopyLocalToGlobalExact(
                 shardPacked_[shardOffset],
                 compactTokens,
                 shardElements);
@@ -744,7 +817,8 @@ public:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(shardPacked_[shardOffset], unionLocal, rank);
+        CopyLocalToGlobalExact(
+            shardPacked_[shardOffset], unionLocal, rank);
         AscendC::DataCopy(
             shardMapping_[mapOffset], mapping, requestWidth_);
         // shardCountStride is at least 16 int32 values. Consequently every
@@ -961,6 +1035,7 @@ public:
         gatherParams.src0RepeatStride = 8;
         gatherParams.src1RepeatStride = 8;
         uint32_t shardElements = 0;
+        uint32_t compactEnd = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
@@ -1029,8 +1104,13 @@ public:
 
             uint64_t tokenElements = 0;
             uint64_t indexElements = 0;
+            // Sibling shards may finish in any order, but every GatherMask
+            // destination within one shard must remain 32-byte aligned.
+            const uint32_t compactOffset =
+                (compactEnd + kInt32PerDataBlock - 1)
+                & ~(kInt32PerDataBlock - 1);
             AscendC::GatherMask(
-                compactTokens[shardElements],
+                compactTokens[compactOffset],
                 input,
                 selectedMask.ReinterpretCast<uint32_t>(),
                 true,
@@ -1038,7 +1118,7 @@ public:
                 gatherParams,
                 tokenElements);
             AscendC::GatherMask(
-                compactIndices[shardElements],
+                compactIndices[compactOffset],
                 indices,
                 selectedMask.ReinterpretCast<uint32_t>(),
                 true,
@@ -1048,6 +1128,8 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_S>();
             shardElements += static_cast<uint32_t>(tokenElements);
+            compactEnd =
+                compactOffset + static_cast<uint32_t>(tokenElements);
         }
 
         if (rowsPerRequest_ == 1) {
@@ -1249,7 +1331,7 @@ public:
         SortAll(src, tmp);
 
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             shardPacked_[shardOffset], unionLocal, uniqueCount);
         AscendC::DataCopy(
             shardPairs_[pairOffset],
@@ -1292,7 +1374,7 @@ private:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             shardPacked_[shardOffset], unionLocal, uniqueCount);
         AscendC::DataCopy(
             shardMapping_[mapOffset], mapping, requestWidth_);
@@ -1353,7 +1435,7 @@ private:
         }
         Sync<AscendC::HardEvent::V_MTE3>();
         if (shardElements != 0) {
-            AscendC::DataCopy(
+            CopyLocalToGlobalExact(
                 shardPacked_[shardOffset],
                 compactTokens,
                 shardElements);
@@ -1706,7 +1788,7 @@ public:
         auto targets = targetBuf_.Get<int64_t>();
         auto blockTable = blockTableBuf_.Get<int32_t>();
 
-        AscendC::DataCopy(
+        CopyGlobalToLocalExact(
             blockTable,
             requestBlockTable_[
                 static_cast<uint64_t>(request) * blockTableWidth_],
@@ -1724,12 +1806,12 @@ public:
                     (static_cast<uint64_t>(request) * shardCount_ + shard)
                     * shardCountStride_));
             if (shardUnique != 0) {
-                AscendC::DataCopy(
+                CopyGlobalToLocalExact(
                     packed,
                     shardPacked_[shardBase + shard * rowWidth_],
                     shardUnique);
                 Sync<AscendC::HardEvent::MTE2_MTE3>();
-                AscendC::DataCopy(
+                CopyLocalToGlobalExact(
                     selectedPacked_[outputBase + count],
                     packed,
                     shardUnique);
@@ -1785,7 +1867,7 @@ public:
                 tile);
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE3>();
-            AscendC::DataCopy(
+            CopyLocalToGlobalExact(
                 targetSlots_[outputBase + offset], targets, tile);
             Sync<AscendC::HardEvent::MTE3_V>();
         }
@@ -2051,7 +2133,7 @@ public:
         auto targets = targetBuf_.Get<int64_t>();
         auto blockTable = blockTableBuf_.Get<int32_t>();
         auto remapMask = remapMaskBuf_.Get<uint8_t>();
-        AscendC::DataCopy(
+        CopyGlobalToLocalExact(
             blockTable,
             requestBlockTable_[
                 static_cast<uint64_t>(request) * blockTableWidth_],
@@ -2069,7 +2151,7 @@ public:
                 shardCounts_.GetValue(
                     (static_cast<uint64_t>(request) * shardCount_ + shard)
                     * shardCountStride_));
-            AscendC::DataCopy(
+            CopyGlobalToLocalExact(
                 packed,
                 shardPacked_[shardBase + shard * rowWidth_],
                 shardUnique);
@@ -2089,7 +2171,7 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE2>();
             Sync<AscendC::HardEvent::MTE2_MTE3>();
-            AscendC::DataCopy(
+            CopyLocalToGlobalExact(
                 selectedPacked_[outputOffset + count],
                 packed,
                 shardUnique);
@@ -2181,7 +2263,7 @@ public:
                 tile);
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE3>();
-            AscendC::DataCopy(
+            CopyLocalToGlobalExact(
                 targetSlots_[outputOffset + offset], targets, tile);
             Sync<AscendC::HardEvent::MTE3_V>();
         }
@@ -2392,8 +2474,8 @@ private:
         auto physicalBlocks = physicalBlockBuf_.Get<int32_t>();
         auto targets = targetBuf_.Get<int64_t>();
         auto blockTable = blockTableBuf_.Get<int32_t>();
-        AscendC::DataCopy(keys, uniqueKeys_[begin], count);
-        AscendC::DataCopy(
+        CopyGlobalToLocalExact(keys, uniqueKeys_[begin], count);
+        CopyGlobalToLocalExact(
             blockTable,
             requestBlockTable_[
                 static_cast<uint64_t>(request) * blockTableWidth_],
@@ -2402,7 +2484,8 @@ private:
         AscendC::Adds(keys, keys, -keyBase, count);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(selectedPacked_[outputOffset], keys, count);
+        CopyLocalToGlobalExact(
+            selectedPacked_[outputOffset], keys, count);
 
         AscendC::CreateVecIndex(
             ranks, static_cast<int32_t>(0), count);
@@ -2449,7 +2532,7 @@ private:
             count);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(
+        CopyLocalToGlobalExact(
             targetSlotWords_[2 * outputOffset],
             targets.ReinterpretCast<int32_t>(),
             2 * count);

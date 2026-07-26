@@ -570,6 +570,51 @@ def test_vector_sharded_union_mtp1_preserves_compacted_topk_order(
     [False, True],
     ids=["pair-map", "position-map"],
 )
+def test_vector_sharded_union_copies_unaligned_tails_exactly(
+    use_position_map,
+):
+    topk = 2048
+    request_count = 8
+    source = torch.stack(
+        tuple(
+            torch.roll(
+                torch.arange(topk, dtype=torch.int32),
+                137 * request,
+            )
+            for request in range(request_count)
+        )
+    ).unsqueeze(1)
+    # Exercise every int32 count residue modulo one 32-byte data block.
+    boundaries = torch.arange(193, 201, dtype=torch.int32)
+
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+    )
+    _assert_vector_sharded_result(
+        result,
+        source,
+        boundaries,
+        request_count,
+    )
+    for request, boundary in enumerate(boundaries.tolist()):
+        original = source[request].flatten()
+        expected = original[original < boundary]
+        count = result["counts"][request, 0].item()
+        assert count == boundary
+        assert torch.equal(
+            result["selected"][request, :count],
+            expected,
+        )
+
+
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
 def test_vector_sharded_union_preserves_all_ignored_positions(
     use_position_map,
 ):
