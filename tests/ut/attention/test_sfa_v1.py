@@ -969,7 +969,9 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         args = impl._cross_layer_pre_compute.call_args.args
-        self.assertEqual(args[-6].tolist(), [0, 1, 2, 3])
+        # The graph keeps four fixed rows, while -1 prevents its three
+        # padding rows from participating in the request-level union.
+        self.assertEqual(args[-6].tolist(), [0, -1, -1, -1])
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
