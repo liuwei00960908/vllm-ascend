@@ -1935,6 +1935,7 @@ class NPUModelRunner(GPUModelRunner):
             None,
             cudagraph_stats,
             batch_desc,
+            None,
         )
         self.kv_connector_output = kv_connector_output
 
