@@ -2491,7 +2491,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if (
             prompt_rows.size != token_capacity
-            or np.any(prompt_rows[:actual_rows] < self.index_topk)
             or np.any(prompt_rows[actual_rows:] != 0)
             or request_rows.size != token_capacity
             or not np.array_equal(request_rows, expected_request_rows)

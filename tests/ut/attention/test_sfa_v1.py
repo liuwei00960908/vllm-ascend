@@ -1464,6 +1464,13 @@ class TestStagedSFAGraphPoc(TestBase):
                         metadata,
                     )
                     self.assertIsNone(reason)
+            metadata.prompt_lens_cpu_rows = [1]
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(dtype=torch.bfloat16),
+                metadata,
+            )
+            self.assertIsNone(reason)
             metadata.need_sparse_lmcache_payload = False
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),

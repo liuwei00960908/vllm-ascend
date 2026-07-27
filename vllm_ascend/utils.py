@@ -106,7 +106,6 @@ class StagedSFARouteReason(str, Enum):
     UNSUPPORTED_BATCH = "unsupported_batch"
     PADDED_BATCH = "padded_batch"
     NON_Q1 = "non_q1"
-    SHORT_PROMPT = "short_prompt"
     BATCH_DESCRIPTOR = "batch_descriptor"
     INVALID_REQUEST_IDS = "invalid_request_ids"
     DENSE_PREFIX_HIT = "dense_prefix_hit"

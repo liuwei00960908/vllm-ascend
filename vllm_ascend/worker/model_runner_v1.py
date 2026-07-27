@@ -175,6 +175,22 @@ if TYPE_CHECKING:
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
+
+def _staged_sfa_dummy_remap_boundaries(
+    seq_lens: Any,
+    query_width: int,
+    index_topk: int,
+) -> np.ndarray:
+    """Build safe synthetic remap boundaries for staged graph capture."""
+    boundaries = (
+        np.asarray(seq_lens, dtype=np.int32).reshape(-1)
+        - int(query_width)
+    )
+    scratch_capacity = int(query_width) * int(index_topk)
+    boundaries[boundaries < scratch_capacity] = 0
+    return boundaries
+
+
 def _mtp_dw_diag_enabled() -> bool:
     return envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
 
@@ -436,7 +452,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
-        self._dsa_short_prompt_warned = False
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1400,7 +1415,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_reqs=num_reqs,
                     num_scheduled_tokens=num_scheduled_tokens_np,
-                    prompt_lens=self.input_batch.num_prompt_tokens[:num_reqs],
                     index_topk=self.dsa_index_topk,
                     has_cascade_attention=(
                         cascade_attn_prefix_lens is not None
@@ -2591,17 +2605,17 @@ class NPUModelRunner(GPUModelRunner):
                     f'fixed query width {query_width}.'
                 )
             staged_dummy_prompt_lens = (
-                self.seq_lens.np[:num_reqs].astype(np.int32)
-                - self.decode_threshold
+                _staged_sfa_dummy_remap_boundaries(
+                    self.seq_lens.np[:num_reqs],
+                    query_width,
+                    self.dsa_index_topk,
+                )
             )
-            if (
-                staged_dummy_prompt_lens.shape != (num_reqs,)
-                or np.any(staged_dummy_prompt_lens < self.dsa_index_topk)
-            ):
+            if staged_dummy_prompt_lens.shape != (num_reqs,):
                 raise RuntimeError(
-                    'Every staged SFA graph dummy prompt boundary must be at '
-                    f'least index_topk={self.dsa_index_topk}, got '
-                    f'{staged_dummy_prompt_lens.tolist()}.'
+                    'The staged SFA graph dummy remap boundary shape differs '
+                    f'from num_reqs={num_reqs}: '
+                    f'{staged_dummy_prompt_lens.shape}.'
                 )
             staged_dummy_computed_tokens = torch.zeros_like(
                 self.input_batch.num_computed_tokens_cpu_tensor[
@@ -2747,18 +2761,6 @@ class NPUModelRunner(GPUModelRunner):
                         if staged_dummy_prompt_lens is not None
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
-                    if (
-                        not self._dsa_short_prompt_warned
-                        and (plens_np > 0).any()
-                        and plens_np[plens_np > 0].min() < self.dsa_index_topk
-                    ):
-                        logger.warning(
-                            "DSA shrink-latent: request with prompt_len < index_topk (%d) detected; "
-                            "the compact-scratch path does not support it yet (scratch rows would alias "
-                            "live decode positions). Expect wrong output for such requests.",
-                            self.dsa_index_topk,
-                        )
-                        self._dsa_short_prompt_warned = True
                     cm.prompt_lens_cpu = plens_np
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
@@ -2868,7 +2870,6 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_unpadded: int,
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
-        prompt_lens: np.ndarray,
         index_topk: int,
         has_cascade_attention: bool,
         request_ids: Any,
@@ -2908,7 +2909,6 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
-        prompt_lens = np.asarray(prompt_lens).reshape(-1)
         if scheduled.shape != (num_reqs,) or not np.all(
             scheduled == query_width
         ):
@@ -2931,11 +2931,6 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
-            )
-        if prompt_lens.shape != (num_reqs,):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                StagedSFARouteReason.SHORT_PROMPT,
             )
         scratch_capacity = query_width * index_topk
         if any(

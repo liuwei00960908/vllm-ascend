@@ -586,6 +586,27 @@ class TestPrepareSparseIndices:
         assert targets[0, :3].tolist() == [20, 21, 22]
         assert all(index >= 4 for row in remapped for index in row if index >= 3)
 
+    def test_zero_boundary_keeps_absolute_indices_and_selects_nothing(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor(
+            [[0, 1, 7, 8], [1, 0, 8, 9]],
+            dtype=torch.int32,
+        )
+        remapped, packed, counts, _ = prepare_sparse_indices(
+            topk,
+            torch.zeros(2, dtype=torch.int32),
+            row_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+            request_block_table=torch.tensor([[10, 11, 12, 13, 14]]),
+            block_size=2,
+        )
+
+        torch.testing.assert_close(remapped, topk)
+        self.assertEqual(counts.tolist(), [0])
+        self.assertEqual(torch.count_nonzero(packed).item(), 0)
+
     def test_short_committed_prefix_cannot_overwrite_live_npu_cache(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
             _prepare_sparse_indices_torch as prepare_sparse_indices,

@@ -25,6 +25,35 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
+    def test_short_synthetic_sequences_use_no_remap_sentinel(self):
+        for query_width, seq_lens, expected in (
+            (
+                1,
+                [1, 2048, 2049, 4097],
+                [0, 0, 2048, 4096],
+            ),
+            (
+                2,
+                [2, 4097, 4098, 8194],
+                [0, 0, 4096, 8192],
+            ),
+        ):
+            with self.subTest(query_width=query_width):
+                boundaries = (
+                    model_runner_module
+                    ._staged_sfa_dummy_remap_boundaries(
+                        np.asarray(seq_lens, dtype=np.int32),
+                        query_width,
+                        2048,
+                    )
+                )
+                np.testing.assert_array_equal(
+                    boundaries,
+                    np.asarray(expected, dtype=np.int32),
+                )
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -499,7 +528,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "num_tokens_unpadded": 4,
             "num_reqs": 4,
             "num_scheduled_tokens": np.ones(4, dtype=np.int32),
-            "prompt_lens": np.full(4, 4096, dtype=np.int32),
             "index_topk": 2048,
             "has_cascade_attention": False,
             "request_ids": request_ids,
@@ -553,7 +581,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 num_tokens_unpadded=1,
                 num_reqs=1,
                 num_scheduled_tokens=np.ones(1, dtype=np.int32),
-                prompt_lens=np.full(1, 4096, dtype=np.int32),
                 request_ids=request_ids[:1],
                 kv_connector_metadata=SimpleNamespace(requests=local_kwargs["kv_connector_metadata"].requests[:1]),
             )
@@ -578,11 +605,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "cascade": {"has_cascade_attention": True},
-                "resident_short_prompt": {
-                    "prompt_lens": np.array([4096, 2047, 4096, 4096]),
-                },
                 "dense_prefix_hit": {
-                    "prompt_lens": np.full(4, 1, dtype=np.int32),
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
                             SimpleNamespace(
@@ -634,8 +657,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         (
                             StagedSFARouteAction.FATAL
                             if name == "short_frontier"
-                            else StagedSFARouteAction.STAGED
-                            if name == "resident_short_prompt"
                             else StagedSFARouteAction.SAFE_NATIVE
                         ),
                     )
@@ -787,7 +808,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             num_tokens_unpadded=4,
             num_reqs=2,
             num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
-            prompt_lens=np.full(2, 4096, dtype=np.int32),
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
@@ -825,7 +845,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             num_tokens_unpadded=1,
             num_reqs=1,
             num_scheduled_tokens=np.ones(1, dtype=np.int32),
-            prompt_lens=np.array([257], dtype=np.int32),
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
