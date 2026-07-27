@@ -337,7 +337,13 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
 
 
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
-    """Return a proven sparse frontier for every active request."""
+    """Return a proven remap frontier for every active request.
+
+    Sparse-decode metadata contributes its committed LMCache frontier. A
+    loadable dense-prefix request contributes zero because its first decoder
+    step intentionally waits for the full prefix to become resident before
+    attention, so compact-scratch remapping must remain disabled for it.
+    """
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
     normalized_request_ids = [str(req_id) for req_id in list(request_ids)]
@@ -361,20 +367,28 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
 
     cached_by_req: dict[str, int] = {}
     for request in getattr(metadata, "requests", ()):
-        if not getattr(request, "is_sparse_decode", False):
+        is_sparse_decode = bool(getattr(request, "is_sparse_decode", False))
+        load_spec = getattr(request, "load_spec", None)
+        is_dense_prefix_load = bool(
+            not is_sparse_decode
+            and load_spec is not None
+            and getattr(load_spec, "can_load", False)
+        )
+        if not is_sparse_decode and not is_dense_prefix_load:
             continue
         req_id = str(getattr(request, "req_id", ""))
         if not req_id:
             raise RuntimeError(
-                "[SFA sparse remap] sparse connector metadata has an empty request ID."
+                "[SFA sparse remap] connector remap metadata has an empty request ID."
             )
         if req_id in cached_by_req:
             raise RuntimeError(
-                "[SFA sparse remap] sparse connector metadata contains a "
+                "[SFA sparse remap] connector remap metadata contains a "
                 f"duplicate request ID: {req_id!r}."
             )
-        load_spec = getattr(request, "load_spec", None)
-        if load_spec is None or not getattr(load_spec, "can_load", False):
+        if is_dense_prefix_load:
+            cached_by_req[req_id] = 0
+        elif load_spec is None or not getattr(load_spec, "can_load", False):
             cached_by_req[req_id] = 0
         else:
             cached_by_req[req_id] = int(
