@@ -508,6 +508,8 @@ class TestUtils(TestBase):
         parallel_config = mock.MagicMock()
         parallel_config.data_parallel_size = 1
         parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
         vllm_config = mock.MagicMock(
             compilation_config=compilation_config,
             model_config=model_config,

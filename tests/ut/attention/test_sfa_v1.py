@@ -234,7 +234,12 @@ def test_sparse_boundary_prefers_explicit_committed_end():
             ),
         ]
     )
-    connector = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    connector = SimpleNamespace(
+        supports_staged_sfa_sparse_load=True,
+        uses_layerwise_model_callbacks=True,
+        wait_for_layer_load=lambda *_args, **_kwargs: None,
+        _get_connector_metadata=lambda: metadata,
+    )
     with (
         patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
         patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
@@ -676,6 +681,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl.dsa_shrink_latent = 2
         impl.num_kv_heads = 1
+        impl.local_num_heads = 2
         impl.kv_lora_rank = 2
         impl.qk_rope_head_dim = 2
         impl.head_dim = 2
@@ -769,7 +775,7 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_scratch_base_compact = None
         metadata.decode_scratch_base_cpu = [0] * batch_size
-        metadata.decode_scratch_capacity = 128
+        metadata.decode_scratch_capacity = 4
         metadata.decode_selected_tokens = torch.empty(
             batch_size, 4, dtype=torch.int32
         )
@@ -871,7 +877,10 @@ class TestStagedSFAGraphPoc(TestBase):
             patch.object(
                 sfa_v1,
                 "get_forward_context",
-                side_effect=contexts,
+                # The eager call resolves the context once in graph_pre and
+                # once more while allocating its fixed bridge storage. Replay
+                # reuses that storage and resolves the context only once.
+                side_effect=(contexts[0], contexts[0], contexts[1]),
             ),
             patch.object(
                 sfa_v1,
@@ -1047,10 +1056,11 @@ class TestStagedSFAGraphPoc(TestBase):
             runtime=("layer-0",),
         )
         bridge = tuple(torch.empty(4) for _ in range(6))
+        first_cache = self._make_eligible_kv_cache()
         state.register(
             STAGED_SFA_SINGLETON_GRAPH_KEY,
             bridge,
-            self._make_eligible_kv_cache(),
+            first_cache,
         )
 
         with self.assertRaisesRegex(
@@ -1435,6 +1445,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0, 1, 1]
         metadata.seq_lens_cpu = torch.tensor([110, 210])
         metadata.decode_scratch_base_cpu = [0, 4, 0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(4, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
@@ -1459,6 +1470,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0]
         metadata.seq_lens_cpu = torch.tensor([110])
         metadata.decode_scratch_base_cpu = [0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(2, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 

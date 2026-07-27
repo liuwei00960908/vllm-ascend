@@ -604,8 +604,8 @@ class TestPrepareSparseIndices:
         )
 
         torch.testing.assert_close(remapped, topk)
-        self.assertEqual(counts.tolist(), [0])
-        self.assertEqual(torch.count_nonzero(packed).item(), 0)
+        assert counts.tolist() == [0]
+        assert torch.count_nonzero(packed).item() == 0
 
     def test_short_committed_prefix_cannot_overwrite_live_npu_cache(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
