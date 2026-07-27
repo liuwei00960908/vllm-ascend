@@ -920,12 +920,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # Builder-owned backing storage. Metadata instances expose only
             # active-prefix views, while storage addresses remain stable across
             # scheduler steps for a later staged-graph merge.
+            self._dsa_prompt_lens_cpu = np.empty(
+                max_num_rows,
+                dtype=np.int32,
+            )
             self._dsa_split_boundary_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_req_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_row_offsets_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_current_positions_cpu = np.empty(max_num_rows, dtype=np.int64)
             self._dsa_valid_row_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_compact_req_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
+            self._dsa_prompt_lens_cpu_tensor = torch.from_numpy(
+                self._dsa_prompt_lens_cpu
+            )
             self._dsa_split_boundary_cpu_tensor = torch.from_numpy(self._dsa_split_boundary_cpu)
             self._dsa_req_indices_cpu_tensor = torch.from_numpy(self._dsa_req_indices_cpu)
             self._dsa_row_offsets_cpu_tensor = torch.from_numpy(self._dsa_row_offsets_cpu)
@@ -934,6 +941,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
             self._dsa_compact_req_indices_cpu_tensor = torch.from_numpy(
                 self._dsa_compact_req_indices_cpu
+            )
+            self._dsa_prompt_lens = torch.empty(
+                max_num_rows,
+                dtype=torch.int32,
+                device=device,
             )
             self._dsa_split_boundary = torch.empty(max_num_rows, dtype=torch.int32, device=device)
             self._dsa_req_indices = torch.empty(max_num_rows, dtype=torch.int32, device=device)
@@ -959,17 +971,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             self._dsa_max_num_rows = 0
             self._dsa_max_num_reqs = 0
+            self._dsa_prompt_lens_cpu = None
             self._dsa_split_boundary_cpu = None
             self._dsa_req_indices_cpu = None
             self._dsa_row_offsets_cpu = None
             self._dsa_current_positions_cpu = None
             self._dsa_valid_row_indices_cpu = None
             self._dsa_compact_req_indices_cpu = None
+            self._dsa_prompt_lens_cpu_tensor = None
             self._dsa_split_boundary_cpu_tensor = None
             self._dsa_req_indices_cpu_tensor = None
             self._dsa_row_offsets_cpu_tensor = None
             self._dsa_valid_row_indices_cpu_tensor = None
             self._dsa_compact_req_indices_cpu_tensor = None
+            self._dsa_prompt_lens = None
             self._dsa_split_boundary = None
             self._dsa_req_indices = None
             self._dsa_row_offsets = None
@@ -977,6 +992,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
             self._dsa_union_mapping = None
+        self._dsa_q1_signature = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
@@ -1077,33 +1093,33 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         current_positions = None
         plens_cpu = common_attn_metadata.prompt_lens_cpu if self.dsa_shrink_latent else None
         if plens_cpu is not None:
+            assert self._dsa_prompt_lens_cpu is not None
             assert self._dsa_split_boundary_cpu is not None
             assert self._dsa_req_indices_cpu is not None
             assert self._dsa_row_offsets_cpu is not None
             assert self._dsa_current_positions_cpu is not None
             assert self._dsa_valid_row_indices_cpu is not None
             assert self._dsa_compact_req_indices_cpu is not None
+            assert self._dsa_prompt_lens_cpu_tensor is not None
             assert self._dsa_split_boundary_cpu_tensor is not None
             assert self._dsa_req_indices_cpu_tensor is not None
             assert self._dsa_row_offsets_cpu_tensor is not None
             assert self._dsa_valid_row_indices_cpu_tensor is not None
             assert self._dsa_compact_req_indices_cpu_tensor is not None
+            assert self._dsa_prompt_lens is not None
             assert self._dsa_split_boundary is not None
             assert self._dsa_req_indices is not None
             assert self._dsa_row_offsets is not None
 
-            rows = self._dsa_split_boundary_cpu[:num_input_tokens]
+            plens_cpu = np.asarray(plens_cpu, dtype=np.int32)
+            rows = self._dsa_prompt_lens_cpu[:num_input_tokens]
+            boundary_rows = self._dsa_split_boundary_cpu[:num_input_tokens]
             req_rows = self._dsa_req_indices_cpu[:num_input_tokens]
             row_offsets = self._dsa_row_offsets_cpu[:num_input_tokens]
             valid_rows = self._dsa_valid_row_indices_cpu[:num_input_tokens]
             compact_req_indices = self._dsa_compact_req_indices_cpu[
                 :num_input_tokens
             ]
-            rows.fill(0)
-            req_rows.fill(-1)
-            row_offsets.fill(0)
-            valid_rows.fill(0)
-            compact_req_indices.fill(-1)
             current_positions = (
                 self._dsa_current_positions_cpu[:num_input_tokens]
                 if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG and self.dsa_shrink_latent == 2
@@ -1112,45 +1128,135 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             if current_positions is not None:
                 current_positions.fill(0)
             n_real = min(len(plens_cpu), num_reqs)
-            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            for r in range(n_real):
-                s, e = int(qsl[r]), int(qsl[r + 1])
-                plen = int(plens_cpu[r])
-                first_decode = max(s, s + plen - int(computed[r]))
-                if first_decode < e:
-                    count = e - first_decode
-                    rows[first_decode:e] = plen
-                    req_rows[first_decode:e] = r
-                    computed_start = int(computed[r]) + first_decode - s
-                    for row_index in range(first_decode, e):
-                        offset = row_index - first_decode
-                        row_offsets[row_index] = offset
-                        compact_index = num_decode_rows + offset
-                        valid_rows[compact_index] = row_index
-                        compact_req_indices[compact_index] = r
-                        if current_positions is not None:
-                            current_positions[row_index] = computed_start + offset
-                    num_decode_rows += count
+            q1_decode = (
+                not self.enable_dsa_cp
+                and common_attn_metadata.attn_state
+                == AscendAttentionState.DecodeOnly
+                and num_input_tokens == num_reqs
+                and num_actual_tokens == len(plens_cpu)
+                and n_real == len(plens_cpu)
+                and np.all(computed >= plens_cpu[:n_real])
+            )
+            if q1_decode:
+                num_decode_rows = num_actual_tokens
+                signature = (
+                    num_input_tokens,
+                    tuple(common_attn_metadata.request_ids or ()),
+                    tuple(map(int, plens_cpu)),
+                )
+                if signature != self._dsa_q1_signature:
+                    rows.fill(0)
+                    rows[:num_decode_rows] = plens_cpu
+                    boundary_rows[:] = rows
+                    req_rows.fill(-1)
+                    req_rows[:num_decode_rows] = np.arange(
+                        num_decode_rows,
+                        dtype=np.int32,
+                    )
+                    row_offsets.fill(0)
+                    valid_rows.fill(0)
+                    valid_rows[:num_decode_rows] = np.arange(
+                        num_decode_rows,
+                        dtype=np.int32,
+                    )
+                    compact_req_indices.fill(-1)
+                    compact_req_indices[:num_decode_rows] = np.arange(
+                        num_decode_rows,
+                        dtype=np.int32,
+                    )
+                    self._dsa_prompt_lens[:num_input_tokens].copy_(
+                        self._dsa_prompt_lens_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_split_boundary[:num_input_tokens].copy_(
+                        self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_req_indices[:num_input_tokens].copy_(
+                        self._dsa_req_indices_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_row_offsets[:num_input_tokens].copy_(
+                        self._dsa_row_offsets_cpu_tensor[:num_input_tokens]
+                    )
+                    self.decode_valid_row_indices[:num_decode_rows].copy_(
+                        self._dsa_valid_row_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self.decode_req_indices_compact[:num_decode_rows].copy_(
+                        self._dsa_compact_req_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self._dsa_q1_signature = signature
+                if current_positions is not None:
+                    current_positions[:num_decode_rows] = computed[
+                        :num_decode_rows
+                    ]
+            else:
+                self._dsa_q1_signature = None
+                rows.fill(0)
+                boundary_rows.fill(0)
+                req_rows.fill(-1)
+                row_offsets.fill(0)
+                valid_rows.fill(0)
+                compact_req_indices.fill(-1)
+                qsl = common_attn_metadata.query_start_loc_cpu[
+                    : n_real + 1
+                ].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_cpu[r])
+                    first_decode = max(s, s + plen - int(computed[r]))
+                    if first_decode < e:
+                        count = e - first_decode
+                        rows[first_decode:e] = plen
+                        boundary_rows[first_decode:e] = plen
+                        req_rows[first_decode:e] = r
+                        computed_start = int(computed[r]) + first_decode - s
+                        for row_index in range(first_decode, e):
+                            offset = row_index - first_decode
+                            row_offsets[row_index] = offset
+                            compact_index = num_decode_rows + offset
+                            valid_rows[compact_index] = row_index
+                            compact_req_indices[compact_index] = r
+                            if current_positions is not None:
+                                current_positions[row_index] = (
+                                    computed_start + offset
+                                )
+                        num_decode_rows += count
+                self._dsa_prompt_lens[:num_input_tokens].copy_(
+                    self._dsa_prompt_lens_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_split_boundary[:num_input_tokens].copy_(
+                    self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_req_indices[:num_input_tokens].copy_(
+                    self._dsa_req_indices_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_row_offsets[:num_input_tokens].copy_(
+                    self._dsa_row_offsets_cpu_tensor[:num_input_tokens]
+                )
+                if num_decode_rows:
+                    self.decode_valid_row_indices[:num_decode_rows].copy_(
+                        self._dsa_valid_row_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self.decode_req_indices_compact[:num_decode_rows].copy_(
+                        self._dsa_compact_req_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
 
-            split_boundary_cpu = rows
+            split_boundary_cpu = boundary_rows
             decode_req_indices_cpu = req_rows
             split_boundary_cpu_tensor = self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
-            self._dsa_split_boundary[:num_input_tokens].copy_(split_boundary_cpu_tensor)
-            self._dsa_req_indices[:num_input_tokens].copy_(self._dsa_req_indices_cpu_tensor[:num_input_tokens])
-            self._dsa_row_offsets[:num_input_tokens].copy_(self._dsa_row_offsets_cpu_tensor[:num_input_tokens])
             split_boundary_rows = self._dsa_split_boundary[:num_input_tokens]
-            prompt_lens_rows = split_boundary_rows
+            prompt_lens_rows = self._dsa_prompt_lens[:num_input_tokens]
             decode_req_indices_rows = self._dsa_req_indices[:num_input_tokens]
             row_offsets_rows = self._dsa_row_offsets[:num_input_tokens]
             decode_valid_rows_all = num_decode_rows == num_input_tokens
             if num_decode_rows:
-                self.decode_valid_row_indices[:num_decode_rows].copy_(
-                    self._dsa_valid_row_indices_cpu_tensor[:num_decode_rows]
-                )
-                self.decode_req_indices_compact[:num_decode_rows].copy_(
-                    self._dsa_compact_req_indices_cpu_tensor[:num_decode_rows]
-                )
                 decode_valid_row_indices = self.decode_valid_row_indices[
                     :num_decode_rows
                 ]
