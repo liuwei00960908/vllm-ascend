@@ -281,6 +281,24 @@ def _update_dsa_split_boundary_in_place(
 
     seq_lens_cpu = attn_metadata.seq_lens_cpu
     num_reqs = int(seq_lens_cpu.shape[0])
+    row_req_indices = np.asarray(
+        row_req_indices_cpu[:num_rows],
+        dtype=np.int32,
+    )
+    valid_rows = row_req_indices >= 0
+    if np.any(row_req_indices[valid_rows] >= num_reqs):
+        bad_row = int(
+            np.flatnonzero(
+                valid_rows & (row_req_indices >= num_reqs)
+            )[0]
+        )
+        raise RuntimeError(
+            "DSA sparse row references a request outside seq_lens: "
+            f"row={bad_row}, "
+            f"request_index={int(row_req_indices[bad_row])}, "
+            f"num_reqs={num_reqs}."
+        )
+
     has_cached_frontier = cached_tokens is not None
     if (
         has_cached_frontier
@@ -290,26 +308,55 @@ def _update_dsa_split_boundary_in_place(
     ):
         raise RuntimeError("LMCache sparse remap has decode rows but no request boundaries")
 
-    for row_index in range(num_rows):
-        request_index = int(row_req_indices_cpu[row_index])
-        if request_index < 0:
-            continue
-        if request_index >= num_reqs:
-            raise RuntimeError(
-                "DSA sparse row references a request outside seq_lens: "
-                f"row={row_index}, request_index={request_index}, "
-                f"num_reqs={num_reqs}."
+    if np.any(valid_rows) and (
+        has_cached_frontier or decode_window_size > 0
+    ):
+        if has_cached_frontier:
+            cached_count = min(len(cached_tokens), num_reqs)
+            if cached_count == num_reqs:
+                request_boundaries = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+            else:
+                request_boundaries = np.zeros(
+                    num_reqs,
+                    dtype=np.int32,
+                )
+                request_boundaries[:cached_count] = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+        else:
+            request_boundaries = np.empty(
+                num_reqs,
+                dtype=np.int32,
             )
-
-        cached_end = (
-            int(cached_tokens[request_index]) if has_cached_frontier and request_index < len(cached_tokens) else 0
-        )
         if decode_window_size > 0:
-            current_position = max(int(seq_lens_cpu[request_index]) - 1, 0)
-            window_start = current_position // decode_window_size * decode_window_size
-            boundary_cpu[row_index] = min(window_start, cached_end) if has_cached_frontier else window_start
-        elif has_cached_frontier:
-            boundary_cpu[row_index] = cached_end
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens = seq_lens_cpu.detach().numpy()
+            else:
+                seq_lens = np.asarray(seq_lens_cpu)
+            current_positions = np.maximum(
+                seq_lens[:num_reqs].astype(np.int64, copy=False) - 1,
+                0,
+            )
+            window_starts = (
+                current_positions // decode_window_size
+                * decode_window_size
+            )
+            if has_cached_frontier:
+                np.minimum(
+                    window_starts,
+                    request_boundaries,
+                    out=request_boundaries,
+                    casting="unsafe",
+                )
+            else:
+                request_boundaries[:] = window_starts
+        boundary_cpu[:num_rows][valid_rows] = request_boundaries[
+            row_req_indices[valid_rows]
+        ]
 
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
@@ -379,7 +426,10 @@ def _prepare_sfa_remap_boundary(
         row_req_indices,
         dtype=np.int64,
     ).reshape(-1)
-    seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens = seq_lens_cpu.detach().numpy().reshape(-1)
+    else:
+        seq_lens = np.asarray(seq_lens_cpu).reshape(-1)
     if int(boundary.numel()) != int(prompt_rows_np.size) or row_req_indices_np.size != prompt_rows_np.size:
         raise RuntimeError(
             "[SFA sparse remap] boundary shapes differ: "
@@ -388,18 +438,24 @@ def _prepare_sfa_remap_boundary(
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    decode_request_indices = sorted(
-        {int(request_index) for request_index in row_req_indices_np if int(request_index) >= 0}
+    valid_rows = row_req_indices_np >= 0
+    decode_request_indices_np = np.unique(
+        row_req_indices_np[valid_rows]
     )
-    for request_index in decode_request_indices:
-        if request_index >= len(seq_lens):
-            raise RuntimeError(
-                "[SFA staged graph POC] decode row references request "
-                f"{request_index}, but only {len(seq_lens)} sequence lengths "
-                "are available."
-            )
+    if (
+        decode_request_indices_np.size
+        and int(decode_request_indices_np[-1]) >= len(seq_lens)
+    ):
+        request_index = int(decode_request_indices_np[-1])
+        raise RuntimeError(
+            "[SFA staged graph POC] decode row references request "
+            f"{request_index}, but only {len(seq_lens)} sequence lengths "
+            "are available."
+        )
+    decode_request_indices = decode_request_indices_np.tolist()
 
-    cached_tokens_by_request: dict[int, int] = {}
+    cached_tokens_by_request = np.zeros(len(seq_lens), dtype=np.int32)
+    cached_request_mask = np.zeros(len(seq_lens), dtype=np.bool_)
     if not is_dummy_run:
         if cached_tokens is None:
             if decode_request_indices:
@@ -410,28 +466,57 @@ def _prepare_sfa_remap_boundary(
                     raise RuntimeError("[SFA sparse remap] active request IDs do not cover all decode rows.")
                 decode_request_ids = [request_ids[index] for index in decode_request_indices]
                 resolved_tokens = get_lmcache_sparse_cached_tokens(decode_request_ids)
-                cached_tokens_by_request = dict(zip(decode_request_indices, resolved_tokens, strict=True))
+                cached_tokens_by_request[
+                    decode_request_indices_np
+                ] = np.asarray(resolved_tokens, dtype=np.int32)
+                cached_request_mask[decode_request_indices_np] = True
         else:
             if len(cached_tokens) != len(decode_request_indices):
                 raise RuntimeError(
                     f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}"
                 )
-            cached_tokens_by_request = dict(zip(decode_request_indices, cached_tokens, strict=True))
+            cached_tokens_by_request[
+                decode_request_indices_np
+            ] = np.asarray(cached_tokens, dtype=np.int32)
+            cached_request_mask[decode_request_indices_np] = True
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
-    for row_index, request_index_value in enumerate(row_req_indices_np):
-        request_index = int(request_index_value)
-        if request_index < 0:
-            continue
-        cached_for_request = cached_tokens_by_request.get(request_index)
+    if decode_request_indices_np.size:
+        request_boundaries = np.zeros(
+            len(seq_lens),
+            dtype=np.int32,
+        )
         if decode_window_size > 0:
-            current_position = max(seq_lens[request_index] - 1, 0)
-            row_boundary = current_position // decode_window_size * decode_window_size
-            if cached_for_request is not None:
-                row_boundary = min(row_boundary, cached_for_request)
-            boundary_rows[row_index] = row_boundary
-        elif cached_for_request is not None:
-            boundary_rows[row_index] = cached_for_request
+            current_positions = np.maximum(
+                seq_lens.astype(np.int64, copy=False) - 1,
+                0,
+            )
+            request_boundaries[:] = (
+                current_positions // decode_window_size
+                * decode_window_size
+            )
+            np.minimum(
+                request_boundaries,
+                cached_tokens_by_request,
+                out=request_boundaries,
+                where=cached_request_mask,
+            )
+        else:
+            request_boundaries[cached_request_mask] = (
+                cached_tokens_by_request[cached_request_mask]
+            )
+        rows_with_dynamic_boundary = valid_rows.copy()
+        if decode_window_size <= 0:
+            rows_with_dynamic_boundary[valid_rows] = (
+                cached_request_mask[
+                    row_req_indices_np[valid_rows]
+                ]
+            )
+        boundary_rows[rows_with_dynamic_boundary] = (
+            request_boundaries[
+                row_req_indices_np[rows_with_dynamic_boundary]
+            ]
+        )
 
     _validate_dsa_scratch_capacity(
         boundary_rows,
@@ -968,6 +1053,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            fixed_query_starts = np.arange(
+                max_num_reqs + 1,
+                dtype=np.int32,
+            )
+            self._dsa_fixed_query_starts_cpu = np.stack(
+                (
+                    fixed_query_starts,
+                    fixed_query_starts * 2,
+                )
+            )
         else:
             self._dsa_max_num_rows = 0
             self._dsa_max_num_reqs = 0
@@ -992,7 +1087,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
             self._dsa_union_mapping = None
-        self._dsa_q1_signature = None
+            self._dsa_fixed_query_starts_cpu = None
+        self._dsa_fixed_layout_signature = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
@@ -1129,42 +1225,84 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 current_positions.fill(0)
             n_real = min(len(plens_cpu), num_reqs)
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            q1_decode = (
-                not self.enable_dsa_cp
-                and common_attn_metadata.attn_state
+            fixed_decode_width = 0
+            if (
+                common_attn_metadata.attn_state
                 == AscendAttentionState.DecodeOnly
-                and num_input_tokens == num_reqs
-                and num_actual_tokens == len(plens_cpu)
+            ):
+                fixed_decode_width = 1
+            elif (
+                common_attn_metadata.attn_state
+                == AscendAttentionState.SpecDecoding
+            ):
+                fixed_decode_width = self.decode_threshold
+            if fixed_decode_width in (1, 2):
+                qsl = common_attn_metadata.query_start_loc_cpu[
+                    : n_real + 1
+                ].numpy()
+                assert self._dsa_fixed_query_starts_cpu is not None
+                fixed_query_starts = (
+                    self._dsa_fixed_query_starts_cpu[
+                        fixed_decode_width - 1,
+                        : n_real + 1,
+                    ]
+                )
+            else:
+                qsl = None
+                fixed_query_starts = None
+            fixed_width_decode = (
+                not self.enable_dsa_cp
+                and fixed_decode_width in (1, 2)
+                and num_input_tokens
+                == num_reqs * fixed_decode_width
+                and num_actual_tokens
+                == len(plens_cpu) * fixed_decode_width
                 and n_real == len(plens_cpu)
                 and np.all(computed >= plens_cpu[:n_real])
+                and np.array_equal(qsl, fixed_query_starts)
             )
-            if q1_decode:
+            if fixed_width_decode:
                 num_decode_rows = num_actual_tokens
                 signature = (
+                    fixed_decode_width,
                     num_input_tokens,
                     tuple(common_attn_metadata.request_ids or ()),
                     tuple(map(int, plens_cpu)),
                 )
-                if signature != self._dsa_q1_signature:
+                if signature != self._dsa_fixed_layout_signature:
                     rows.fill(0)
-                    rows[:num_decode_rows] = plens_cpu
+                    rows[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = plens_cpu[:, None]
                     boundary_rows[:] = rows
                     req_rows.fill(-1)
-                    req_rows[:num_decode_rows] = np.arange(
-                        num_decode_rows,
+                    request_indices = np.arange(
+                        n_real,
                         dtype=np.int32,
                     )
+                    req_rows[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = request_indices[:, None]
                     row_offsets.fill(0)
+                    row_offsets[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = np.arange(
+                        fixed_decode_width,
+                        dtype=np.int32,
+                    )
                     valid_rows.fill(0)
                     valid_rows[:num_decode_rows] = np.arange(
                         num_decode_rows,
                         dtype=np.int32,
                     )
                     compact_req_indices.fill(-1)
-                    compact_req_indices[:num_decode_rows] = np.arange(
-                        num_decode_rows,
-                        dtype=np.int32,
-                    )
+                    compact_req_indices[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = request_indices[:, None]
                     self._dsa_prompt_lens[:num_input_tokens].copy_(
                         self._dsa_prompt_lens_cpu_tensor[:num_input_tokens]
                     )
@@ -1187,13 +1325,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             :num_decode_rows
                         ]
                     )
-                    self._dsa_q1_signature = signature
+                    self._dsa_fixed_layout_signature = signature
                 if current_positions is not None:
-                    current_positions[:num_decode_rows] = computed[
-                        :num_decode_rows
-                    ]
+                    current_positions[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = (
+                        computed[:n_real, None]
+                        + np.arange(
+                            fixed_decode_width,
+                            dtype=np.int32,
+                        )
+                    )
             else:
-                self._dsa_q1_signature = None
+                self._dsa_fixed_layout_signature = None
                 rows.fill(0)
                 boundary_rows.fill(0)
                 req_rows.fill(-1)

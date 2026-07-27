@@ -333,6 +333,64 @@ class ExecuteModelState(NamedTuple):
     staged_sfa_graph_key: StagedSFAGraphKey | None
 
 
+def _fixed_decode_layout_arrays(
+    max_num_reqs: int,
+    query_width: int,
+    dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precompute request-major CPU metadata for fixed-width decode."""
+    if max_num_reqs <= 0 or query_width not in (1, 2):
+        raise ValueError(
+            "fixed decode layout requires positive requests and "
+            f"MTP=1 or MTP=2, got requests={max_num_reqs}, "
+            f"MTP={query_width}"
+        )
+    request_indices = np.repeat(
+        np.arange(max_num_reqs, dtype=dtype),
+        query_width,
+    )
+    position_offsets = np.tile(
+        np.arange(query_width, dtype=dtype),
+        max_num_reqs,
+    )
+    cumulative_tokens = (
+        np.arange(1, max_num_reqs + 1, dtype=dtype)
+        * query_width
+    )
+    return request_indices, position_offsets, cumulative_tokens
+
+
+def _fill_fixed_decode_positions(
+    positions: np.ndarray,
+    computed_tokens: np.ndarray,
+    position_offsets: np.ndarray,
+    num_reqs: int,
+    query_width: int,
+) -> None:
+    """Fill request-major positions without per-step repeat/cumsum arrays."""
+    if query_width not in (1, 2):
+        raise ValueError(
+            "fixed decode positions only support MTP=1 or MTP=2, "
+            f"got MTP={query_width}"
+        )
+    num_tokens = num_reqs * query_width
+    if (
+        positions.size != num_tokens
+        or computed_tokens.size < num_reqs
+        or position_offsets.size < num_tokens
+    ):
+        raise ValueError(
+            "fixed decode position buffers do not match the layout: "
+            f"positions={positions.size}, computed={computed_tokens.size}, "
+            f"offsets={position_offsets.size}, requests={num_reqs}, "
+            f"MTP={query_width}"
+        )
+    positions.reshape(num_reqs, query_width)[:] = (
+        computed_tokens[:num_reqs, None]
+    )
+    positions += position_offsets[:num_tokens]
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -512,6 +570,20 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        if self.decode_threshold in (1, 2):
+            (
+                self._fixed_decode_req_indices,
+                self._fixed_decode_position_offsets,
+                self._fixed_decode_cu_num_tokens,
+            ) = _fixed_decode_layout_arrays(
+                self.max_num_reqs,
+                self.decode_threshold,
+                self.arange_np.dtype,
+            )
+        else:
+            self._fixed_decode_req_indices = None
+            self._fixed_decode_position_offsets = None
+            self._fixed_decode_cu_num_tokens = None
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -810,15 +882,47 @@ class NPUModelRunner(GPUModelRunner):
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
-        uniform_q1 = (
-            not self.use_cp
-            and attn_state == AscendAttentionState.DecodeOnly
-            and total_num_scheduled_tokens == num_reqs
+        fixed_decode_width = (
+            1
+            if attn_state == AscendAttentionState.DecodeOnly
+            else self.decode_threshold
+            if attn_state == AscendAttentionState.SpecDecoding
+            else 0
         )
-        if uniform_q1:
-            req_indices = self.arange_np[:num_reqs]
-            cu_num_tokens = self.arange_np[1 : num_reqs + 1]
-            positions_np[:] = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        uniform_fixed_decode = (
+            not self.use_cp
+            and fixed_decode_width in (1, 2)
+            and total_num_scheduled_tokens
+            == num_reqs * fixed_decode_width
+            and np.all(
+                num_scheduled_tokens[:num_reqs]
+                == fixed_decode_width
+            )
+        )
+        if uniform_fixed_decode:
+            if fixed_decode_width == 1:
+                req_indices = self.arange_np[:num_reqs]
+                cu_num_tokens = self.arange_np[1 : num_reqs + 1]
+                positions_np[:] = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                )
+            else:
+                assert self._fixed_decode_req_indices is not None
+                assert self._fixed_decode_position_offsets is not None
+                assert self._fixed_decode_cu_num_tokens is not None
+                req_indices = self._fixed_decode_req_indices[
+                    :total_num_scheduled_tokens
+                ]
+                cu_num_tokens = self._fixed_decode_cu_num_tokens[
+                    :num_reqs
+                ]
+                _fill_fixed_decode_positions(
+                    positions_np,
+                    self.input_batch.num_computed_tokens_cpu,
+                    self._fixed_decode_position_offsets,
+                    num_reqs,
+                    fixed_decode_width,
+                )
         else:
             req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
             cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)

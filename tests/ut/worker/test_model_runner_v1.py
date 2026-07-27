@@ -25,6 +25,104 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestFixedDecodeLayoutArrays(unittest.TestCase):
+    def test_q1_layout_is_identity(self):
+        req_indices, offsets, cumulative = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                1,
+                np.dtype(np.int64),
+            )
+        )
+
+        np.testing.assert_array_equal(
+            req_indices,
+            np.array([0, 1, 2], dtype=np.int64),
+        )
+        np.testing.assert_array_equal(
+            offsets,
+            np.zeros(3, dtype=np.int64),
+        )
+        np.testing.assert_array_equal(
+            cumulative,
+            np.array([1, 2, 3], dtype=np.int64),
+        )
+
+    def test_mtp2_layout_is_request_major(self):
+        req_indices, offsets, cumulative = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                2,
+                np.dtype(np.int32),
+            )
+        )
+
+        np.testing.assert_array_equal(
+            req_indices,
+            np.array([0, 0, 1, 1, 2, 2], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            offsets,
+            np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            cumulative,
+            np.array([2, 4, 6], dtype=np.int32),
+        )
+
+    def test_layout_rejects_mtp_above_two(self):
+        with self.assertRaisesRegex(ValueError, "MTP=3"):
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                3,
+                np.dtype(np.int32),
+            )
+
+    def test_layout_rejects_empty_request_capacity(self):
+        with self.assertRaisesRegex(ValueError, "requests=0"):
+            model_runner_module._fixed_decode_layout_arrays(
+                0,
+                2,
+                np.dtype(np.int32),
+            )
+
+    def test_mtp2_positions_follow_each_request_frontier(self):
+        positions = np.empty(6, dtype=np.int64)
+        _, offsets, _ = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                2,
+                np.dtype(np.int64),
+            )
+        )
+
+        model_runner_module._fill_fixed_decode_positions(
+            positions,
+            np.array([100, 200, 300], dtype=np.int64),
+            offsets,
+            3,
+            2,
+        )
+
+        np.testing.assert_array_equal(
+            positions,
+            np.array([100, 101, 200, 201, 300, 301]),
+        )
+
+    def test_positions_reject_mismatched_buffers(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "do not match",
+        ):
+            model_runner_module._fill_fixed_decode_positions(
+                np.empty(3, dtype=np.int64),
+                np.array([100, 200], dtype=np.int64),
+                np.array([0, 1, 0, 1], dtype=np.int64),
+                2,
+                2,
+            )
+
+
 class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
     def test_short_synthetic_sequences_use_no_remap_sentinel(self):
         for query_width, seq_lens, expected in (
