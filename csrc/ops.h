@@ -57,6 +57,172 @@ namespace vllm_ascend {
     uint32_t block_size,
     bool need_packed,
     bool clear_invalid_rows);
+
+  extern void dsa_prepare_sparse_indices_legacy_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* valid_rows,
+    void* scratch_base,
+    void* selected_packed,
+    void* row_req_indices,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t valid_row_count,
+    uint32_t core_count,
+    bool need_packed,
+    bool clear_invalid_rows,
+    uint32_t packed_key_stride);
+
+  extern void dsa_prepare_sparse_indices_staged_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* request_block_table,
+    void* selected_packed,
+    void* selected_count,
+    void* target_slots,
+    void* local_to_union,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t scratch_capacity,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size,
+    uint32_t core_count,
+    bool need_packed,
+    bool clear_invalid_rows);
+
+  extern void dsa_staged_hash_union_impl(
+    void* stream,
+    void* row_packed,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t max_tokens,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_sort_union_impl(
+    void* stream,
+    void* row_packed,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_sharded_sort_union_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t shard_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_sharded_vector_union_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    void* shard_pairs,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t shard_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_sharded_vector_dedup_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t shard_count_stride,
+    uint32_t block_size);
+
+  extern void dsa_staged_remap_rows_impl(
+    void* stream,
+    void* local_indices,
+    void* local_to_union,
+    uint32_t row_count,
+    uint32_t row_width);
+
+  extern void dsa_staged_unique_finalize_impl(
+    void* stream,
+    void* unique_keys,
+    void* inverse,
+    void* row_req_indices,
+    void* selected_packed,
+    void* local_to_union,
+    void* selected_count,
+    void* request_block_table,
+    void* target_slots,
+    uint32_t unique_count,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t scratch_capacity,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size,
+    uint32_t block_size_shift,
+    uint32_t packed_key_stride);
+
+  extern void dsa_staged_copy_rows_impl(
+    void* stream,
+    void* output,
+    void* local_indices,
+    uint32_t row_count,
+    uint32_t row_width);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {

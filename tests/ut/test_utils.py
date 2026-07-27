@@ -508,6 +508,8 @@ class TestUtils(TestBase):
         parallel_config = mock.MagicMock()
         parallel_config.data_parallel_size = 1
         parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
         vllm_config = mock.MagicMock(
             compilation_config=compilation_config,
             model_config=model_config,
@@ -526,12 +528,82 @@ class TestUtils(TestBase):
                 "staged_sfa_graph_capture_sizes",
                 return_value=tuple(range(1, 33)),
             ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
             self.assertRaisesRegex(
                 ValueError,
                 "exceeding the device quota",
             ),
         ):
             utils.update_aclgraph_sizes(vllm_config)
+
+    def test_staged_sfa_capture_uses_aiv_resource_budget(self):
+        compilation_config = mock.MagicMock(
+            cudagraph_capture_sizes=[1],
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 78
+        model_config.architecture = "StagedSFAAIVResourceTest"
+        parallel_config = mock.MagicMock(
+            data_parallel_size=2,
+            tensor_parallel_size=2,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+        )
+        vllm_config = mock.MagicMock(
+            compilation_config=compilation_config,
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=None,
+            additional_config={},
+        )
+
+        for key_count, should_fail in ((5, False), (6, True)):
+            compilation_config.cudagraph_capture_sizes = [1]
+            capture_sizes = tuple(range(1, key_count + 1))
+            with (
+                self.subTest(key_count=key_count),
+                mock.patch.object(
+                    utils,
+                    "staged_sfa_graph_configured",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    utils,
+                    "staged_sfa_graph_capture_sizes",
+                    return_value=capture_sizes,
+                ),
+                mock.patch.object(
+                    utils,
+                    "is_moe_model",
+                    return_value=True,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"HCCL_OP_EXPANSION_MODE": "AIV"},
+                ),
+                mock.patch.object(
+                    utils,
+                    "update_cudagraph_capture_sizes",
+                ) as update_sizes,
+            ):
+                if should_fail:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "device quota of 5 keys",
+                    ):
+                        utils.update_aclgraph_sizes(vllm_config)
+                    update_sizes.assert_not_called()
+                else:
+                    utils.update_aclgraph_sizes(vllm_config)
+                    update_sizes.assert_called_once_with(
+                        vllm_config,
+                        list(capture_sizes),
+                    )
 
     def test_staged_sfa_cross_layer_capture_drops_native_buckets(self):
         compilation_config = mock.MagicMock()
@@ -658,7 +730,7 @@ class TestUtils(TestBase):
             ),
             mock.patch.dict(
                 os.environ,
-                {"HCCL_OP_EXPANSION_MODE": ""},
+                {"HCCL_OP_EXPANSION_MODE": "AIV"},
             ),
         ):
             self.assertTrue(utils.staged_sfa_graph_configured(vllm_config))
@@ -726,7 +798,7 @@ class TestUtils(TestBase):
         reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
         self.assertNotIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
 
-    def test_staged_sfa_rejects_profiling_side_effect_modes(self):
+    def test_staged_sfa_aiv_keeps_other_profiling_guards(self):
         vllm_config = mock.MagicMock()
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
         vllm_config.model_config.use_mla = True
@@ -762,7 +834,6 @@ class TestUtils(TestBase):
             reasons,
         )
         self.assertIn(utils.StagedSFAConfigReason.ADAPTER_CACHE, reasons)
-        self.assertIn(utils.StagedSFAConfigReason.HCCL_AIV, reasons)
 
     @mock.patch("vllm.model_executor.custom_op.CustomOp")
     @mock.patch("vllm_ascend.ops.activation.AscendQuickGELU")

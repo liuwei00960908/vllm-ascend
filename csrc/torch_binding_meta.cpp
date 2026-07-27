@@ -75,6 +75,114 @@ at::Tensor npu_dsa_prepare_sparse_indices_meta(
     return selected_counts;
 }
 
+at::Tensor npu_dsa_prepare_sparse_indices_staged_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)row_req_indices;
+    (void)request_block_table;
+    (void)selected_packed;
+    (void)target_slots;
+    (void)local_to_union_workspace;
+    (void)block_size;
+    (void)mtp;
+    (void)need_packed;
+    (void)clear_invalid_rows;
+    return selected_counts;
+}
+
+at::Tensor npu_dsa_staged_sharded_union_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    int64_t block_size)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)selected_packed;
+    (void)local_to_union;
+    (void)request_block_table;
+    (void)target_slots;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)block_size;
+    return selected_count;
+}
+
+at::Tensor npu_dsa_staged_sharded_vector_union_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    at::Tensor &shard_pairs,
+    int64_t block_size)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)selected_packed;
+    (void)local_to_union;
+    (void)request_block_table;
+    (void)target_slots;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)shard_pairs;
+    (void)block_size;
+    return selected_count;
+}
+
+at::Tensor npu_dsa_staged_sharded_vector_dedup_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    at::Tensor &selected_packed,
+    at::Tensor &local_to_union,
+    at::Tensor &selected_count,
+    const at::Tensor &request_block_table,
+    at::Tensor &target_slots,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    int64_t block_size)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)selected_packed;
+    (void)local_to_union;
+    (void)request_block_table;
+    (void)target_slots;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)block_size;
+    return selected_count;
+}
+
 at::Tensor bgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y,
                        int64_t slice_offset, int64_t slice_size) {
     at::Tensor y_out = at::empty_like(y);
@@ -608,6 +716,18 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_prepare_sparse_indices_",
         &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_meta);
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_staged_",
+        &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_staged_meta);
+    ops.impl(
+        "npu_dsa_staged_sharded_union_",
+        &vllm_ascend::meta::npu_dsa_staged_sharded_union_meta);
+    ops.impl(
+        "npu_dsa_staged_sharded_vector_union_",
+        &vllm_ascend::meta::npu_dsa_staged_sharded_vector_union_meta);
+    ops.impl(
+        "npu_dsa_staged_sharded_vector_dedup_",
+        &vllm_ascend::meta::npu_dsa_staged_sharded_vector_dedup_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

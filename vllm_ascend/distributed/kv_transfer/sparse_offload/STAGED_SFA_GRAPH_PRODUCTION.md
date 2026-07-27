@@ -927,8 +927,10 @@ TP8 full-model sign-off on the exact current commit remains**.
   temporary cache and dummy capture are connector-independent because worker
   connector creation follows memory sizing; connector capability validation and
   registration run during real cache initialization. All static staged checks
-  remain active during profiling. Legacy DSA offload, adapter-cache, and HCCL-AIV
-  configurations are rejected before this profiling lifecycle. Successful
+  remain active during profiling. Legacy DSA offload and adapter-cache
+  configurations are rejected before this profiling lifecycle. HCCL-AIV uses
+  the native ACL-graph resource formula for the exact staged key set and still
+  requires NPU capture/replay qualification. Successful
   cleanup remains owned by vLLM; the Ascend adapter additionally resets its
   graph-parameter tables and staged layer state. On failure it also completes
   the parent cleanup for ACL wrappers, pools, dispatcher keys, capture gate,

@@ -175,6 +175,22 @@ if TYPE_CHECKING:
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
+
+def _staged_sfa_dummy_remap_boundaries(
+    seq_lens: Any,
+    query_width: int,
+    index_topk: int,
+) -> np.ndarray:
+    """Build safe synthetic remap boundaries for staged graph capture."""
+    boundaries = (
+        np.asarray(seq_lens, dtype=np.int32).reshape(-1)
+        - int(query_width)
+    )
+    scratch_capacity = int(query_width) * int(index_topk)
+    boundaries[boundaries < scratch_capacity] = 0
+    return boundaries
+
+
 def _mtp_dw_diag_enabled() -> bool:
     return envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
 
@@ -317,6 +333,64 @@ class ExecuteModelState(NamedTuple):
     staged_sfa_graph_key: StagedSFAGraphKey | None
 
 
+def _fixed_decode_layout_arrays(
+    max_num_reqs: int,
+    query_width: int,
+    dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precompute request-major CPU metadata for fixed-width decode."""
+    if max_num_reqs <= 0 or query_width not in (1, 2):
+        raise ValueError(
+            "fixed decode layout requires positive requests and "
+            f"MTP=1 or MTP=2, got requests={max_num_reqs}, "
+            f"MTP={query_width}"
+        )
+    request_indices = np.repeat(
+        np.arange(max_num_reqs, dtype=dtype),
+        query_width,
+    )
+    position_offsets = np.tile(
+        np.arange(query_width, dtype=dtype),
+        max_num_reqs,
+    )
+    cumulative_tokens = (
+        np.arange(1, max_num_reqs + 1, dtype=dtype)
+        * query_width
+    )
+    return request_indices, position_offsets, cumulative_tokens
+
+
+def _fill_fixed_decode_positions(
+    positions: np.ndarray,
+    computed_tokens: np.ndarray,
+    position_offsets: np.ndarray,
+    num_reqs: int,
+    query_width: int,
+) -> None:
+    """Fill request-major positions without per-step repeat/cumsum arrays."""
+    if query_width not in (1, 2):
+        raise ValueError(
+            "fixed decode positions only support MTP=1 or MTP=2, "
+            f"got MTP={query_width}"
+        )
+    num_tokens = num_reqs * query_width
+    if (
+        positions.size != num_tokens
+        or computed_tokens.size < num_reqs
+        or position_offsets.size < num_tokens
+    ):
+        raise ValueError(
+            "fixed decode position buffers do not match the layout: "
+            f"positions={positions.size}, computed={computed_tokens.size}, "
+            f"offsets={position_offsets.size}, requests={num_reqs}, "
+            f"MTP={query_width}"
+        )
+    positions.reshape(num_reqs, query_width)[:] = (
+        computed_tokens[:num_reqs, None]
+    )
+    positions += position_offsets[:num_tokens]
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -436,7 +510,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
-        self._dsa_short_prompt_warned = False
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -497,6 +570,20 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        if self.decode_threshold in (1, 2):
+            (
+                self._fixed_decode_req_indices,
+                self._fixed_decode_position_offsets,
+                self._fixed_decode_cu_num_tokens,
+            ) = _fixed_decode_layout_arrays(
+                self.max_num_reqs,
+                self.decode_threshold,
+                self.arange_np.dtype,
+            )
+        else:
+            self._fixed_decode_req_indices = None
+            self._fixed_decode_position_offsets = None
+            self._fixed_decode_cu_num_tokens = None
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -727,10 +814,12 @@ class NPUModelRunner(GPUModelRunner):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
-            last_loc = self.query_start_loc.np[num_reqs]
-            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
-                self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
-            )
+            if num_reqs < num_reqs_padded:
+                last_loc = self.query_start_loc.np[num_reqs]
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+                    self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
+                )
+                self.query_start_loc.copy_to_gpu()
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
             assert num_reqs == num_reqs_padded
@@ -738,8 +827,7 @@ class NPUModelRunner(GPUModelRunner):
             # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
             self.query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
-
-        self.query_start_loc.copy_to_gpu()
+            self.query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
 
@@ -774,8 +862,6 @@ class NPUModelRunner(GPUModelRunner):
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
-
         # Get the attention state.
         if not scheduler_output.scheduled_spec_decode_tokens:
             num_valid_tokens = num_scheduled_tokens
@@ -796,8 +882,51 @@ class NPUModelRunner(GPUModelRunner):
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+        fixed_decode_width = (
+            1
+            if attn_state == AscendAttentionState.DecodeOnly
+            else self.decode_threshold
+            if attn_state == AscendAttentionState.SpecDecoding
+            else 0
+        )
+        uniform_fixed_decode = (
+            not self.use_cp
+            and fixed_decode_width in (1, 2)
+            and total_num_scheduled_tokens
+            == num_reqs * fixed_decode_width
+            and np.all(
+                num_scheduled_tokens[:num_reqs]
+                == fixed_decode_width
+            )
+        )
+        if uniform_fixed_decode:
+            if fixed_decode_width == 1:
+                req_indices = self.arange_np[:num_reqs]
+                cu_num_tokens = self.arange_np[1 : num_reqs + 1]
+                positions_np[:] = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                )
+            else:
+                assert self._fixed_decode_req_indices is not None
+                assert self._fixed_decode_position_offsets is not None
+                assert self._fixed_decode_cu_num_tokens is not None
+                req_indices = self._fixed_decode_req_indices[
+                    :total_num_scheduled_tokens
+                ]
+                cu_num_tokens = self._fixed_decode_cu_num_tokens[
+                    :num_reqs
+                ]
+                _fill_fixed_decode_positions(
+                    positions_np,
+                    self.input_batch.num_computed_tokens_cpu,
+                    self._fixed_decode_position_offsets,
+                    num_reqs,
+                    fixed_decode_width,
+                )
+        else:
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+            cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+            np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
@@ -968,7 +1097,8 @@ class NPUModelRunner(GPUModelRunner):
         discard_request_indices = np.nonzero(discard_requests_mask)[0]
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        if self.num_discarded_requests:
+            self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -1389,7 +1519,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_reqs=num_reqs,
                     num_scheduled_tokens=num_scheduled_tokens_np,
-                    prompt_lens=self.input_batch.num_prompt_tokens[:num_reqs],
                     index_topk=self.dsa_index_topk,
                     has_cascade_attention=(
                         cascade_attn_prefix_lens is not None
@@ -2545,8 +2674,10 @@ class NPUModelRunner(GPUModelRunner):
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 if self.pcp_size == 1:
-                    slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
-                    blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+                    if num_tokens < num_tokens_padded:
+                        slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+                    if num_reqs < num_reqs_padded:
+                        blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                     num_tokens,
@@ -2578,17 +2709,17 @@ class NPUModelRunner(GPUModelRunner):
                     f'fixed query width {query_width}.'
                 )
             staged_dummy_prompt_lens = (
-                self.seq_lens.np[:num_reqs].astype(np.int32)
-                - self.decode_threshold
+                _staged_sfa_dummy_remap_boundaries(
+                    self.seq_lens.np[:num_reqs],
+                    query_width,
+                    self.dsa_index_topk,
+                )
             )
-            if (
-                staged_dummy_prompt_lens.shape != (num_reqs,)
-                or np.any(staged_dummy_prompt_lens < self.dsa_index_topk)
-            ):
+            if staged_dummy_prompt_lens.shape != (num_reqs,):
                 raise RuntimeError(
-                    'Every staged SFA graph dummy prompt boundary must be at '
-                    f'least index_topk={self.dsa_index_topk}, got '
-                    f'{staged_dummy_prompt_lens.tolist()}.'
+                    'The staged SFA graph dummy remap boundary shape differs '
+                    f'from num_reqs={num_reqs}: '
+                    f'{staged_dummy_prompt_lens.shape}.'
                 )
             staged_dummy_computed_tokens = torch.zeros_like(
                 self.input_batch.num_computed_tokens_cpu_tensor[
@@ -2734,19 +2865,7 @@ class NPUModelRunner(GPUModelRunner):
                         if staged_dummy_prompt_lens is not None
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
-                    if (
-                        not self._dsa_short_prompt_warned
-                        and (plens_np > 0).any()
-                        and plens_np[plens_np > 0].min() < self.dsa_index_topk
-                    ):
-                        logger.warning(
-                            "DSA shrink-latent: request with prompt_len < index_topk (%d) detected; "
-                            "the compact-scratch path does not support it yet (scratch rows would alias "
-                            "live decode positions). Expect wrong output for such requests.",
-                            self.dsa_index_topk,
-                        )
-                        self._dsa_short_prompt_warned = True
-                    cm.prompt_lens_cpu = plens_np.copy()
+                    cm.prompt_lens_cpu = plens_np
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -2855,7 +2974,6 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_unpadded: int,
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
-        prompt_lens: np.ndarray,
         index_topk: int,
         has_cascade_attention: bool,
         request_ids: Any,
@@ -2895,7 +3013,6 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
-        prompt_lens = np.asarray(prompt_lens).reshape(-1)
         if scheduled.shape != (num_reqs,) or not np.all(
             scheduled == query_width
         ):
@@ -2918,11 +3035,6 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
-            )
-        if prompt_lens.shape != (num_reqs,):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                StagedSFARouteReason.SHORT_PROMPT,
             )
         scratch_capacity = query_width * index_topk
         if any(
@@ -3192,7 +3304,7 @@ class NPUModelRunner(GPUModelRunner):
             block_table.num_blocks_per_row[:batch_size] = (
                 block_table.max_num_blocks_per_req
             )
-            block_table.commit_block_table(batch_size)
+            block_table.commit_block_table(batch_size, force=True)
             block_table.compute_slot_mapping(req_indices, positions)
             block_table.commit_slot_mapping(positions.size)
 

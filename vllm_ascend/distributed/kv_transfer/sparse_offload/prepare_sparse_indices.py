@@ -116,6 +116,8 @@ def prepare_sparse_indices(
     block_size: int,
     need_packed: bool = True,
     clear_invalid_rows: bool = False,
+    local_to_union_workspace: torch.Tensor | None = None,
+    staged_mtp: int | None = None,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -131,39 +133,79 @@ def prepare_sparse_indices(
             zeroed in the same kernel. Pass this only for pure
             decode/spec-decode; a mixed prefill row also has a negative request
             index but is real.
+        local_to_union_workspace: caller-owned fixed-address int32 workspace
+            matching ``selected_packed``. Required by the staged path so graph
+            replay never allocates temporary storage inside the operator.
+        staged_mtp: enable the fixed-layout production path for pure decode.
+            MTP=1 compacts each unique top-k row without sorting or union.
+            MTP=2 compacts two rows, runs staged sort union, then remaps rows in
+            parallel. Values at or above each row's split boundary are ignored
+            by the union and remain absolute. Values greater than 2 are not
+            supported.
 
     Returns:
         new_indices: same shape as topk_indices. LMCache-selected entries are
             replaced by their compact scratch row (scratch_base + rank in
             top-k order); live-cache and padding entries stay unchanged.
-        selected_packed: [num_requests, scratch_capacity] int32. Unique
-            LMCache-selected absolute positions are packed in ascending token
-            order. None when need_packed=False.
+        selected_packed: [num_requests, scratch_capacity] int32. Selected
+            positions use source order for MTP=1 and sorted union order for
+            MTP=2. None when need_packed=False.
     """
+    if staged_mtp is not None and staged_mtp not in (1, 2):
+        raise RuntimeError(
+            "staged sparse-index preparation only supports MTP=1 or MTP=2; "
+            f"got MTP={staged_mtp}"
+        )
+    if staged_mtp is not None and local_to_union_workspace is None:
+        raise ValueError(
+            "local_to_union_workspace is required when staged_mtp is enabled"
+        )
     if topk_indices.device.type != "npu":
         raise RuntimeError(
             "prepare_sparse_indices requires the NPU custom op; use "
             "_prepare_sparse_indices_torch only as a test reference"
         )
+    op_name = (
+        "npu_dsa_prepare_sparse_indices_staged_"
+        if staged_mtp is not None
+        else "npu_dsa_prepare_sparse_indices_"
+    )
     try:
-        fused_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_
+        fused_op = getattr(torch.ops._C_ascend, op_name)
     except AttributeError as exc:
         raise RuntimeError(
-            "vllm_ascend_C does not expose npu_dsa_prepare_sparse_indices_; rebuild the custom-op extension"
+            f"vllm_ascend_C does not expose {op_name}; rebuild the custom-op "
+            "extension"
         ) from exc
 
-    fused_op(
-        topk_indices,
-        split_boundary,
-        row_req_indices,
-        request_block_table,
-        selected_packed,
-        selected_counts,
-        target_slot_mapping,
-        block_size,
-        need_packed,
-        clear_invalid_rows,
-    )
+    if staged_mtp is None:
+        fused_op(
+            topk_indices,
+            split_boundary,
+            row_req_indices,
+            request_block_table,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+            block_size,
+            need_packed,
+            clear_invalid_rows,
+        )
+    else:
+        fused_op(
+            topk_indices,
+            split_boundary,
+            row_req_indices,
+            request_block_table,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+            local_to_union_workspace,
+            block_size,
+            staged_mtp,
+            need_packed,
+            clear_invalid_rows,
+        )
     return (
         topk_indices,
         selected_packed if need_packed else None,

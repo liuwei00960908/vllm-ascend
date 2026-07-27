@@ -66,6 +66,7 @@ _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
 _MAX_ACL_GRAPH_ENTRIES = 1800
 _ACL_COMMUNICATION_STREAM_RESERVE = 40
+_ACL_CONTEXT_PARALLEL_STREAM_RESERVE = 100
 
 
 class StagedSFARouteAction(str, Enum):
@@ -90,7 +91,6 @@ class StagedSFAConfigReason(str, Enum):
     CONTEXT_PARALLEL = "context_parallel"
     LEGACY_DSA_OFFLOAD = "legacy_dsa_offload"
     ADAPTER_CACHE = "adapter_cache"
-    HCCL_AIV = "hccl_aiv"
 
 
 class StagedSFARouteReason(str, Enum):
@@ -106,7 +106,6 @@ class StagedSFARouteReason(str, Enum):
     UNSUPPORTED_BATCH = "unsupported_batch"
     PADDED_BATCH = "padded_batch"
     NON_Q1 = "non_q1"
-    SHORT_PROMPT = "short_prompt"
     BATCH_DESCRIPTOR = "batch_descriptor"
     INVALID_REQUEST_IDS = "invalid_request_ids"
     DENSE_PREFIX_HIT = "dense_prefix_hit"
@@ -585,8 +584,6 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.LEGACY_DSA_OFFLOAD)
     if envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE:
         reasons.append(StagedSFAConfigReason.ADAPTER_CACHE)
-    if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
-        reasons.append(StagedSFAConfigReason.HCCL_AIV)
     return tuple(reasons)
 
 
@@ -605,7 +602,6 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallel staged graphs are not implemented",
     StagedSFAConfigReason.LEGACY_DSA_OFFLOAD: "legacy DSA latent offload is not supported by staged graphs",
     StagedSFAConfigReason.ADAPTER_CACHE: "the DSA adapter cache is not supported by staged graphs",
-    StagedSFAConfigReason.HCCL_AIV: "HCCL AIV resource accounting is not qualified for staged graphs",
 }
 
 
@@ -680,6 +676,35 @@ def staged_sfa_graph_capture_sizes(
     return tuple(size * query_width for size in sizes)
 
 
+def _max_aclgraph_keys(
+    vllm_config: VllmConfig,
+    resources_per_graph: int,
+    num_comm_groups: int,
+) -> int:
+    max_capture_size = _MAX_ACL_GRAPH_ENTRIES
+    parallel_config = vllm_config.parallel_config
+    if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
+        parallel_factor = (
+            1
+            + num_comm_groups
+            + int(parallel_config.enable_expert_parallel)
+            + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
+        )
+        if is_moe_model(vllm_config):
+            parallel_factor += parallel_config.data_parallel_size > 1
+        else:
+            # Dense-model all-reduce occupies one additional key's streams.
+            max_capture_size -= parallel_factor * resources_per_graph
+    else:
+        if parallel_config.prefill_context_parallel_size > 1:
+            max_capture_size -= _ACL_CONTEXT_PARALLEL_STREAM_RESERVE
+        if parallel_config.decode_context_parallel_size > 1:
+            max_capture_size -= _ACL_CONTEXT_PARALLEL_STREAM_RESERVE
+        max_capture_size -= num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE
+        parallel_factor = 1 + num_comm_groups * 2
+    return math.floor(max_capture_size / resources_per_graph / parallel_factor)
+
+
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
     # NOTE: Currently, we can only capture 1800 graphs at most,
@@ -688,11 +713,6 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     # as a buffer.
     # Maximum number of graphs that can be captured by ACL Graph
     # TODO: Find out whether we need to solve allreduce function
-    max_capture_size = _MAX_ACL_GRAPH_ENTRIES
-
-    # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
-    CP_ADDITIONAL_STREAM_NUM = 100
-
     # Store original configuration and temporarily clear it
     compilation_config = vllm_config.compilation_config
     original_sizes, compilation_config.cudagraph_capture_sizes = compilation_config.cudagraph_capture_sizes, None
@@ -729,21 +749,24 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             parallel_config.tensor_parallel_size,
         ]
     )
+    max_num_batch_sizes = _max_aclgraph_keys(
+        vllm_config,
+        resources_per_graph,
+        num_comm_groups,
+    )
 
     staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
     staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
     if staged_sfa_graph_active:
-        entry_limit = (
-            max_capture_size
-            - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE
-        ) // (1 + num_comm_groups * 2)
         required_entries = len(staged_sfa_sizes) * resources_per_graph
-        if required_entries > entry_limit:
+        entry_limit = max_num_batch_sizes * resources_per_graph
+        if len(staged_sfa_sizes) > max_num_batch_sizes:
             raise ValueError(
                 "Staged SFA capture requires "
                 f"{required_entries} outer graph entries for "
                 f"{len(staged_sfa_sizes)} keys, exceeding the "
-                f"device quota {entry_limit}. Reduce "
+                f"device quota of {max_num_batch_sizes} keys "
+                f"({entry_limit} outer graph entries). Reduce "
                 "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES."
             )
         update_cudagraph_capture_sizes(
@@ -760,33 +783,12 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         return
 
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
-        # TODO: Find out whether we need to take into account the pp_size
-        parallel_factor = (
-            1
-            + num_comm_groups
-            + int(parallel_config.enable_expert_parallel)
-            + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
-        )
-        if is_moe_model(vllm_config):
-            parallel_factor += parallel_config.data_parallel_size > 1
-        else:
-            # When AIV mode is enabled, the allreduce operator of the dense
-            # layer model will occupy additional streams, which are buffered here.
-            max_capture_size = max_capture_size - parallel_factor * resources_per_graph
-
         # Calculate maximum supported batch sizes considering model architecture on the A2 Hardware Device
         # Assume the following case:
         # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
         # According to the formula, max_num_batch_sizes = math.floor(1920 / (48 + 1) / 2) = 19
-        max_num_batch_sizes = math.floor(max_capture_size / resources_per_graph / parallel_factor)
         logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
     else:
-        # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
-        if parallel_config.prefill_context_parallel_size > 1:
-            max_capture_size -= CP_ADDITIONAL_STREAM_NUM
-        if parallel_config.decode_context_parallel_size > 1:
-            max_capture_size -= CP_ADDITIONAL_STREAM_NUM
-
         # The above describes an empirical formula applicable to the A2 hardware.
         # Under this configuration, HCCL employs the FFTS+ method for execution unfolding,
         # which adds only 1 concurrent stream without consuming collective communication execution unfolding streams.
@@ -799,11 +801,6 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         # Assume the following case:
         # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
         # According to the formula, max_num_batch_sizes = math.floor((1920 - 1 * 40) / (48 + 1) / (1 + 1 * 2)) = 12
-        max_num_batch_sizes = math.floor(
-            (max_capture_size - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE)
-            / resources_per_graph
-            / (1 + num_comm_groups * 2)
-        )
         logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
         logger.warning(
             "Currently, communication is performed using FFTS+ method, which reduces "

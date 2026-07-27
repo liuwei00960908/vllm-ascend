@@ -281,6 +281,24 @@ def _update_dsa_split_boundary_in_place(
 
     seq_lens_cpu = attn_metadata.seq_lens_cpu
     num_reqs = int(seq_lens_cpu.shape[0])
+    row_req_indices = np.asarray(
+        row_req_indices_cpu[:num_rows],
+        dtype=np.int32,
+    )
+    valid_rows = row_req_indices >= 0
+    if np.any(row_req_indices[valid_rows] >= num_reqs):
+        bad_row = int(
+            np.flatnonzero(
+                valid_rows & (row_req_indices >= num_reqs)
+            )[0]
+        )
+        raise RuntimeError(
+            "DSA sparse row references a request outside seq_lens: "
+            f"row={bad_row}, "
+            f"request_index={int(row_req_indices[bad_row])}, "
+            f"num_reqs={num_reqs}."
+        )
+
     has_cached_frontier = cached_tokens is not None
     if (
         has_cached_frontier
@@ -290,26 +308,55 @@ def _update_dsa_split_boundary_in_place(
     ):
         raise RuntimeError("LMCache sparse remap has decode rows but no request boundaries")
 
-    for row_index in range(num_rows):
-        request_index = int(row_req_indices_cpu[row_index])
-        if request_index < 0:
-            continue
-        if request_index >= num_reqs:
-            raise RuntimeError(
-                "DSA sparse row references a request outside seq_lens: "
-                f"row={row_index}, request_index={request_index}, "
-                f"num_reqs={num_reqs}."
+    if np.any(valid_rows) and (
+        has_cached_frontier or decode_window_size > 0
+    ):
+        if has_cached_frontier:
+            cached_count = min(len(cached_tokens), num_reqs)
+            if cached_count == num_reqs:
+                request_boundaries = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+            else:
+                request_boundaries = np.zeros(
+                    num_reqs,
+                    dtype=np.int32,
+                )
+                request_boundaries[:cached_count] = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+        else:
+            request_boundaries = np.empty(
+                num_reqs,
+                dtype=np.int32,
             )
-
-        cached_end = (
-            int(cached_tokens[request_index]) if has_cached_frontier and request_index < len(cached_tokens) else 0
-        )
         if decode_window_size > 0:
-            current_position = max(int(seq_lens_cpu[request_index]) - 1, 0)
-            window_start = current_position // decode_window_size * decode_window_size
-            boundary_cpu[row_index] = min(window_start, cached_end) if has_cached_frontier else window_start
-        elif has_cached_frontier:
-            boundary_cpu[row_index] = cached_end
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens = seq_lens_cpu.detach().numpy()
+            else:
+                seq_lens = np.asarray(seq_lens_cpu)
+            current_positions = np.maximum(
+                seq_lens[:num_reqs].astype(np.int64, copy=False) - 1,
+                0,
+            )
+            window_starts = (
+                current_positions // decode_window_size
+                * decode_window_size
+            )
+            if has_cached_frontier:
+                np.minimum(
+                    window_starts,
+                    request_boundaries,
+                    out=request_boundaries,
+                    casting="unsafe",
+                )
+            else:
+                request_boundaries[:] = window_starts
+        boundary_cpu[:num_rows][valid_rows] = request_boundaries[
+            row_req_indices[valid_rows]
+        ]
 
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
@@ -379,7 +426,10 @@ def _prepare_sfa_remap_boundary(
         row_req_indices,
         dtype=np.int64,
     ).reshape(-1)
-    seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens = seq_lens_cpu.detach().numpy().reshape(-1)
+    else:
+        seq_lens = np.asarray(seq_lens_cpu).reshape(-1)
     if int(boundary.numel()) != int(prompt_rows_np.size) or row_req_indices_np.size != prompt_rows_np.size:
         raise RuntimeError(
             "[SFA sparse remap] boundary shapes differ: "
@@ -388,18 +438,24 @@ def _prepare_sfa_remap_boundary(
             f"row_req_indices={tuple(row_req_indices_np.shape)}."
         )
 
-    decode_request_indices = sorted(
-        {int(request_index) for request_index in row_req_indices_np if int(request_index) >= 0}
+    valid_rows = row_req_indices_np >= 0
+    decode_request_indices_np = np.unique(
+        row_req_indices_np[valid_rows]
     )
-    for request_index in decode_request_indices:
-        if request_index >= len(seq_lens):
-            raise RuntimeError(
-                "[SFA staged graph POC] decode row references request "
-                f"{request_index}, but only {len(seq_lens)} sequence lengths "
-                "are available."
-            )
+    if (
+        decode_request_indices_np.size
+        and int(decode_request_indices_np[-1]) >= len(seq_lens)
+    ):
+        request_index = int(decode_request_indices_np[-1])
+        raise RuntimeError(
+            "[SFA staged graph POC] decode row references request "
+            f"{request_index}, but only {len(seq_lens)} sequence lengths "
+            "are available."
+        )
+    decode_request_indices = decode_request_indices_np.tolist()
 
-    cached_tokens_by_request: dict[int, int] = {}
+    cached_tokens_by_request = np.zeros(len(seq_lens), dtype=np.int32)
+    cached_request_mask = np.zeros(len(seq_lens), dtype=np.bool_)
     if not is_dummy_run:
         if cached_tokens is None:
             if decode_request_indices:
@@ -410,28 +466,57 @@ def _prepare_sfa_remap_boundary(
                     raise RuntimeError("[SFA sparse remap] active request IDs do not cover all decode rows.")
                 decode_request_ids = [request_ids[index] for index in decode_request_indices]
                 resolved_tokens = get_lmcache_sparse_cached_tokens(decode_request_ids)
-                cached_tokens_by_request = dict(zip(decode_request_indices, resolved_tokens, strict=True))
+                cached_tokens_by_request[
+                    decode_request_indices_np
+                ] = np.asarray(resolved_tokens, dtype=np.int32)
+                cached_request_mask[decode_request_indices_np] = True
         else:
             if len(cached_tokens) != len(decode_request_indices):
                 raise RuntimeError(
                     f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.FRONTIER_COUNT_MISMATCH.value}"
                 )
-            cached_tokens_by_request = dict(zip(decode_request_indices, cached_tokens, strict=True))
+            cached_tokens_by_request[
+                decode_request_indices_np
+            ] = np.asarray(cached_tokens, dtype=np.int32)
+            cached_request_mask[decode_request_indices_np] = True
     decode_window_size = _decode_window_save_window_size()
     boundary_rows = prompt_rows_np.copy()
-    for row_index, request_index_value in enumerate(row_req_indices_np):
-        request_index = int(request_index_value)
-        if request_index < 0:
-            continue
-        cached_for_request = cached_tokens_by_request.get(request_index)
+    if decode_request_indices_np.size:
+        request_boundaries = np.zeros(
+            len(seq_lens),
+            dtype=np.int32,
+        )
         if decode_window_size > 0:
-            current_position = max(seq_lens[request_index] - 1, 0)
-            row_boundary = current_position // decode_window_size * decode_window_size
-            if cached_for_request is not None:
-                row_boundary = min(row_boundary, cached_for_request)
-            boundary_rows[row_index] = row_boundary
-        elif cached_for_request is not None:
-            boundary_rows[row_index] = cached_for_request
+            current_positions = np.maximum(
+                seq_lens.astype(np.int64, copy=False) - 1,
+                0,
+            )
+            request_boundaries[:] = (
+                current_positions // decode_window_size
+                * decode_window_size
+            )
+            np.minimum(
+                request_boundaries,
+                cached_tokens_by_request,
+                out=request_boundaries,
+                where=cached_request_mask,
+            )
+        else:
+            request_boundaries[cached_request_mask] = (
+                cached_tokens_by_request[cached_request_mask]
+            )
+        rows_with_dynamic_boundary = valid_rows.copy()
+        if decode_window_size <= 0:
+            rows_with_dynamic_boundary[valid_rows] = (
+                cached_request_mask[
+                    row_req_indices_np[valid_rows]
+                ]
+            )
+        boundary_rows[rows_with_dynamic_boundary] = (
+            request_boundaries[
+                row_req_indices_np[rows_with_dynamic_boundary]
+            ]
+        )
 
     _validate_dsa_scratch_capacity(
         boundary_rows,
@@ -493,6 +578,54 @@ def _validate_dsa_scratch_capacity(
                 f"{request_boundaries.tolist()}, "
                 f"scratch_capacity={capacity}."
             )
+
+
+def _fixed_staged_decode_mtp(
+    row_req_indices: Any,
+    request_count: int,
+    row_count: int,
+    *,
+    pure_decode: bool,
+) -> int | None:
+    """Return the MTP for the request-major staged layout, else fall back."""
+    if (
+        not pure_decode
+        or request_count <= 0
+        or row_req_indices is None
+    ):
+        return None
+    request_rows = np.asarray(row_req_indices, dtype=np.int64).reshape(-1)
+    if request_rows.size < row_count:
+        return None
+    request_rows = request_rows[:row_count]
+    valid_rows = request_rows[request_rows >= 0]
+    if valid_rows.size:
+        if np.any(valid_rows >= request_count):
+            return None
+        counts = np.bincount(valid_rows, minlength=request_count)
+        max_mtp = int(counts.max(initial=0))
+        if max_mtp > 2:
+            raise RuntimeError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={max_mtp}"
+            )
+    if row_count % request_count:
+        return None
+    mtp = row_count // request_count
+    if mtp not in (1, 2):
+        if mtp > 2:
+            raise RuntimeError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={mtp}"
+            )
+        return None
+    expected = np.repeat(
+        np.arange(request_count, dtype=np.int64),
+        mtp,
+    )
+    if not np.array_equal(request_rows, expected):
+        return None
+    return mtp
 
 
 def _prepare_dsa_sparse_lmcache_payload(
@@ -776,6 +909,7 @@ class AscendSFAMetadata:
     decode_target_slot_mapping: torch.Tensor | None = None
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
+    decode_union_mapping_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
@@ -828,6 +962,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
+        if self.dsa_shrink_latent and self.decode_threshold > 2:
+            raise ValueError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={self.decode_threshold}"
+            )
         hf_config = self.model_config.hf_config
         hf_text_config = self.model_config.hf_text_config
         self.index_topk = int(
@@ -866,12 +1005,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # Builder-owned backing storage. Metadata instances expose only
             # active-prefix views, while storage addresses remain stable across
             # scheduler steps for a later staged-graph merge.
+            self._dsa_prompt_lens_cpu = np.empty(
+                max_num_rows,
+                dtype=np.int32,
+            )
             self._dsa_split_boundary_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_req_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_row_offsets_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_current_positions_cpu = np.empty(max_num_rows, dtype=np.int64)
             self._dsa_valid_row_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
             self._dsa_compact_req_indices_cpu = np.empty(max_num_rows, dtype=np.int32)
+            self._dsa_prompt_lens_cpu_tensor = torch.from_numpy(
+                self._dsa_prompt_lens_cpu
+            )
             self._dsa_split_boundary_cpu_tensor = torch.from_numpy(self._dsa_split_boundary_cpu)
             self._dsa_req_indices_cpu_tensor = torch.from_numpy(self._dsa_req_indices_cpu)
             self._dsa_row_offsets_cpu_tensor = torch.from_numpy(self._dsa_row_offsets_cpu)
@@ -880,6 +1026,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
             self._dsa_compact_req_indices_cpu_tensor = torch.from_numpy(
                 self._dsa_compact_req_indices_cpu
+            )
+            self._dsa_prompt_lens = torch.empty(
+                max_num_rows,
+                dtype=torch.int32,
+                device=device,
             )
             self._dsa_split_boundary = torch.empty(max_num_rows, dtype=torch.int32, device=device)
             self._dsa_req_indices = torch.empty(max_num_rows, dtype=torch.int32, device=device)
@@ -897,26 +1048,47 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.long,
                 device=device,
             )
+            self._dsa_union_mapping = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            fixed_query_starts = np.arange(
+                max_num_reqs + 1,
+                dtype=np.int32,
+            )
+            self._dsa_fixed_query_starts_cpu = np.stack(
+                (
+                    fixed_query_starts,
+                    fixed_query_starts * 2,
+                )
+            )
         else:
             self._dsa_max_num_rows = 0
             self._dsa_max_num_reqs = 0
+            self._dsa_prompt_lens_cpu = None
             self._dsa_split_boundary_cpu = None
             self._dsa_req_indices_cpu = None
             self._dsa_row_offsets_cpu = None
             self._dsa_current_positions_cpu = None
             self._dsa_valid_row_indices_cpu = None
             self._dsa_compact_req_indices_cpu = None
+            self._dsa_prompt_lens_cpu_tensor = None
             self._dsa_split_boundary_cpu_tensor = None
             self._dsa_req_indices_cpu_tensor = None
             self._dsa_row_offsets_cpu_tensor = None
             self._dsa_valid_row_indices_cpu_tensor = None
             self._dsa_compact_req_indices_cpu_tensor = None
+            self._dsa_prompt_lens = None
             self._dsa_split_boundary = None
             self._dsa_req_indices = None
             self._dsa_row_offsets = None
             self._dsa_selected_tokens = None
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
+            self._dsa_union_mapping = None
+            self._dsa_fixed_query_starts_cpu = None
+        self._dsa_fixed_layout_signature = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
@@ -1007,6 +1179,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_target_slot_mapping = None
         decode_selected_tokens = None
         decode_selected_counts = None
+        decode_union_mapping_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         decode_req_indices_cpu = None
@@ -1016,33 +1189,33 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         current_positions = None
         plens_cpu = common_attn_metadata.prompt_lens_cpu if self.dsa_shrink_latent else None
         if plens_cpu is not None:
+            assert self._dsa_prompt_lens_cpu is not None
             assert self._dsa_split_boundary_cpu is not None
             assert self._dsa_req_indices_cpu is not None
             assert self._dsa_row_offsets_cpu is not None
             assert self._dsa_current_positions_cpu is not None
             assert self._dsa_valid_row_indices_cpu is not None
             assert self._dsa_compact_req_indices_cpu is not None
+            assert self._dsa_prompt_lens_cpu_tensor is not None
             assert self._dsa_split_boundary_cpu_tensor is not None
             assert self._dsa_req_indices_cpu_tensor is not None
             assert self._dsa_row_offsets_cpu_tensor is not None
             assert self._dsa_valid_row_indices_cpu_tensor is not None
             assert self._dsa_compact_req_indices_cpu_tensor is not None
+            assert self._dsa_prompt_lens is not None
             assert self._dsa_split_boundary is not None
             assert self._dsa_req_indices is not None
             assert self._dsa_row_offsets is not None
 
-            rows = self._dsa_split_boundary_cpu[:num_input_tokens]
+            plens_cpu = np.asarray(plens_cpu, dtype=np.int32)
+            rows = self._dsa_prompt_lens_cpu[:num_input_tokens]
+            boundary_rows = self._dsa_split_boundary_cpu[:num_input_tokens]
             req_rows = self._dsa_req_indices_cpu[:num_input_tokens]
             row_offsets = self._dsa_row_offsets_cpu[:num_input_tokens]
             valid_rows = self._dsa_valid_row_indices_cpu[:num_input_tokens]
             compact_req_indices = self._dsa_compact_req_indices_cpu[
                 :num_input_tokens
             ]
-            rows.fill(0)
-            req_rows.fill(-1)
-            row_offsets.fill(0)
-            valid_rows.fill(0)
-            compact_req_indices.fill(-1)
             current_positions = (
                 self._dsa_current_positions_cpu[:num_input_tokens]
                 if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG and self.dsa_shrink_latent == 2
@@ -1051,45 +1224,184 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             if current_positions is not None:
                 current_positions.fill(0)
             n_real = min(len(plens_cpu), num_reqs)
-            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            for r in range(n_real):
-                s, e = int(qsl[r]), int(qsl[r + 1])
-                plen = int(plens_cpu[r])
-                first_decode = max(s, s + plen - int(computed[r]))
-                if first_decode < e:
-                    count = e - first_decode
-                    rows[first_decode:e] = plen
-                    req_rows[first_decode:e] = r
-                    computed_start = int(computed[r]) + first_decode - s
-                    for row_index in range(first_decode, e):
-                        offset = row_index - first_decode
-                        row_offsets[row_index] = offset
-                        compact_index = num_decode_rows + offset
-                        valid_rows[compact_index] = row_index
-                        compact_req_indices[compact_index] = r
-                        if current_positions is not None:
-                            current_positions[row_index] = computed_start + offset
-                    num_decode_rows += count
+            fixed_decode_width = 0
+            if (
+                common_attn_metadata.attn_state
+                == AscendAttentionState.DecodeOnly
+            ):
+                fixed_decode_width = 1
+            elif (
+                common_attn_metadata.attn_state
+                == AscendAttentionState.SpecDecoding
+            ):
+                fixed_decode_width = self.decode_threshold
+            if fixed_decode_width in (1, 2):
+                qsl = common_attn_metadata.query_start_loc_cpu[
+                    : n_real + 1
+                ].numpy()
+                assert self._dsa_fixed_query_starts_cpu is not None
+                fixed_query_starts = (
+                    self._dsa_fixed_query_starts_cpu[
+                        fixed_decode_width - 1,
+                        : n_real + 1,
+                    ]
+                )
+            else:
+                qsl = None
+                fixed_query_starts = None
+            fixed_width_decode = (
+                not self.enable_dsa_cp
+                and fixed_decode_width in (1, 2)
+                and num_input_tokens
+                == num_reqs * fixed_decode_width
+                and num_actual_tokens
+                == len(plens_cpu) * fixed_decode_width
+                and n_real == len(plens_cpu)
+                and np.all(computed >= plens_cpu[:n_real])
+                and np.array_equal(qsl, fixed_query_starts)
+            )
+            if fixed_width_decode:
+                num_decode_rows = num_actual_tokens
+                signature = (
+                    fixed_decode_width,
+                    num_input_tokens,
+                    tuple(common_attn_metadata.request_ids or ()),
+                    tuple(map(int, plens_cpu)),
+                )
+                if signature != self._dsa_fixed_layout_signature:
+                    rows.fill(0)
+                    rows[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = plens_cpu[:, None]
+                    boundary_rows[:] = rows
+                    req_rows.fill(-1)
+                    request_indices = np.arange(
+                        n_real,
+                        dtype=np.int32,
+                    )
+                    req_rows[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = request_indices[:, None]
+                    row_offsets.fill(0)
+                    row_offsets[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = np.arange(
+                        fixed_decode_width,
+                        dtype=np.int32,
+                    )
+                    valid_rows.fill(0)
+                    valid_rows[:num_decode_rows] = np.arange(
+                        num_decode_rows,
+                        dtype=np.int32,
+                    )
+                    compact_req_indices.fill(-1)
+                    compact_req_indices[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = request_indices[:, None]
+                    self._dsa_prompt_lens[:num_input_tokens].copy_(
+                        self._dsa_prompt_lens_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_split_boundary[:num_input_tokens].copy_(
+                        self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_req_indices[:num_input_tokens].copy_(
+                        self._dsa_req_indices_cpu_tensor[:num_input_tokens]
+                    )
+                    self._dsa_row_offsets[:num_input_tokens].copy_(
+                        self._dsa_row_offsets_cpu_tensor[:num_input_tokens]
+                    )
+                    self.decode_valid_row_indices[:num_decode_rows].copy_(
+                        self._dsa_valid_row_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self.decode_req_indices_compact[:num_decode_rows].copy_(
+                        self._dsa_compact_req_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self._dsa_fixed_layout_signature = signature
+                if current_positions is not None:
+                    current_positions[:num_decode_rows].reshape(
+                        n_real,
+                        fixed_decode_width,
+                    )[:] = (
+                        computed[:n_real, None]
+                        + np.arange(
+                            fixed_decode_width,
+                            dtype=np.int32,
+                        )
+                    )
+            else:
+                self._dsa_fixed_layout_signature = None
+                rows.fill(0)
+                boundary_rows.fill(0)
+                req_rows.fill(-1)
+                row_offsets.fill(0)
+                valid_rows.fill(0)
+                compact_req_indices.fill(-1)
+                qsl = common_attn_metadata.query_start_loc_cpu[
+                    : n_real + 1
+                ].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_cpu[r])
+                    first_decode = max(s, s + plen - int(computed[r]))
+                    if first_decode < e:
+                        count = e - first_decode
+                        rows[first_decode:e] = plen
+                        boundary_rows[first_decode:e] = plen
+                        req_rows[first_decode:e] = r
+                        computed_start = int(computed[r]) + first_decode - s
+                        for row_index in range(first_decode, e):
+                            offset = row_index - first_decode
+                            row_offsets[row_index] = offset
+                            compact_index = num_decode_rows + offset
+                            valid_rows[compact_index] = row_index
+                            compact_req_indices[compact_index] = r
+                            if current_positions is not None:
+                                current_positions[row_index] = (
+                                    computed_start + offset
+                                )
+                        num_decode_rows += count
+                self._dsa_prompt_lens[:num_input_tokens].copy_(
+                    self._dsa_prompt_lens_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_split_boundary[:num_input_tokens].copy_(
+                    self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_req_indices[:num_input_tokens].copy_(
+                    self._dsa_req_indices_cpu_tensor[:num_input_tokens]
+                )
+                self._dsa_row_offsets[:num_input_tokens].copy_(
+                    self._dsa_row_offsets_cpu_tensor[:num_input_tokens]
+                )
+                if num_decode_rows:
+                    self.decode_valid_row_indices[:num_decode_rows].copy_(
+                        self._dsa_valid_row_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
+                    self.decode_req_indices_compact[:num_decode_rows].copy_(
+                        self._dsa_compact_req_indices_cpu_tensor[
+                            :num_decode_rows
+                        ]
+                    )
 
-            split_boundary_cpu = rows
+            split_boundary_cpu = boundary_rows
             decode_req_indices_cpu = req_rows
             split_boundary_cpu_tensor = self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
-            self._dsa_split_boundary[:num_input_tokens].copy_(split_boundary_cpu_tensor)
-            self._dsa_req_indices[:num_input_tokens].copy_(self._dsa_req_indices_cpu_tensor[:num_input_tokens])
-            self._dsa_row_offsets[:num_input_tokens].copy_(self._dsa_row_offsets_cpu_tensor[:num_input_tokens])
             split_boundary_rows = self._dsa_split_boundary[:num_input_tokens]
-            prompt_lens_rows = split_boundary_rows
+            prompt_lens_rows = self._dsa_prompt_lens[:num_input_tokens]
             decode_req_indices_rows = self._dsa_req_indices[:num_input_tokens]
             row_offsets_rows = self._dsa_row_offsets[:num_input_tokens]
             decode_valid_rows_all = num_decode_rows == num_input_tokens
             if num_decode_rows:
-                self.decode_valid_row_indices[:num_decode_rows].copy_(
-                    self._dsa_valid_row_indices_cpu_tensor[:num_decode_rows]
-                )
-                self.decode_req_indices_compact[:num_decode_rows].copy_(
-                    self._dsa_compact_req_indices_cpu_tensor[:num_decode_rows]
-                )
                 decode_valid_row_indices = self.decode_valid_row_indices[
                     :num_decode_rows
                 ]
@@ -1107,6 +1419,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 assert self._dsa_target_slots is not None
                 assert self._dsa_selected_tokens is not None
                 assert self._dsa_selected_counts is not None
+                assert self._dsa_union_mapping is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = list(req_ids[:num_reqs])
@@ -1115,6 +1428,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_target_slot_mapping = self._dsa_target_slots[:num_reqs]
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
+                decode_union_mapping_workspace = self._dsa_union_mapping[
+                    :num_reqs
+                ]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -1242,6 +1558,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_target_slot_mapping=decode_target_slot_mapping,
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
+            decode_union_mapping_workspace=decode_union_mapping_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
@@ -1373,6 +1690,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
         # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        if self.dsa_shrink_latent and self.decode_threshold > 2:
+            raise ValueError(
+                "staged sparse-index preparation only supports MTP=1 or "
+                f"MTP=2; got MTP={self.decode_threshold}"
+            )
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
@@ -2105,6 +2427,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if authorized_key is None or authorized_key.token_capacity != token_capacity:
             return "the runner did not authorize this staged SFA token capacity"
         graph_key = authorized_key
+        if graph_key.max_query_len > 2:
+            return "staged sparse-index preparation only supports MTP=1 or MTP=2"
         if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1:
             if graph_key.max_query_len != 1 or graph_key.request_capacity != token_capacity:
                 return "the Q1 staged SFA graph key is structurally invalid"
@@ -2261,6 +2585,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             or attn_metadata.decode_target_slot_mapping is None
             or int(attn_metadata.decode_target_slot_mapping.shape[0])
             != graph_key.request_capacity
+            or attn_metadata.decode_union_mapping_workspace is None
+            or int(attn_metadata.decode_union_mapping_workspace.shape[0])
+            != graph_key.request_capacity
+            or attn_metadata.decode_union_mapping_workspace.shape
+            != attn_metadata.decode_selected_tokens.shape
         ):
             return "the request-union remap buffers do not match the graph key"
 
@@ -2307,7 +2636,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if (
             prompt_rows.size != token_capacity
-            or np.any(prompt_rows[:actual_rows] < self.index_topk)
             or np.any(prompt_rows[actual_rows:] != 0)
             or request_rows.size != token_capacity
             or not np.array_equal(request_rows, expected_request_rows)
@@ -2345,6 +2673,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
         target_slot_mapping: torch.Tensor,
+        local_to_union_workspace: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph."""
         assert self.fused_qkv_a_proj is not None
@@ -2414,6 +2743,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_size=self.block_size,
             need_packed=True,
             clear_invalid_rows=True,
+            local_to_union_workspace=local_to_union_workspace,
+            staged_mtp=int(topk_indices.shape[0])
+            // int(request_block_table.shape[0]),
         )
         assert selected_packed is not None
         assert selected_count_values is not None
@@ -2672,6 +3004,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed = attn_metadata.decode_selected_tokens
         selected_counts = attn_metadata.decode_selected_counts
         target_slots = attn_metadata.decode_target_slot_mapping
+        local_to_union_workspace = (
+            attn_metadata.decode_union_mapping_workspace
+        )
         if any(
             value is None
             for value in (
@@ -2679,6 +3014,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_packed,
                 selected_counts,
                 target_slots,
+                local_to_union_workspace,
             )
         ):
             raise RuntimeError("staged SFA request-union buffers are unavailable")
@@ -2700,6 +3036,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_packed,
             selected_counts,
             target_slots,
+            local_to_union_workspace,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -3166,6 +3503,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if _row_req_indices is None:
                 raise RuntimeError("DSA union remap requires row request indices")
             _selected_token_counts = attn_metadata.decode_selected_counts
+            _staged_mtp = _fixed_staged_decode_mtp(
+                attn_metadata.decode_req_indices_cpu,
+                int(attn_metadata.block_table.shape[0]),
+                _topk_rows,
+                pure_decode=_is_pure_decode,
+            )
             with _dsa_prof.section("prepare_sparse_indices"):
                 (
                     topk_indices,
@@ -3183,6 +3526,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     block_size=self.block_size,
                     need_packed=_need_packed,
                     clear_invalid_rows=_is_pure_decode,
+                    local_to_union_workspace=(
+                        attn_metadata.decode_union_mapping_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    staged_mtp=_staged_mtp,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None

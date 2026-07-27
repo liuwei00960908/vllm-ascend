@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -107,6 +108,107 @@ def test_sparse_boundary_short_frontier_preserves_zero_pad_semantics():
     assert actual.tolist() == [8, 0]
 
 
+def test_sparse_boundary_gathers_by_request_for_mtp_rows():
+    boundary_cpu = torch.tensor(
+        [11, 11, 22, 22],
+        dtype=torch.int32,
+    )
+    boundary = boundary_cpu.clone()
+    metadata = SimpleNamespace(
+        split_boundary=boundary,
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array(
+            [1, 0, 1, 0],
+            dtype=np.int32,
+        ),
+        seq_lens_cpu=torch.tensor([129, 257], dtype=torch.int32),
+        num_decode_tokens=4,
+        decode_split_boundary=None,
+    )
+
+    actual = _update_dsa_split_boundary_in_place(
+        metadata,
+        cached_tokens=[120, 240],
+        decode_window_size=0,
+    )
+
+    assert actual.tolist() == [240, 120, 240, 120]
+
+
+def test_sparse_boundary_gathers_decode_window_without_cached_frontier():
+    boundary_cpu = torch.tensor(
+        [11, 11, 22, 22, 0],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array(
+            [0, 0, 1, 1, -1],
+            dtype=np.int32,
+        ),
+        seq_lens_cpu=torch.tensor([513, 770], dtype=torch.int32),
+        num_decode_tokens=4,
+        decode_split_boundary=None,
+    )
+
+    actual = _update_dsa_split_boundary_in_place(
+        metadata,
+        cached_tokens=None,
+        decode_window_size=256,
+    )
+
+    assert actual.tolist() == [512, 512, 768, 768, 0]
+
+
+def test_sparse_boundary_rejects_request_outside_seq_lens():
+    boundary_cpu = torch.tensor([11, 22], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array([0, 2], dtype=np.int32),
+        seq_lens_cpu=torch.tensor([513, 770], dtype=torch.int32),
+        num_decode_tokens=2,
+        decode_split_boundary=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="request outside seq_lens",
+    ):
+        _update_dsa_split_boundary_in_place(
+            metadata,
+            cached_tokens=[512, 768],
+            decode_window_size=0,
+        )
+
+
+def test_sparse_boundary_rejects_empty_frontiers_with_decode_rows():
+    boundary_cpu = torch.tensor([11], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array([0], dtype=np.int32),
+        seq_lens_cpu=torch.tensor([513], dtype=torch.int32),
+        num_decode_tokens=1,
+        decode_split_boundary=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="no request boundaries",
+    ):
+        _update_dsa_split_boundary_in_place(
+            metadata,
+            cached_tokens=[],
+            decode_window_size=0,
+        )
+
+
 def test_sparse_boundary_prefers_explicit_committed_end():
     from vllm_ascend.attention import utils as attention_utils
 
@@ -132,7 +234,12 @@ def test_sparse_boundary_prefers_explicit_committed_end():
             ),
         ]
     )
-    connector = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    connector = SimpleNamespace(
+        supports_staged_sfa_sparse_load=True,
+        uses_layerwise_model_callbacks=True,
+        wait_for_layer_load=lambda *_args, **_kwargs: None,
+        _get_connector_metadata=lambda: metadata,
+    )
     with (
         patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
         patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
@@ -503,6 +610,53 @@ class TestLMCacheSparseFrontier(TestBase):
                 scratch_capacity=8,
             )
 
+    def test_fixed_staged_decode_layout_selects_q1_and_mtp2(self):
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 1, 2],
+                3,
+                3,
+                pure_decode=True,
+            ),
+            1,
+        )
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, 1, 1],
+                2,
+                4,
+                pure_decode=True,
+            ),
+            2,
+        )
+
+    def test_fixed_staged_decode_layout_falls_back_for_mixed_or_irregular(self):
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, -1, 1],
+                2,
+                3,
+                pure_decode=False,
+            )
+        )
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 1, 0, 1],
+                2,
+                4,
+                pure_decode=True,
+            )
+        )
+
+    def test_fixed_staged_decode_layout_rejects_mtp_above_two(self):
+        with self.assertRaisesRegex(RuntimeError, "got MTP=3"):
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, 0, 1, 1, 1],
+                2,
+                6,
+                pure_decode=True,
+            )
+
 
 class TestStagedSFAGraphPoc(TestBase):
     def setUp(self):
@@ -527,6 +681,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl.dsa_shrink_latent = 2
         impl.num_kv_heads = 1
+        impl.local_num_heads = 2
         impl.kv_lora_rank = 2
         impl.qk_rope_head_dim = 2
         impl.head_dim = 2
@@ -620,7 +775,7 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_scratch_base_compact = None
         metadata.decode_scratch_base_cpu = [0] * batch_size
-        metadata.decode_scratch_capacity = 128
+        metadata.decode_scratch_capacity = 4
         metadata.decode_selected_tokens = torch.empty(
             batch_size, 4, dtype=torch.int32
         )
@@ -629,6 +784,9 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_target_slot_mapping = torch.empty(
             batch_size, 4, dtype=torch.long
+        )
+        metadata.decode_union_mapping_workspace = torch.empty(
+            batch_size, 4, dtype=torch.int32
         )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
@@ -719,7 +877,10 @@ class TestStagedSFAGraphPoc(TestBase):
             patch.object(
                 sfa_v1,
                 "get_forward_context",
-                side_effect=contexts,
+                # The eager call resolves the context once in graph_pre and
+                # once more while allocating its fixed bridge storage. Replay
+                # reuses that storage and resolves the context only once.
+                side_effect=(contexts[0], contexts[0], contexts[1]),
             ),
             patch.object(
                 sfa_v1,
@@ -751,7 +912,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
-            impl._cross_layer_pre_compute.call_args_list[1].args[-6],
+            impl._cross_layer_pre_compute.call_args_list[1].args[-7],
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
@@ -808,7 +969,9 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         args = impl._cross_layer_pre_compute.call_args.args
-        self.assertEqual(args[-5].tolist(), [0, 1, 2, 3])
+        # The graph keeps four fixed rows, while -1 prevents its three
+        # padding rows from participating in the request-level union.
+        self.assertEqual(args[-6].tolist(), [0, -1, -1, -1])
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -895,10 +1058,11 @@ class TestStagedSFAGraphPoc(TestBase):
             runtime=("layer-0",),
         )
         bridge = tuple(torch.empty(4) for _ in range(6))
+        first_cache = self._make_eligible_kv_cache()
         state.register(
             STAGED_SFA_SINGLETON_GRAPH_KEY,
             bridge,
-            self._make_eligible_kv_cache(),
+            first_cache,
         )
 
         with self.assertRaisesRegex(
@@ -1283,6 +1447,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0, 1, 1]
         metadata.seq_lens_cpu = torch.tensor([110, 210])
         metadata.decode_scratch_base_cpu = [0, 4, 0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(4, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
@@ -1307,6 +1472,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0]
         metadata.seq_lens_cpu = torch.tensor([110])
         metadata.decode_scratch_base_cpu = [0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(2, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
@@ -1414,6 +1580,13 @@ class TestStagedSFAGraphPoc(TestBase):
                         metadata,
                     )
                     self.assertIsNone(reason)
+            metadata.prompt_lens_cpu_rows = [1]
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(dtype=torch.bfloat16),
+                metadata,
+            )
+            self.assertIsNone(reason)
             metadata.need_sparse_lmcache_payload = False
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),
@@ -1502,6 +1675,9 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_target_slot_mapping = torch.empty(
             2, 8, dtype=torch.long
+        )
+        metadata.decode_union_mapping_workspace = torch.empty(
+            2, 8, dtype=torch.int32
         )
         graph_key = StagedSFAGraphKey.fixed_spec(2, 2)
         context = SimpleNamespace(
@@ -2001,6 +2177,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             first.decode_selected_tokens.data_ptr(),
             first.decode_selected_counts.data_ptr(),
             first.decode_target_slot_mapping.data_ptr(),
+            first.decode_union_mapping_workspace.data_ptr(),
         )
         assert first.decode_req_indices.tolist() == [0, 0, 1, 1]
         assert first.decode_row_offsets.tolist() == [0, 1, 0, 1]
@@ -2022,6 +2199,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             second.decode_selected_tokens.data_ptr(),
             second.decode_selected_counts.data_ptr(),
             second.decode_target_slot_mapping.data_ptr(),
+            second.decode_union_mapping_workspace.data_ptr(),
         )
 
         assert second_addresses == addresses
@@ -2200,3 +2378,296 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+    @patch("vllm_ascend.attention.sfa_v1.staged_sfa_connector_supports_sparse_load", return_value=True)
+    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
+    def test_q1_sparse_rows_reuse_builder_storage(self, mock_get_cos_and_sin_mla, _):
+        vllm_config = MagicMock()
+        vllm_config.cache_config.block_size = 16
+        vllm_config.model_config.max_model_len = 1024
+        vllm_config.model_config.get_head_size.return_value = 64
+        vllm_config.model_config.dtype = torch.float16
+        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
+        vllm_config.model_config.hf_text_config.topk_tokens = 32
+        vllm_config.speculative_config = None
+        vllm_config.scheduler_config.max_num_seqs = 4
+        vllm_config.scheduler_config.max_num_batched_tokens = 4
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_DSA_UNBUNDLE": "1",
+                "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
+            },
+        ):
+            builder = AscendSFAMetadataBuilder(
+                kv_cache_spec=MagicMock(),
+                layer_names=["layer1"],
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+            )
+        builder.enable_dsa_cp = False
+
+        common = MagicMock()
+        common.num_reqs = 4
+        common.num_actual_tokens = 2
+        common.num_input_tokens = 4
+        common.block_table_tensor = torch.zeros((4, 4), dtype=torch.int32)
+        common.slot_mapping = torch.arange(4, dtype=torch.int32)
+        common.positions = torch.arange(4, dtype=torch.long)
+        common.indexer_block_table_tensor = None
+        common.indexer_slot_mapping = None
+        common.prompt_lens_cpu = np.array([128, 256], dtype=np.int32)
+        common.request_ids = ["req0", "req1"]
+        common.query_start_loc = torch.arange(5, dtype=torch.int32)
+        common.query_start_loc_cpu = torch.arange(5, dtype=torch.int32)
+        common.num_computed_tokens_cpu = torch.tensor([128, 256, 0, 0], dtype=torch.int32)
+        common.seq_lens = torch.tensor([129, 257, 0, 0], dtype=torch.int32)
+        common.seq_lens_cpu = common.seq_lens.cpu()
+        common.attn_state = AscendAttentionState.DecodeOnly
+        mock_get_cos_and_sin_mla.return_value = (
+            torch.zeros((4, 1)),
+            torch.zeros((4, 1)),
+        )
+
+        first = builder.build(0, common)
+        prompt_lens_version = first.prompt_lens._version
+        second = builder.build(0, common)
+
+        self.assertEqual(first.prompt_lens.data_ptr(), second.prompt_lens.data_ptr())
+        self.assertEqual(first.decode_req_indices.data_ptr(), second.decode_req_indices.data_ptr())
+        self.assertEqual(second.prompt_lens._version, prompt_lens_version)
+        torch.testing.assert_close(
+            second.prompt_lens,
+            torch.tensor([128, 256, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_req_indices,
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+        self.assertFalse(second.decode_valid_rows_all)
+
+        common.num_computed_tokens_cpu = torch.tensor([127, 256, 0, 0], dtype=torch.int32)
+        prompt_remainder = builder.build(0, common)
+
+        self.assertEqual(prompt_remainder.num_decode_tokens, 1)
+        torch.testing.assert_close(
+            prompt_remainder.decode_valid_row_indices,
+            torch.tensor([1], dtype=torch.int32),
+        )
+
+        common.num_computed_tokens_cpu = torch.tensor([128, 384, 0, 0], dtype=torch.int32)
+        common.prompt_lens_cpu = np.array([128, 384], dtype=np.int32)
+        common.request_ids = ["req0", "req2"]
+        updated = builder.build(0, common)
+
+        self.assertEqual(first.prompt_lens.data_ptr(), updated.prompt_lens.data_ptr())
+        self.assertGreater(updated.prompt_lens._version, prompt_lens_version)
+        torch.testing.assert_close(
+            updated.prompt_lens,
+            torch.tensor([128, 384, 0, 0], dtype=torch.int32),
+        )
+        self.assertEqual(updated.decode_request_ids_compact, ["req0", "req2"])
+
+        common.attn_state = AscendAttentionState.ChunkedPrefill
+        common.num_actual_tokens = 4
+        common.query_start_loc = torch.tensor([0, 2, 4, 4, 4], dtype=torch.int32)
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        common.num_computed_tokens_cpu = torch.tensor([127, 383, 0, 0], dtype=torch.int32)
+        builder.build(0, common)
+
+        common.attn_state = AscendAttentionState.DecodeOnly
+        common.num_actual_tokens = 2
+        common.query_start_loc = torch.arange(5, dtype=torch.int32)
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        common.num_computed_tokens_cpu = torch.tensor([128, 384, 0, 0], dtype=torch.int32)
+        restored = builder.build(0, common)
+
+        torch.testing.assert_close(
+            restored.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+
+    @patch("vllm_ascend.attention.sfa_v1.staged_sfa_connector_supports_sparse_load", return_value=True)
+    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
+    def test_mtp2_sparse_rows_reuse_fixed_layout_storage(self, mock_get_cos_and_sin_mla, _):
+        vllm_config = MagicMock()
+        vllm_config.cache_config.block_size = 16
+        vllm_config.model_config.max_model_len = 1024
+        vllm_config.model_config.get_head_size.return_value = 64
+        vllm_config.model_config.dtype = torch.float16
+        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
+        vllm_config.model_config.hf_text_config.topk_tokens = 32
+        vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        vllm_config.scheduler_config.max_num_seqs = 2
+        vllm_config.scheduler_config.max_num_batched_tokens = 4
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_DSA_UNBUNDLE": "1",
+                "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
+            },
+        ):
+            builder = AscendSFAMetadataBuilder(
+                kv_cache_spec=MagicMock(),
+                layer_names=["layer1"],
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+            )
+        builder.enable_dsa_cp = False
+
+        common = MagicMock()
+        common.num_reqs = 2
+        common.num_actual_tokens = 2
+        common.num_input_tokens = 4
+        common.block_table_tensor = torch.zeros((2, 4), dtype=torch.int32)
+        common.slot_mapping = torch.arange(4, dtype=torch.int32)
+        common.positions = torch.arange(4, dtype=torch.long)
+        common.indexer_block_table_tensor = None
+        common.indexer_slot_mapping = None
+        common.prompt_lens_cpu = np.array([128], dtype=np.int32)
+        common.request_ids = ["req0"]
+        common.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        common.num_computed_tokens_cpu = torch.tensor(
+            [128, 0],
+            dtype=torch.int32,
+        )
+        common.seq_lens = torch.tensor([130, 0], dtype=torch.int32)
+        common.seq_lens_cpu = common.seq_lens.cpu()
+        common.attn_state = AscendAttentionState.SpecDecoding
+        mock_get_cos_and_sin_mla.return_value = (
+            torch.zeros((4, 1)),
+            torch.zeros((4, 1)),
+        )
+
+        first = builder.build(0, common)
+        prompt_lens_version = first.prompt_lens._version
+        request_rows_version = first.decode_req_indices._version
+        row_offsets_version = first.decode_row_offsets._version
+        second = builder.build(0, common)
+
+        self.assertEqual(
+            first.prompt_lens.data_ptr(),
+            second.prompt_lens.data_ptr(),
+        )
+        self.assertEqual(
+            second.prompt_lens._version,
+            prompt_lens_version,
+        )
+        self.assertEqual(
+            second.decode_req_indices._version,
+            request_rows_version,
+        )
+        self.assertEqual(
+            second.decode_row_offsets._version,
+            row_offsets_version,
+        )
+        torch.testing.assert_close(
+            second.prompt_lens,
+            torch.tensor([128, 128, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_req_indices,
+            torch.tensor([0, 0, -1, -1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_row_offsets,
+            torch.tensor([0, 1, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_req_indices_compact,
+            torch.tensor([0, 0], dtype=torch.int32),
+        )
+        self.assertFalse(second.decode_valid_rows_all)
+
+        common.prompt_lens_cpu = np.array([160], dtype=np.int32)
+        common.request_ids = ["req1"]
+        common.num_computed_tokens_cpu = torch.tensor(
+            [160, 0],
+            dtype=torch.int32,
+        )
+        common.seq_lens = torch.tensor([162, 0], dtype=torch.int32)
+        common.seq_lens_cpu = common.seq_lens.cpu()
+        updated = builder.build(0, common)
+
+        self.assertGreater(
+            updated.prompt_lens._version,
+            prompt_lens_version,
+        )
+        torch.testing.assert_close(
+            updated.prompt_lens,
+            torch.tensor([160, 160, 0, 0], dtype=torch.int32),
+        )
+        self.assertEqual(
+            updated.decode_request_ids_compact,
+            ["req1"],
+        )
+
+        common.num_computed_tokens_cpu = torch.tensor(
+            [159, 0],
+            dtype=torch.int32,
+        )
+        prompt_remainder = builder.build(0, common)
+
+        self.assertEqual(prompt_remainder.num_decode_tokens, 1)
+        torch.testing.assert_close(
+            prompt_remainder.decode_valid_row_indices,
+            torch.tensor([1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            prompt_remainder.decode_req_indices,
+            torch.tensor([-1, 0, -1, -1], dtype=torch.int32),
+        )
+
+        common.num_computed_tokens_cpu = torch.tensor(
+            [160, 0],
+            dtype=torch.int32,
+        )
+        restored = builder.build(0, common)
+
+        self.assertEqual(restored.num_decode_tokens, 2)
+        torch.testing.assert_close(
+            restored.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            restored.decode_req_indices,
+            torch.tensor([0, 0, -1, -1], dtype=torch.int32),
+        )
+
+        common.attn_state = AscendAttentionState.SpecDecoding
+        common.num_actual_tokens = 1
+        common.num_input_tokens = 2
+        common.slot_mapping = torch.arange(2, dtype=torch.int32)
+        common.positions = torch.arange(2, dtype=torch.long)
+        common.query_start_loc = torch.tensor(
+            [0, 1, 2],
+            dtype=torch.int32,
+        )
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        mock_get_cos_and_sin_mla.return_value = (
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1)),
+        )
+        single_row_mtp_step = builder.build(0, common)
+
+        self.assertEqual(single_row_mtp_step.num_decode_tokens, 1)
+        torch.testing.assert_close(
+            single_row_mtp_step.decode_req_indices,
+            torch.tensor([0, -1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            single_row_mtp_step.decode_valid_row_indices,
+            torch.tensor([0], dtype=torch.int32),
+        )

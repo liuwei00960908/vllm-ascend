@@ -25,6 +25,133 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestFixedDecodeLayoutArrays(unittest.TestCase):
+    def test_q1_layout_is_identity(self):
+        req_indices, offsets, cumulative = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                1,
+                np.dtype(np.int64),
+            )
+        )
+
+        np.testing.assert_array_equal(
+            req_indices,
+            np.array([0, 1, 2], dtype=np.int64),
+        )
+        np.testing.assert_array_equal(
+            offsets,
+            np.zeros(3, dtype=np.int64),
+        )
+        np.testing.assert_array_equal(
+            cumulative,
+            np.array([1, 2, 3], dtype=np.int64),
+        )
+
+    def test_mtp2_layout_is_request_major(self):
+        req_indices, offsets, cumulative = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                2,
+                np.dtype(np.int32),
+            )
+        )
+
+        np.testing.assert_array_equal(
+            req_indices,
+            np.array([0, 0, 1, 1, 2, 2], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            offsets,
+            np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            cumulative,
+            np.array([2, 4, 6], dtype=np.int32),
+        )
+
+    def test_layout_rejects_mtp_above_two(self):
+        with self.assertRaisesRegex(ValueError, "MTP=3"):
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                3,
+                np.dtype(np.int32),
+            )
+
+    def test_layout_rejects_empty_request_capacity(self):
+        with self.assertRaisesRegex(ValueError, "requests=0"):
+            model_runner_module._fixed_decode_layout_arrays(
+                0,
+                2,
+                np.dtype(np.int32),
+            )
+
+    def test_mtp2_positions_follow_each_request_frontier(self):
+        positions = np.empty(6, dtype=np.int64)
+        _, offsets, _ = (
+            model_runner_module._fixed_decode_layout_arrays(
+                3,
+                2,
+                np.dtype(np.int64),
+            )
+        )
+
+        model_runner_module._fill_fixed_decode_positions(
+            positions,
+            np.array([100, 200, 300], dtype=np.int64),
+            offsets,
+            3,
+            2,
+        )
+
+        np.testing.assert_array_equal(
+            positions,
+            np.array([100, 101, 200, 201, 300, 301]),
+        )
+
+    def test_positions_reject_mismatched_buffers(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "do not match",
+        ):
+            model_runner_module._fill_fixed_decode_positions(
+                np.empty(3, dtype=np.int64),
+                np.array([100, 200], dtype=np.int64),
+                np.array([0, 1, 0, 1], dtype=np.int64),
+                2,
+                2,
+            )
+
+
+class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
+    def test_short_synthetic_sequences_use_no_remap_sentinel(self):
+        for query_width, seq_lens, expected in (
+            (
+                1,
+                [1, 2048, 2049, 4097],
+                [0, 0, 2048, 4096],
+            ),
+            (
+                2,
+                [2, 4097, 4098, 8194],
+                [0, 0, 4096, 8192],
+            ),
+        ):
+            with self.subTest(query_width=query_width):
+                boundaries = (
+                    model_runner_module
+                    ._staged_sfa_dummy_remap_boundaries(
+                        np.asarray(seq_lens, dtype=np.int32),
+                        query_width,
+                        2048,
+                    )
+                )
+                np.testing.assert_array_equal(
+                    boundaries,
+                    np.asarray(expected, dtype=np.int32),
+                )
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -178,6 +305,52 @@ class TestStagedSFAGraphKey(unittest.TestCase):
     def test_fixed_spec_rejects_q1_width(self):
         with self.assertRaises(ValueError):
             StagedSFAGraphKey.fixed_spec(4, 1)
+
+
+class TestQueryStartPadding(unittest.TestCase):
+    @staticmethod
+    def _build_runner():
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.uniform_decode_query_len = 1
+        runner.compilation_config = SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        runner.arange_np = np.arange(8, dtype=np.int32)
+        runner.query_start_loc = SimpleNamespace(
+            np=np.array([0, 1, 2, -1, -1, -1, -1, -1], dtype=np.int32),
+            copy_to_gpu=MagicMock(),
+        )
+        return runner
+
+    def test_exact_q1_capacity_reuses_uploaded_query_starts(self):
+        runner = self._build_runner()
+
+        padded_reqs = runner._pad_query_start_loc_for_fia(
+            num_tokens_padded=2,
+            num_reqs_padded=2,
+            num_reqs=2,
+            batch_desc_num_reqs=2,
+        )
+
+        self.assertEqual(padded_reqs, 2)
+        runner.query_start_loc.copy_to_gpu.assert_not_called()
+
+    def test_padded_q1_capacity_uploads_padding(self):
+        runner = self._build_runner()
+
+        padded_reqs = runner._pad_query_start_loc_for_fia(
+            num_tokens_padded=4,
+            num_reqs_padded=4,
+            num_reqs=2,
+            batch_desc_num_reqs=4,
+        )
+
+        self.assertEqual(padded_reqs, 4)
+        np.testing.assert_array_equal(
+            runner.query_start_loc.np[:5],
+            np.arange(5, dtype=np.int32),
+        )
+        runner.query_start_loc.copy_to_gpu.assert_called_once_with()
 
 
 class TestStagedSFADummyBatch(unittest.TestCase):
@@ -453,7 +626,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "num_tokens_unpadded": 4,
             "num_reqs": 4,
             "num_scheduled_tokens": np.ones(4, dtype=np.int32),
-            "prompt_lens": np.full(4, 4096, dtype=np.int32),
             "index_topk": 2048,
             "has_cascade_attention": False,
             "request_ids": request_ids,
@@ -507,7 +679,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 num_tokens_unpadded=1,
                 num_reqs=1,
                 num_scheduled_tokens=np.ones(1, dtype=np.int32),
-                prompt_lens=np.full(1, 4096, dtype=np.int32),
                 request_ids=request_ids[:1],
                 kv_connector_metadata=SimpleNamespace(requests=local_kwargs["kv_connector_metadata"].requests[:1]),
             )
@@ -532,11 +703,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "cascade": {"has_cascade_attention": True},
-                "resident_short_prompt": {
-                    "prompt_lens": np.array([4096, 2047, 4096, 4096]),
-                },
                 "dense_prefix_hit": {
-                    "prompt_lens": np.full(4, 1, dtype=np.int32),
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
                             SimpleNamespace(
@@ -588,8 +755,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         (
                             StagedSFARouteAction.FATAL
                             if name == "short_frontier"
-                            else StagedSFARouteAction.STAGED
-                            if name == "resident_short_prompt"
                             else StagedSFARouteAction.SAFE_NATIVE
                         ),
                     )
@@ -741,7 +906,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             num_tokens_unpadded=4,
             num_reqs=2,
             num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
-            prompt_lens=np.full(2, 4096, dtype=np.int32),
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
@@ -779,7 +943,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             num_tokens_unpadded=1,
             num_reqs=1,
             num_scheduled_tokens=np.ones(1, dtype=np.int32),
-            prompt_lens=np.array([257], dtype=np.int32),
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,

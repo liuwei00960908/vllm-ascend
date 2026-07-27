@@ -524,6 +524,46 @@ class TestPrepareSparseIndices:
                 block_size=64,
             )
 
+    def test_public_staged_prepare_rejects_mtp_above_two_before_dispatch(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        with pytest.raises(RuntimeError, match="got MTP=3"):
+            prepare_sparse_indices(
+                torch.zeros((3, 2048), dtype=torch.int32),
+                torch.zeros(3, dtype=torch.int32),
+                row_req_indices=torch.zeros(3, dtype=torch.int32),
+                request_block_table=torch.zeros((1, 32), dtype=torch.int32),
+                selected_packed=torch.zeros((1, 6144), dtype=torch.int32),
+                selected_counts=torch.zeros((1, 16), dtype=torch.int32),
+                target_slot_mapping=torch.zeros((1, 6144), dtype=torch.long),
+                block_size=128,
+                staged_mtp=3,
+            )
+
+    def test_public_staged_prepare_requires_caller_owned_workspace(self):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        with pytest.raises(ValueError, match="local_to_union_workspace"):
+            prepare_sparse_indices(
+                torch.zeros((2, 2048), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+                row_req_indices=torch.zeros(2, dtype=torch.int32),
+                request_block_table=torch.zeros((1, 32), dtype=torch.int32),
+                selected_packed=torch.zeros((1, 4096), dtype=torch.int32),
+                selected_counts=torch.zeros((1, 16), dtype=torch.int32),
+                target_slot_mapping=torch.zeros((1, 4096), dtype=torch.long),
+                block_size=128,
+                staged_mtp=2,
+            )
+
     def test_mtp_request_union_deduplicates_without_touching_live_indices(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
             _prepare_sparse_indices_torch as prepare_sparse_indices,
@@ -545,6 +585,27 @@ class TestPrepareSparseIndices:
         assert packed[0, :3].tolist() == [1, 2, 3]
         assert targets[0, :3].tolist() == [20, 21, 22]
         assert all(index >= 4 for row in remapped for index in row if index >= 3)
+
+    def test_zero_boundary_keeps_absolute_indices_and_selects_nothing(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_torch as prepare_sparse_indices,
+        )
+
+        topk = torch.tensor(
+            [[0, 1, 7, 8], [1, 0, 8, 9]],
+            dtype=torch.int32,
+        )
+        remapped, packed, counts, _ = prepare_sparse_indices(
+            topk,
+            torch.zeros(2, dtype=torch.int32),
+            row_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+            request_block_table=torch.tensor([[10, 11, 12, 13, 14]]),
+            block_size=2,
+        )
+
+        torch.testing.assert_close(remapped, topk)
+        assert counts.tolist() == [0]
+        assert torch.count_nonzero(packed).item() == 0
 
     def test_short_committed_prefix_cannot_overwrite_live_npu_cache(self):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
