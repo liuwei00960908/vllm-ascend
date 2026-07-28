@@ -481,6 +481,96 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
     )
 
 
+_FINAL_HIDDEN_PROBE_SAMPLE_INDICES = (0, 1, 7, 31, 63, 127, 255, 511, 1023)
+
+
+def _final_hidden_probe_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    """Summarize a CPU tensor without treating NaNs as equal values."""
+    if tensor.device.type != "cpu":
+        raise ValueError("Final-hidden probe tensors must be on CPU")
+
+    tensor = tensor.detach().contiguous()
+    flat = tensor.reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_values = flat[finite]
+    sample_indices = [
+        index for index in _FINAL_HIDDEN_PROBE_SAMPLE_INDICES if index < flat.numel()
+    ]
+    if flat.numel() and flat.numel() - 1 not in sample_indices:
+        sample_indices.append(flat.numel() - 1)
+    raw = tensor.view(torch.uint8).numpy().tobytes()
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "numel": tensor.numel(),
+        "finite_count": int(finite.sum()),
+        "nan_count": int(torch.isnan(flat).sum()),
+        "posinf_count": int(torch.isposinf(flat).sum()),
+        "neginf_count": int(torch.isneginf(flat).sum()),
+        "finite_abs_max": (
+            float(finite_values.float().abs().max())
+            if finite_values.numel()
+            else None
+        ),
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "fixed_samples": {
+            index: float(flat[index].float()) for index in sample_indices
+        },
+    }
+
+
+def _final_hidden_probe_tensor_compare(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+) -> dict[str, Any]:
+    """Compare CPU tensors while reporting NaN and infinity masks separately."""
+    if lhs.device.type != "cpu" or rhs.device.type != "cpu":
+        raise ValueError("Final-hidden probe tensors must be on CPU")
+
+    lhs = lhs.detach().contiguous()
+    rhs = rhs.detach().contiguous()
+    result = {
+        "shape_match": tuple(lhs.shape) == tuple(rhs.shape),
+        "dtype_match": lhs.dtype == rhs.dtype,
+        "raw_hash_equal": (
+            hashlib.sha256(lhs.view(torch.uint8).numpy().tobytes()).hexdigest()
+            == hashlib.sha256(rhs.view(torch.uint8).numpy().tobytes()).hexdigest()
+        ),
+    }
+    if not result["shape_match"] or not result["dtype_match"]:
+        return result
+
+    lhs_flat = lhs.reshape(-1)
+    rhs_flat = rhs.reshape(-1)
+    lhs_nan = torch.isnan(lhs_flat)
+    rhs_nan = torch.isnan(rhs_flat)
+    lhs_posinf = torch.isposinf(lhs_flat)
+    rhs_posinf = torch.isposinf(rhs_flat)
+    lhs_neginf = torch.isneginf(lhs_flat)
+    rhs_neginf = torch.isneginf(rhs_flat)
+    finite = torch.isfinite(lhs_flat) & torch.isfinite(rhs_flat)
+    result.update(
+        {
+            "nan_mask_equal": bool(torch.equal(lhs_nan, rhs_nan)),
+            "posinf_mask_equal": bool(torch.equal(lhs_posinf, rhs_posinf)),
+            "neginf_mask_equal": bool(torch.equal(lhs_neginf, rhs_neginf)),
+            "finite_value_exact": bool(
+                torch.equal(lhs_flat[finite], rhs_flat[finite])
+            ),
+            "finite_max_abs_diff": (
+                float(
+                    (lhs_flat[finite].float() - rhs_flat[finite].float())
+                    .abs()
+                    .max()
+                )
+                if bool(finite.any())
+                else None
+            ),
+        }
+    )
+    return result
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -1547,6 +1637,239 @@ class NPUModelRunner(GPUModelRunner):
             )
         return final_hidden_states
 
+    def _capture_final_hidden_producer_probe(
+        self,
+        *,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        cudagraph_mode: CUDAGraphMode,
+        staged_sfa_graph_key: StagedSFAGraphKey | None,
+    ) -> None:
+        """Freeze one final-prefill sample from each P request mode."""
+        if (
+            not envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
+            or not self._is_final_hidden_output_rank()
+            or scheduler_output.bootstrap_sample_req_ids
+        ):
+            return
+
+        captured_req_ids = scheduler_output.capture_final_hidden_req_ids or set()
+        prior_results = getattr(self, "_final_hidden_producer_probe_results", {})
+        pending_records = []
+        pending_modes: set[str] = set()
+        cumulative_scheduled_tokens = 0
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            cumulative_scheduled_tokens += scheduled_tokens
+            prompt_tokens = int(self.input_batch.num_prompt_tokens[req_idx])
+            computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            completes_prompt = (
+                computed_before < prompt_tokens
+                and prompt_tokens <= computed_before + scheduled_tokens
+            )
+            if req_idx >= sample_hidden_states.shape[0] or not completes_prompt:
+                continue
+
+            mode = "final_hidden" if req_id in captured_req_ids else "normal_sampling"
+            if mode in prior_results or mode in pending_modes:
+                continue
+
+            capture_row_index = (
+                cumulative_scheduled_tokens - 1
+                if mode == "final_hidden"
+                else None
+            )
+            prompt_token_ids = self.input_batch.token_ids_cpu[
+                req_idx, :prompt_tokens
+            ]
+            pending_modes.add(mode)
+            pending_records.append(
+                {
+                    "mode": mode,
+                    "request_id": req_id,
+                    "request_index": req_idx,
+                    "prompt_tokens": prompt_tokens,
+                    "prompt_sha256": hashlib.sha256(
+                        prompt_token_ids.tobytes()
+                    ).hexdigest(),
+                    "computed_tokens_before": computed_before,
+                    "scheduled_tokens": scheduled_tokens,
+                    "num_tokens_unpadded": num_tokens_unpadded,
+                    "num_tokens_padded": num_tokens_padded,
+                    "hidden_shape": tuple(hidden_states.shape),
+                    "cudagraph_mode": str(cudagraph_mode),
+                    "staged_sfa_graph_key": repr(staged_sfa_graph_key),
+                    "sample_row_index": logits_indices[req_idx].detach().clone(),
+                    "capture_row_index": capture_row_index,
+                    "hidden": sample_hidden_states[req_idx].detach().clone(),
+                    "captured_hidden": (
+                        hidden_states[capture_row_index].detach().clone()
+                        if capture_row_index is not None
+                        else None
+                    ),
+                }
+            )
+        if pending_records:
+            setattr(
+                scheduler_output,
+                "_final_hidden_producer_probe_records",
+                pending_records,
+            )
+
+    def _complete_final_hidden_producer_probe(
+        self,
+        scheduler_output: "SchedulerOutput",
+        logits: torch.Tensor | None,
+    ) -> None:
+        """Freeze LM-head outputs before sampling mutates bookkeeping state."""
+        records = getattr(
+            scheduler_output,
+            "_final_hidden_producer_probe_records",
+            None,
+        )
+        if not records:
+            return
+        if logits is None:
+            delattr(scheduler_output, "_final_hidden_producer_probe_records")
+            logger.warning(
+                "[FINAL_HIDDEN_P_PROBE] skipping probe because the output rank "
+                "did not produce logits."
+            )
+            return
+        for record in records:
+            req_idx = record["request_index"]
+            record["logits"] = logits[req_idx].detach().clone()
+            record["top_ids"] = torch.topk(
+                logits[req_idx], k=min(5, logits.shape[-1])
+            ).indices.detach().clone()
+
+    def _finalize_final_hidden_producer_probe(
+        self,
+        scheduler_output: "SchedulerOutput",
+        valid_sampled_token_ids: list[list[int]],
+    ) -> None:
+        """Log P probe snapshots after sampling has completed."""
+        records = getattr(
+            scheduler_output,
+            "_final_hidden_producer_probe_records",
+            None,
+        )
+        if not records:
+            return
+
+        results = getattr(self, "_final_hidden_producer_probe_results", {})
+        for record in records:
+            mode = record["mode"]
+            if mode in results:
+                continue
+            req_idx = record.pop("request_index")
+            hidden = record.pop("hidden").to("cpu")
+            logits = record.pop("logits").to("cpu")
+            sample_row_index = int(record.pop("sample_row_index").to("cpu"))
+            top_ids = record.pop("top_ids").to("cpu").tolist()
+            captured_hidden = record.pop("captured_hidden")
+            capture_sample = None
+            if captured_hidden is not None:
+                capture_sample = _final_hidden_probe_tensor_compare(
+                    captured_hidden.to("cpu"), hidden
+                )
+            record.update(
+                {
+                    "sample_row_index": sample_row_index,
+                    "capture_sample_row_match": (
+                        record["capture_row_index"] == sample_row_index
+                    ),
+                    "capture_sample": capture_sample,
+                    "hidden_summary": _final_hidden_probe_tensor_summary(hidden),
+                    "logits_summary": _final_hidden_probe_tensor_summary(logits),
+                    "top_ids": top_ids,
+                    "sampled_tokens": (
+                        valid_sampled_token_ids[req_idx]
+                        if req_idx < len(valid_sampled_token_ids)
+                        else []
+                    ),
+                    "_hidden": hidden,
+                    "_logits": logits,
+                }
+            )
+            results[mode] = record
+            logger.warning(
+                "[FINAL_HIDDEN_P_PROBE] mode=%s req=%s prompt_tokens=%d "
+                "prompt_sha256=%s computed_tokens_before=%d scheduled_tokens=%d "
+                "capture_row_index=%s sample_row_index=%d "
+                "capture_sample_row_match=%s capture_sample=%s "
+                "num_tokens_unpadded=%d num_tokens_padded=%d hidden_shape=%s "
+                "cudagraph_mode=%s staged_sfa_graph_key=%s hidden=%s logits=%s "
+                "top_ids=%s sampled_tokens=%s",
+                mode,
+                record["request_id"],
+                record["prompt_tokens"],
+                record["prompt_sha256"],
+                record["computed_tokens_before"],
+                record["scheduled_tokens"],
+                record["capture_row_index"],
+                sample_row_index,
+                record["capture_sample_row_match"],
+                capture_sample,
+                record["num_tokens_unpadded"],
+                record["num_tokens_padded"],
+                record["hidden_shape"],
+                record["cudagraph_mode"],
+                record["staged_sfa_graph_key"],
+                record["hidden_summary"],
+                record["logits_summary"],
+                top_ids,
+                record["sampled_tokens"],
+            )
+        self._final_hidden_producer_probe_results = results
+        delattr(scheduler_output, "_final_hidden_producer_probe_records")
+
+        normal = results.get("normal_sampling")
+        final_hidden = results.get("final_hidden")
+        if (
+            normal is None
+            or final_hidden is None
+            or getattr(self, "_final_hidden_producer_probe_compare_logged", False)
+        ):
+            return
+        logger.warning(
+            "[FINAL_HIDDEN_P_PROBE_COMPARE] normal_req=%s final_hidden_req=%s "
+            "prompt_hash_match=%s prompt_length_match=%s "
+            "scheduled_tokens_match=%s sample_row_match=%s route_match=%s "
+            "hidden=%s logits=%s top1_match=%s sampled_token_match=%s",
+            normal["request_id"],
+            final_hidden["request_id"],
+            normal["prompt_sha256"] == final_hidden["prompt_sha256"],
+            normal["prompt_tokens"] == final_hidden["prompt_tokens"],
+            normal["scheduled_tokens"] == final_hidden["scheduled_tokens"],
+            normal["sample_row_index"] == final_hidden["sample_row_index"],
+            (
+                normal["cudagraph_mode"],
+                normal["staged_sfa_graph_key"],
+            )
+            == (
+                final_hidden["cudagraph_mode"],
+                final_hidden["staged_sfa_graph_key"],
+            ),
+            _final_hidden_probe_tensor_compare(
+                normal["_hidden"], final_hidden["_hidden"]
+            ),
+            _final_hidden_probe_tensor_compare(
+                normal["_logits"], final_hidden["_logits"]
+            ),
+            bool(
+                normal["top_ids"]
+                and final_hidden["top_ids"]
+                and normal["top_ids"][0] == final_hidden["top_ids"][0]
+            ),
+            normal["sampled_tokens"] == final_hidden["sampled_tokens"],
+        )
+        self._final_hidden_producer_probe_compare_logged = True
+
     @staticmethod
     def _is_final_hidden_output_rank() -> bool:
         # MultiprocExecutor returns the first TP worker of the last PP stage.
@@ -2431,6 +2754,16 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                self._capture_final_hidden_producer_probe(
+                    scheduler_output=scheduler_output,
+                    hidden_states=hidden_states,
+                    sample_hidden_states=sample_hidden_states,
+                    logits_indices=logits_indices,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    cudagraph_mode=cudagraph_mode,
+                    staged_sfa_graph_key=staged_sfa_graph_key,
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -2442,6 +2775,16 @@ class NPUModelRunner(GPUModelRunner):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
+                    self._capture_final_hidden_producer_probe(
+                        scheduler_output=scheduler_output,
+                        hidden_states=hidden_states,
+                        sample_hidden_states=sample_hidden_states,
+                        logits_indices=logits_indices,
+                        num_tokens_unpadded=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                        cudagraph_mode=cudagraph_mode,
+                        staged_sfa_graph_key=staged_sfa_graph_key,
+                    )
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -2452,6 +2795,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            self._complete_final_hidden_producer_probe(scheduler_output, logits)
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -2690,6 +3035,10 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+        )
+        self._finalize_final_hidden_producer_probe(
+            scheduler_output,
+            valid_sampled_token_ids,
         )
         if final_hidden_states:
             setattr(
