@@ -123,6 +123,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # outputs match. Use during Step 2 of bring-up; disable in production (it doubles
     # the attention cost). Default 0.
     "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))),
+    # Trace P-side normal sampling against final-hidden capture. This performs
+    # diagnostic device-to-host copies after sampling and must stay disabled in
+    # production.
+    "VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE", "0"))
+    ),
     # DSA un-bundle (proper route P1). When 1, the SFA KV cache is split into TWO
     # vLLM-managed KV cache groups: the MLA latent (k_nope+k_pe) and the indexer key,
     # instead of the bundled 3-tuple. This is the prerequisite for freeing the latent

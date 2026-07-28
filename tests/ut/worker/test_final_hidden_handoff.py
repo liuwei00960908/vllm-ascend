@@ -8,6 +8,8 @@ import vllm_ascend.worker.model_runner_v1 as model_runner_v1
 from vllm_ascend.worker.model_runner_v1 import (
     ExecuteModelState,
     NPUModelRunner,
+    _final_hidden_probe_tensor_compare,
+    _final_hidden_probe_tensor_summary,
     deserialize_final_hidden_state,
     serialize_final_hidden_state,
 )
@@ -48,6 +50,46 @@ def test_final_hidden_payload_rejects_oversize_before_decode():
 
     with pytest.raises(ValueError, match="16 MiB decoded size limit"):
         deserialize_final_hidden_state(payload)
+
+
+def test_final_hidden_probe_tensor_summary_counts_nonfinite_values():
+    tensor = torch.tensor([1.0, float("nan"), float("inf"), float("-inf")])
+
+    summary = _final_hidden_probe_tensor_summary(tensor)
+
+    assert summary["shape"] == (4,)
+    assert summary["finite_count"] == 1
+    assert summary["nan_count"] == 1
+    assert summary["posinf_count"] == 1
+    assert summary["neginf_count"] == 1
+    assert summary["finite_abs_max"] == 1.0
+    assert len(summary["raw_sha256"]) == 64
+
+
+def test_final_hidden_probe_compare_treats_matching_nans_as_masks():
+    lhs = torch.tensor([1.0, float("nan"), float("inf")])
+    rhs = torch.tensor([1.0, float("nan"), float("inf")])
+
+    comparison = _final_hidden_probe_tensor_compare(lhs, rhs)
+
+    assert comparison["raw_hash_equal"]
+    assert comparison["nan_mask_equal"]
+    assert comparison["posinf_mask_equal"]
+    assert comparison["neginf_mask_equal"]
+    assert comparison["finite_value_exact"]
+    assert comparison["finite_max_abs_diff"] == 0.0
+
+
+def test_final_hidden_probe_compare_reports_finite_difference():
+    comparison = _final_hidden_probe_tensor_compare(
+        torch.tensor([1.0, float("nan")]),
+        torch.tensor([2.0, float("nan")]),
+    )
+
+    assert not comparison["raw_hash_equal"]
+    assert comparison["nan_mask_equal"]
+    assert not comparison["finite_value_exact"]
+    assert comparison["finite_max_abs_diff"] == 1.0
 
 
 def test_capture_final_hidden_uses_last_scheduled_row_per_request():
