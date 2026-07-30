@@ -657,14 +657,13 @@ class TestLMCacheSparseFrontier(TestBase):
                 pure_decode=True,
             )
 
-    def test_fixed_staged_decode_layout_falls_back_for_dense_prompt_remainder(self):
+    def test_fixed_staged_decode_layout_falls_back_for_dp_padding(self):
         self.assertIsNone(
             sfa_v1._fixed_staged_decode_mtp(
-                [0] * 73,
+                [0] + [-1] * 72,
                 1,
                 73,
                 pure_decode=True,
-                remap_required=False,
             )
         )
 
