@@ -586,8 +586,13 @@ def _fixed_staged_decode_mtp(
     row_count: int,
     *,
     pure_decode: bool,
+    remap_required: bool = True,
 ) -> int | None:
-    """Return the MTP for the request-major staged layout, else fall back."""
+    """Return the MTP for the request-major staged layout, else fall back.
+
+    Wide dense-prefix remainders are safe to fall back because boundary zero
+    makes the generic remap kernel a no-op.
+    """
     if (
         not pure_decode
         or request_count <= 0
@@ -605,6 +610,8 @@ def _fixed_staged_decode_mtp(
         counts = np.bincount(valid_rows, minlength=request_count)
         max_mtp = int(counts.max(initial=0))
         if max_mtp > 2:
+            if not remap_required:
+                return None
             raise RuntimeError(
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={max_mtp}"
@@ -613,7 +620,7 @@ def _fixed_staged_decode_mtp(
         return None
     mtp = row_count // request_count
     if mtp not in (1, 2):
-        if mtp > 2:
+        if mtp > 2 and remap_required:
             raise RuntimeError(
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={mtp}"
@@ -3503,11 +3510,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if _row_req_indices is None:
                 raise RuntimeError("DSA union remap requires row request indices")
             _selected_token_counts = attn_metadata.decode_selected_counts
+            _boundary_cpu = attn_metadata.decode_split_boundary_cpu
             _staged_mtp = _fixed_staged_decode_mtp(
                 attn_metadata.decode_req_indices_cpu,
                 int(attn_metadata.block_table.shape[0]),
                 _topk_rows,
                 pure_decode=_is_pure_decode,
+                remap_required=bool(
+                    _boundary_cpu is None
+                    or np.any(np.asarray(_boundary_cpu[:_topk_rows]) != 0)
+                ),
             )
             with _dsa_prof.section("prepare_sparse_indices"):
                 (
