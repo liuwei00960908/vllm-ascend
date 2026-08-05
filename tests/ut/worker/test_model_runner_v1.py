@@ -821,6 +821,82 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             ):
                 runner._apply_staged_sfa_route(route)
 
+    def test_q1_cold_compact_resume_uses_staged_graph(self):
+        runner = self._build_runner()
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8193,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_resume=True,
+                    ),
+                )
+            ]
+        )
+        kwargs = dict(
+            num_tokens_unpadded=1,
+            num_reqs=1,
+            num_scheduled_tokens=np.ones(1, dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["cold"],
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([8192], dtype=np.int32),
+            prompt_lens=np.array([8193], dtype=np.int32),
+        )
+
+        route = runner._staged_sfa_local_route(**kwargs)
+        self.assertEqual(route.action, StagedSFARouteAction.STAGED)
+        self.assertEqual(route.frontiers, (8192,))
+        self.assertEqual(route.cold_compact_resumes, (True,))
+        live = runner._staged_sfa_live_route(
+            local_route=route,
+            dp_route_action=StagedSFARouteAction.STAGED,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=BatchDescriptor(num_tokens=1),
+            num_tokens_unpadded=1,
+            num_tokens_padded=1,
+            num_reqs=1,
+            should_ubatch=False,
+        )
+        self.assertEqual(live.graph_key, StagedSFAGraphKey.exact_q1(1))
+        self.assertEqual(live.cold_compact_resumes, (True,))
+
+        for name, override in {
+            "computed": {"num_computed_tokens": np.array([8191])},
+            "prompt": {"prompt_lens": np.array([8194])},
+            "frontier": {
+                "kv_connector_metadata": SimpleNamespace(
+                    requests=[
+                        SimpleNamespace(
+                            req_id="cold",
+                            is_sparse_decode=True,
+                            load_spec=SimpleNamespace(
+                                can_load=True,
+                                dsa_committed_end=7936,
+                                dsa_cold_compact_resume=True,
+                            ),
+                        )
+                    ]
+                )
+            },
+        }.items():
+            with self.subTest(name=name):
+                rejected = runner._staged_sfa_local_route(
+                    **{**kwargs, **override}
+                )
+                self.assertEqual(
+                    rejected.action, StagedSFARouteAction.SAFE_NATIVE
+                )
+                self.assertEqual(
+                    rejected.reason,
+                    StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+                )
+
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()
         route = model_runner_module.StagedSFARouteDecision(
@@ -917,6 +993,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=4096,
+                            dsa_cold_compact_resume=True,
                         ),
                     )
                     for req_id in request_ids
@@ -933,6 +1010,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             num_reqs=2,
             should_ubatch=False,
         )
+        self.assertEqual(local.cold_compact_resumes, ())
         self.assertEqual(route.action, StagedSFARouteAction.STAGED)
         self.assertEqual(route.graph_key, StagedSFAGraphKey.fixed_spec(2, 2))
 
@@ -961,6 +1039,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             ),
         )
         self.assertEqual(local.action, StagedSFARouteAction.STAGED)
+        self.assertEqual(local.cold_compact_resumes, ())
         self.assertEqual(local.frontiers, (0,))
 
     def test_two_group_dummy_rows_use_noncolliding_physical_slots(self):

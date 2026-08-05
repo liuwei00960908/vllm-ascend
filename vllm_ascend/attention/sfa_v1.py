@@ -1220,6 +1220,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 current_positions.fill(0)
             n_real = min(len(plens_cpu), num_reqs)
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
+            cold_resumes = tuple(
+                getattr(common_attn_metadata, "cold_compact_resumes", ())
+            )
+            if cold_resumes and len(cold_resumes) != n_real:
+                raise RuntimeError(
+                    "Cold-compact resume markers do not match active requests: "
+                    f"markers={len(cold_resumes)}, requests={n_real}."
+                )
             fixed_decode_width = 0
             if (
                 common_attn_metadata.attn_state
@@ -1347,6 +1355,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     s, e = int(qsl[r]), int(qsl[r + 1])
                     plen = int(plens_cpu[r])
                     first_decode = max(s, s + plen - int(computed[r]))
+                    if cold_resumes and cold_resumes[r]:
+                        if e - s != 1 or int(computed[r]) != plen - 1:
+                            raise RuntimeError(
+                                "Invalid cold-compact Q1 resume layout: "
+                                f"request={r}, rows={e - s}, prompt={plen}, "
+                                f"computed={int(computed[r])}."
+                            )
+                        first_decode = s
                     if first_decode < e:
                         count = e - first_decode
                         rows[first_decode:e] = plen

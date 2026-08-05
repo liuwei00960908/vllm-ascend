@@ -107,7 +107,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_lmcache_sparse_cached_tokens,
     staged_sfa_connector_supports_sparse_load,
-    staged_sfa_metadata_sparse_load,
+    staged_sfa_metadata_sparse_route,
     using_paged_attention,
 )
 
@@ -1524,6 +1524,10 @@ class NPUModelRunner(GPUModelRunner):
                         cascade_attn_prefix_lens is not None
                     ),
                     request_ids=self.input_batch.req_ids[:num_reqs],
+                    num_computed_tokens=(
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    ),
+                    prompt_lens=self.input_batch.num_prompt_tokens[:num_reqs],
                     kv_connector_metadata=(
                         scheduler_output.kv_connector_metadata
                     ),
@@ -1649,6 +1653,9 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    cold_compact_resumes=(
+                        staged_sfa_route.cold_compact_resumes
+                    ),
                 )
 
             (
@@ -2602,6 +2609,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        cold_compact_resumes: tuple[bool, ...] = (),
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2771,6 +2779,7 @@ class NPUModelRunner(GPUModelRunner):
                     else None
                 )
             ),
+            cold_compact_resumes=cold_compact_resumes,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -2978,6 +2987,8 @@ class NPUModelRunner(GPUModelRunner):
         has_cascade_attention: bool,
         request_ids: Any,
         kv_connector_metadata: Any,
+        num_computed_tokens: Any = None,
+        prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
         def native(reason):
@@ -3017,9 +3028,11 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
-        metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
-            kv_connector_metadata,
-            request_ids,
+        metadata_reason, frontiers, cold_resumes = (
+            staged_sfa_metadata_sparse_route(
+                kv_connector_metadata,
+                request_ids,
+            )
         )
         if metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
@@ -3036,6 +3049,24 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
+        if query_width == 1:
+            if any(cold_resumes):
+                computed = np.asarray(num_computed_tokens).reshape(-1)
+                prompts = np.asarray(prompt_lens).reshape(-1)
+                if (
+                    len(cold_resumes) != num_reqs
+                    or computed.shape != (num_reqs,)
+                    or prompts.shape != (num_reqs,)
+                    or any(
+                        int(computed[i]) != int(prompts[i]) - 1
+                        or frontiers[i] != int(computed[i])
+                        for i, resume in enumerate(cold_resumes)
+                        if resume
+                    )
+                ):
+                    return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
+        else:
+            cold_resumes = ()
         scratch_capacity = query_width * index_topk
         if any(
             frontier != 0 and frontier < scratch_capacity
@@ -3049,6 +3080,7 @@ class NPUModelRunner(GPUModelRunner):
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
             frontiers=frontiers,
+            cold_compact_resumes=cold_resumes,
         )
 
     def _staged_sfa_live_route(
@@ -3121,8 +3153,9 @@ class NPUModelRunner(GPUModelRunner):
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
-            graph_key,
-            local_route.frontiers,
+            graph_key=graph_key,
+            frontiers=local_route.frontiers,
+            cold_compact_resumes=local_route.cold_compact_resumes,
         )
 
     def _apply_staged_sfa_route(

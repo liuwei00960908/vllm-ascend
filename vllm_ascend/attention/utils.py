@@ -220,6 +220,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    cold_compact_resumes: tuple[bool, ...] = ()
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -248,6 +249,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
+            cold_compact_resumes=self.cold_compact_resumes[
+                :num_actual_reqs
+            ],
         )
 
 
@@ -405,18 +409,19 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
-def staged_sfa_metadata_sparse_load(
+def staged_sfa_metadata_sparse_route(
     metadata: Any,
     request_ids: Any,
-) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
-    """Classify active connector metadata and return ordered frontiers."""
+) -> tuple[StagedSFARouteReason, tuple[int, ...], tuple[bool, ...]]:
+    """Classify active connector metadata in one request-list scan."""
     if metadata is None or request_ids is None:
-        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
     active_request_ids = [str(req_id) for req_id in request_ids]
     if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
-        return StagedSFARouteReason.INVALID_REQUEST_IDS, ()
+        return StagedSFARouteReason.INVALID_REQUEST_IDS, (), ()
     active_request_id_set = set(active_request_ids)
     sparse_frontiers: dict[str, int] = {}
+    cold_resumes: set[str] = set()
     dense_request_ids: set[str] = set()
     matched_request_ids: set[str] = set()
     for request in getattr(metadata, "requests", ()):
@@ -425,9 +430,11 @@ def staged_sfa_metadata_sparse_load(
             continue
         matched_request_ids.add(req_id)
         load_spec = getattr(request, "load_spec", None)
+        if getattr(load_spec, "dsa_cold_compact_resume", False):
+            cold_resumes.add(req_id)
         if getattr(request, "is_sparse_decode", False):
             if req_id in sparse_frontiers:
-                return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+                return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, (), ()
             sparse_frontiers[req_id] = int(
                 getattr(load_spec, "dsa_committed_end", None)
                 if getattr(load_spec, "dsa_committed_end", None)
@@ -444,17 +451,36 @@ def staged_sfa_metadata_sparse_load(
             dense_request_ids.add(req_id)
 
     if dense_request_ids.intersection(sparse_frontiers):
-        return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+        return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, (), ()
     loadable_request_ids = dense_request_ids.union(sparse_frontiers)
     if loadable_request_ids == active_request_id_set:
         if dense_request_ids and sparse_frontiers:
-            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
+            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (), ()
         if sparse_frontiers:
-            return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
-        return StagedSFARouteReason.DENSE_PREFIX_HIT, ()
+            return (
+                StagedSFARouteReason.ELIGIBLE,
+                tuple(sparse_frontiers[req_id] for req_id in active_request_ids),
+                (
+                    tuple(req_id in cold_resumes for req_id in active_request_ids)
+                    if cold_resumes
+                    else ()
+                ),
+            )
+        return StagedSFARouteReason.DENSE_PREFIX_HIT, (), ()
     if matched_request_ids != active_request_id_set:
-        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
-    return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
+    return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
+
+
+def staged_sfa_metadata_sparse_load(
+    metadata: Any,
+    request_ids: Any,
+) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
+    """Preserve the existing frontier-only helper contract."""
+    reason, frontiers, _ = staged_sfa_metadata_sparse_route(
+        metadata, request_ids
+    )
+    return reason, frontiers
 
 
 def wait_for_kv_layer_from_connector(

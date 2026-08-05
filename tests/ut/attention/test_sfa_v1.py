@@ -496,6 +496,7 @@ class TestLMCacheSparseFrontier(TestBase):
                         lmcache_cached_tokens=8193,
                         dsa_committed_end=8192,
                         dsa_cold_compact_load=False,
+                        dsa_cold_compact_resume=True,
                     ),
                 )
             ]
@@ -511,6 +512,12 @@ class TestLMCacheSparseFrontier(TestBase):
         self.assertEqual(
             self._remap_frontiers(metadata, ["cold-compact"]),
             [8192],
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_route(
+                metadata, ["cold-compact"]
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (8192,), (True,)),
         )
 
     def test_mixed_load_requires_every_row_to_be_loadable(self):
@@ -2177,6 +2184,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             computed,
             prompt_lens,
             request_ids,
+            cold_compact_resumes=(),
         ):
             num_reqs = len(request_ids)
             num_tokens = int(query_start_loc[-1])
@@ -2197,7 +2205,38 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 seq_lens_cpu=torch.tensor(computed, dtype=torch.int32),
                 request_ids=request_ids,
                 attn_state=AscendAttentionState.DecodeOnly,
+                cold_compact_resumes=cold_compact_resumes,
             )
+
+        ordinary_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 1], [8], [9], ["ordinary"]
+            ),
+        )
+        assert ordinary_transition.num_decode_tokens == 0
+
+        cold_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 1], [8], [9], ["cold"], (True,)
+            ),
+        )
+        assert cold_transition.decode_req_indices.tolist() == [0]
+        assert cold_transition.decode_row_offsets.tolist() == [0]
+        assert cold_transition.split_boundary.tolist() == [9]
+        assert cold_transition.num_decode_tokens == 1
+        with patch.object(
+            sfa_v1, "_decode_window_save_window_size", return_value=0
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                cold_transition,
+                ["cold"],
+                is_dummy_run=False,
+                index_topk=16,
+                cached_tokens=(8,),
+            )
+        assert boundary.tolist() == [8]
 
         first = builder.build(
             common_prefix_len=0,

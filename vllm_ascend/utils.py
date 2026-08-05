@@ -115,6 +115,7 @@ class StagedSFARouteReason(str, Enum):
     FRONTIER_TOO_SHORT = "frontier_too_short"
     FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
     DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    COLD_COMPACT_LAYOUT = "cold_compact_layout"
     RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
 
 
@@ -124,6 +125,7 @@ class StagedSFARouteDecision:
     reason: StagedSFARouteReason
     graph_key: Any = None
     frontiers: tuple[int, ...] = ()
+    cold_compact_resumes: tuple[bool, ...] = ()
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
