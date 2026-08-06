@@ -3520,9 +3520,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _topk_rows,
                 pure_decode=_is_pure_decode,
             )
-            if _staged_mtp is None:
+            if getattr(attn_metadata, "_sfa_staged_mtp_logged", False) is not True:
+                attn_metadata._sfa_staged_mtp_logged = True
                 logger.info(
-                    "[SFA_DEBUG] staged_mtp=None topk_rows=%d reqs=%d",
+                    "[SFA_DEBUG] layer=%s staged_mtp=%s topk_rows=%d reqs=%d",
+                    layer_name,
+                    _staged_mtp,
                     _topk_rows,
                     int(attn_metadata.block_table.shape[0]),
                 )
