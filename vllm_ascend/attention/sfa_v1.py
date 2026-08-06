@@ -3520,6 +3520,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _topk_rows,
                 pure_decode=_is_pure_decode,
             )
+            if _staged_mtp is None:
+                logger.info(
+                    "[SFA_DEBUG] staged_mtp=None topk_rows=%d reqs=%d",
+                    _topk_rows,
+                    int(attn_metadata.block_table.shape[0]),
+                )
             with _dsa_prof.section("prepare_sparse_indices"):
                 (
                     topk_indices,
