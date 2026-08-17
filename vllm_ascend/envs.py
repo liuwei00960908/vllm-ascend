@@ -100,6 +100,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # DSA KV-organization replay gates (replay Step 1 / A1). Semantics ported
+    # from the internal fork (vllm-ascend-sparse@sparse, envs.py:126-154):
+    # unbundle splits latent/indexer into separate specs; two_groups requires
+    # unbundle=1 plus --no-enable-prefix-caching; shared_pool (raw default 1)
+    # is only effective under two_groups; shrink_latent stays 0 during the
+    # replay slice (no connector, no release chain).
+    "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))
+    ),
+    "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))
+    ),
+    "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))
+    ),
+    "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") or "0"
+    ),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
