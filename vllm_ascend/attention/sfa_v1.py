@@ -8,6 +8,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -20,6 +21,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -548,6 +550,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         return attn_metadata
 
 
+def _dsa_indexer_layer_name(layer_name: str) -> str:
+    """Map an inner MLAAttention layer name to its sibling indexer cache.
+
+    ``layer_name`` is the inner name (``...self_attn.attn``); the unbundle
+    replay slice stores the indexer key in the sibling
+    ``...self_attn.indexer.k_cache`` layer's own KV cache.
+    """
+    return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+
+
 class AscendSFAImpl(MLAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -671,6 +683,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 self.c8_k_cache_dtype = torch.int8
                 self.c8_k_scale_cache_dtype = torch.float16
+
+        # DSA unbundle replay (Step 2 / A2b): the MLA layer owns a latent-only
+        # 2-tuple while the sibling DeepseekV32IndexerCache layer owns the
+        # indexer key as its own 1-tuple. Re-assemble a 3-tuple in forward so
+        # the indexer read/write (kv_cache[2]) work unchanged (fork semantics
+        # vllm-ascend-sparse@c7c4a4ac sfa_v1.py:3220-3238; official final has
+        # no virtual_engine, so the sibling cache is taken as-is).
+        self.dsa_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
+        self._dsa_idx_cache_t = None
 
         if self.enable_sparse_sfa_c8:
             self.sfa_qsfa_packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
@@ -850,6 +871,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendSFAImpl.k_hadamard = torch.tensor(scipy.linalg.hadamard(128), dtype=torch.bfloat16, device="npu") / (
                 128**0.5
             )
+
+    def _dsa_reassemble_kv_cache(
+        self, layer_name: str, kv_cache: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        """Re-assemble the unbundle MLA 2-tuple into a 3-tuple for indexer.
+
+        Un-bundled (Step 2 / A2): the MLA layer owns only the latent 2-tuple
+        while the sibling ``...self_attn.indexer.k_cache`` layer owns the
+        indexer key as its own 1-tuple. Both groups share the same block id
+        space in the unbundle-only slice, so ``attn_metadata.block_table`` /
+        ``slot_mapping`` address both caches; reassembling
+        ``(k_nope, k_pe, indexer_k)`` keeps the indexer read/write
+        (``kv_cache[2]``) unchanged in both ``sfa_v1`` and ``device_op``.
+
+        The indexer KV tensor is allocated once at startup, so the sibling
+        reference is resolved lazily and cached to avoid a per-step
+        ``no_compile_layers`` dict lookup + tuple rebuild on the decode path.
+        """
+        if not self.dsa_unbundle or len(kv_cache) >= 3:
+            return kv_cache
+        _idx_t = getattr(self, "_dsa_idx_cache_t", None)
+        if _idx_t is None:
+            _idx_cache = get_forward_context().no_compile_layers[
+                _dsa_indexer_layer_name(layer_name)
+            ].kv_cache
+            _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+            self._dsa_idx_cache_t = _idx_t
+        return (kv_cache[0], kv_cache[1], _idx_t)
 
     @staticmethod
     def _is_w8a8_dynamic_linear(layer: torch.nn.Module | None) -> bool:
@@ -1636,6 +1685,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if is_hidden_layer(layer):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
+
+        kv_cache = self._dsa_reassemble_kv_cache(layer_name, kv_cache)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
