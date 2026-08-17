@@ -267,6 +267,28 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+def _patch_ascend_indexer_kernel_block_size() -> None:
+    """Advertise 128-token kernel blocks for the upstream indexer backend.
+
+    Upstream ``DeepseekV32IndexerBackend.get_supported_kernel_block_sizes``
+    returns CUDA/ROCm sizes (``[64]``); on Ascend the indexer cache layout
+    uses 128-token kernel blocks. Once the DSA unbundle slice registers
+    indexer specs, ``select_common_block_size(128, ...)`` in
+    ``may_reinitialize_input_batch`` would otherwise reject the indexer
+    backend (``ValueError: No common block size for 128``).
+
+    Fork provenance: vllm-ascend-sparse@c7c4a4ac
+    patch/platform/patch_kv_cache_interface.py:151-157. Only the static
+    method's return value is replaced; the class identity and the KV
+    spec registry are untouched (no monkey-patch of the spec class).
+    """
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+
+    DeepseekV32IndexerBackend.get_supported_kernel_block_sizes = staticmethod(
+        lambda: [128]
+    )
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -430,6 +452,7 @@ class NPUModelRunner(GPUModelRunner):
                     "DSA unbundle replay does not support context parallelism; "
                     "use decode and prefill context parallel size 1."
                 )
+            _patch_ascend_indexer_kernel_block_size()
         if self.dsa_two_groups:
             raise ValueError(
                 "DSA two-groups is not implemented in replay Step 2; "
