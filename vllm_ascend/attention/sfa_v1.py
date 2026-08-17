@@ -247,6 +247,11 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    # DSA two-groups replay (Step 4): the indexer group's own table/slots.
+    # None in unbundle-only mode (shared block id space); consumers fall back
+    # to block_table / slot_mapping when None.
+    indexer_block_table: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -376,6 +381,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+
+        # DSA two-groups mirror: slice the indexer group's table/slots with
+        # the same bounds as the latent's (fork F-ascend :1150-1156).
+        indexer_block_table = None
+        indexer_slot_mapping = None
+        if common_attn_metadata.indexer_block_table_tensor is not None:
+            indexer_block_table = common_attn_metadata.indexer_block_table_tensor[
+                :num_reqs
+            ]
+            assert common_attn_metadata.indexer_slot_mapping is not None
+            indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[
+                :num_input_tokens
+            ]
 
         block_size = self.kernel_block_size
 
@@ -531,6 +549,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=actual_group_len,
             group_key_idx=actual_group_key_idx,
             group_key_cache_idx=actual_group_key_cache_idx,
+            indexer_block_table=indexer_block_table,
+            indexer_slot_mapping=indexer_slot_mapping,
         )
 
     def build_for_graph_capture(
@@ -1707,6 +1727,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if attn_metadata.dcp_context is not None
             else attn_metadata.slot_mapping
         )
+        # DSA two-groups: the indexer key cache lives in the indexer group's
+        # own block pool; its writes must use the indexer group's slot
+        # mapping. Falls back to the shared (latent) slot mapping in
+        # unbundle-only mode. Never use `or` on tensors (ambiguous truth
+        # value). Fork semantics: F-ascend :3243-3247.
+        idx_slot_mapping = (
+            attn_metadata.indexer_slot_mapping
+            if attn_metadata.indexer_slot_mapping is not None
+            else slot_mapping
+        )
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -1964,7 +1994,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    idx_slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.enable_sparse_li_c8:
@@ -1982,7 +2012,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            idx_slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 

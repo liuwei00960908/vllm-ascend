@@ -255,6 +255,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
 
+    # DSA two-groups replay (Step 4): the indexer group's own block table /
+    # slot mapping, mirrored onto the latent (group-0) metadata. None in
+    # unbundle-only mode (shared block id space) and for non-DSA models.
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.

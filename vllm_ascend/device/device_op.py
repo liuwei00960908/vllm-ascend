@@ -593,6 +593,18 @@ class BaseDeviceAdaptor:
         indexer_cache_idx = 1 if packed_kv_cache else 2
         indexer_scale_cache_idx = 2 if packed_kv_cache else 3
 
+        # DSA two-groups: the indexer key cache lives in the indexer group's
+        # own block pool, so the top-k kernels must gather keys through the
+        # indexer group's block table. Falls back to the shared (latent)
+        # table in unbundle-only mode. Never use `or` on tensors. Fork
+        # semantics: F-ascend :2219-2231 / :2270 / :2285 / :2298.
+        indexer_block_table = getattr(attn_metadata, "indexer_block_table", None)
+        topk_block_table = (
+            indexer_block_table
+            if indexer_block_table is not None
+            else attn_metadata.block_table
+        )
+
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if packed_kv_cache else 4)
             assert q_li_scale is not None
@@ -606,7 +618,7 @@ class BaseDeviceAdaptor:
                 key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=topk_block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -621,7 +633,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=topk_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -634,7 +646,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=topk_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
