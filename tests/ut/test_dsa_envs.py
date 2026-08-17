@@ -18,12 +18,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from vllm_ascend.envs import (
-    VLLM_ASCEND_DSA_SHARED_POOL,
-    VLLM_ASCEND_DSA_SHRINK_LATENT,
-    VLLM_ASCEND_DSA_TWO_GROUPS,
-    VLLM_ASCEND_DSA_UNBUNDLE,
-)
+from vllm_ascend import envs
 
 _NAMES = (
     "VLLM_ASCEND_DSA_UNBUNDLE",
@@ -54,33 +49,33 @@ def _dsa_env(**kwargs):
 
 def test_defaults():
     with _dsa_env():
-        assert VLLM_ASCEND_DSA_UNBUNDLE is False
-        assert VLLM_ASCEND_DSA_TWO_GROUPS is False
+        assert envs.VLLM_ASCEND_DSA_UNBUNDLE is False
+        assert envs.VLLM_ASCEND_DSA_TWO_GROUPS is False
         # Raw default "1" mirrors the fork; suppression happens in the
         # composite gate (model_runner), not in the raw env value.
-        assert VLLM_ASCEND_DSA_SHARED_POOL is True
-        assert VLLM_ASCEND_DSA_SHRINK_LATENT == 0
+        assert envs.VLLM_ASCEND_DSA_SHARED_POOL is True
+        assert envs.VLLM_ASCEND_DSA_SHRINK_LATENT == 0
 
 
 def test_lazy_eval_reflects_env_changes():
     with _dsa_env(VLLM_ASCEND_DSA_UNBUNDLE="1", VLLM_ASCEND_DSA_SHRINK_LATENT="2"):
-        assert VLLM_ASCEND_DSA_UNBUNDLE is True
-        assert VLLM_ASCEND_DSA_SHRINK_LATENT == 2
-        assert VLLM_ASCEND_DSA_TWO_GROUPS is False
+        assert envs.VLLM_ASCEND_DSA_UNBUNDLE is True
+        assert envs.VLLM_ASCEND_DSA_SHRINK_LATENT == 2
+        assert envs.VLLM_ASCEND_DSA_TWO_GROUPS is False
     with _dsa_env():
-        assert VLLM_ASCEND_DSA_UNBUNDLE is False
+        assert envs.VLLM_ASCEND_DSA_UNBUNDLE is False
 
 
 def test_shrink_empty_string_falls_back_to_zero():
     with _dsa_env(VLLM_ASCEND_DSA_SHRINK_LATENT=""):
-        assert VLLM_ASCEND_DSA_SHRINK_LATENT == 0
+        assert envs.VLLM_ASCEND_DSA_SHRINK_LATENT == 0
 
 
 def test_invalid_shrink_raises():
     # Non-integer values must fail loudly rather than silently defaulting.
     with _dsa_env(VLLM_ASCEND_DSA_SHRINK_LATENT="abc"):
         with pytest.raises(ValueError):
-            _ = VLLM_ASCEND_DSA_SHRINK_LATENT
+            _ = envs.VLLM_ASCEND_DSA_SHRINK_LATENT
 
 
 if __name__ == "__main__":
