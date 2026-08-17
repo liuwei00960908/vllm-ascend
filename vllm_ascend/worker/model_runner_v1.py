@@ -126,6 +126,7 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.envs import VLLM_ASCEND_DSA_SHARED_POOL, VLLM_ASCEND_DSA_SHRINK_LATENT, VLLM_ASCEND_DSA_TWO_GROUPS, VLLM_ASCEND_DSA_UNBUNDLE
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -396,6 +397,31 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.c8_k_cache_dtype = torch.int8
                 self.c8_k_scale_cache_dtype = torch.float16
+
+        # DSA KV-organization replay gates (replay Step 1 / A1, adapted from
+        # fork vllm-ascend-sparse@sparse model_runner_v1.py:484-510). No
+        # consumer yet: flags are read and logged only; composite gating
+        # mirrors vllm.v1.kv_cache_interface helpers so that enabling a
+        # downstream variable without its prerequisite stays a no-op.
+        self.dsa_unbundle = self.use_sparse and VLLM_ASCEND_DSA_UNBUNDLE
+        self.dsa_two_groups = self.dsa_unbundle and VLLM_ASCEND_DSA_TWO_GROUPS
+        self.dsa_shared_pool = (
+            self.dsa_two_groups and VLLM_ASCEND_DSA_SHARED_POOL
+        )
+        self.dsa_shrink_latent = (
+            int(VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if self.dsa_two_groups
+            else 0
+        )
+        if self.dsa_unbundle:
+            logger.info(
+                "DSA replay gates: unbundle=%s two_groups=%s shared_pool=%s "
+                "shrink_latent=%s (no consumers yet)",
+                self.dsa_unbundle,
+                self.dsa_two_groups,
+                self.dsa_shared_pool,
+                self.dsa_shrink_latent,
+            )
 
         self.attn_backend = get_attn_backend(
             0,
