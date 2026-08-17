@@ -453,11 +453,6 @@ class NPUModelRunner(GPUModelRunner):
                     "use decode and prefill context parallel size 1."
                 )
             _patch_ascend_indexer_kernel_block_size()
-        if self.dsa_two_groups:
-            raise ValueError(
-                "DSA two-groups is not implemented in replay Step 2; "
-                "set VLLM_ASCEND_DSA_TWO_GROUPS=0."
-            )
         if self.dsa_unbundle_requested:
             logger.info(
                 "DSA replay gates: requested_unbundle=%s requested_two_groups=%s "
@@ -3374,6 +3369,22 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
+            if (
+                kv_cache_gid == 0
+                and self.dsa_two_groups
+                and len(kv_cache_groups) == 2
+            ):
+                # DSA two-groups mirror: MLA layers (group 0) compute the
+                # indexer top-k / write the indexer key cache, which lives in
+                # the indexer group's own block pool. Mirror group 1's table
+                # and slot mapping into the group-0 metadata so the SFA impl
+                # can address the indexer cache (fork F-ascend :2859-2877
+                # semantics; consumers fall back to the shared tables when
+                # these are None, e.g. unbundle-only mode).
+                (
+                    cm.indexer_block_table_tensor,
+                    cm.indexer_slot_mapping,
+                ) = _get_block_table_and_slot_mapping(1)
             if self.speculative_config and isinstance(self.drafter, AscendStep3p5MTPProposer):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can
