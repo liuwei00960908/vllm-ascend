@@ -46,6 +46,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
@@ -102,6 +103,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -126,7 +128,6 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
-from vllm_ascend.envs import VLLM_ASCEND_DSA_SHARED_POOL, VLLM_ASCEND_DSA_SHRINK_LATENT, VLLM_ASCEND_DSA_TWO_GROUPS, VLLM_ASCEND_DSA_UNBUNDLE
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -398,25 +399,53 @@ class NPUModelRunner(GPUModelRunner):
                 self.c8_k_cache_dtype = torch.int8
                 self.c8_k_scale_cache_dtype = torch.float16
 
-        # DSA KV-organization replay gates (replay Step 1 / A1, adapted from
-        # fork vllm-ascend-sparse@sparse model_runner_v1.py:484-510). No
-        # consumer yet: flags are read and logged only; composite gating
-        # mirrors vllm.v1.kv_cache_interface helpers so that enabling a
-        # downstream variable without its prerequisite stays a no-op.
-        self.dsa_unbundle = self.use_sparse and VLLM_ASCEND_DSA_UNBUNDLE
-        self.dsa_two_groups = self.dsa_unbundle and VLLM_ASCEND_DSA_TWO_GROUPS
+        # DSA KV-organization replay gates. Keep requested values separate
+        # from effective values so a model outside the sparse path is
+        # diagnosable rather than silently ignoring UNBUNDLE=1.
+        self.dsa_unbundle_requested = envs.VLLM_ASCEND_DSA_UNBUNDLE
+        self.dsa_two_groups_requested = envs.VLLM_ASCEND_DSA_TWO_GROUPS
+        self.dsa_shared_pool_requested = envs.VLLM_ASCEND_DSA_SHARED_POOL
+        self.dsa_shrink_latent_requested = envs.VLLM_ASCEND_DSA_SHRINK_LATENT
+        self.dsa_unbundle = self.use_sparse and self.dsa_unbundle_requested
+        self.dsa_two_groups = self.dsa_unbundle and self.dsa_two_groups_requested
         self.dsa_shared_pool = (
-            self.dsa_two_groups and VLLM_ASCEND_DSA_SHARED_POOL
+            self.dsa_two_groups and self.dsa_shared_pool_requested
         )
         self.dsa_shrink_latent = (
-            int(VLLM_ASCEND_DSA_SHRINK_LATENT)
+            int(self.dsa_shrink_latent_requested)
             if self.dsa_two_groups
             else 0
         )
         if self.dsa_unbundle:
+            if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+                raise ValueError(
+                    "DSA unbundle replay does not support sparse SFA/LI C8; "
+                    "disable both C8 modes before enabling UNBUNDLE."
+                )
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                or vllm_config.parallel_config.prefill_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "DSA unbundle replay does not support context parallelism; "
+                    "use decode and prefill context parallel size 1."
+                )
+        if self.dsa_two_groups:
+            raise ValueError(
+                "DSA two-groups is not implemented in replay Step 2; "
+                "set VLLM_ASCEND_DSA_TWO_GROUPS=0."
+            )
+        if self.dsa_unbundle_requested:
             logger.info(
-                "DSA replay gates: unbundle=%s two_groups=%s shared_pool=%s "
-                "shrink_latent=%s (no consumers yet)",
+                "DSA replay gates: requested_unbundle=%s requested_two_groups=%s "
+                "requested_shared_pool=%s requested_shrink_latent=%s "
+                "use_sparse=%s effective_unbundle=%s effective_two_groups=%s "
+                "effective_shared_pool=%s effective_shrink_latent=%s",
+                self.dsa_unbundle_requested,
+                self.dsa_two_groups_requested,
+                self.dsa_shared_pool_requested,
+                self.dsa_shrink_latent_requested,
+                self.use_sparse,
                 self.dsa_unbundle,
                 self.dsa_two_groups,
                 self.dsa_shared_pool,
@@ -4103,6 +4132,19 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
+    def _get_dsa_unbundle_spec_kind(self, kv_cache_spec: KVCacheSpec) -> str | None:
+        """Classify the two layouts introduced by the unbundle replay slice."""
+        if not self.dsa_unbundle or not isinstance(
+            kv_cache_spec, AscendMLAAttentionSpec
+        ):
+            return None
+        sparse_head_dim = kv_cache_spec.sparse_head_dim
+        if sparse_head_dim == self.sparse_head_dim[:2]:
+            return "latent"
+        if sparse_head_dim == (self.sparse_head_dim[-1],):
+            return "indexer"
+        return None
+
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
@@ -4168,6 +4210,65 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
+                elif (
+                    (dsa_unbundle_kind := self._get_dsa_unbundle_spec_kind(
+                        layer_kv_cache_spec[layer_name]
+                    )) is not None
+                    and layer_name not in kv_cache_raw_tensors
+                    and not use_mamba
+                ):
+                    # Unbundle-only: latent and indexer layers own different
+                    # layouts, so they cannot use the bundled three-way split
+                    # below. Step 2 keeps one logical group but allocates each
+                    # layer's tensor according to its own final Ascend spec.
+                    current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                    assert isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
+                    assert current_kv_cache_spec.sparse_head_dim is not None
+                    assert (
+                        kv_cache_tensor.size
+                        % current_kv_cache_spec.page_size_bytes
+                        == 0
+                    )
+
+                    num_blocks = (
+                        kv_cache_tensor.size // current_kv_cache_spec.page_size_bytes
+                    )
+                    block_elements = (
+                        num_blocks
+                        * current_kv_cache_spec.block_size
+                        * current_kv_cache_spec.num_kv_heads
+                    )
+                    dtype_size = get_dtype_size(current_kv_cache_spec.dtype)
+                    if dsa_unbundle_kind == "latent":
+                        k_head_dim, v_head_dim = current_kv_cache_spec.sparse_head_dim
+                        k_tensor = self._allocate_int8_cache_tensor(
+                            block_elements * k_head_dim * dtype_size,
+                            alignment,
+                        )
+                        v_tensor = self._allocate_int8_cache_tensor(
+                            block_elements * v_head_dim * dtype_size,
+                            alignment,
+                        )
+                        raw_tensors = (k_tensor, v_tensor)
+                    else:
+                        (index_head_dim,) = current_kv_cache_spec.sparse_head_dim
+                        indexer_tensor = self._allocate_int8_cache_tensor(
+                            block_elements * index_head_dim * dtype_size,
+                            alignment,
+                        )
+                        raw_tensors = (indexer_tensor,)
+
+                    for layer_name_inner in kv_cache_tensor.shared_by:
+                        if (
+                            self._get_dsa_unbundle_spec_kind(
+                                layer_kv_cache_spec[layer_name_inner]
+                            ) != dsa_unbundle_kind
+                        ):
+                            raise RuntimeError(
+                                "DSA unbundle-only does not support a KV tensor "
+                                "shared by latent and indexer layouts."
+                            )
+                        kv_cache_raw_tensors[layer_name_inner] = raw_tensors
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
                     # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
                     # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
@@ -4400,6 +4501,55 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                dsa_unbundle_kind = self._get_dsa_unbundle_spec_kind(
+                    current_kv_cache_spec
+                )
+                if dsa_unbundle_kind is not None:
+                    assert isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
+                    assert current_kv_cache_spec.sparse_head_dim is not None
+                    raw_tensors = kv_cache_raw_tensors[layer_name]
+                    block_size = current_kv_cache_spec.block_size
+                    num_kv_heads = current_kv_cache_spec.num_kv_heads
+                    dtype = current_kv_cache_spec.dtype
+                    dtype_size = get_dtype_size(dtype)
+
+                    if dsa_unbundle_kind == "latent":
+                        k_head_dim, v_head_dim = current_kv_cache_spec.sparse_head_dim
+                        raw_k_tensor, raw_v_tensor = raw_tensors  # type: ignore[misc]
+                        num_blocks = raw_k_tensor.numel() // (
+                            block_size * num_kv_heads * k_head_dim * dtype_size
+                        )
+                        assert raw_v_tensor.numel() == (
+                            num_blocks
+                            * block_size
+                            * num_kv_heads
+                            * v_head_dim
+                            * dtype_size
+                        )
+                        kv_caches[layer_name] = (
+                            raw_k_tensor.view(dtype).view(
+                                num_blocks, block_size, num_kv_heads, k_head_dim
+                            ),
+                            raw_v_tensor.view(dtype).view(
+                                num_blocks, block_size, num_kv_heads, v_head_dim
+                            ),
+                        )
+                    else:
+                        (index_head_dim,) = current_kv_cache_spec.sparse_head_dim
+                        (raw_indexer_tensor,) = raw_tensors  # type: ignore[misc]
+                        num_blocks = raw_indexer_tensor.numel() // (
+                            block_size * num_kv_heads * index_head_dim * dtype_size
+                        )
+                        kv_caches[layer_name] = (
+                            raw_indexer_tensor.view(dtype).view(
+                                num_blocks,
+                                block_size,
+                                num_kv_heads,
+                                index_head_dim,
+                            ),
+                        )
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
@@ -4971,43 +5121,59 @@ class NPUModelRunner(GPUModelRunner):
 
             elif isinstance(attn_module, MLAAttention):
                 if self.use_sparse:
-                    impl = attn_module.impl
-                    has_indexer = bool(getattr(impl, "has_indexer", False))
-                    enable_sparse_sfa_c8_for_layer = bool(getattr(impl, "enable_sparse_sfa_c8", False))
-                    enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
-
-                    if enable_sparse_sfa_c8_for_layer:
-                        packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
-                            self.model_config.hf_text_config.kv_lora_rank,
-                            self.model_config.hf_text_config.qk_rope_head_dim,
+                    if self.dsa_unbundle:
+                        # Step 2 / A2: preserve the final Ascend spec type while
+                        # splitting the bundled MLA layout into latent-only and
+                        # standalone indexer specs. C8 is fail-closed in this slice.
+                        kv_lora_rank, qk_rope_head_dim = self.sparse_head_dim[:2]
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=kv_lora_rank + qk_rope_head_dim,
+                            sparse_head_dim=(kv_lora_rank, qk_rope_head_dim),
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_sfa_c8=False,
+                            cache_sparse_li_c8=False,
                         )
-                        sparse_head_dim = (
-                            packed_kv_head_dim,
-                            0,
-                            self.model_config.hf_text_config.index_head_dim if has_indexer else 0,
-                        )
-                    elif has_indexer:
-                        sparse_head_dim = self.sparse_head_dim
                     else:
-                        # Layers that reuse another layer's top-k indices only
-                        # need the MLA latent and RoPE caches.
-                        sparse_head_dim = (
-                            self.model_config.hf_text_config.kv_lora_rank,
-                            self.model_config.hf_text_config.qk_rope_head_dim,
-                            0,
-                        )
+                        impl = attn_module.impl
+                        has_indexer = bool(getattr(impl, "has_indexer", False))
+                        enable_sparse_sfa_c8_for_layer = bool(getattr(impl, "enable_sparse_sfa_c8", False))
+                        enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=sum(sparse_head_dim),
-                        sparse_head_dim=sparse_head_dim,
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_sfa_c8=enable_sparse_sfa_c8_for_layer,
-                        cache_sparse_li_c8=enable_sparse_li_c8_for_layer,
-                        sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
-                    )
+                        if enable_sparse_sfa_c8_for_layer:
+                            packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
+                                self.model_config.hf_text_config.kv_lora_rank,
+                                self.model_config.hf_text_config.qk_rope_head_dim,
+                            )
+                            sparse_head_dim = (
+                                packed_kv_head_dim,
+                                0,
+                                self.model_config.hf_text_config.index_head_dim if has_indexer else 0,
+                            )
+                        elif has_indexer:
+                            sparse_head_dim = self.sparse_head_dim
+                        else:
+                            # Layers that reuse another layer's top-k indices only
+                            # need the MLA latent and RoPE caches.
+                            sparse_head_dim = (
+                                self.model_config.hf_text_config.kv_lora_rank,
+                                self.model_config.hf_text_config.qk_rope_head_dim,
+                                0,
+                            )
+
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=sum(sparse_head_dim),
+                            sparse_head_dim=sparse_head_dim,
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_sfa_c8=enable_sparse_sfa_c8_for_layer,
+                            cache_sparse_li_c8=enable_sparse_li_c8_for_layer,
+                            sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
+                        )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
@@ -5025,6 +5191,19 @@ class NPUModelRunner(GPUModelRunner):
 
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
+
+            elif self.dsa_unbundle and isinstance(attn_module, DeepseekV32IndexerCache):
+                index_head_dim = self.sparse_head_dim[-1]
+                kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                    block_size=self.block_size,
+                    num_kv_heads=1,
+                    head_size=index_head_dim,
+                    sparse_head_dim=(index_head_dim,),
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    cache_sparse_sfa_c8=False,
+                    cache_sparse_li_c8=False,
+                )
 
             elif isinstance(attn_module, CacheOnlyAttentionLayer):
                 # Only CacheOnlyAttentionLayer (extract_hidden_states draft model)
@@ -5058,6 +5237,22 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+
+        if self.dsa_unbundle:
+            latent_specs = sum(
+                self._get_dsa_unbundle_spec_kind(spec) == "latent"
+                for spec in kv_cache_spec.values()
+            )
+            indexer_specs = sum(
+                self._get_dsa_unbundle_spec_kind(spec) == "indexer"
+                for spec in kv_cache_spec.values()
+            )
+            logger.info(
+                "DSA KV registration: latent_specs=%d standalone_indexer_specs=%d "
+                "mode=unbundle-only",
+                latent_specs,
+                indexer_specs,
+            )
 
         return kv_cache_spec
 

@@ -5,9 +5,22 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from vllm.model_executor.layers.attention import MLAAttention
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    register_ascend_kv_cache_specs,
+)
+from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -109,6 +122,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
         runner.use_sparse = False
+        runner.dsa_unbundle = False
         runner.use_sparse_c8 = False
         runner.use_compress = False
         runner.use_hybrid_blocks = False
@@ -130,6 +144,182 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         runner.attn_backend = backend
         return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_unbundle_registers_final_latent_and_indexer_specs(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.dsa_unbundle = True
+        runner.block_size = 16
+        runner.sparse_head_dim = (512, 64, 128)
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.shared_kv_cache_layers = {}
+        runner.vllm_config.cache_config.cache_dtype = "auto"
+
+        mla_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(mla_layer)
+        indexer_layer = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
+        torch.nn.Module.__init__(indexer_layer)
+        mock_get_layers.return_value = {
+            "model.layers.0.self_attn.attn": mla_layer,
+            "model.layers.0.self_attn.indexer.k_cache": indexer_layer,
+        }
+
+        specs = runner.get_kv_cache_spec()
+
+        latent_spec = specs["model.layers.0.self_attn.attn"]
+        indexer_spec = specs["model.layers.0.self_attn.indexer.k_cache"]
+        self.assertIsInstance(latent_spec, AscendMLAAttentionSpec)
+        self.assertIsInstance(indexer_spec, AscendMLAAttentionSpec)
+        self.assertEqual(latent_spec.sparse_head_dim, (512, 64))
+        self.assertEqual(latent_spec.head_size, 576)
+        self.assertEqual(indexer_spec.sparse_head_dim, (128,))
+        self.assertEqual(indexer_spec.head_size, 128)
+
+    def test_unbundle_allocates_and_reshapes_latent_and_indexer_layouts(self):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.dsa_unbundle = True
+        runner.sparse_head_dim = (512, 64, 128)
+        runner.kv_cache_dtype = torch.bfloat16
+        latent_name = "model.layers.0.self_attn.attn"
+        indexer_name = "model.layers.0.self_attn.indexer.k_cache"
+        latent_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            sparse_head_dim=(512, 64),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        indexer_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            sparse_head_dim=(128,),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=latent_spec.page_size_bytes * 2,
+                    shared_by=[latent_name],
+                ),
+                KVCacheTensor(
+                    size=indexer_spec.page_size_bytes * 2,
+                    shared_by=[indexer_name],
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[latent_name],
+                    kv_cache_spec=latent_spec,
+                ),
+                KVCacheGroupSpec(
+                    layer_names=[indexer_name],
+                    kv_cache_spec=indexer_spec,
+                ),
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+        self.assertEqual(len(raw_caches[latent_name]), 2)
+        self.assertEqual(len(raw_caches[indexer_name]), 1)
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=latent_spec,
+                backend=runner.attn_backend,
+                layer_names=[latent_name],
+            ),
+            SimpleNamespace(
+                kv_cache_spec=indexer_spec,
+                backend=runner.attn_backend,
+                layer_names=[indexer_name],
+            ),
+        ]
+
+        kv_caches = runner._reshape_kv_cache_tensors(kv_cache_config, raw_caches)
+
+        latent_k, latent_rope = kv_caches[latent_name]
+        (indexer_k,) = kv_caches[indexer_name]
+        self.assertEqual(latent_k.shape, (2, 16, 1, 512))
+        self.assertEqual(latent_rope.shape, (2, 16, 1, 64))
+        self.assertEqual(indexer_k.shape, (2, 16, 1, 128))
+
+    def test_unbundle_specs_use_final_ascend_registry(self):
+        register_ascend_kv_cache_specs()
+        latent_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            sparse_head_dim=(512, 64),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        indexer_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            sparse_head_dim=(128,),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+
+        self.assertIs(
+            KVCacheSpecRegistry.get_manager_class(latent_spec),
+            CompressAttentionManager,
+        )
+        self.assertIs(
+            KVCacheSpecRegistry.get_manager_class(indexer_spec),
+            CompressAttentionManager,
+        )
+
+    def test_unbundle_specs_form_one_uniform_type_group(self):
+        register_ascend_kv_cache_specs()
+        latent_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            sparse_head_dim=(512, 64),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        indexer_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            sparse_head_dim=(128,),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        specs = {
+            **{
+                f"model.layers.{layer_id}.self_attn.attn": latent_spec
+                for layer_id in range(78)
+            },
+            **{
+                f"model.layers.{layer_id}.self_attn.indexer.k_cache": indexer_spec
+                for layer_id in range(78)
+            },
+        }
+        vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+        )
+
+        groups = get_kv_cache_groups(vllm_config, specs)
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertIsInstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        self.assertEqual(len(group.layer_names), 156)
+        self.assertEqual(len(group.kv_cache_spec.kv_cache_specs), 156)
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
