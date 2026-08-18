@@ -593,6 +593,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     q_hadamard: torch.Tensor | None = None
     k_hadamard: torch.Tensor | None = None
 
+    # One-shot gate for the VLLM_ASCEND_DSA_DEBUG runtime table evidence.
+    _dsa_debug_logged: bool = False
+
     def __init__(
         self,
         num_heads: int,
@@ -1737,6 +1740,29 @@ class AscendSFAImpl(MLAAttentionImpl):
             if attn_metadata.indexer_slot_mapping is not None
             else slot_mapping
         )
+        if envs.VLLM_ASCEND_DSA_DEBUG and not AscendSFAImpl._dsa_debug_logged:
+            # One-shot runtime evidence that the two-group tables are live:
+            # whether the indexer mirror exists, the first few block ids of
+            # each table (distinct id spaces = independent pools), and which
+            # slot mapping the indexer writes use.
+            AscendSFAImpl._dsa_debug_logged = True
+            indexer_bt = getattr(attn_metadata, "indexer_block_table", None)
+            if indexer_bt is not None:
+                logger.info(
+                    "[DSA_DEBUG] layer=%s two_groups tables live: "
+                    "latent_bt[:1]=%s indexer_bt[:1]=%s "
+                    "idx_slot_is_shared=%s",
+                    layer_name,
+                    attn_metadata.block_table[:1, :4].tolist(),
+                    indexer_bt[:1, :4].tolist(),
+                    idx_slot_mapping is slot_mapping,
+                )
+            else:
+                logger.info(
+                    "[DSA_DEBUG] layer=%s indexer tables absent "
+                    "(unbundle-only shared id space); idx_slot_is_shared=True",
+                    layer_name,
+                )
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens

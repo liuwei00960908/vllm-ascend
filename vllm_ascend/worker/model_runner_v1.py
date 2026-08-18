@@ -4232,6 +4232,40 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache for all shared layers
                         kv_cache_raw_tensors[layer_name_inner] = tensor
+                elif (
+                    self.dsa_shared_pool
+                    and use_attn
+                    and not use_mamba
+                    and layer_name not in kv_cache_raw_tensors
+                    and any("indexer" in ln for ln in kv_cache_tensor.shared_by)
+                    and any("indexer" not in ln for ln in kv_cache_tensor.shared_by)
+                ):
+                    # DSA shared bundle pool: one raw int8 slab per
+                    # latent/indexer pair (KVCacheTensor shared_by both
+                    # siblings); both layers get the SAME raw tensor and the
+                    # reshape step cuts the two views. Fork semantics:
+                    # vllm-ascend-sparse@c7c4a4ac model_runner_v1.py:4157-4175
+                    # (adapted: official C8 flags read instead of the fork's
+                    # use_sparse_c8_indexer; C8 stays fail-closed).
+                    if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+                        raise ValueError(
+                            "DSA shared pool does not support sparse C8; "
+                            "disable both C8 modes before enabling SHARED_POOL."
+                        )
+                    if self.vllm_config.kv_transfer_config is None:
+                        raw_tensor = torch.zeros(
+                            kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                        )
+                    else:
+                        cache_size_aligned = kv_cache_tensor.size + alignment
+                        raw_tensor = torch.zeros(
+                            cache_size_aligned, dtype=torch.int8, device=self.device
+                        )
+                        raw_tensor = self._align_memory(raw_tensor, alignment)[
+                            : kv_cache_tensor.size
+                        ]
+                    for layer_name_inner in kv_cache_tensor.shared_by:
+                        kv_cache_raw_tensors[layer_name_inner] = (raw_tensor,)
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
                     if self.vllm_config.kv_transfer_config is None:
                         tensor = torch.zeros(kv_cache_tensor.size,
@@ -4535,6 +4569,32 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if (
+                    self.dsa_shared_pool
+                    and isinstance(current_kv_cache_spec, AttentionSpec)
+                    and len(kv_cache_raw_tensors[layer_name]) == 1
+                ):
+                    # DSA shared bundle: every layer of a pair holds the SAME
+                    # raw slab (1-tuple); cut the latent (k_nope, k_pe) or
+                    # indexer view from it. Fork semantics:
+                    # vllm-ascend-sparse@c7c4a4ac model_runner_v1.py:4354-4364.
+                    from vllm_ascend.worker.dsa_shared_pool import (
+                        reshape_dsa_shared_pool_raw,
+                    )
+
+                    raw = kv_cache_raw_tensors[layer_name][0]
+                    kv_caches[layer_name] = reshape_dsa_shared_pool_raw(
+                        raw,
+                        current_kv_cache_spec.dtype,
+                        current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        self.sparse_head_dim[0],
+                        self.sparse_head_dim[1],
+                        self.sparse_head_dim[2],
+                        is_indexer="indexer" in layer_name,
+                    )
+                    continue
 
                 dsa_unbundle_kind = self._get_dsa_unbundle_spec_kind(
                     current_kv_cache_spec
@@ -4982,6 +5042,21 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            if (
+                self.dsa_shared_pool
+                and isinstance(kv_cache_group.kv_cache_spec, AttentionSpec)
+            ):
+                # DSA shared bundle: round each request's block budget up to a
+                # whole number of bundles (latent: 2 blocks/bundle, indexer:
+                # 9 blocks/bundle) so the input batch never requests a partial
+                # bundle. Fork semantics: F-ascend :4618-4625.
+                if kv_cache_group.kv_cache_spec.head_size > self.sparse_head_dim[-1]:
+                    blocks_per_bundle = 2
+                else:
+                    blocks_per_bundle = 9
+                max_num_blocks_per_req = cdiv(
+                    max_num_blocks_per_req, blocks_per_bundle
+                ) * blocks_per_bundle
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
