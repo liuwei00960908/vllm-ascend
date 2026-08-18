@@ -118,6 +118,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") or "0"
     ),
+    # DSA replay diagnostics: 1 = one-shot runtime log in SFA forward showing
+    # the two-group block tables / slot mappings (evidence that the indexer
+    # group's own tables are live). Default off; first forward per process
+    # logs once, then silent.
+    "VLLM_ASCEND_DSA_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_DEBUG", "0"))
+    ),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
