@@ -3968,7 +3968,56 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            kv_transfer_group = get_kv_transfer_group()
+            kv_caches_to_register = kv_caches
+            register_full_dsa_kv_caches = False
+            if self.dsa_unbundle:
+                # P1 Phase 2 / A2: fork semantics
+                # (vllm-ascend-sparse@c7c4a4ac model_runner_v1.py:3971-4005).
+                # Un-bundled: the indexer layer holds a 1-tuple (key only, no
+                # value). The KV connector only offloads the latent, and
+                # LMCache's permute requires >=2 tensors per entry, so filter
+                # sub-2-tuple layers out of the registration set. Connectors
+                # that explicitly opted into indexer offload via
+                # requires_full_dsa_kv_caches / supports_dsa_index_lmcache
+                # keep the full set (future LMCache-aware path; none in this
+                # replay slice, so the raw env fallback is not ported).
+                supports_dsa_index_lmcache = bool(
+                    getattr(kv_transfer_group, "supports_dsa_index_lmcache", False)
+                )
+                requires_full_dsa_kv_caches = bool(
+                    getattr(kv_transfer_group, "requires_full_dsa_kv_caches", False)
+                )
+                register_full_dsa_kv_caches = (
+                    requires_full_dsa_kv_caches or supports_dsa_index_lmcache
+                )
+                if not register_full_dsa_kv_caches:
+                    kv_caches_to_register = {
+                        name: kv
+                        for name, kv in kv_caches.items()
+                        if not (isinstance(kv, (tuple, list)) and len(kv) < 2)
+                    }
+                    logger.info(
+                        "DSA un-bundle: registering %d/%d KV layers with the "
+                        "connector (latent only; indexer kept resident; "
+                        "supports_dsa_index_lmcache=%s "
+                        "requires_full_dsa_kv_caches=%s).",
+                        len(kv_caches_to_register),
+                        len(kv_caches),
+                        supports_dsa_index_lmcache,
+                        requires_full_dsa_kv_caches,
+                    )
+                else:
+                    logger.info(
+                        "DSA un-bundle: registering all %d KV layers with the "
+                        "group-aware connector for latent/indexer sub-dispatch "
+                        "(supports_dsa_index_lmcache=%s "
+                        "requires_full_dsa_kv_caches=%s).",
+                        len(kv_caches_to_register),
+                        supports_dsa_index_lmcache,
+                        requires_full_dsa_kv_caches,
+                    )
+            kv_transfer_group.register_kv_caches(kv_caches_to_register)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
