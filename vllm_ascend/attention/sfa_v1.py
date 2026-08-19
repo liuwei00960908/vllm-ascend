@@ -923,6 +923,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._dsa_idx_cache_t = _idx_t
         return (kv_cache[0], kv_cache[1], _idx_t)
 
+    def _maybe_save_unbundled_kv_cache(
+        self,
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Save the unbundled latent and indexer groups separately (A2d).
+
+        Fork semantics (vllm-ascend-sparse sfa_v1.py:3187-3189): the latent
+        group is dispatched under the MLA layer name and the indexer group
+        under its sibling ``...self_attn.indexer.k_cache`` name so the
+        connector routes kv_group=0 / kv_group=1 independently. Bundled
+        (2-tuple) layers keep the single latent-only save.
+        """
+        maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+        if self.dsa_unbundle and len(kv_cache) >= 3:
+            maybe_save_kv_layer_to_connector(
+                _dsa_indexer_layer_name(layer_name),
+                [kv_cache[2]],
+            )
+
     @staticmethod
     def _is_w8a8_dynamic_linear(layer: torch.nn.Module | None) -> bool:
         quant_method = getattr(getattr(layer, "quant_method", None), "quant_method", None)
@@ -2105,7 +2125,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        self._maybe_save_unbundled_kv_cache(layer_name, kv_cache)
 
         return output_padded
 

@@ -205,5 +205,66 @@ class TestDsaTwoGroupsMetadataFields(unittest.TestCase):
         self.assertIsNone(released["indexer_slot_mapping"])
 
 
+class TestDsaSaveDispatch(unittest.TestCase):
+    """A2d: unbundled save splits latent (kv_group=0) and indexer
+    (kv_group=1) dispatches with their own layer names so the connector
+    stores both groups independently."""
+
+    def _build_impl(self, unbundle: bool):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_unbundle = unbundle
+        return impl
+
+    def test_bundled_two_tuple_saves_latent_only(self):
+        impl = self._build_impl(unbundle=False)
+        k_nope, k_pe = torch.zeros(2), torch.zeros(3)
+        with patch(
+            "vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"
+        ) as mock_save:
+            impl._maybe_save_unbundled_kv_cache(
+                "model.layers.0.self_attn.attn", (k_nope, k_pe)
+            )
+        self.assertEqual(mock_save.call_count, 1)
+        name, kv = mock_save.call_args.args
+        self.assertEqual(name, "model.layers.0.self_attn.attn")
+        self.assertIs(kv[0], k_nope)
+        self.assertIs(kv[1], k_pe)
+
+    def test_unbundle_three_tuple_saves_latent_and_indexer(self):
+        impl = self._build_impl(unbundle=True)
+        k_nope, k_pe, indexer_t = torch.zeros(2), torch.zeros(3), torch.zeros(5)
+        with patch(
+            "vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"
+        ) as mock_save:
+            impl._maybe_save_unbundled_kv_cache(
+                "model.layers.0.self_attn.attn", (k_nope, k_pe, indexer_t)
+            )
+        self.assertEqual(mock_save.call_count, 2)
+        latent_name, latent_kv = mock_save.call_args_list[0].args
+        indexer_name, indexer_kv = mock_save.call_args_list[1].args
+        self.assertEqual(latent_name, "model.layers.0.self_attn.attn")
+        self.assertIs(latent_kv[0], k_nope)
+        self.assertIs(latent_kv[1], k_pe)
+        self.assertEqual(indexer_name, "model.layers.0.self_attn.indexer.k_cache")
+        self.assertIs(indexer_kv[0], indexer_t)
+
+    def test_unbundle_off_three_tuple_keeps_single_latent_save(self):
+        # Non-DSA model with a 3-tuple cache: keep the previous single-call
+        # behavior (no indexer dispatch).
+        impl = self._build_impl(unbundle=False)
+        kv_cache = (torch.zeros(2), torch.zeros(3), torch.zeros(5))
+        with patch(
+            "vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"
+        ) as mock_save:
+            impl._maybe_save_unbundled_kv_cache(
+                "model.layers.0.self_attn.attn", kv_cache
+            )
+        self.assertEqual(mock_save.call_count, 1)
+        name, kv = mock_save.call_args.args
+        self.assertEqual(name, "model.layers.0.self_attn.attn")
+        self.assertIs(kv[0], kv_cache[0])
+        self.assertIs(kv[1], kv_cache[1])
+
+
 if __name__ == "__main__":
     unittest.main()
