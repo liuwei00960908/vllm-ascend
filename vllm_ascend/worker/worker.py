@@ -500,6 +500,20 @@ class NPUWorker(WorkerBase):
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
+        # Bind cpus before model loading and before any component registers
+        # large host buffers (e.g. LMCache shared CPU cache pins its slab via
+        # aclrtHostRegister). migratepages cannot move registered pages and
+        # retries them until it exceeds the subprocess timeout, so binding
+        # must happen while the process still has a small, movable
+        # footprint. Fork semantics: vllm-ascend-sparse@c7c4a4ac worker.py
+        # :313-318 (upstream v0.23.0 placed this in
+        # compile_or_warm_up_model, after warmup allocations).
+        if get_ascend_config().enable_cpu_binding:
+            try:
+                bind_cpus(self.local_rank)
+            except Exception as e:
+                logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+
         return device
 
     def init_device(self):
@@ -774,13 +788,6 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
-        # Bind after warmup so hot allocations are already materialized on the
-        # worker process before migratepages/taskset run.
-        if get_ascend_config().enable_cpu_binding:
-            try:
-                bind_cpus(self.local_rank)
-            except Exception as e:
-                logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
