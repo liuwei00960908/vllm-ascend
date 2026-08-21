@@ -1,9 +1,12 @@
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+import numpy as np
 import scipy  # type: ignore
 import torch
 import torch_npu
+import os
 import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -33,9 +36,11 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    get_lmcache_sparse_cached_tokens,
     get_sfa_qsfa_packed_head_dim,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
+    staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -253,6 +258,30 @@ class AscendSFAMetadata:
     indexer_block_table: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
 
+    # DSA shrink replay (B2c): per-request compact-scratch data plane.
+    # decode_req_indices_cpu/tensor map each decode row to its request index
+    # (-1 for padding rows); decode_split_boundary_cpu(+tensor) is the
+    # builder-owned boundary storage the B2c updater overwrites in place;
+    # split_boundary is its device view. decode_target_slot_mapping /
+    # decode_selected_tokens / decode_selected_counts carry the remap kernel's
+    # outputs for the selective retrieve (populated by B2d). All None for
+    # non-shrink modes (official paths untouched).
+    # Provenance: fork sfa_v1.py:885-912 (subset; decode_scratch_base fields,
+    # union_mapping and the staged-graph buffers are P9/P11+ and not ported).
+    req_ids: list[str] | None = None
+    prompt_lens: list[int] | None = None
+    decode_req_indices_cpu: Any = None
+    decode_valid_row_indices: Any = None
+    decode_row_offsets: Any = None
+    decode_split_boundary_cpu: Any = None
+    decode_split_boundary_cpu_tensor: Any = None
+    split_boundary: torch.Tensor | None = None
+    decode_split_boundary: torch.Tensor | None = None
+    decode_target_slot_mapping: torch.Tensor | None = None
+    decode_selected_tokens: torch.Tensor | None = None
+    decode_selected_counts: torch.Tensor | None = None
+    need_sparse_lmcache_payload: bool = False
+
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 
@@ -333,6 +362,50 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
 
+        # DSA shrink replay (B2c): builder-side gate and the scratch
+        # structural check. The gate reads UNBUNDLE (fork :959-964); the
+        # runner only injects the data plane under two-groups, so an
+        # unbundle-without-two-groups configuration stays inert here.
+        # decode_threshold > 2 with shrink is rejected (MTP<=2 constraint).
+        # Provenance: fork sfa_v1.py:959-982.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
+            else 0
+        )
+        if self.dsa_shrink_latent and self.decode_threshold > 2:
+            raise ValueError(
+                "DSA shrink-latent compact-scratch decode supports at most "
+                f"MTP2 (decode_threshold={self.decode_threshold})."
+            )
+        self.dsa_index_topk = int(
+            getattr(self.model_config.hf_text_config, "index_topk", 0) or 0
+        )
+        if self.dsa_shrink_latent:
+            if self.dsa_index_topk <= 0:
+                raise ValueError(
+                    "DSA shrink-latent requires the model to define "
+                    "index_topk."
+                )
+            if self.dsa_index_topk % self.kernel_block_size:
+                raise ValueError(
+                    "DSA index_topk must be an integer multiple of "
+                    f"block_size: index_topk={self.dsa_index_topk}, "
+                    f"block_size={self.kernel_block_size}."
+                )
+            # Builder-owned fixed-address per-row storage (fork :984-1059):
+            # CPU numpy + device tensors so the boundary updater can rewrite
+            # rows without allocating (graph-replay address stability; eager
+            # fills the same structures).
+            max_rows = max_num_batched_tokens
+            self._dsa_split_boundary_np = np.zeros(max_rows, dtype=np.int32)
+            self._dsa_split_boundary_tensor = torch.zeros(
+                max_rows, dtype=torch.int32, device=self.device
+            )
+            self._dsa_req_indices_np = np.full(
+                max_rows, -1, dtype=np.int32
+            )
+
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
         return ascend_chunked_prefill_workspace_size(vllm_config)
@@ -394,6 +467,68 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[
                 :num_input_tokens
             ]
+
+        # DSA shrink replay (B2c): expand the per-row data plane when the
+        # runner injected the channels (plens_cpu present => shrink active
+        # for this batch). Decode rows get their request index and an
+        # initial boundary of the request's prompt length (overwritten
+        # in-place each step by _update_dsa_split_boundary_in_place);
+        # prefill rows keep -1 / 0. Provenance: fork sfa_v1.py:1185-1444
+        # (fixed-width fast path + mixed path unified into this scan; the
+        # staged-only layout-signature caching and cold-compact resume
+        # validation are not ported).
+        shrink_kwargs: dict = {}
+        plens_cpu = common_attn_metadata.prompt_lens_cpu
+        if self.dsa_shrink_latent and plens_cpu is not None:
+            attn_state = common_attn_metadata.attn_state
+            is_decode_like = attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            )
+            req_ids = common_attn_metadata.request_ids
+            if is_decode_like and req_ids is not None:
+                num_rows = num_reqs * self.decode_threshold
+                row_req = np.repeat(
+                    np.arange(num_reqs, dtype=np.int32),
+                    self.decode_threshold,
+                )
+                boundary = np.asarray(
+                    plens_cpu[:num_reqs], dtype=np.int32
+                )
+                boundary_rows = np.repeat(boundary, self.decode_threshold)
+            else:
+                # Mixed / prefill batch: rows are per-token; decode rows are
+                # those at or past each request's prompt frontier. Chunked
+                # prefill steps simply carry no decode rows here (their
+                # remap stays disabled by num_decode_tokens == 0).
+                num_rows = num_reqs
+                row_req = np.arange(num_reqs, dtype=np.int32)
+                plen = np.asarray(plens_cpu[:num_reqs], dtype=np.int32)
+                seq = (
+                    seq_lens_cpu.detach().numpy()
+                    if isinstance(seq_lens_cpu, torch.Tensor)
+                    else np.asarray(seq_lens_cpu)
+                )[:num_reqs]
+                boundary_rows = np.where(
+                    seq > plen, plen, seq.astype(np.int32, copy=False)
+                )
+            self._dsa_req_indices_np[:num_rows] = row_req
+            self._dsa_split_boundary_np[:num_rows] = boundary_rows
+            self._dsa_split_boundary_tensor[:num_rows].copy_(
+                torch.from_numpy(boundary_rows)
+            )
+            shrink_kwargs = dict(
+                req_ids=list(req_ids) if req_ids is not None else None,
+                prompt_lens=list(plens_cpu[:num_reqs]),
+                decode_req_indices_cpu=self._dsa_req_indices_np[:num_rows],
+                decode_split_boundary_cpu=self._dsa_split_boundary_np[:num_rows],
+                decode_split_boundary_cpu_tensor=self._dsa_split_boundary_tensor,
+                split_boundary=self._dsa_split_boundary_tensor[:num_rows],
+                need_sparse_lmcache_payload=(
+                    self.dsa_shrink_latent != 3
+                    and staged_sfa_connector_supports_sparse_load()
+                ),
+            )
 
         block_size = self.kernel_block_size
 
@@ -551,6 +686,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_key_cache_idx=actual_group_key_cache_idx,
             indexer_block_table=indexer_block_table,
             indexer_slot_mapping=indexer_slot_mapping,
+            **shrink_kwargs,
         )
 
     def build_for_graph_capture(
@@ -578,6 +714,221 @@ def _dsa_indexer_layer_name(layer_name: str) -> str:
     ``...self_attn.indexer.k_cache`` layer's own KV cache.
     """
     return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+
+
+# ---------------------------------------------------------------------------
+# DSA shrink replay (B2c): module-level remap support helpers.
+# Provenance: vllm-ascend-sparse@c7c4a4ac sfa_v1.py:236-241, :244-250,
+# :253-363, :366-395, :704-727. The staged-graph consumers
+# (_prepare_sfa_remap_boundary / _validate_dsa_scratch_capacity /
+# _fixed_staged_decode_mtp) and _dsa_build_target_slot_mapping are P9/P11+
+# and intentionally not ported in this slice.
+# ---------------------------------------------------------------------------
+
+
+def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
+        return topk_indices[:, 0, :]
+    if topk_indices.dim() == 2:
+        return topk_indices
+    return topk_indices.reshape(topk_indices.shape[0], -1)
+
+
+@lru_cache(maxsize=1)
+def _decode_window_save_window_size() -> int:
+    value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
+
+
+def _update_dsa_split_boundary_in_place(
+    attn_metadata: Any,
+    cached_tokens: list[int] | None,
+    decode_window_size: int,
+) -> torch.Tensor:
+    """Update the builder-owned row boundary without temporary device tensors.
+
+    Each decode row's boundary is overwritten with the proven LMCache
+    frontier (min with the decode-window start when window saving is on):
+    rows below the boundary read through compact scratch, rows above keep
+    their absolute positions. Provenance: fork sfa_v1.py:253-363.
+    """
+    split_boundary = attn_metadata.split_boundary
+    boundary_cpu = attn_metadata.decode_split_boundary_cpu
+    boundary_cpu_tensor = attn_metadata.decode_split_boundary_cpu_tensor
+    row_req_indices_cpu = attn_metadata.decode_req_indices_cpu
+    if split_boundary is None or boundary_cpu is None or boundary_cpu_tensor is None or row_req_indices_cpu is None:
+        raise RuntimeError(
+            "DSA sparse boundary backing storage is incomplete. Rebuild "
+            "attention metadata with the configured max_num_batched_tokens."
+        )
+
+    num_rows = int(split_boundary.shape[0])
+    if (
+        len(boundary_cpu) < num_rows
+        or int(boundary_cpu_tensor.shape[0]) < num_rows
+        or len(row_req_indices_cpu) < num_rows
+    ):
+        raise RuntimeError(
+            "DSA sparse boundary active view exceeds its backing storage: "
+            f"num_rows={num_rows}, boundary_cpu={len(boundary_cpu)}, "
+            f"boundary_tensor={int(boundary_cpu_tensor.shape[0])}, "
+            f"row_req_indices={len(row_req_indices_cpu)}."
+        )
+
+    seq_lens_cpu = attn_metadata.seq_lens_cpu
+    num_reqs = int(seq_lens_cpu.shape[0])
+    row_req_indices = np.asarray(
+        row_req_indices_cpu[:num_rows],
+        dtype=np.int32,
+    )
+    valid_rows = row_req_indices >= 0
+    if np.any(row_req_indices[valid_rows] >= num_reqs):
+        bad_row = int(
+            np.flatnonzero(
+                valid_rows & (row_req_indices >= num_reqs)
+            )[0]
+        )
+        raise RuntimeError(
+            "DSA sparse row references a request outside seq_lens: "
+            f"row={bad_row}, "
+            f"request_index={int(row_req_indices[bad_row])}, "
+            f"num_reqs={num_reqs}."
+        )
+
+    has_cached_frontier = cached_tokens is not None
+    if (
+        has_cached_frontier
+        and decode_window_size <= 0
+        and len(cached_tokens) == 0
+        and attn_metadata.num_decode_tokens > 0
+    ):
+        raise RuntimeError(
+            "LMCache sparse remap has decode rows but no request boundaries"
+        )
+
+    if np.any(valid_rows) and (
+        has_cached_frontier or decode_window_size > 0
+    ):
+        if has_cached_frontier:
+            cached_count = min(len(cached_tokens), num_reqs)
+            if cached_count == num_reqs:
+                request_boundaries = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+            else:
+                request_boundaries = np.zeros(
+                    num_reqs,
+                    dtype=np.int32,
+                )
+                request_boundaries[:cached_count] = np.asarray(
+                    cached_tokens[:cached_count],
+                    dtype=np.int32,
+                )
+        else:
+            request_boundaries = np.empty(
+                num_reqs,
+                dtype=np.int32,
+            )
+        if decode_window_size > 0:
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens = seq_lens_cpu.detach().numpy()
+            else:
+                seq_lens = np.asarray(seq_lens_cpu)
+            current_positions = np.maximum(
+                seq_lens[:num_reqs].astype(np.int64, copy=False) - 1,
+                0,
+            )
+            window_starts = (
+                current_positions // decode_window_size
+                * decode_window_size
+            )
+            if has_cached_frontier:
+                np.minimum(
+                    window_starts,
+                    request_boundaries,
+                    out=request_boundaries,
+                    casting="unsafe",
+                )
+            else:
+                request_boundaries[:] = window_starts
+        boundary_cpu[:num_rows][valid_rows] = request_boundaries[
+            row_req_indices[valid_rows]
+        ]
+
+    split_boundary.copy_(boundary_cpu_tensor[:num_rows])
+    attn_metadata.decode_split_boundary = split_boundary
+    return split_boundary
+
+
+def _resolve_sparse_cached_tokens_by_request(
+    attn_metadata: Any,
+    request_ids: Any,
+) -> list[int]:
+    """Resolve strict connector frontiers in the native request order.
+
+    Provenance: fork sfa_v1.py:366-395.
+    """
+    row_req_indices = attn_metadata.decode_req_indices_cpu
+    if row_req_indices is None:
+        raise RuntimeError(
+            "[SFA sparse remap] row/request mapping is unavailable."
+        )
+    decode_request_indices = sorted(
+        {
+            int(request_index)
+            for request_index in row_req_indices
+            if int(request_index) >= 0
+        }
+    )
+    request_ids = list(request_ids) if request_ids is not None else []
+    if decode_request_indices and decode_request_indices[-1] >= len(request_ids):
+        raise RuntimeError(
+            "[SFA sparse remap] active request IDs do not cover all decode "
+            "rows."
+        )
+    decode_request_ids = [
+        request_ids[request_index] for request_index in decode_request_indices
+    ]
+    resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
+    cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
+    for request_index, committed_end in zip(
+        decode_request_indices, resolved, strict=True
+    ):
+        cached_tokens[request_index] = int(committed_end)
+    return cached_tokens
+
+
+def _dsa_mask_padding_sparse_rows(
+    topk_indices: torch.Tensor,
+    row_req_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep graph padding rows from referencing freed DSA logical blocks.
+
+    Provenance: fork sfa_v1.py:704-727.
+    """
+    topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+    num_rows = int(topk_2d.shape[0])
+    if row_req_indices is None:
+        return topk_indices, topk_2d
+    row_req_indices = row_req_indices[:num_rows].to(device=topk_indices.device)
+    if int(row_req_indices.numel()) < num_rows:
+        pad = torch.full(
+            (num_rows - int(row_req_indices.numel()),),
+            -1,
+            dtype=row_req_indices.dtype,
+            device=topk_indices.device,
+        )
+        row_req_indices = torch.cat((row_req_indices, pad), dim=0)
+    padding_mask = row_req_indices < 0
+    if not topk_indices.is_contiguous():
+        topk_indices = topk_indices.contiguous()
+        topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+    topk_2d.masked_fill_(padding_mask.reshape(-1, 1), 0)
+    return topk_indices, topk_2d
 
 
 class AscendSFAImpl(MLAAttentionImpl):
