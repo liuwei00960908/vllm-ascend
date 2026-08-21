@@ -261,6 +261,15 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
 
+    # DSA shrink replay (B2b): per-request data plane inputs for the
+    # compact-scratch decode path. request_ids keys the LMCache committed
+    # frontier queries; prompt_lens_cpu seeds the per-row split boundary
+    # (initial value = prompt length, later overwritten in-place by
+    # _update_dsa_split_boundary_in_place). None for non-shrink modes and
+    # for every official path. Provenance: fork attention/utils.py:218-223.
+    request_ids: list[str] | None = None
+    prompt_lens_cpu: list[int] | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -288,6 +297,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # the SFA consumers fall back to the latent tables.
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
+            # DSA shrink (B2b): per-request lists must shrink with the copy,
+            # same rule as seq_lens_cpu above.
+            request_ids=_slice_reqs(self.request_ids),
+            prompt_lens_cpu=_slice_reqs(self.prompt_lens_cpu),
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
