@@ -523,8 +523,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             plens = np.asarray(plens_cpu[:num_reqs], dtype=np.int32)
             computed_cpu = common_attn_metadata.num_computed_tokens_cpu
             if computed_cpu is None:
+                # Async speculative decode keeps the authoritative CPU mirror
+                # on the underscored field (the public tensor is intentionally
+                # None to avoid a blocking copy in the runner).
+                computed_cpu = common_attn_metadata._num_computed_tokens_cpu
+            if computed_cpu is None:
                 raise RuntimeError(
-                    "DSA shrink requires num_computed_tokens_cpu for "
+                    "DSA shrink requires num_computed_tokens_cpu (or its "
+                    "async-spec CPU mirror) for "
                     "per-row decode layout expansion."
                 )
             computed = (
@@ -1455,8 +1461,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         (DecodeOnly / SpecDecoding — MTP verify steps included) the latent
         tail stays NPU-resident and a regular per-token store buys nothing
         (~88KB/token of PCIe for no consumer), so the regular save is
-        skipped. Decode-window saves (store-only synthetic requests) are
-        unaffected: they never flow through this hook.
+        skipped only while decode-window saving is disabled. When a window
+        is configured, the same layer callback must remain active so the
+        synthetic store-only metadata can persist the window and advance the
+        committed frontier (fork :4220-4231 exact gate).
         """
         if (
             self.dsa_shrink_latent
@@ -1465,6 +1473,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 AscendAttentionState.DecodeOnly,
                 AscendAttentionState.SpecDecoding,
             )
+            and _decode_window_save_window_size() <= 0
         ):
             return
         maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
@@ -2243,6 +2252,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         return bool(
             self.dsa_shrink_latent
             and attn_metadata.num_decode_tokens > 0
+            and (
+                attn_metadata.need_sparse_lmcache_payload
+                or self.dsa_shrink_latent == 3
+            )
         )
 
     def _record_dcp_kv_gather_context(
@@ -2663,19 +2676,63 @@ class AscendSFAImpl(MLAAttentionImpl):
                 prepare_sparse_indices,
             )
 
-            _cached = _resolve_sparse_cached_tokens_by_request(
-                attn_metadata, attn_metadata.req_ids
-            )
-            _update_dsa_split_boundary_in_place(
-                attn_metadata,
-                _cached,
-                _decode_window_save_window_size(),
-            )
+            if self.dsa_shrink_latent != 3:
+                _cached = _resolve_sparse_cached_tokens_by_request(
+                    attn_metadata, attn_metadata.req_ids
+                )
+                _update_dsa_split_boundary_in_place(
+                    attn_metadata,
+                    _cached,
+                    _decode_window_save_window_size(),
+                )
+            # Stage 3 is an isolation diagnostic by design: keep the
+            # builder's prompt boundary, remap and run FA on uninitialized
+            # scratch, but do NOT query/call LMCache. Crash => remap/FA;
+            # clean (wrong output expected) => transfer path is implicated.
             _row_req_indices = attn_metadata.decode_req_indices
-            topk_indices, _topk_2d = _dsa_mask_padding_sparse_rows(
-                topk_indices,
-                _row_req_indices,
+            _is_pure_decode = attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
             )
+            if _is_pure_decode:
+                topk_indices, _topk_2d = _dsa_mask_padding_sparse_rows(
+                    topk_indices,
+                    _row_req_indices,
+                )
+            else:
+                _topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+            _row_req_cpu = np.asarray(
+                attn_metadata.decode_req_indices_cpu,
+                dtype=np.int32,
+            )[: int(_topk_2d.shape[0])]
+            _valid_req = _row_req_cpu[_row_req_cpu >= 0]
+            _rows_per_req = (
+                int(np.bincount(_valid_req).max())
+                if _valid_req.size
+                else 0
+            )
+            _required_union_capacity = (
+                _rows_per_req * int(_topk_2d.shape[1])
+            )
+            if _required_union_capacity > self.dsa_scratch_capacity:
+                raise RuntimeError(
+                    "DSA scratch capacity is smaller than the per-request "
+                    "top-k union upper bound: "
+                    f"rows_per_request={_rows_per_req}, "
+                    f"topk_width={int(_topk_2d.shape[1])}, "
+                    f"required={_required_union_capacity}, "
+                    f"capacity={self.dsa_scratch_capacity}."
+                )
+            _table_capacity = (
+                int(attn_metadata.block_table.shape[1])
+                * int(attn_metadata.block_size)
+            )
+            if self.dsa_scratch_capacity > _table_capacity:
+                raise RuntimeError(
+                    "DSA scratch reservation exceeds the request block-table "
+                    f"capacity: scratch={self.dsa_scratch_capacity}, "
+                    f"table_capacity={_table_capacity}."
+                )
             (
                 topk_indices,
                 _sel_packed,
@@ -2689,6 +2746,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache[0].device,
                 row_req_indices=_row_req_indices,
                 scratch_capacity=self.dsa_scratch_capacity,
+                clear_invalid_rows=_is_pure_decode,
             )
             attn_metadata.decode_selected_tokens = _sel_packed
             attn_metadata.decode_selected_counts = _sel_counts

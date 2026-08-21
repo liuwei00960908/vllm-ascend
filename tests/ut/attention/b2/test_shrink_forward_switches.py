@@ -30,13 +30,34 @@ class TestSkipDenseWait(unittest.TestCase):
 
     def test_skip_only_with_shrink_and_decode_rows(self):
         impl = self._impl(shrink=2)
-        meta = SimpleNamespace(num_decode_tokens=4)
+        meta = SimpleNamespace(
+            num_decode_tokens=4, need_sparse_lmcache_payload=True
+        )
         self.assertTrue(impl._dsa_skip_dense_layer_wait(meta))
-        meta = SimpleNamespace(num_decode_tokens=0)
+        meta = SimpleNamespace(
+            num_decode_tokens=0, need_sparse_lmcache_payload=True
+        )
         self.assertFalse(impl._dsa_skip_dense_layer_wait(meta))  # prefill-only batch
         impl = self._impl(shrink=0)
-        meta = SimpleNamespace(num_decode_tokens=4)
+        meta = SimpleNamespace(
+            num_decode_tokens=4, need_sparse_lmcache_payload=True
+        )
         self.assertFalse(impl._dsa_skip_dense_layer_wait(meta))  # shrink off
+
+    def test_dense_wait_preserved_without_sparse_contract(self):
+        impl = self._impl(shrink=2)
+        meta = SimpleNamespace(
+            num_decode_tokens=4, need_sparse_lmcache_payload=False
+        )
+        self.assertFalse(impl._dsa_skip_dense_layer_wait(meta))
+
+    def test_stage3_intentionally_skips_dense_wait_without_contract(self):
+        # Isolation diagnostic: remap+FA over garbage scratch, no LMCache.
+        impl = self._impl(shrink=3)
+        meta = SimpleNamespace(
+            num_decode_tokens=4, need_sparse_lmcache_payload=False
+        )
+        self.assertTrue(impl._dsa_skip_dense_layer_wait(meta))
 
 
 class TestSkipDecodeSave(unittest.TestCase):
@@ -60,12 +81,33 @@ class TestSkipDecodeSave(unittest.TestCase):
             AscendAttentionState.SpecDecoding,  # MTP verify counts as pure decode
         ):
             with patch(
+                "vllm_ascend.attention.sfa_v1._decode_window_save_window_size",
+                return_value=0,
+            ), patch(
                 "vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"
             ) as mock_save:
                 impl._maybe_save_unbundled_kv_cache(
                     "model.layers.0.self_attn.attn", kv, self._meta(state)
                 )
             mock_save.assert_not_called()
+
+    def test_decode_window_keeps_save_hook_active(self):
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+        impl, _ = self._impl(shrink=2)
+        kv = (torch.zeros(1), torch.zeros(1))
+        with patch(
+            "vllm_ascend.attention.sfa_v1._decode_window_save_window_size",
+            return_value=256,
+        ), patch(
+            "vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"
+        ) as mock_save:
+            impl._maybe_save_unbundled_kv_cache(
+                "model.layers.0.self_attn.attn",
+                kv,
+                self._meta(AscendAttentionState.DecodeOnly),
+            )
+        mock_save.assert_called_once()
 
     def test_prefill_and_shrink_off_still_save(self):
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
