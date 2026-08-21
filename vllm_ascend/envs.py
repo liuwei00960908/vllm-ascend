@@ -118,6 +118,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") or "0"
     ),
+    # DSA shrink replay (B2c): sync the compute stream once after the first
+    # selective sparse wait of a forward, closing the first-hit race between
+    # the retrieve scatter and the attention read. Default 1 (fork semantics).
+    "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE": lambda: (
+        os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1") != "0"
+    ),
     # DSA replay diagnostics: 1 = one-shot runtime log in SFA forward showing
     # the two-group block tables / slot mappings (evidence that the indexer
     # group's own tables are live). Default off; first forward per process

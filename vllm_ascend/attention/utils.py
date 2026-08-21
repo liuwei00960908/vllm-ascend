@@ -449,18 +449,174 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def wait_for_kv_layer_from_connector(layer_name: str):
+def wait_for_kv_layer_from_connector(
+    layer_name: str,
+    selected_tokens=None,
+    token_start_index=None,
+    request_ids=None,
+    target_slot_mapping=None,
+    selected_token_counts=None,
+):
+    """Wait for this layer's KV to be loadable; selective when selected given.
+
+    DSA shrink (B2c): when ``selected_tokens`` is provided (the remap
+    kernel's deduplicated history list), LMCache loads only those tokens and
+    scatters them into the request's scratch slots via ``target_slot_mapping``
+    instead of loading the whole prefix. Without selected tokens the official
+    dense whole-layer wait is preserved verbatim.
+    """
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
     connector = get_kv_transfer_group()
+    wait_kwargs = {}
+    if target_slot_mapping is not None:
+        wait_kwargs["target_slot_mapping"] = target_slot_mapping
+    if selected_token_counts is not None:
+        wait_kwargs["selected_token_counts"] = selected_token_counts
+
+    if selected_tokens is not None and request_ids is not None:
+        connector.wait_for_layer_load(
+            layer_name,
+            selected_tokens,
+            token_start_index,
+            request_ids,
+            **wait_kwargs,
+        )
+        return
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.wait_for_layer_load(layer_name)
+    if selected_tokens is not None:
+        # Selective load requested but per-row ids not supplied: reuse the
+        # forward-context ids in batch order (same slice semantics as the
+        # runner-injected metadata channel).
+        dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+        if request_ids is None and dsa_req_ids is not None:
+            request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+        connector.wait_for_layer_load(
+            layer_name,
+            selected_tokens,
+            token_start_index,
+            request_ids,
+            **wait_kwargs,
+        )
+    else:
+        connector.wait_for_layer_load(layer_name)
+
+
+def staged_sfa_connector_supports_sparse_load() -> bool:
+    """Whether the active v1 connector satisfies the sparse-load contract.
+
+    DSA shrink (B2c): the selective retrieve path requires the connector to
+    advertise ``supports_staged_sfa_sparse_load`` plus the layerwise callback
+    surface. Provenance: fork attention/utils.py:328-340.
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    try:
+        connector = get_kv_transfer_group()
+        return bool(
+            getattr(connector, "supports_staged_sfa_sparse_load", False)
+            and getattr(connector, "uses_layerwise_model_callbacks", False)
+            and callable(getattr(connector, "wait_for_layer_load", None))
+        )
+    except Exception:
+        return False
+
+
+def get_lmcache_sparse_cached_tokens(request_ids) -> list[int]:
+    """Return a proven remap frontier for every active request (B2c).
+
+    Sparse-decode metadata contributes its committed LMCache frontier
+    (``load_spec.dsa_committed_end`` preferred, ``lmcache_cached_tokens``
+    fallback). A loadable dense-prefix request contributes zero because its
+    first decoder step intentionally waits for the full prefix to become
+    resident before attention, so compact-scratch remapping must stay
+    disabled for it. Provenance: fork attention/utils.py:343-409.
+    """
+    if request_ids is None:
+        raise RuntimeError(
+            "[SFA sparse remap] active request IDs are unavailable."
+        )
+    normalized_request_ids = [str(req_id) for req_id in list(request_ids)]
+    if len(set(normalized_request_ids)) != len(normalized_request_ids):
+        raise RuntimeError(
+            "[SFA sparse remap] frontier lookup requires unique native "
+            "request IDs."
+        )
+    if not normalized_request_ids:
+        return []
+    if not staged_sfa_connector_supports_sparse_load():
+        raise RuntimeError(
+            "[SFA sparse remap] the active connector does not advertise the "
+            "sparse selective-load/frontier contract."
+        )
+
+    get_metadata = getattr(
+        get_kv_transfer_group(), "_get_connector_metadata", None
+    )
+    if not callable(get_metadata):
+        raise RuntimeError(
+            "[SFA sparse remap] connector frontier metadata is unavailable."
+        )
+    try:
+        metadata = get_metadata()
+    except Exception as exc:
+        raise RuntimeError(
+            "[SFA sparse remap] connector frontier metadata lookup failed."
+        ) from exc
+
+    cached_by_req: dict[str, int] = {}
+    for request in getattr(metadata, "requests", ()):
+        is_sparse_decode = bool(
+            getattr(request, "is_sparse_decode", False)
+        )
+        load_spec = getattr(request, "load_spec", None)
+        is_dense_prefix_load = bool(
+            not is_sparse_decode
+            and load_spec is not None
+            and getattr(load_spec, "can_load", False)
+        )
+        if not is_sparse_decode and not is_dense_prefix_load:
+            continue
+        req_id = str(getattr(request, "req_id", ""))
+        if not req_id:
+            raise RuntimeError(
+                "[SFA sparse remap] connector remap metadata has an empty "
+                "request ID."
+            )
+        if req_id in cached_by_req:
+            raise RuntimeError(
+                "[SFA sparse remap] connector remap metadata contains a "
+                f"duplicate request ID: {req_id!r}."
+            )
+        if is_dense_prefix_load:
+            cached_by_req[req_id] = 0
+        elif load_spec is None or not getattr(load_spec, "can_load", False):
+            cached_by_req[req_id] = 0
+        else:
+            committed = getattr(load_spec, "dsa_committed_end", None)
+            cached_by_req[req_id] = int(
+                committed
+                if committed is not None
+                else getattr(load_spec, "lmcache_cached_tokens", 0)
+            )
+
+    missing = [
+        req_id
+        for req_id in normalized_request_ids
+        if req_id not in cached_by_req
+    ]
+    if missing:
+        raise RuntimeError(
+            "[SFA sparse remap] connector metadata has no proven sparse "
+            f"frontier for active requests: {missing!r}."
+        )
+    return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
 def maybe_save_kv_layer_to_connector(
