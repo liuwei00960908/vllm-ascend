@@ -171,6 +171,8 @@ def prepare_sparse_indices(
         selected_counts,
         target_slot_mapping,
         block_size,
+        True,
+        True,
     )
     return (
         topk_indices,

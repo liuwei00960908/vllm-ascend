@@ -1,12 +1,13 @@
+import os
 from dataclasses import dataclass
 from functools import lru_cache
+from threading import Lock
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import numpy as np
 import scipy  # type: ignore
 import torch
 import torch_npu
-import os
 import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -86,6 +87,9 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+_lmcache_sparse_wait_sync_once_done = False
+_lmcache_sparse_wait_sync_once_lock = Lock()
 
 
 class _ByteGatherPart(NamedTuple):
@@ -270,6 +274,7 @@ class AscendSFAMetadata:
     # union_mapping and the staged-graph buffers are P9/P11+ and not ported).
     req_ids: list[str] | None = None
     prompt_lens: list[int] | None = None
+    decode_req_indices: torch.Tensor | None = None
     decode_req_indices_cpu: Any = None
     decode_valid_row_indices: Any = None
     decode_row_offsets: Any = None
@@ -398,12 +403,29 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # rows without allocating (graph-replay address stability; eager
             # fills the same structures).
             max_rows = max_num_batched_tokens
+            self._dsa_max_num_rows = max_rows
             self._dsa_split_boundary_np = np.zeros(max_rows, dtype=np.int32)
-            self._dsa_split_boundary_tensor = torch.zeros(
-                max_rows, dtype=torch.int32, device=self.device
-            )
             self._dsa_req_indices_np = np.full(
                 max_rows, -1, dtype=np.int32
+            )
+            self._dsa_row_offsets_np = np.zeros(max_rows, dtype=np.int32)
+            self._dsa_split_boundary_cpu_tensor = torch.from_numpy(
+                self._dsa_split_boundary_np
+            )
+            self._dsa_req_indices_cpu_tensor = torch.from_numpy(
+                self._dsa_req_indices_np
+            )
+            self._dsa_row_offsets_cpu_tensor = torch.from_numpy(
+                self._dsa_row_offsets_np
+            )
+            self._dsa_split_boundary_tensor = torch.empty(
+                max_rows, dtype=torch.int32, device=self.device
+            )
+            self._dsa_req_indices_tensor = torch.empty(
+                max_rows, dtype=torch.int32, device=self.device
+            )
+            self._dsa_row_offsets_tensor = torch.empty(
+                max_rows, dtype=torch.int32, device=self.device
             )
 
     @staticmethod
@@ -455,6 +477,18 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
+        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+
+        # Prefer _seq_lens_cpu (always available, updated during draft
+        # iterations) over seq_lens_cpu (None in async spec decode mode).
+        if common_attn_metadata._seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+
         # DSA two-groups mirror: slice the indexer group's table/slots with
         # the same bounds as the latent's (fork F-ascend :1150-1156).
         indexer_block_table = None
@@ -474,56 +508,83 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # initial boundary of the request's prompt length (overwritten
         # in-place each step by _update_dsa_split_boundary_in_place);
         # prefill rows keep -1 / 0. Provenance: fork sfa_v1.py:1185-1444
-        # (fixed-width fast path + mixed path unified into this scan; the
-        # staged-only layout-signature caching and cold-compact resume
-        # validation are not ported).
+        # (the fork's general mixed-batch path; the staged-only fixed-layout
+        # signature cache and cold-compact resume validation are not ported).
         shrink_kwargs: dict = {}
         plens_cpu = common_attn_metadata.prompt_lens_cpu
         if self.dsa_shrink_latent and plens_cpu is not None:
-            attn_state = common_attn_metadata.attn_state
-            is_decode_like = attn_state in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            )
+            if num_input_tokens > self._dsa_max_num_rows:
+                raise RuntimeError(
+                    "DSA sparse row metadata capacity exceeded: "
+                    f"num_input_tokens={num_input_tokens}, "
+                    f"max_num_batched_tokens={self._dsa_max_num_rows}."
+                )
             req_ids = common_attn_metadata.request_ids
-            if is_decode_like and req_ids is not None:
-                num_rows = num_reqs * self.decode_threshold
-                row_req = np.repeat(
-                    np.arange(num_reqs, dtype=np.int32),
-                    self.decode_threshold,
+            plens = np.asarray(plens_cpu[:num_reqs], dtype=np.int32)
+            computed_cpu = common_attn_metadata.num_computed_tokens_cpu
+            if computed_cpu is None:
+                raise RuntimeError(
+                    "DSA shrink requires num_computed_tokens_cpu for "
+                    "per-row decode layout expansion."
                 )
-                boundary = np.asarray(
-                    plens_cpu[:num_reqs], dtype=np.int32
+            computed = (
+                computed_cpu[:num_reqs].detach().numpy()
+                if isinstance(computed_cpu, torch.Tensor)
+                else np.asarray(computed_cpu[:num_reqs])
+            )
+            query_start_cpu = common_attn_metadata.query_start_loc_cpu
+            if query_start_cpu is None:
+                raise RuntimeError(
+                    "DSA shrink requires query_start_loc_cpu for per-row "
+                    "request ownership."
                 )
-                boundary_rows = np.repeat(boundary, self.decode_threshold)
-            else:
-                # Mixed / prefill batch: rows are per-token; decode rows are
-                # those at or past each request's prompt frontier. Chunked
-                # prefill steps simply carry no decode rows here (their
-                # remap stays disabled by num_decode_tokens == 0).
-                num_rows = num_reqs
-                row_req = np.arange(num_reqs, dtype=np.int32)
-                plen = np.asarray(plens_cpu[:num_reqs], dtype=np.int32)
-                seq = (
-                    seq_lens_cpu.detach().numpy()
-                    if isinstance(seq_lens_cpu, torch.Tensor)
-                    else np.asarray(seq_lens_cpu)
-                )[:num_reqs]
-                boundary_rows = np.where(
-                    seq > plen, plen, seq.astype(np.int32, copy=False)
-                )
-            self._dsa_req_indices_np[:num_rows] = row_req
-            self._dsa_split_boundary_np[:num_rows] = boundary_rows
-            self._dsa_split_boundary_tensor[:num_rows].copy_(
-                torch.from_numpy(boundary_rows)
+            qsl = (
+                query_start_cpu[: num_reqs + 1].detach().numpy()
+                if isinstance(query_start_cpu, torch.Tensor)
+                else np.asarray(query_start_cpu[: num_reqs + 1])
+            )
+
+            (
+                built_boundaries,
+                built_req_indices,
+                built_row_offsets,
+                num_decode_rows,
+                num_decode_reqs,
+            ) = _dsa_build_decode_row_metadata(
+                qsl,
+                plens,
+                computed,
+                num_input_tokens,
+            )
+            boundary_rows = self._dsa_split_boundary_np[:num_input_tokens]
+            row_req = self._dsa_req_indices_np[:num_input_tokens]
+            row_offsets = self._dsa_row_offsets_np[:num_input_tokens]
+            boundary_rows[:] = built_boundaries
+            row_req[:] = built_req_indices
+            row_offsets[:] = built_row_offsets
+
+            self._dsa_split_boundary_tensor[:num_input_tokens].copy_(
+                self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+            )
+            self._dsa_req_indices_tensor[:num_input_tokens].copy_(
+                self._dsa_req_indices_cpu_tensor[:num_input_tokens]
+            )
+            self._dsa_row_offsets_tensor[:num_input_tokens].copy_(
+                self._dsa_row_offsets_cpu_tensor[:num_input_tokens]
             )
             shrink_kwargs = dict(
                 req_ids=list(req_ids) if req_ids is not None else None,
-                prompt_lens=list(plens_cpu[:num_reqs]),
-                decode_req_indices_cpu=self._dsa_req_indices_np[:num_rows],
-                decode_split_boundary_cpu=self._dsa_split_boundary_np[:num_rows],
-                decode_split_boundary_cpu_tensor=self._dsa_split_boundary_tensor,
-                split_boundary=self._dsa_split_boundary_tensor[:num_rows],
+                prompt_lens=list(plens),
+                decode_req_indices=self._dsa_req_indices_tensor[:num_input_tokens],
+                decode_req_indices_cpu=row_req,
+                decode_row_offsets=self._dsa_row_offsets_tensor[:num_input_tokens],
+                decode_split_boundary_cpu=boundary_rows,
+                decode_split_boundary_cpu_tensor=(
+                    self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
+                ),
+                split_boundary=self._dsa_split_boundary_tensor[:num_input_tokens],
+                num_decodes=num_decode_reqs,
+                num_decode_tokens=num_decode_rows,
                 need_sparse_lmcache_payload=(
                     self.dsa_shrink_latent != 3
                     and staged_sfa_connector_supports_sparse_load()
@@ -531,18 +592,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
 
         block_size = self.kernel_block_size
-
-        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-
-        # Prefer _seq_lens_cpu (always available, updated during draft
-        # iterations) over seq_lens_cpu (None in async spec decode mode).
-        if common_attn_metadata._seq_lens_cpu is not None:
-            seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
-        elif common_attn_metadata.seq_lens_cpu is not None:
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
-        else:
-            seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
 
@@ -732,6 +781,91 @@ def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices
     return topk_indices.reshape(topk_indices.shape[0], -1)
+
+
+def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
+    """Fence the first selective sparse load once per worker process."""
+    global _lmcache_sparse_wait_sync_once_done
+
+    if (
+        not envs.VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE
+        or _lmcache_sparse_wait_sync_once_done
+    ):
+        return
+    with _lmcache_sparse_wait_sync_once_lock:
+        if _lmcache_sparse_wait_sync_once_done:
+            return
+        if not (
+            hasattr(torch, "npu")
+            and hasattr(torch.npu, "current_stream")
+        ):
+            return
+        torch.npu.current_stream().synchronize()
+        _lmcache_sparse_wait_sync_once_done = True
+
+
+def _dsa_build_decode_row_metadata(
+    query_start_locs: Any,
+    prompt_lens: Any,
+    computed_tokens: Any,
+    num_input_tokens: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Build the eager/mixed shrink row layout using CPU metadata only.
+
+    Returns ``(boundaries, request_indices, row_offsets,
+    num_decode_rows, num_decode_requests)``. Prefill/padding rows keep
+    boundary=0/request=-1; decode rows carry the request prompt boundary,
+    request owner and their offset within this step. This is the fork's
+    general mixed-batch path (sfa_v1.py:1343-1405) without the P11+
+    cold-compact resume special case; it naturally covers pure decode and
+    MTP rows as well, so correctness does not depend on the staged/fixed
+    layout optimization.
+    """
+    plens = np.asarray(prompt_lens, dtype=np.int32)
+    computed = np.asarray(computed_tokens, dtype=np.int64)
+    qsl = np.asarray(query_start_locs, dtype=np.int64)
+    num_reqs = len(plens)
+    if len(computed) < num_reqs or len(qsl) < num_reqs + 1:
+        raise RuntimeError(
+            "DSA shrink row metadata inputs do not cover all requests: "
+            f"requests={num_reqs}, computed={len(computed)}, "
+            f"query_starts={len(qsl)}."
+        )
+    if num_reqs and int(qsl[num_reqs]) > num_input_tokens:
+        raise RuntimeError(
+            "DSA shrink query rows exceed the active input view: "
+            f"query_end={int(qsl[num_reqs])}, "
+            f"num_input_tokens={num_input_tokens}."
+        )
+
+    boundaries = np.zeros(num_input_tokens, dtype=np.int32)
+    request_indices = np.full(num_input_tokens, -1, dtype=np.int32)
+    row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
+    num_decode_rows = 0
+    num_decode_requests = 0
+    for request_index in range(num_reqs):
+        start, end = int(qsl[request_index]), int(qsl[request_index + 1])
+        prompt_len = int(plens[request_index])
+        first_decode = max(
+            start,
+            start + prompt_len - int(computed[request_index]),
+        )
+        if first_decode >= end:
+            continue
+        num_decode_requests += 1
+        boundaries[first_decode:end] = prompt_len
+        request_indices[first_decode:end] = request_index
+        row_offsets[first_decode:end] = np.arange(
+            end - first_decode, dtype=np.int32
+        )
+        num_decode_rows += end - first_decode
+    return (
+        boundaries,
+        request_indices,
+        row_offsets,
+        num_decode_rows,
+        num_decode_requests,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -1007,17 +1141,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             if bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
             else 0
         )
+        decode_threshold = 1 + int(
+            self.vllm_config.speculative_config.num_speculative_tokens
+            if self.vllm_config.speculative_config is not None
+            else 0
+        )
         if self.dsa_shrink_latent:
-            decode_threshold = 1 + int(
-                (self.vllm_config.speculative_config.num_speculative_tokens)
-                if self.vllm_config.speculative_config is not None
-                else 0
-            )
             if decode_threshold > 2:
                 raise ValueError(
                     "DSA shrink-latent compact-scratch decode supports at "
                     f"most MTP2 (decode_threshold={decode_threshold})."
                 )
+        self.dsa_index_topk = int(
+            getattr(
+                self.vllm_config.model_config.hf_text_config,
+                "index_topk",
+                0,
+            )
+            or 0
+        )
+        self.dsa_scratch_capacity = decode_threshold * self.dsa_index_topk
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
 
@@ -2507,7 +2650,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         _sel_packed = None
         _target_slots = None
         _sel_counts = None
-        _sparse_waited = False
         if (
             self.dsa_shrink_latent
             and attn_metadata.split_boundary is not None
@@ -2529,18 +2671,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _cached,
                 _decode_window_save_window_size(),
             )
+            _row_req_indices = attn_metadata.decode_req_indices
             topk_indices, _topk_2d = _dsa_mask_padding_sparse_rows(
                 topk_indices,
-                (
-                    torch.from_numpy(
-                        np.asarray(
-                            attn_metadata.decode_req_indices_cpu,
-                            dtype=np.int32,
-                        )
-                    ).to(device=kv_cache[0].device)
-                    if attn_metadata.decode_req_indices_cpu is not None
-                    else None
-                ),
+                _row_req_indices,
             )
             (
                 topk_indices,
@@ -2553,20 +2687,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.block_table,
                 attn_metadata.block_size,
                 kv_cache[0].device,
+                row_req_indices=_row_req_indices,
+                scratch_capacity=self.dsa_scratch_capacity,
             )
             attn_metadata.decode_selected_tokens = _sel_packed
             attn_metadata.decode_selected_counts = _sel_counts
             attn_metadata.decode_target_slot_mapping = _target_slots
-
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope,
-            q_pe,
-            kv_cache,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-        )
 
         # DSA shrink replay (B2d): selective retrieve. When the remap
         # produced a non-empty selected list, wait for exactly those tokens
@@ -2587,12 +2713,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 target_slot_mapping=_target_slots,
                 selected_token_counts=_sel_counts,
             )
-            if (
-                envs.VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE
-                and not _sparse_waited
-            ):
-                torch.npu.synchronize()
-                _sparse_waited = True
+            _sync_compute_stream_after_lmcache_sparse_wait()
+
+        # The selective retrieve must finish before FA consumes the remapped
+        # scratch rows. Running FA first reads stale/uninitialized scratch.
+        attn_output = self._execute_sparse_flash_attention_process(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+        )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
