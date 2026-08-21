@@ -24,6 +24,28 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+  // DSA shrink replay (B2e): compact-scratch sparse-index preparation.
+  // Provenance: vllm-ascend-sparse@c7c4a4ac csrc/ops.h:41-59.
+  extern void dsa_prepare_sparse_indices_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* request_block_table,
+    void* selected_packed,
+    void* selected_counts,
+    void* target_slots,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t block_table_width,
+    uint32_t scratch_capacity,
+    uint32_t selected_count_stride,
+    uint32_t bitmap_words,
+    uint32_t block_size,
+    bool need_packed,
+    bool clear_invalid_rows);
+
   extern void get_masked_input_and_mask_impl(
     void* stream,
     void* input,

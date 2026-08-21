@@ -170,5 +170,53 @@ class TestSplitBoundaryUpdate(unittest.TestCase):
         )
 
 
+class TestDecodeRowMetadata(unittest.TestCase):
+    """Pure CPU row-layout builder: prefill, decode/MTP and mixed batches."""
+
+    def _build(self, qsl, plens, computed, rows):
+        from vllm_ascend.attention.sfa_v1 import (
+            _dsa_build_decode_row_metadata,
+        )
+
+        return _dsa_build_decode_row_metadata(qsl, plens, computed, rows)
+
+    def test_prefill_only_has_no_decode_rows(self):
+        boundary, req, offsets, nrows, nreqs = self._build(
+            [0, 4], [10], [0], 4
+        )
+        self.assertEqual(boundary.tolist(), [0, 0, 0, 0])
+        self.assertEqual(req.tolist(), [-1, -1, -1, -1])
+        self.assertEqual((nrows, nreqs), (0, 0))
+
+    def test_pure_decode_one_row_per_request(self):
+        boundary, req, offsets, nrows, nreqs = self._build(
+            [0, 1, 2], [100, 200], [100, 200], 2
+        )
+        self.assertEqual(boundary.tolist(), [100, 200])
+        self.assertEqual(req.tolist(), [0, 1])
+        self.assertEqual(offsets.tolist(), [0, 0])
+        self.assertEqual((nrows, nreqs), (2, 2))
+
+    def test_mtp_two_rows_get_request_major_offsets(self):
+        boundary, req, offsets, nrows, nreqs = self._build(
+            [0, 2, 4], [100, 200], [100, 200], 4
+        )
+        self.assertEqual(boundary.tolist(), [100, 100, 200, 200])
+        self.assertEqual(req.tolist(), [0, 0, 1, 1])
+        self.assertEqual(offsets.tolist(), [0, 1, 0, 1])
+        self.assertEqual((nrows, nreqs), (4, 2))
+
+    def test_mixed_batch_marks_only_decode_suffix(self):
+        # r0 contributes 3 prefill rows (computed=5<prompt=8); r1 contributes
+        # 2 decode rows (computed already at prompt frontier).
+        boundary, req, offsets, nrows, nreqs = self._build(
+            [0, 3, 5], [8, 20], [5, 20], 5
+        )
+        self.assertEqual(boundary.tolist(), [0, 0, 0, 20, 20])
+        self.assertEqual(req.tolist(), [-1, -1, -1, 1, 1])
+        self.assertEqual(offsets.tolist(), [0, 0, 0, 0, 1])
+        self.assertEqual((nrows, nreqs), (2, 1))
+
+
 if __name__ == "__main__":
     unittest.main()
