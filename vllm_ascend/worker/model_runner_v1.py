@@ -3385,6 +3385,17 @@ class NPUModelRunner(GPUModelRunner):
                     cm.indexer_block_table_tensor,
                     cm.indexer_slot_mapping,
                 ) = _get_block_table_and_slot_mapping(1)
+                # DSA shrink (B2b): per-request data plane for the
+                # compact-scratch decode path — request_ids keys the LMCache
+                # committed-frontier queries and prompt_lens_cpu seeds the
+                # per-row split boundary. Forward metadata only; no pool or
+                # sizing interaction. Provenance: fork model_runner_v1.py
+                # :2773-2781, :2867-2877.
+                if self.dsa_shrink_latent:
+                    cm.request_ids = list(self.input_batch.req_ids[:num_reqs])
+                    cm.prompt_lens_cpu = list(
+                        self.input_batch.num_prompt_tokens[:num_reqs]
+                    )
             if self.speculative_config and isinstance(self.drafter, AscendStep3p5MTPProposer):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can
