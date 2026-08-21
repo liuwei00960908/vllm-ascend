@@ -99,6 +99,7 @@ def prepare_sparse_indices(
     device: torch.device,
     row_req_indices: torch.Tensor | None = None,
     scratch_capacity: int | None = None,
+    clear_invalid_rows: bool = False,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -172,7 +173,7 @@ def prepare_sparse_indices(
         target_slot_mapping,
         block_size,
         True,
-        True,
+        clear_invalid_rows,
     )
     return (
         topk_indices,
