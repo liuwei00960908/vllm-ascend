@@ -998,6 +998,26 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.sfa_qsfa_tile_size = SFA_QSFA_TILE_SIZE
         self.sfa_qsfa_packed_kv_head_dim = 0
+
+        # DSA shrink replay (B2d): impl-side gate (UNBUNDLE, fork :1698-1708)
+        # and the MTP<=2 combination guard. The runner only injects the data
+        # plane under two-groups, so the flag alone never enables a path.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
+            else 0
+        )
+        if self.dsa_shrink_latent:
+            decode_threshold = 1 + int(
+                (self.vllm_config.speculative_config.num_speculative_tokens)
+                if self.vllm_config.speculative_config is not None
+                else 0
+            )
+            if decode_threshold > 2:
+                raise ValueError(
+                    "DSA shrink-latent compact-scratch decode supports at "
+                    f"most MTP2 (decode_threshold={decode_threshold})."
+                )
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
 
@@ -1278,6 +1298,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         layer_name: str,
         kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M | None = None,
     ) -> None:
         """Save the unbundled latent and indexer groups separately (A2d).
 
@@ -1286,7 +1307,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         under its sibling ``...self_attn.indexer.k_cache`` name so the
         connector routes kv_group=0 / kv_group=1 independently. Bundled
         (2-tuple) layers keep the single latent-only save.
+
+        DSA shrink (B2d, fork :4220-4231 simplified): on a pure decode step
+        (DecodeOnly / SpecDecoding — MTP verify steps included) the latent
+        tail stays NPU-resident and a regular per-token store buys nothing
+        (~88KB/token of PCIe for no consumer), so the regular save is
+        skipped. Decode-window saves (store-only synthetic requests) are
+        unaffected: they never flow through this hook.
         """
+        if (
+            self.dsa_shrink_latent
+            and attn_metadata is not None
+            and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            )
+        ):
+            return
         maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
         if self.dsa_unbundle and len(kv_cache) >= 3:
             maybe_save_kv_layer_to_connector(
@@ -2050,6 +2087,21 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         return
 
+    def _dsa_skip_dense_layer_wait(self, attn_metadata: M) -> bool:
+        """DSA shrink (B2d): skip the pre-attention dense layer wait.
+
+        Under shrink with decode rows in the batch, the dense
+        wait_for_kv_layer call would advance the layerwise retriever once
+        more than the selective retrieve path expects (double advance ->
+        desync). The selective wait driven by the remap outputs becomes the
+        only retrieve driver for those steps. Provenance: fork
+        sfa_v1.py:3299-3305.
+        """
+        return bool(
+            self.dsa_shrink_latent
+            and attn_metadata.num_decode_tokens > 0
+        )
+
     def _record_dcp_kv_gather_context(
         self,
         kv_cache: tuple[torch.Tensor, ...],
@@ -2168,7 +2220,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             # Prolog updates the paged KV cache in place. Wait for the prompt
             # blocks before writing the first Decode token into their tail block.
-            wait_for_kv_layer_from_connector(layer_name)
+            if not self._dsa_skip_dense_layer_wait(attn_metadata):
+                wait_for_kv_layer_from_connector(layer_name)
             hidden_states, ql_nope, q_pe, q_c, _, _ = self._sfa_preprocess_with_prolog_v3(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -2200,7 +2253,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-            wait_for_kv_layer_from_connector(layer_name)
+            if not self._dsa_skip_dense_layer_wait(attn_metadata):
+                wait_for_kv_layer_from_connector(layer_name)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -2229,7 +2283,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
 
-            wait_for_kv_layer_from_connector(layer_name)
+            if not self._dsa_skip_dense_layer_wait(attn_metadata):
+                wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -2440,6 +2495,69 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        # DSA shrink replay (B2d): remap main chain. Resolve the proven
+        # frontier, overwrite the per-row boundary in place, then dispatch
+        # the remap kernel (B2e registers the NPU op; the dispatch module
+        # imports lazily so the Python-only batches stay importable before
+        # the csrc rebuild). Outputs: indices rewritten to compact scratch
+        # rows below the boundary (>= boundary keeps absolute positions),
+        # selected_packed / counts / target_slots for the selective
+        # retrieve. Padding rows are zeroed so freed blocks are never
+        # referenced. Provenance: fork sfa_v1.py:3451-3546.
+        _sel_packed = None
+        _target_slots = None
+        _sel_counts = None
+        _sparse_waited = False
+        if (
+            self.dsa_shrink_latent
+            and attn_metadata.split_boundary is not None
+            and attn_metadata.num_decode_tokens > 0
+            and (
+                attn_metadata.need_sparse_lmcache_payload
+                or self.dsa_shrink_latent == 3
+            )
+        ):
+            from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+                prepare_sparse_indices,
+            )
+
+            _cached = _resolve_sparse_cached_tokens_by_request(
+                attn_metadata, attn_metadata.req_ids
+            )
+            _update_dsa_split_boundary_in_place(
+                attn_metadata,
+                _cached,
+                _decode_window_save_window_size(),
+            )
+            topk_indices, _topk_2d = _dsa_mask_padding_sparse_rows(
+                topk_indices,
+                (
+                    torch.from_numpy(
+                        np.asarray(
+                            attn_metadata.decode_req_indices_cpu,
+                            dtype=np.int32,
+                        )
+                    ).to(device=kv_cache[0].device)
+                    if attn_metadata.decode_req_indices_cpu is not None
+                    else None
+                ),
+            )
+            (
+                topk_indices,
+                _sel_packed,
+                _sel_counts,
+                _target_slots,
+            ) = prepare_sparse_indices(
+                topk_indices,
+                attn_metadata.decode_split_boundary,
+                attn_metadata.block_table,
+                attn_metadata.block_size,
+                kv_cache[0].device,
+            )
+            attn_metadata.decode_selected_tokens = _sel_packed
+            attn_metadata.decode_selected_counts = _sel_counts
+            attn_metadata.decode_target_slot_mapping = _target_slots
+
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
@@ -2449,6 +2567,32 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
+
+        # DSA shrink replay (B2d): selective retrieve. When the remap
+        # produced a non-empty selected list, wait for exactly those tokens
+        # and scatter them into the request's scratch slots (LMCache
+        # selective load). Stage 3 (isolation diagnostics) skips the
+        # retrieve on purpose. One-shot stream fence after the first
+        # selective wait closes the first-hit race. Provenance: fork
+        # sfa_v1.py:3915-3932.
+        if (
+            _sel_packed is not None
+            and self.dsa_shrink_latent != 3
+            and int(_sel_packed.numel()) > 0
+        ):
+            wait_for_kv_layer_from_connector(
+                layer_name,
+                selected_tokens=_sel_packed,
+                request_ids=attn_metadata.req_ids,
+                target_slot_mapping=_target_slots,
+                selected_token_counts=_sel_counts,
+            )
+            if (
+                envs.VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE
+                and not _sparse_waited
+            ):
+                torch.npu.synchronize()
+                _sparse_waited = True
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -2476,7 +2620,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        self._maybe_save_unbundled_kv_cache(layer_name, kv_cache)
+        self._maybe_save_unbundled_kv_cache(layer_name, kv_cache, attn_metadata)
 
         return output_padded
 
