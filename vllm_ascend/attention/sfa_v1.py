@@ -1147,6 +1147,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
             else 0
         )
+        self._dsa_remap_diag_count = 0
         decode_threshold = 1 + int(
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config is not None
@@ -2752,15 +2753,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.decode_selected_counts = _sel_counts
             attn_metadata.decode_target_slot_mapping = _target_slots
             if ".layers.0." in layer_name:
-                logger.info(
-                    "[DSA_REMAP] layer=%s decode_rows=%d topk_rows=%d "
-                    "selected=%d boundary=%s",
-                    layer_name,
-                    attn_metadata.num_decode_tokens,
-                    int(_topk_2d.shape[0]),
-                    int(_sel_counts.sum()) if _sel_counts is not None else 0,
-                    _cached if self.dsa_shrink_latent != 3 else "stage3",
+                self._dsa_remap_diag_count += 1
+                _diag_due = (
+                    self._dsa_remap_diag_count <= 2
+                    or self._dsa_remap_diag_count % 64 == 0
                 )
+                if _diag_due:
+                    _selected_head = (
+                        _sel_packed[0, :16].tolist()
+                        if _sel_packed is not None
+                        else None
+                    )
+                    _slots_head = (
+                        _target_slots[0, :16].tolist()
+                        if _target_slots is not None
+                        else None
+                    )
+                    logger.info(
+                        "[DSA_REMAP] layer=%s decode_rows=%d topk_rows=%d "
+                        "selected=%d boundary=%s selected_head=%s "
+                        "slots_head=%s",
+                        layer_name,
+                        attn_metadata.num_decode_tokens,
+                        int(_topk_2d.shape[0]),
+                        int(_sel_counts.sum()) if _sel_counts is not None else 0,
+                        _cached if self.dsa_shrink_latent != 3 else "stage3",
+                        _selected_head,
+                        _slots_head,
+                    )
 
         # DSA shrink replay (B2d): selective retrieve. When the remap
         # produced a non-empty selected list, wait for exactly those tokens
@@ -2782,6 +2802,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=_sel_counts,
             )
             _sync_compute_stream_after_lmcache_sparse_wait()
+            if ".layers.0." in layer_name and _diag_due:
+                _probed_slots = _target_slots[0, :16]
+                _valid_slots = _probed_slots[_probed_slots >= 0]
+                _nonzero = 0
+                if int(_valid_slots.numel()) > 0:
+                    _nonzero = int(
+                        (kv_cache[0][_valid_slots].float().abs().sum(-1) != 0)
+                        .sum()
+                    )
+                logger.info(
+                    "[DSA_RETRIEVE] layer=%s slots_probed=%d nonzero=%d",
+                    layer_name,
+                    int(_valid_slots.numel()),
+                    _nonzero,
+                )
 
         # The selective retrieve must finish before FA consumes the remapped
         # scratch rows. Running FA first reads stale/uninitialized scratch.
