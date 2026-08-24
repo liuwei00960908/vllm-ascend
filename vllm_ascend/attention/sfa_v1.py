@@ -2807,10 +2807,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _valid_slots = _probed_slots[_probed_slots >= 0]
                 _nonzero = 0
                 if int(_valid_slots.numel()) > 0:
-                    _nonzero = int(
-                        (kv_cache[0][_valid_slots].float().abs().sum(-1) != 0)
-                        .sum()
+                    _blocks = _valid_slots // attn_metadata.block_size
+                    _offsets = _valid_slots % attn_metadata.block_size
+                    _slot_energy = (
+                        kv_cache[0][_blocks, _offsets].float().abs().sum((-1, -2, -3))
                     )
+                    _nonzero = int((_slot_energy != 0).sum())
                 logger.info(
                     "[DSA_RETRIEVE] layer=%s slots_probed=%d nonzero=%d",
                     layer_name,
