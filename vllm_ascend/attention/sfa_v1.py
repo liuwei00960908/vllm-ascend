@@ -2751,6 +2751,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.decode_selected_tokens = _sel_packed
             attn_metadata.decode_selected_counts = _sel_counts
             attn_metadata.decode_target_slot_mapping = _target_slots
+            if ".layers.0." in layer_name:
+                logger.info(
+                    "[DSA_REMAP] layer=%s decode_rows=%d topk_rows=%d "
+                    "selected=%d boundary=%s",
+                    layer_name,
+                    attn_metadata.num_decode_tokens,
+                    int(_topk_2d.shape[0]),
+                    int(_sel_counts.sum()) if _sel_counts is not None else 0,
+                    _cached if self.dsa_shrink_latent != 3 else "stage3",
+                )
 
         # DSA shrink replay (B2d): selective retrieve. When the remap
         # produced a non-empty selected list, wait for exactly those tokens
