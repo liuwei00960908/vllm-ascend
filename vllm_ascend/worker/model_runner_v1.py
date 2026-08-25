@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -2597,7 +2598,27 @@ class NPUModelRunner(GPUModelRunner):
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
-                self.finalize_kv_connector()
+                completed_decode_window_saves = self.finalize_kv_connector()
+                # Merge the receipts drained at finalize time (after
+                # wait_for_save) into the local output captured at the top
+                # of sample_tokens; self.kv_connector_output was already
+                # read out and cleared there, keeping the most advanced
+                # committed end per request. Provenance: fork
+                # model_runner_v1.py:2084-2115 (diagnostics stripped).
+                if completed_decode_window_saves:
+                    if kv_connector_output is None:
+                        kv_connector_output = KVConnectorOutput()
+                    for req_id, window_end in (
+                        completed_decode_window_saves.items()
+                    ):
+                        kv_connector_output.completed_decode_window_saves[
+                            req_id
+                        ] = max(
+                            kv_connector_output.completed_decode_window_saves.get(
+                                req_id, 0
+                            ),
+                            window_end,
+                        )
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
