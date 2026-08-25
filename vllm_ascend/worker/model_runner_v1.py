@@ -3267,6 +3267,18 @@ class NPUModelRunner(GPUModelRunner):
             # TODO
             # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            # DSA shrink (B2c): async-spec mode nulls the public CPU tensor
+            # (GPU is authoritative), but the per-row decode layout expansion
+            # needs a CPU mirror. Follow the _seq_lens_cpu pattern and keep
+            # the underscored mirror populated when shrink is active; the SFA
+            # builder prefers the public field when present. Provenance: fork
+            # model_runner_v1.py:2753-2757 (the fork passes the tensor
+            # unconditionally; official v0.23 added the async null-out).
+            _num_computed_tokens_cpu=(
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded]
+                if self.dsa_shrink_latent
+                else None
+            ),
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
