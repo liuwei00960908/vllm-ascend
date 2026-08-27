@@ -579,6 +579,20 @@ class NPUModelRunner(GPUModelRunner):
         set_potential_max_tokens(vllm_config)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
+        # P9 batch 5: the model runner reads staged capture sizes for routing
+        # decisions (the AscendSFAImpl reads them independently in its own
+        # __init__ for bridge allocation). Single-DP is the P9 production
+        # shape, so _staged_sfa_dp_route_action stays None. Provenance: fork
+        # model_runner_v1.py:1709-1714.
+        self.enable_staged_sfa_graph = bool(envs.VLLM_ASCEND_SFA_STAGED_GRAPH)
+        self._staged_sfa_graph_capture_sizes: tuple[int, ...] = (
+            self._parse_staged_capture_sizes()
+            if self.enable_staged_sfa_graph
+            else ()
+        )
+        self._staged_sfa_impls: tuple = ()
+        self._staged_sfa_dp_route_action = None
+
         self.use_aclgraph = self._use_aclgraph()
 
         eplb_config = self.ascend_config.eplb_config
@@ -2186,6 +2200,22 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                # P9 batch 5: staged SFA routing chain — classify this step
+                # locally, then bind the decision to a captured graph
+                # capacity after padding is determined. Provenance: fork
+                # model_runner_v1.py:1518-1588 (simplified: single-DP, no
+                # cold-resume, no cascade gate on routing).
+                staged_sfa_local_route = self._staged_sfa_local_route(
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    index_topk=self.dsa_index_topk,
+                    request_ids=self.input_batch.req_ids[:num_reqs],
+                    kv_connector_metadata=(
+                        scheduler_output.kv_connector_metadata
+                    ),
+                )
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -2213,6 +2243,31 @@ class NPUModelRunner(GPUModelRunner):
                     )
 
                 num_tokens_padded = batch_desc.num_tokens
+
+                # P9 batch 5: bind the local route to a captured capacity
+                # and extract the graph key (None for native fallback).
+                # When staged is configured but no graph key was bound,
+                # force CUDAGraphMode.NONE so the aclgraph wrapper does
+                # not dispatch by a stale batch descriptor. Provenance:
+                # fork model_runner_v1.py:1568-1588.
+                staged_sfa_route = self._staged_sfa_live_route(
+                    local_route=staged_sfa_local_route,
+                    cudagraph_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    should_ubatch=should_ubatch,
+                )
+                staged_sfa_graph_key = self._apply_staged_sfa_route(
+                    staged_sfa_route
+                )
+                if (
+                    self._staged_sfa_graph_capture_sizes
+                    and staged_sfa_graph_key is None
+                ):
+                    cudagraph_mode = CUDAGraphMode.NONE
+
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
@@ -2381,6 +2436,8 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                staged_sfa_route=staged_sfa_route,
+                staged_sfa_graph_key=staged_sfa_graph_key,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -5519,6 +5576,26 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    @staticmethod
+    def _parse_staged_capture_sizes() -> tuple[int, ...]:
+        """Parse and validate the staged graph capture size list."""
+        raw = envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
+        try:
+            sizes = tuple(sorted({
+                int(s.strip()) for s in raw.split(",") if s.strip()
+            }))
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES: "
+                f"{raw!r} ({exc})"
+            ) from exc
+        if not sizes or any(s <= 0 for s in sizes):
+            raise ValueError(
+                "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
+                f"at least one positive integer, got {raw!r}"
+            )
+        return sizes
+
     def _staged_sfa_local_route(
         self,
         *,
@@ -5691,6 +5768,40 @@ class NPUModelRunner(GPUModelRunner):
             graph_key=graph_key,
             frontiers=local_route.frontiers,
         )
+
+    def _apply_staged_sfa_route(self, route):
+        """Extract the graph key from a route decision, or None for fallback.
+
+        FATAL/RECOMPUTE decisions raise loudly. SAFE_NATIVE decisions log
+        their reason once per unique reason for observability. Provenance:
+        fork model_runner_v1.py:3161-3185.
+        """
+        from vllm_ascend.utils import (
+            StagedSFARouteAction,
+            StagedSFARouteReason,
+        )
+
+        if route.action == StagedSFARouteAction.STAGED:
+            return route.graph_key
+        message = (
+            f"[SFA_ROUTE] action={route.action.value} "
+            f"reason={route.reason.value}"
+        )
+        if route.action in (
+            StagedSFARouteAction.RECOMPUTE,
+            StagedSFARouteAction.FATAL,
+        ):
+            raise RuntimeError(message)
+        logged = getattr(self, "_staged_sfa_logged_routes", None)
+        if logged is None:
+            logged = self._staged_sfa_logged_routes = set()
+        if (
+            route.reason not in logged
+            and route.reason != StagedSFARouteReason.NOT_CONFIGURED
+        ):
+            logged.add(route.reason)
+            logger.info(message)
+        return None
 
     def _collect_staged_sfa_impls(self):
         """Return each target-model staged SFA implementation exactly once.
