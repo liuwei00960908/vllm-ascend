@@ -1,6 +1,7 @@
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -29,6 +30,90 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+
+
+# ---------------------------------------------------------------------------
+# P9 staged SFA graph (Batch 5): the shape/topology key for one captured
+# outer-graph entry and its two construction profiles. Actual token/request
+# counts are dynamic buffer contents; capacities and query topology are
+# structural and must never collapse onto the same entry (03-4 §9.1).
+# Provenance: fork ascend_forward_context.py:35-108.
+# ---------------------------------------------------------------------------
+
+
+class StagedSFAQueryProfile(str, Enum):
+    """Structural query layouts that require distinct staged SFA graphs."""
+
+    DECODE_Q1 = "decode_q1"
+    SPEC_FIXED = "spec_fixed"
+
+
+@dataclass(frozen=True)
+class StagedSFAGraphKey:
+    """Shape/topology key for a staged SFA outer-graph plan."""
+
+    token_capacity: int
+    request_capacity: int
+    query_profile: StagedSFAQueryProfile
+    max_query_len: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.token_capacity <= 0
+            or self.request_capacity <= 0
+            or self.max_query_len <= 0
+        ):
+            raise ValueError("Staged SFA graph capacities must be positive.")
+        if self.query_profile == StagedSFAQueryProfile.DECODE_Q1:
+            if (
+                self.max_query_len != 1
+                or self.token_capacity != self.request_capacity
+            ):
+                raise ValueError(
+                    "DECODE_Q1 requires equal token/request capacity and "
+                    "max_query_len=1."
+                )
+        elif (
+            self.max_query_len <= 1
+            or self.token_capacity
+            != self.request_capacity * self.max_query_len
+        ):
+            raise ValueError(
+                "SPEC_FIXED requires token_capacity == request_capacity * "
+                "max_query_len with max_query_len > 1."
+            )
+
+    @classmethod
+    def exact_q1(cls, size: int) -> "StagedSFAGraphKey":
+        """Construct an equal token/request-capacity Q=1 key."""
+        return cls(
+            token_capacity=size,
+            request_capacity=size,
+            query_profile=StagedSFAQueryProfile.DECODE_Q1,
+            max_query_len=1,
+        )
+
+    @classmethod
+    def fixed_spec(
+        cls,
+        request_capacity: int,
+        query_width: int,
+    ) -> "StagedSFAGraphKey":
+        """Construct a fixed-width speculative-decode graph key."""
+        if query_width <= 1:
+            raise ValueError(
+                "SPEC_FIXED query_width must be greater than one."
+            )
+        return cls(
+            token_capacity=request_capacity * query_width,
+            request_capacity=request_capacity,
+            query_profile=StagedSFAQueryProfile.SPEC_FIXED,
+            max_query_len=query_width,
+        )
+
+    def to_legacy_batch_descriptor(self) -> BatchDescriptor:
+        """Adapt the structural key to normalized PIECEWISE dispatch."""
+        return BatchDescriptor(num_tokens=self.token_capacity)
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
@@ -72,6 +157,9 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_route=None,
+    staged_sfa_graph_key=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -110,6 +198,17 @@ def set_ascend_forward_context(
 
         # TODO: remove it when fia merge in fiav2
         forward_context.sinks = has_sinks
+
+        # P9 staged SFA graph (Batch 5): route/key/dummy-run channels read
+        # by cross_layer_graph_pre and the aclgraph dispatch hook. None/False
+        # when staged routing is inactive — the wrapper falls back to the
+        # native forward in that case. Provenance: fork
+        # ascend_forward_context.py:175-177.
+        forward_context.staged_sfa_graph_dummy_run = (
+            staged_sfa_graph_dummy_run
+        )
+        forward_context.staged_sfa_route = staged_sfa_route
+        forward_context.staged_sfa_graph_key = staged_sfa_graph_key
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8

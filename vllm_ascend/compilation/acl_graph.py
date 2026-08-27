@@ -135,6 +135,57 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
+    @classmethod
+    def seal_staged_entries(
+        cls,
+        keys: tuple,
+        expected_islands: int,
+    ) -> int:
+        """Validate every captured island before live staged admission.
+
+        Provenance: fork compilation/acl_graph.py:110-160.
+        """
+        expected = set(keys)
+        if not expected or expected_islands <= 0:
+            raise RuntimeError("staged ACL graph plan is empty")
+        key_type = type(keys[0])
+        wrappers = [
+            wrapper
+            for wrapper in _acl_graph_wrappers
+            if any(
+                isinstance(key, key_type)
+                for key in wrapper.concrete_aclgraph_entries
+            )
+        ]
+        if len(wrappers) != expected_islands:
+            raise RuntimeError(
+                "staged ACL graph island count is incomplete: "
+                f"expected={expected_islands}, captured={len(wrappers)}"
+            )
+        for wrapper in wrappers:
+            actual = set(wrapper.concrete_aclgraph_entries)
+            missing = expected - actual
+            unexpected = actual - expected
+            incomplete = tuple(
+                key
+                for key, entry in wrapper.concrete_aclgraph_entries.items()
+                if key in expected
+                and (
+                    entry.aclgraph is None
+                    or entry.input_addresses is None
+                )
+            )
+            if missing or unexpected or incomplete:
+                raise RuntimeError(
+                    "staged ACL graph island is incomplete: "
+                    f"missing={tuple(missing)}, "
+                    f"unexpected={tuple(unexpected)}, "
+                    f"incomplete={incomplete}"
+                )
+        return sum(
+            len(wrapper.concrete_aclgraph_entries) for wrapper in wrappers
+        )
+
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
@@ -149,11 +200,20 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+        # P9 staged SFA graph (Batch 5): dispatch by the structural key when
+        # the route authorized a staged graph, falling back to the official
+        # batch descriptor otherwise (identical to the unmodified path).
+        # Provenance: fork acl_graph.py:183-184.
+        staged_graph_key = getattr(
+            forward_context, "staged_sfa_graph_key", None
+        )
+        dispatch_key = staged_graph_key or batch_descriptor
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        if dispatch_key not in self.concrete_aclgraph_entries:
+            # create a new entry for this batch descriptor
+            self.concrete_aclgraph_entries[dispatch_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+
+        entry = self.concrete_aclgraph_entries[dispatch_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:

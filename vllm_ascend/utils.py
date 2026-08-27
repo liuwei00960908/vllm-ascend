@@ -25,6 +25,7 @@ import math
 import os
 from contextlib import nullcontext
 from enum import Enum
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,55 @@ SOC_VERSION_INFERENCE_SERIES = ["Ascend310P3"]
 REGISTERED_ASCEND_OPS = {}
 
 ACL_FORMAT_FRACTAL_ND = 2
+
+# ---------------------------------------------------------------------------
+# P9 staged SFA graph (Batch 5): route action/reason enums and the frozen
+# route decision consumed by the model runner's routing chain. SAFE_NATIVE
+# is the graceful fallback (eager forward); FATAL is reserved for
+# configuration contradictions detected mid-forward. Provenance: fork
+# utils.py:72-135 (StagedSFAConfigReason and the cold-compact reason are
+# trimmed per the P9 plan; cold_compact_resumes keeps its field for the
+# P11+ resume slice).
+# ---------------------------------------------------------------------------
+
+
+class StagedSFARouteAction(str, Enum):
+    STAGED = "staged"
+    SAFE_NATIVE = "safe_native"
+    RECOMPUTE = "recompute"
+    FATAL = "fatal"
+
+
+class StagedSFARouteReason(str, Enum):
+    ELIGIBLE = "eligible"
+    NOT_CONFIGURED = "not_configured"
+    RUNTIME_MODE = "runtime_mode"
+    RUNTIME_PARALLELISM = "runtime_parallelism"
+    LORA = "lora"
+    NOT_DECODE = "not_decode"
+    UBATCH = "ubatch"
+    UNSUPPORTED_BATCH = "unsupported_batch"
+    PADDED_BATCH = "padded_batch"
+    NON_Q1 = "non_q1"
+    BATCH_DESCRIPTOR = "batch_descriptor"
+    INVALID_REQUEST_IDS = "invalid_request_ids"
+    DENSE_PREFIX_HIT = "dense_prefix_hit"
+    MIXED_CONNECTOR_LOAD = "mixed_connector_load"
+    MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
+    SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
+    FRONTIER_TOO_SHORT = "frontier_too_short"
+    FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
+    DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class StagedSFARouteDecision:
+    action: StagedSFARouteAction
+    reason: StagedSFARouteReason
+    graph_key: Any = None
+    frontiers: tuple[int, ...] = ()
+    cold_compact_resumes: tuple[bool, ...] = ()
 ACL_FORMAT_FRACTAL_NZ = 29
 
 _CUSTOM_OP_ENABLED = None
