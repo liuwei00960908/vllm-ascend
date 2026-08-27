@@ -2303,6 +2303,173 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     return selected_counts;
 }
 
+// P9 staged graph: fixed-layout sparse-index preparation for graph replay.
+// Outputs are caller-owned fixed-address buffers; the count rows occupy
+// whole 64-byte cachelines and the row buffers must be 256-byte aligned so
+// graph capture never observes transient allocations or misaligned GM
+// access. Provenance: vllm-ascend-sparse@c7c4a4ac
+// csrc/torch_binding.cpp:1294-1452.
+at::Tensor npu_dsa_prepare_sparse_indices_staged_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    TORCH_CHECK(mtp == 1 || mtp == 2,
+                "staged sparse-index preparation only supports MTP=1 or "
+                "MTP=2; got MTP=", mtp);
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    const auto device = topk_indices.device();
+    TORCH_CHECK(split_boundary.device() == device &&
+                    row_req_indices.device() == device &&
+                    request_block_table.device() == device &&
+                    selected_packed.device() == device &&
+                    selected_counts.device() == device &&
+                    target_slots.device() == device &&
+                    local_to_union_workspace.device() == device,
+                "all staged sparse-index tensors must share one NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    split_boundary.scalar_type() == at::kInt &&
+                    row_req_indices.scalar_type() == at::kInt &&
+                    request_block_table.scalar_type() == at::kInt &&
+                    selected_packed.scalar_type() == at::kInt &&
+                    selected_counts.scalar_type() == at::kInt &&
+                    local_to_union_workspace.scalar_type() == at::kInt &&
+                    target_slots.scalar_type() == at::kLong,
+                "staged sparse indices/counts/tables must be int32 and "
+                "target slots int64");
+    TORCH_CHECK(topk_indices.is_contiguous() &&
+                    split_boundary.is_contiguous() &&
+                    row_req_indices.is_contiguous() &&
+                    request_block_table.is_contiguous() &&
+                    selected_packed.is_contiguous() &&
+                    selected_counts.is_contiguous() &&
+                    target_slots.is_contiguous() &&
+                    local_to_union_workspace.is_contiguous(),
+                "all staged sparse-index tensors must be contiguous");
+    TORCH_CHECK(topk_indices.dim() == 2 ||
+                    (topk_indices.dim() == 3 &&
+                     topk_indices.size(1) == 1),
+                "topk_indices must have shape [rows,k] or [rows,1,k]");
+    TORCH_CHECK(request_block_table.dim() == 2 &&
+                    selected_packed.dim() == 2 &&
+                    local_to_union_workspace.sizes() ==
+                        selected_packed.sizes() &&
+                    target_slots.sizes() == selected_packed.sizes(),
+                "staged payload and workspace buffers must be matching 2D "
+                "tensors");
+
+    const int64_t row_count = topk_indices.size(0);
+    const int64_t request_count = request_block_table.size(0);
+    TORCH_CHECK(row_count > 0 && request_count > 0,
+                "staged sparse-index preparation requires non-empty rows "
+                "and requests");
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t block_table_width = request_block_table.size(1);
+    TORCH_CHECK(row_count == request_count * mtp,
+                "fixed staged layout requires exactly MTP rows per request");
+    TORCH_CHECK(row_width == 2048,
+                "staged sort union currently requires top-k width 2048");
+    TORCH_CHECK(split_boundary.numel() >= row_count &&
+                    row_req_indices.numel() >= row_count,
+                "split_boundary and row_req_indices must cover every row");
+    TORCH_CHECK(selected_packed.size(0) == request_count &&
+                    selected_counts.dim() == 2 &&
+                    selected_counts.size(0) == request_count &&
+                    selected_counts.size(1) >= 16 &&
+                    selected_counts.size(1) % 16 == 0,
+                "staged payload/count rows must match request rows and each "
+                "count row must occupy whole 64-byte cachelines");
+    TORCH_CHECK(scratch_capacity >= mtp * row_width,
+                "staged payload/workspace width must cover all MTP rows");
+    TORCH_CHECK(block_size > 0 &&
+                    (block_size & (block_size - 1)) == 0 &&
+                    block_table_width * block_size >= scratch_capacity,
+                "block_size must be a positive power of two and the request "
+                "block table must cover the fixed scratch prefix");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 256 == 0 &&
+            reinterpret_cast<std::uintptr_t>(selected_packed.data_ptr()) %
+                    256 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(
+                local_to_union_workspace.data_ptr()) %
+                    256 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(target_slots.data_ptr()) % 256 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(selected_counts.data_ptr()) %
+                    64 ==
+                0,
+        "staged row buffers must be 256-byte aligned and the count buffer "
+        "must be 64-byte aligned");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    static thread_local int32_t cached_device = -1;
+    static thread_local int64_t cached_aiv_count = 0;
+    const int32_t current_device =
+        static_cast<int32_t>(topk_indices.get_device());
+    if (current_device != cached_device || cached_aiv_count <= 0) {
+        TORCH_CHECK(
+            aclGetDeviceCapability(
+                current_device,
+                ACL_DEVICE_INFO_VECTOR_CORE_NUM,
+                &cached_aiv_count) == ACL_SUCCESS,
+            "failed to query the NPU vector core count");
+        cached_device = current_device;
+    }
+    TORCH_CHECK(cached_aiv_count > 0,
+                "NPU reported no available vector cores");
+    const uint32_t core_count = static_cast<uint32_t>(
+        std::min<int64_t>(cached_aiv_count, row_count));
+    const int64_t selected_count_stride = selected_counts.size(1);
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* boundary_ptr = split_boundary.data_ptr();
+    void* row_req_ptr = row_req_indices.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* counts_ptr = selected_counts.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    void* map_ptr = local_to_union_workspace.data_ptr();
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_prepare_sparse_indices_staged_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+        counts_ptr, slots_ptr, map_ptr, row_count, row_width, request_count,
+        mtp, scratch_capacity, block_table_width, selected_count_stride,
+        block_size, core_count, need_packed,
+        clear_invalid_rows]() -> int {
+        dsa_prepare_sparse_indices_staged_impl(
+            stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
+            packed_ptr, counts_ptr, slots_ptr, map_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(mtp),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(block_size), core_count, need_packed,
+            clear_invalid_rows);
+        return 0;
+    });
+    cmd.Run();
+    return selected_counts;
+}
+
 std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
 {
     TORCH_CHECK(
@@ -2411,6 +2578,21 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_prepare_sparse_indices_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_prepare_sparse_indices_);
+
+    // P9 staged graph: fixed-layout variant. Provenance:
+    // vllm-ascend-sparse@c7c4a4ac csrc/torch_binding.cpp:1967-1980.
+    ops.def(
+        "npu_dsa_prepare_sparse_indices_staged_("
+        "Tensor(a!) topk_indices, Tensor split_boundary, "
+        "Tensor row_req_indices, Tensor request_block_table, "
+        "Tensor(b!) selected_packed, Tensor(c!) selected_counts, "
+        "Tensor(d!) target_slots, Tensor(e!) local_to_union_workspace, "
+        "int block_size, int mtp, bool need_packed, "
+        "bool clear_invalid_rows) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_staged_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_prepare_sparse_indices_staged_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
