@@ -19,6 +19,12 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+# Break the device_op <-> ops.fused_moe circular import that fires when
+# sfa_v1 is imported directly by unittest (serving loads ops first and
+# hides this). Importing the ops package here completes its initialization
+# before sfa_v1 pulls in device_op.
+import vllm_ascend.ops  # noqa: F401
+
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAMetadata,
     _lmcache_sparse_wait_sync_once_enabled,
@@ -33,6 +39,7 @@ def _metadata(**overrides):
         "num_actual_tokens": 4,
         "slot_mapping": torch.zeros(4, dtype=torch.int64),
         "seq_lens": torch.tensor([100, 200], dtype=torch.int64),
+        "seq_lens_cpu": torch.tensor([100, 200], dtype=torch.int64),
         "cum_query_lens": torch.tensor([100, 200], dtype=torch.int64),
         "block_table": torch.zeros((2, 10), dtype=torch.int64),
         "sin": torch.zeros(4),
@@ -40,6 +47,20 @@ def _metadata(**overrides):
     }
     base.update(overrides)
     return AscendSFAMetadata(**base)
+
+
+def _staged_metadata(**overrides):
+    """Create an AscendSFAMetadata with staged boundary fields populated."""
+    overrides.setdefault(
+        "decode_remap_boundary", torch.zeros(4, dtype=torch.int32)
+    )
+    overrides.setdefault("decode_remap_boundary_ready", False)
+    overrides.setdefault("prompt_lens_cpu_rows", np.array([50, 50, 60, 60], dtype=np.int32))
+    overrides.setdefault(
+        "decode_req_indices_cpu", np.array([0, 0, 1, 1], dtype=np.int64)
+    )
+    overrides.setdefault("decode_scratch_capacity", 16)
+    return _metadata(**overrides)
 
 
 class TestStagedMetadataDefaults(unittest.TestCase):
@@ -123,20 +144,8 @@ class TestValidateScratchCapacity(unittest.TestCase):
 
 
 class TestPrepareSfaRemapBoundary(unittest.TestCase):
-    def _staged_metadata(self, **overrides):
-        overrides.setdefault(
-            "decode_remap_boundary", torch.zeros(4, dtype=torch.int32)
-        )
-        overrides.setdefault("decode_remap_boundary_ready", False)
-        overrides.setdefault("prompt_lens_cpu_rows", np.array([50, 50, 60, 60], dtype=np.int32))
-        overrides.setdefault(
-            "decode_req_indices_cpu", np.array([0, 0, 1, 1], dtype=np.int64)
-        )
-        overrides.setdefault("decode_scratch_capacity", 16)
-        return _metadata(**overrides)
-
     def test_idempotent_when_ready(self):
-        metadata = self._staged_metadata()
+        metadata = _staged_metadata()
         metadata.decode_remap_boundary_ready = True
         result = _prepare_sfa_remap_boundary(
             metadata, ["req-0", "req-1"], is_dummy_run=True, index_topk=8
@@ -146,7 +155,7 @@ class TestPrepareSfaRemapBoundary(unittest.TestCase):
         self.assertTrue(torch.all(result == 0))
 
     def test_rejects_missing_cpu_metadata(self):
-        metadata = self._staged_metadata()
+        metadata = _staged_metadata()
         metadata.prompt_lens_cpu_rows = None
         with self.assertRaisesRegex(RuntimeError, "CPU metadata is incomplete"):
             _prepare_sfa_remap_boundary(
@@ -154,7 +163,7 @@ class TestPrepareSfaRemapBoundary(unittest.TestCase):
             )
 
     def test_rejects_missing_boundary_storage(self):
-        metadata = self._staged_metadata()
+        metadata = _staged_metadata()
         metadata.decode_remap_boundary = None
         with self.assertRaisesRegex(RuntimeError, "boundary storage"):
             _prepare_sfa_remap_boundary(
@@ -162,7 +171,7 @@ class TestPrepareSfaRemapBoundary(unittest.TestCase):
             )
 
     def test_dummy_run_fills_prompt_boundary(self):
-        metadata = self._staged_metadata()
+        metadata = _staged_metadata()
         result = _prepare_sfa_remap_boundary(
             metadata, ["req-0", "req-1"], is_dummy_run=True, index_topk=8
         )
@@ -174,7 +183,7 @@ class TestPrepareSfaRemapBoundary(unittest.TestCase):
         self.assertTrue(metadata.decode_remap_boundary_ready)
 
     def test_cached_tokens_override_boundary(self):
-        metadata = self._staged_metadata()
+        metadata = _staged_metadata()
         result = _prepare_sfa_remap_boundary(
             metadata,
             ["req-0", "req-1"],
@@ -212,7 +221,7 @@ class TestRetrieveWindowEarlyReturn(unittest.TestCase):
         from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
-        next_metadata = self._staged_metadata()
+        next_metadata = _staged_metadata()
         next_metadata.req_ids = ["req-0", "req-1"]
         context = SimpleNamespace(
             staged_sfa_graph_key=object(),

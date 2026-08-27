@@ -21,6 +21,10 @@ from unittest.mock import patch
 import torch
 from vllm.config import CUDAGraphMode
 
+# Break the device_op <-> ops.fused_moe circular import (see
+# test_staged_functions.py for the full explanation).
+import vllm_ascend.ops  # noqa: F401
+
 import vllm_ascend.attention.sfa_v1 as sfa_module
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,

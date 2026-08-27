@@ -307,6 +307,12 @@ class AscendSFAMetadata:
     decode_remap_boundary_ready: bool = False
     decode_request_ids_compact: list[str] | None = None
     staged_sfa_payload_validated: bool = False
+    # Scratch capacity for the request-union layout (decode_threshold ×
+    # index_topk); _validate_dsa_scratch_capacity reads it defensively via
+    # getattr. The row-specific decode_scratch_base fields remain dead
+    # pipes (P11+) and are not ported.
+    # Provenance: fork sfa_v1.py:903.
+    decode_scratch_capacity: int | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
