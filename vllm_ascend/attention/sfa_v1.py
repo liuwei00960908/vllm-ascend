@@ -1551,11 +1551,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             or 0
         )
         self.dsa_scratch_capacity = decode_threshold * self.dsa_index_topk
-        # P9 batch 2: staged capture owns immutable bridge/storage state even
-        # while staged routing is disconnected. Batch 4 will populate capture
-        # sizes from the env/config gate; an empty tuple is fail-closed for
-        # bridge allocation and leaves staged=0 behavior untouched.
-        self._staged_sfa_graph_capture_sizes: tuple[int, ...] = ()
+        # P9 batch 4: read the staged capture sizes from the env gate. An
+        # empty tuple when staged graph is disabled (fail-closed for bridge
+        # allocation, leaves staged=0 behavior untouched).
+        # Provenance: fork sfa_v1.py:1709-1714.
+        self.enable_staged_sfa_graph = bool(
+            envs.VLLM_ASCEND_SFA_STAGED_GRAPH
+        )
+        self._staged_sfa_graph_capture_sizes: tuple[int, ...] = (
+            self._parse_staged_capture_sizes()
+            if self.enable_staged_sfa_graph
+            else ()
+        )
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._staged_sfa_bridge_buffers: tuple[torch.Tensor, ...] | None = None
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
@@ -1816,6 +1823,30 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             destination[:rows].copy_(source)
         return buffers
+
+    @staticmethod
+    def _parse_staged_capture_sizes() -> tuple[int, ...]:
+        """Parse and validate the staged graph capture size list.
+
+        Provenance: fork envs VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
+        consumer logic (inlined here per the batch-4 plan).
+        """
+        raw = envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
+        try:
+            sizes = tuple(sorted({
+                int(s.strip()) for s in raw.split(",") if s.strip()
+            }))
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES: "
+                f"{raw!r} ({exc})"
+            ) from exc
+        if not sizes or any(s <= 0 for s in sizes):
+            raise ValueError(
+                "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
+                f"at least one positive integer, got {raw!r}"
+            )
+        return sizes
 
     def _cross_layer_kv_cache(
         self,
@@ -2159,6 +2190,210 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if index_layer_name is not None and index_enabled:
             maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
+
+    def cross_layer_graph_pre(
+        self,
+        layer_name: str,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M | None,
+        need_gather_q_kv: bool,
+        output: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run graph A, or the complete native path outside staged replay.
+
+        Provenance: fork sfa_v1.py:2936-3075. The eligibility/route checks
+        (~50 lines in the fork) belong to the batch-5 routing layer and
+        are intentionally not ported here; this wrapper runs the eager
+        warmup orchestration that Batch 5 will gate behind its own checks.
+        """
+        context = get_forward_context()
+        if attn_metadata is None:
+            self.forward(
+                layer_name,
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+                need_gather_q_kv,
+                output,
+            )
+            return self._cross_layer_empty_outputs(hidden_states)
+
+        kv_cache, index_layer_name, index_enabled = (
+            self._cross_layer_kv_cache(layer_name, kv_cache)
+        )
+        graph_key = getattr(context, "staged_sfa_graph_key", None)
+        if graph_key is None:
+            self.forward(
+                layer_name,
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+                need_gather_q_kv,
+                output,
+            )
+            return self._cross_layer_empty_outputs(hidden_states)
+
+        # Batch 5 will insert eligibility and route validation here.
+
+        is_dummy = bool(
+            getattr(context, "staged_sfa_graph_dummy_run", False)
+        )
+        state = self._staged_sfa_capture_state
+        initialized_capacity = state.initialized_cache_capacity
+        if (
+            is_dummy
+            and int(graph_key.request_capacity) > initialized_capacity
+        ):
+            for cache in kv_cache:
+                cache[initialized_capacity : int(graph_key.request_capacity)].zero_()
+            state.initialized_cache_capacity = int(graph_key.request_capacity)
+
+        if (
+            is_dummy
+            and getattr(context, "cudagraph_runtime_mode", CUDAGraphMode.NONE)
+            == CUDAGraphMode.PIECEWISE
+        ):
+            # ACL capture cannot include the host copy in boundary
+            # preparation. The immediately preceding eager warmup filled
+            # this stable buffer (03-4 §7 constraint ②).
+            capture_boundary = state.remap_boundary
+            boundary = attn_metadata.decode_remap_boundary
+            if (
+                capture_boundary is None
+                or boundary is None
+                or capture_boundary.data_ptr() != boundary.data_ptr()
+                or capture_boundary.shape != boundary.shape
+            ):
+                raise RuntimeError(
+                    "[SFA cross-layer graph] remap boundary was not "
+                    "prepared in stable storage by eager warmup"
+                )
+            remap_boundary = capture_boundary
+        else:
+            remap_boundary = _prepare_sfa_remap_boundary(
+                attn_metadata,
+                attn_metadata.req_ids,
+                is_dummy_run=is_dummy,
+                index_topk=self.dsa_index_topk,
+                cached_tokens=getattr(
+                    getattr(context, "staged_sfa_route", None),
+                    "frontiers",
+                    None,
+                ),
+            )
+            if is_dummy:
+                state.remap_boundary = remap_boundary
+
+        row_req_indices = attn_metadata.decode_req_indices
+        selected_packed = attn_metadata.decode_selected_tokens
+        selected_counts = attn_metadata.decode_selected_counts
+        target_slots = attn_metadata.decode_target_slot_mapping
+        local_to_union_workspace = (
+            attn_metadata.decode_union_mapping_workspace
+        )
+        if any(
+            value is None
+            for value in (
+                row_req_indices,
+                selected_packed,
+                selected_counts,
+                target_slots,
+                local_to_union_workspace,
+            )
+        ):
+            raise RuntimeError(
+                "staged SFA request-union buffers are unavailable"
+            )
+
+        outputs = self._cross_layer_pre_compute(
+            hidden_states,
+            kv_cache[0],
+            kv_cache[1],
+            kv_cache[2],
+            attn_metadata.cos,
+            attn_metadata.sin,
+            attn_metadata.slot_mapping,
+            attn_metadata.indexer_slot_mapping,
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            attn_metadata.indexer_block_table,
+            remap_boundary,
+            row_req_indices,
+            attn_metadata.block_table,
+            selected_packed,
+            selected_counts,
+            target_slots,
+            local_to_union_workspace,
+            attn_metadata,
+        )
+        outputs = self._copy_to_staged_sfa_bridge(
+            hidden_states,
+            outputs,
+        )
+        producer_event = state.producer_event
+        if producer_event is None:
+            if (
+                getattr(
+                    context, "cudagraph_runtime_mode", CUDAGraphMode.NONE
+                )
+                != CUDAGraphMode.NONE
+            ):
+                raise RuntimeError(
+                    "staged SFA producer event was not created by "
+                    "eager warmup"
+                )
+            producer_event = torch.npu.Event()
+            state.producer_event = producer_event
+        attn_metadata.reshape_cache_event = producer_event
+        producer_event.record()
+        state.runtime = (
+            layer_name,
+            kv_cache,
+            index_layer_name,
+            index_enabled,
+        )
+        if (
+            is_dummy
+            and getattr(context, "cudagraph_runtime_mode", CUDAGraphMode.NONE)
+            == CUDAGraphMode.PIECEWISE
+        ):
+            state.register(graph_key, outputs, kv_cache)
+        return outputs
+
+    def cross_layer_graph_post(
+        self,
+        layer_name: str,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M | None,
+        output: torch.Tensor,
+    ) -> None:
+        """Run graph B: sparse FA + projections into the fixed output.
+
+        Provenance: fork sfa_v1.py:3152-3175.
+        """
+        graph_key = getattr(
+            get_forward_context(), "staged_sfa_graph_key", None
+        )
+        if attn_metadata is None or graph_key is None:
+            return
+        rows = int(graph_key.token_capacity)
+        kv_cache, _, _ = self._cross_layer_kv_cache(layer_name, kv_cache)
+        self._cross_layer_post_compute(
+            ql_nope[:rows],
+            q_pe[:rows],
+            topk_indices[:rows],
+            kv_cache[0],
+            kv_cache[1],
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            attn_metadata.block_table,
+            output,
+            attn_metadata,
+        )
 
     @staticmethod
     def update_graph_params(
