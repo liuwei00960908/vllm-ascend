@@ -92,6 +92,11 @@ _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
 
 
+def _lmcache_sparse_wait_sync_once_enabled() -> bool:
+    """One-shot LMCache sparse wait sync gate (B2b env flag)."""
+    return bool(envs.VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE)
+
+
 class _ByteGatherPart(NamedTuple):
     name: str
     shape: tuple[int, ...]
@@ -287,6 +292,22 @@ class AscendSFAMetadata:
     decode_selected_counts: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
 
+    # P9 staged graph (Batch 3): fixed-layout data plane. The union
+    # workspace is the caller-owned remap kernel workspace (Batch 1
+    # dispatch contract); decode_remap_boundary is the stable-address
+    # graph-A boundary input (mechanism 2 — host writes, graph reads);
+    # prompt_lens_cpu_rows / decode_request_ids_compact feed the staged
+    # metadata channels; staged_sfa_payload_validated is the validate-once
+    # gate for the P10 payload fast path.
+    # Provenance: fork sfa_v1.py:885-912 (staged subset; the
+    # decode_scratch_base/compact fields are dead pipes, not ported).
+    decode_union_mapping_workspace: torch.Tensor | None = None
+    prompt_lens_cpu_rows: Any = None
+    decode_remap_boundary: torch.Tensor | None = None
+    decode_remap_boundary_ready: bool = False
+    decode_request_ids_compact: list[str] | None = None
+    staged_sfa_payload_validated: bool = False
+
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 
@@ -425,6 +446,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 max_rows, dtype=torch.int32, device=self.device
             )
             self._dsa_row_offsets_tensor = torch.empty(
+                max_rows, dtype=torch.int32, device=self.device
+            )
+
+            # P9 staged graph (Batch 3): one builder-owned fixed-address
+            # workspace for the staged remap kernel's local_to_union
+            # contract (Batch 1 dispatch), and one stable boundary device
+            # buffer whose address survives metadata rebuilds so graph A
+            # replay always reads from the same location.
+            # Provenance: fork sfa_v1.py:1031-1034/:1092-1101 (subset).
+            self.scratch_capacity = self.decode_threshold * self.dsa_index_topk
+            self._dsa_union_mapping = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.decode_remap_boundary = torch.empty(
                 max_rows, dtype=torch.int32, device=self.device
             )
 
@@ -596,6 +633,28 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     and staged_sfa_connector_supports_sparse_load()
                 ),
             )
+
+            # P9 staged graph (Batch 3): wire the staged metadata channels
+            # when the batch carries the request-major fixed layout (pure
+            # decode with exactly decode_threshold rows per request). Mixed
+            # batches keep the B2c-only channels above untouched.
+            # Provenance: fork sfa_v1.py:1415-1576 (staged subset).
+            if num_decode_rows == num_reqs * self.decode_threshold:
+                shrink_kwargs.update(
+                    decode_union_mapping_workspace=(
+                        self._dsa_union_mapping[:num_reqs]
+                    ),
+                    decode_request_ids_compact=(
+                        list(req_ids[:num_reqs])
+                        if req_ids is not None
+                        else None
+                    ),
+                    prompt_lens_cpu_rows=plens_cpu[:num_decode_rows],
+                    decode_remap_boundary=(
+                        self.decode_remap_boundary[:num_decode_rows]
+                    ),
+                    decode_remap_boundary_ready=False,
+                )
 
         block_size = self.kernel_block_size
 
@@ -1154,6 +1213,213 @@ def _resolve_sparse_cached_tokens_by_request(
     return cached_tokens
 
 
+def _validate_dsa_scratch_capacity(
+    boundary_rows: Any,
+    row_req_indices: Any,
+    scratch_base_rows: Any,
+    index_topk: int,
+    scratch_capacity: int | None = None,
+) -> None:
+    """Validate request-level union scratch cannot alias live KV positions.
+
+    scratch_base_rows is kept in the signature for provenance parity with
+    the fork; the row-specific base path is a dead pipe (P11+) and is
+    never consumed here.
+
+    Provenance: fork sfa_v1.py:534-577.
+    """
+    width = int(index_topk)
+    if width <= 0:
+        raise RuntimeError(
+            f"DSA compact scratch requires a positive index_topk, got {width}."
+        )
+    boundaries = np.asarray(boundary_rows, dtype=np.int64).reshape(-1)
+    request_rows = np.asarray(row_req_indices, dtype=np.int64).reshape(-1)
+    if boundaries.size != request_rows.size:
+        raise RuntimeError(
+            "DSA compact scratch metadata shapes differ: "
+            f"boundaries={boundaries.size}, request_rows={request_rows.size}."
+        )
+    if scratch_capacity is None or int(scratch_capacity) < width:
+        raise RuntimeError(
+            "DSA request-union scratch reservation is missing or too small: "
+            f"scratch_capacity={scratch_capacity}, index_topk={width}."
+        )
+    capacity = int(scratch_capacity)
+    for request_index in sorted(
+        {int(value) for value in request_rows if int(value) >= 0}
+    ):
+        rows = np.flatnonzero(request_rows == request_index)
+        if rows.size * width > capacity:
+            raise RuntimeError(
+                "DSA request-union scratch reservation is too small: "
+                f"request={request_index}, rows={rows.size}, "
+                f"index_topk={width}, scratch_capacity={capacity}."
+            )
+        request_boundaries = boundaries[rows]
+        if np.any(
+            (request_boundaries != 0)
+            & (request_boundaries < capacity)
+        ):
+            raise RuntimeError(
+                "DSA request-union scratch would alias live KV positions: "
+                f"request={request_index}, boundaries="
+                f"{request_boundaries.tolist()}, "
+                f"scratch_capacity={capacity}."
+            )
+
+
+def _prepare_sfa_remap_boundary(
+    attn_metadata: Any,
+    request_ids: Any,
+    *,
+    is_dummy_run: bool,
+    index_topk: int,
+    cached_tokens: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Fill the stable graph-A remap-boundary input once per step.
+
+    Connector metadata and request/row mapping are host objects that cannot
+    be frozen into a captured runnable. Resolve them eagerly on CPU, then
+    copy the final per-row boundary into the builder-owned NPU tensor whose
+    address survives across decode steps.
+
+    Provenance: fork sfa_v1.py:398-530.
+    """
+    boundary = attn_metadata.decode_remap_boundary
+    if boundary is None:
+        raise RuntimeError(
+            "[SFA sparse remap] boundary storage is unavailable."
+        )
+    if attn_metadata.decode_remap_boundary_ready:
+        return boundary
+
+    prompt_rows = attn_metadata.prompt_lens_cpu_rows
+    row_req_indices = attn_metadata.decode_req_indices_cpu
+    seq_lens_cpu = attn_metadata.seq_lens_cpu
+    if prompt_rows is None or row_req_indices is None or seq_lens_cpu is None:
+        raise RuntimeError("[SFA sparse remap] CPU metadata is incomplete.")
+
+    prompt_rows_np = np.asarray(prompt_rows, dtype=np.int32).reshape(-1)
+    row_req_indices_np = np.asarray(
+        row_req_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens = seq_lens_cpu.detach().numpy().reshape(-1)
+    else:
+        seq_lens = np.asarray(seq_lens_cpu).reshape(-1)
+    if (
+        int(boundary.numel()) != int(prompt_rows_np.size)
+        or row_req_indices_np.size != prompt_rows_np.size
+    ):
+        raise RuntimeError(
+            "[SFA sparse remap] boundary shapes differ: "
+            f"boundary={tuple(boundary.shape)}, "
+            f"prompt_rows={tuple(prompt_rows_np.shape)}, "
+            f"row_req_indices={tuple(row_req_indices_np.shape)}."
+        )
+
+    valid_rows = row_req_indices_np >= 0
+    decode_request_indices_np = np.unique(row_req_indices_np[valid_rows])
+    if (
+        decode_request_indices_np.size
+        and int(decode_request_indices_np[-1]) >= len(seq_lens)
+    ):
+        request_index = int(decode_request_indices_np[-1])
+        raise RuntimeError(
+            "[SFA sparse remap] decode row references request "
+            f"{request_index}, but only {len(seq_lens)} sequence lengths "
+            "are available."
+        )
+
+    cached_tokens_by_request = np.zeros(len(seq_lens), dtype=np.int32)
+    cached_request_mask = np.zeros(len(seq_lens), dtype=np.bool_)
+    if not is_dummy_run:
+        if cached_tokens is None:
+            if decode_request_indices_np.size:
+                if request_ids is None:
+                    raise RuntimeError(
+                        "[SFA sparse remap] active request IDs are unavailable."
+                    )
+                request_ids = list(request_ids)
+                if (
+                    decode_request_indices_np[-1]
+                    >= len(request_ids)
+                ):
+                    raise RuntimeError(
+                        "[SFA sparse remap] active request IDs do not cover "
+                        "all decode rows."
+                    )
+                decode_request_ids = [
+                    request_ids[int(index)]
+                    for index in decode_request_indices_np
+                ]
+                resolved_tokens = get_lmcache_sparse_cached_tokens(
+                    decode_request_ids
+                )
+                cached_tokens_by_request[
+                    decode_request_indices_np
+                ] = np.asarray(resolved_tokens, dtype=np.int32)
+                cached_request_mask[decode_request_indices_np] = True
+        else:
+            if len(cached_tokens) != len(decode_request_indices_np):
+                raise RuntimeError(
+                    "[SFA sparse remap] cached-token count differs from the "
+                    f"active request count: {len(cached_tokens)} vs "
+                    f"{len(decode_request_indices_np)}."
+                )
+            cached_tokens_by_request[
+                decode_request_indices_np
+            ] = np.asarray(cached_tokens, dtype=np.int32)
+            cached_request_mask[decode_request_indices_np] = True
+
+    decode_window_size = _decode_window_save_window_size()
+    boundary_rows = prompt_rows_np.copy()
+    if decode_request_indices_np.size:
+        request_boundaries = np.zeros(len(seq_lens), dtype=np.int32)
+        if decode_window_size > 0:
+            current_positions = np.maximum(
+                seq_lens.astype(np.int64, copy=False) - 1,
+                0,
+            )
+            request_boundaries[:] = (
+                current_positions // decode_window_size * decode_window_size
+            )
+            np.minimum(
+                request_boundaries,
+                cached_tokens_by_request,
+                out=request_boundaries,
+                where=cached_request_mask,
+            )
+        else:
+            request_boundaries[cached_request_mask] = (
+                cached_tokens_by_request[cached_request_mask]
+            )
+        rows_with_dynamic_boundary = valid_rows.copy()
+        if decode_window_size <= 0:
+            rows_with_dynamic_boundary[valid_rows] = (
+                cached_request_mask[row_req_indices_np[valid_rows]]
+            )
+        boundary_rows[rows_with_dynamic_boundary] = (
+            request_boundaries[
+                row_req_indices_np[rows_with_dynamic_boundary]
+            ]
+        )
+
+    _validate_dsa_scratch_capacity(
+        boundary_rows,
+        row_req_indices_np,
+        None,
+        index_topk,
+        getattr(attn_metadata, "decode_scratch_capacity", None),
+    )
+
+    boundary.copy_(torch.from_numpy(boundary_rows))
+    attn_metadata.decode_remap_boundary_ready = True
+    return boundary
+
+
 def _dsa_mask_padding_sparse_rows(
     topk_indices: torch.Tensor,
     row_req_indices: torch.Tensor | None,
@@ -1544,6 +1810,349 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             destination[:rows].copy_(source)
         return buffers
+
+    def _cross_layer_kv_cache(
+        self,
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> tuple[tuple[torch.Tensor, ...], str | None, bool]:
+        """Assemble the 3-tuple KV (latent-nope, latent-pe, indexer).
+
+        Reuses the baseline's cached indexer lookup (``_dsa_idx_cache_t``)
+        for the unbundle mode. Provenance: fork sfa_v1.py:2808-2827.
+        """
+        index_layer_name = (
+            _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
+        )
+        index_enabled = bool(
+            index_layer_name is not None
+            and staged_sfa_connector_supports_sparse_load()
+        )
+        if self.dsa_offload_unbundle and len(kv_cache) < 3:
+            index_cache = getattr(self, "_dsa_idx_cache_t", None)
+            if index_cache is None:
+                context = get_forward_context()
+                assert index_layer_name is not None
+                registered = context.no_compile_layers[index_layer_name].kv_cache[
+                    context.virtual_engine
+                ]
+                index_cache = (
+                    registered[0]
+                    if isinstance(registered, (tuple, list))
+                    else registered
+                )
+                self._dsa_idx_cache_t = index_cache
+            kv_cache = (*kv_cache, index_cache)
+        return kv_cache, index_layer_name, index_enabled
+
+    def _indexer_topk_for_staged(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the indexer top-k for the staged pre-compute path.
+
+        The baseline ``indexer_select_post_process`` requires a positional
+        ``attn_metadata`` argument; the staged path has none to give (the
+        fixed layout carries its own per-request tables), so this helper
+        calls ``DeviceOperator.indexer_select_post_process`` directly with
+        the override block table — the same semantic as fork
+        ``indexer_block_table_override`` (:2746-2760).
+        """
+        if not self.has_indexer:
+            raise RuntimeError(
+                f"indexer is required for the staged path. layer_name={self.layer_name}."
+            )
+        k_li, _ = self.indexer_select_pre_process(
+            x=hidden_states, cos=cos, sin=sin
+        )
+        # Call the device operator directly, bypassing the metadata arg.
+        return DeviceOperator.indexer_select_post_process(
+            self,
+            k_li.view(-1, 1, k_li.shape[-1]),
+            None,  # k_li_scale
+            None,  # k_li_shape_ori
+            None,  # weights — recomputed inside; fork passes the same.
+            kv_cache,
+            None,  # attn_metadata — fixed layout carries its own tables.
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            False,  # enable_sparse_li_c8 — staged rejects C8 (eligibility).
+            False,  # use_torch_npu_lightning_indexer
+        )
+
+    def _cross_layer_pre_compute(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        indexer_slot_mapping: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table: torch.Tensor,
+        remap_boundary: torch.Tensor,
+        row_req_indices: torch.Tensor,
+        request_block_table: torch.Tensor,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slot_mapping: torch.Tensor,
+        local_to_union_workspace: torch.Tensor,
+        attn_metadata: M,
+    ) -> tuple[torch.Tensor, ...]:
+        """Pre-retrieval compute captured by the outer PIECEWISE graph.
+
+        Provenance: fork sfa_v1.py:2668-2771. Adaptations from the fork:
+        exec_kv takes an extra attn_metadata parameter; indexer top-k goes
+        through _indexer_topk_for_staged (attn_metadata positional arg);
+        index_topk is self.dsa_index_topk; block_size is read from config.
+        """
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_a_layernorm is not None
+
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_no_split = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+        k_li, _ = self.indexer_select_pre_process(
+            x=hidden_states,
+            cos=cos,
+            sin=sin,
+        )
+        kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+        self.exec_kv(
+            kv_no_split,
+            cos,
+            sin,
+            kv_cache,
+            slot_mapping,
+            attn_metadata,
+        )
+
+        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+        q_pe = self.rope_single(q_pe, cos, sin)
+
+        torch_npu.npu_scatter_nd_update_(
+            indexer_cache.view(-1, k_li.shape[-1]),
+            indexer_slot_mapping.view(-1, 1),
+            k_li.view(-1, k_li.shape[-1]),
+        )
+        topk_indices = self._indexer_topk_for_staged(
+            hidden_states,
+            q_c,
+            kv_cache,
+            cos,
+            sin,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            indexer_block_table,
+        )
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        row_count = int(topk_indices.shape[0])
+        request_count = int(request_block_table.shape[0])
+        staged_mtp = row_count // max(request_count, 1)
+        block_size = int(self.vllm_config.cache_config.block_size)
+
+        (
+            topk_indices,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+        ) = prepare_sparse_indices(
+            topk_indices,
+            remap_boundary,
+            request_block_table,
+            block_size,
+            hidden_states.device,
+            row_req_indices=row_req_indices,
+            selected_packed=selected_packed,
+            selected_counts=selected_counts,
+            target_slot_mapping=target_slot_mapping,
+            local_to_union_workspace=local_to_union_workspace,
+            staged_mtp=staged_mtp,
+        )
+        return (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+        )
+
+    def _cross_layer_post_compute(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache_nope: torch.Tensor,
+        kv_cache_pe: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: M,
+    ) -> torch.Tensor:
+        """Post-retrieval compute captured by the outer PIECEWISE graph.
+
+        Provenance: fork sfa_v1.py:2773-2808. The FA call passes the
+        caller-provided attn_metadata (baseline requires it; fork passed
+        a lightweight stub — we keep the real metadata since the fixed
+        layout still carries per-request block tables and seq lens).
+        """
+        kv_cache = (kv_cache_nope, kv_cache_pe)
+        attn_output = self._execute_sparse_flash_attention_process(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+        )
+        attn_output = self._v_up_proj(attn_output)
+        output[...] = self.o_proj(attn_output)[0]
+        return output
+
+    def cross_layer_lmcache_retrieve(
+        self,
+        layer_name: str,
+        next_layer_name: str,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slots: torch.Tensor,
+        attn_metadata: M | None,
+        context: Any,
+    ) -> None:
+        """Eager retrieve window between graph A and graph B.
+
+        Provenance: fork sfa_v1.py:3074-3129.
+        """
+        graph_key = getattr(context, "staged_sfa_graph_key", None)
+        if attn_metadata is None or graph_key is None:
+            return
+        if getattr(context, "staged_sfa_graph_dummy_run", False):
+            if next_layer_name:
+                next_metadata = context.attn_metadata[next_layer_name]
+                _prepare_sfa_remap_boundary(
+                    next_metadata,
+                    next_metadata.req_ids,
+                    is_dummy_run=True,
+                    index_topk=self.dsa_index_topk,
+                )
+            return
+
+        route = context.staged_sfa_route
+        state = self._staged_sfa_capture_state
+        index_enabled = bool(state.runtime and state.runtime[3])
+        producer_event = state.producer_event
+        if producer_event is not None:
+            attn_metadata.reshape_cache_event = producer_event
+
+        request_ids = attn_metadata.decode_request_ids_compact
+        if request_ids is None:
+            raise RuntimeError("staged SFA request ids are unavailable")
+        request_count = len(request_ids)
+        wait_for_kv_layer_from_connector(
+            layer_name,
+            selected_tokens=selected_packed[:request_count],
+            token_start_index=None,
+            request_ids=request_ids,
+            target_slot_mapping=target_slots[:request_count],
+            selected_token_counts=selected_counts[:request_count],
+            payload_event=producer_event,
+        )
+        if (
+            _lmcache_sparse_wait_sync_once_enabled()
+            and not _lmcache_sparse_wait_sync_once_done
+        ):
+            _sync_compute_stream_after_lmcache_sparse_wait()
+        if next_layer_name:
+            next_metadata = context.attn_metadata[next_layer_name]
+            _prepare_sfa_remap_boundary(
+                next_metadata,
+                next_metadata.req_ids,
+                is_dummy_run=False,
+                index_topk=self.dsa_index_topk,
+                cached_tokens=getattr(
+                    getattr(route, "frontiers", None), "frontiers", None
+                )
+                if route is not None
+                else None,
+            )
+            if index_enabled:
+                wait_for_kv_layer_from_connector(
+                    _dsa_indexer_layer_name(next_layer_name)
+                )
+
+    def bootstrap_cross_layer(self, layer_name: str) -> None:
+        """Prepare layer zero before the first captured island is launched.
+
+        Provenance: fork sfa_v1.py:3131-3151.
+        """
+        context = get_forward_context()
+        metadata = context.attn_metadata[layer_name]
+        is_dummy = bool(
+            getattr(context, "staged_sfa_graph_dummy_run", False)
+        )
+        _prepare_sfa_remap_boundary(
+            metadata,
+            metadata.req_ids,
+            is_dummy_run=is_dummy,
+            index_topk=self.dsa_index_topk,
+            cached_tokens=(
+                None
+                if is_dummy
+                else getattr(
+                    getattr(context, "staged_sfa_route", None),
+                    "frontiers",
+                    None,
+                )
+            ),
+        )
+        runtime = self._staged_sfa_capture_state.runtime
+        if (
+            not is_dummy
+            and runtime
+            and runtime[2] is not None
+            and runtime[3]
+        ):
+            wait_for_kv_layer_from_connector(runtime[2])
+
+    def submit_cross_layer_save(self) -> None:
+        """Trigger cross-layer save after graph B completes.
+
+        Provenance: fork sfa_v1.py:3180-3190.
+        """
+        runtime = self._staged_sfa_capture_state.runtime
+        if runtime is None:
+            return
+        layer_name, kv_cache, index_layer_name, index_enabled = runtime
+        if (
+            bool(self.dsa_shrink_latent)
+            and _decode_window_save_window_size() == 0
+        ):
+            return
+        maybe_save_kv_layer_to_connector(
+            layer_name, [kv_cache[0], kv_cache[1]]
+        )
+        if index_layer_name is not None and index_enabled:
+            maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
 
     @staticmethod
     def update_graph_params(
