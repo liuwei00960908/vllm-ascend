@@ -10,7 +10,8 @@
 #
 # Unit tests for the staged sparse-index dispatch (P9 batch 1). The
 # parameter-contract cases run on any device; the semantic cases pin the
-# staged MTP=1 source-order layout against the sorted oracle so the two
+# staged Q1 layout (staged_mtp=1: one top-k row per request) source-order
+# layout against the sorted oracle so the two
 # orderings can never drift apart. The NPU kernel comparison itself runs
 # on the test machine (dev boxes have no NPU runtime).
 #
@@ -31,7 +32,7 @@ def _staged_mtp1_reference(
     request_block_table: torch.Tensor,
     block_size: int,
 ):
-    """CPU reference for the staged MTP=1 kernel semantics.
+    """CPU reference for the staged Q1-layout kernel semantics.
 
     One row per request: selected (< boundary) tokens keep their top-k
     source order, are compacted to row-local ranks, and the same ranks are
@@ -105,8 +106,14 @@ class TestStagedDispatchContract(unittest.TestCase):
             )
 
 
-class TestStagedMtp1Semantics(unittest.TestCase):
-    """Staged MTP=1 source-order layout vs the sorted oracle invariants."""
+class TestStagedSingleRowSemantics(unittest.TestCase):
+    """Q1 layout (staged_mtp=1: one top-k row per request) source-order
+    layout vs the sorted-oracle invariants.
+
+    staged_mtp counts top-k ROWS per request (= decode_threshold), not the
+    speculative depth: 1 is the Q1 layout (MTP off / first decode step),
+    2 is the MTP1 verify layout (target + draft rows).
+    """
 
     def _case(self, seed):
         gen = torch.Generator().manual_seed(seed)

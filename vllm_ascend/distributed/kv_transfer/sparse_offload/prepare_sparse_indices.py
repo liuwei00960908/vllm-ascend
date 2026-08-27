@@ -135,11 +135,17 @@ def prepare_sparse_indices(
             matching ``selected_packed``. Required by the staged path so
             graph replay never allocates temporary storage inside the op.
         staged_mtp: enable the fixed-layout graph-replay path for pure
-            decode. MTP=1 compacts each unique top-k row in source order
-            without sorting or union; MTP=2 compacts two rows, runs the
-            staged sort union, then remaps both rows through it. Values
-            other than 1/2 are rejected. Provenance: fork
-            sparse_offload/prepare_sparse_indices.py:104-208.
+            decode. The value is the per-request top-k row count
+            (= decode_threshold = 1 + num_speculative_tokens), NOT the
+            speculative depth itself: 1 = Q1 layout (MTP off, or the
+            first decode step before any draft row exists) and compacts
+            each unique top-k row in source order without sorting;
+            2 = the MTP1 verify layout (target + draft rows) and runs
+            the staged sort union, remapping both rows through the
+            request-level union. Other values are rejected. Provenance:
+            fork sparse_offload/prepare_sparse_indices.py:104-208
+            (fork's docstring calls the row count "MTP"; renamed here to
+            avoid confusing it with num_speculative_tokens).
 
     Returns:
         new_indices: same shape as topk_indices — selected entries replaced
