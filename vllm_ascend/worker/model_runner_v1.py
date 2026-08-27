@@ -5699,8 +5699,8 @@ class NPUModelRunner(GPUModelRunner):
         is at or beyond the target model's hidden layer count.
         Provenance: fork model_runner_v1.py:4913-4952.
         """
-        from vllm.model_executor.layers.attention import AttentionLayerBase
-        from vllm.v1.attention import get_layers_from_vllm_config
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
         from vllm_ascend.utils import parse_layer_idx
 
         attn_layers = get_layers_from_vllm_config(
