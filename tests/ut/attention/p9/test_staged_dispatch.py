@@ -147,9 +147,31 @@ class TestStagedSingleRowSemantics(unittest.TestCase):
             staged_targets,
         ) = _staged_mtp1_reference(tokens, boundary, table, block_size)
 
-        # Hard invariants: the FA-read remap and per-request counts are
-        # identical between the sorted-union and source-order layouts.
-        torch.testing.assert_close(staged_indices, ref_indices)
+        # Hard invariant (fixed): the token the FA reads back is identical
+        # under both rank orderings. Source-order and sorted layouts assign
+        # different ranks to the same token, so comparing raw indices is
+        # wrong; instead, look each index up through its own packed list
+        # and require the same token identity.
+        for row in range(tokens.shape[0]):
+            for col in range(tokens.shape[1]):
+                token = int(tokens[row, col])
+                if 0 <= token < int(boundary[row]):
+                    staged_rank = int(staged_indices[row, col])
+                    ref_rank = int(ref_indices[row, col])
+                    self.assertEqual(
+                        int(staged_packed[row, staged_rank]),
+                        token,
+                        f"staged lookup row={row} col={col}",
+                    )
+                    self.assertEqual(
+                        int(ref_packed[row, ref_rank]),
+                        token,
+                        f"oracle lookup row={row} col={col}",
+                    )
+                else:
+                    # Unselected (absolute or padding): both keep original.
+                    self.assertEqual(int(staged_indices[row, col]), token)
+                    self.assertEqual(int(ref_indices[row, col]), token)
         torch.testing.assert_close(staged_counts, ref_counts)
 
         # Soft invariants: the packed list is the same set of tokens (order
@@ -182,7 +204,7 @@ class TestStagedSingleRowSemantics(unittest.TestCase):
         staged_indices, _, staged_counts, _ = _staged_mtp1_reference(
             tokens, boundary, table, block_size
         )
-        torch.testing.assert_close(staged_indices, tokens.long())
+        torch.testing.assert_close(staged_indices, tokens)
         torch.testing.assert_close(staged_indices, ref_indices)
         torch.testing.assert_close(staged_counts, ref_counts)
         self.assertEqual(int(ref_counts.sum()), 0)
