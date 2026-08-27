@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -10,7 +10,7 @@ import torch
 import torch_npu
 import vllm.envs as envs_vllm
 from torch import nn
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -772,6 +772,118 @@ def _dsa_indexer_layer_name(layer_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# P9 staged graph: fixed-address bridge buffers and capture state.
+# The six bridge slots carry graph A's outputs to the eager retrieve window
+# and graph B. Slots 0/1/2 (ql_nope / q_pe / topk_indices) stay inside the
+# graphs (mechanism 1); slots 3/4/5 (selected_packed / selected_counts /
+# target_slots) must reach the host window (mechanism 3). All buffers are
+# allocated once during eager warmup at the maximum capture size; graph
+# capture/replay mode raises if they are missing (allocation is a Python
+# action and can never be recorded). The capture state seals the addresses
+# so replay never writes to replaced tensors (03-4 §7 constraints 1-3).
+# Provenance: vllm-ascend-sparse@c7c4a4ac sfa_v1.py:128-218, :2845-2934.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorBinding:
+    """Immutable address + layout fingerprint for one captured tensor."""
+
+    address: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def layout(self) -> tuple[Any, ...]:
+        return self.shape, self.stride, self.dtype, self.device
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> "_TensorBinding":
+        return cls(
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedSFALayerBinding:
+    """One graph key's full address contract for a single SFA layer."""
+
+    bridge: tuple[_TensorBinding, ...]
+    kv_cache: tuple[_TensorBinding, ...]
+    remap_boundary: _TensorBinding
+    producer_event_id: int
+
+
+@dataclass(slots=True)
+class _StagedSFACaptureState:
+    """Own the immutable capture contract for one local SFA layer."""
+
+    producer_event: Any | None = None
+    remap_boundary: torch.Tensor | None = None
+    runtime: tuple[Any, ...] | None = None
+    initialized_cache_capacity: int = 0
+    bindings: dict[Any, _StagedSFALayerBinding] = field(
+        default_factory=dict,
+    )
+
+    def register(
+        self,
+        key: Any,
+        bridge: tuple[torch.Tensor, ...],
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        if key in self.bindings:
+            raise RuntimeError(f"staged SFA graph key was captured twice: {key}")
+        if self.producer_event is None or self.remap_boundary is None:
+            raise RuntimeError("staged SFA capture storage is incomplete")
+
+        binding = _StagedSFALayerBinding(
+            tuple(_TensorBinding.from_tensor(tensor) for tensor in bridge),
+            tuple(_TensorBinding.from_tensor(tensor) for tensor in kv_cache),
+            _TensorBinding.from_tensor(self.remap_boundary),
+            id(self.producer_event),
+        )
+        if self.bindings:
+            existing = next(iter(self.bindings.values()))
+            if (
+                binding.kv_cache != existing.kv_cache
+                or binding.producer_event_id != existing.producer_event_id
+                or binding.remap_boundary.address
+                != existing.remap_boundary.address
+                or binding.remap_boundary.layout[1:]
+                != existing.remap_boundary.layout[1:]
+                or binding.bridge != existing.bridge
+            ):
+                raise RuntimeError(
+                    "staged SFA capture bindings changed between graph keys"
+                )
+        self.bindings[key] = binding
+
+    def seal(self, expected_keys: tuple[Any, ...]) -> None:
+        expected = frozenset(expected_keys)
+        missing = expected.difference(self.bindings)
+        unexpected = self.bindings.keys() - expected
+        if (
+            self.producer_event is None
+            or self.remap_boundary is None
+            or self.runtime is None
+            or missing
+            or unexpected
+        ):
+            raise RuntimeError(
+                "staged SFA capture state is incomplete: "
+                f"missing_keys={tuple(getattr(key, 'request_capacity', key) for key in missing)}, "
+                f"unexpected_keys={tuple(getattr(key, 'request_capacity', key) for key in unexpected)}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # DSA shrink replay (B2c): module-level remap support helpers.
 # Provenance: vllm-ascend-sparse@c7c4a4ac sfa_v1.py:236-241, :244-250,
 # :253-363, :366-395, :704-727. The staged-graph consumers
@@ -1167,6 +1279,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             or 0
         )
         self.dsa_scratch_capacity = decode_threshold * self.dsa_index_topk
+        # P9 batch 2: staged capture owns immutable bridge/storage state even
+        # while staged routing is disconnected. Batch 4 will populate capture
+        # sizes from the env/config gate; an empty tuple is fail-closed for
+        # bridge allocation and leaves staged=0 behavior untouched.
+        self._staged_sfa_graph_capture_sizes: tuple[int, ...] = ()
+        self._staged_sfa_capture_state = _StagedSFACaptureState()
+        self._staged_sfa_bridge_buffers: tuple[torch.Tensor, ...] | None = None
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
 
@@ -1290,6 +1409,141 @@ class AscendSFAImpl(MLAAttentionImpl):
                             f"Check layer_sharding config and model layer names."
                         )
                 register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
+
+    def _cross_layer_empty_outputs(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return the fixed bridge tuple used by staged custom-op fakes."""
+        return self._ensure_staged_sfa_bridge_buffers(hidden_states)
+
+    def reset_staged_sfa_capture(self) -> None:
+        """Discard one capture generation before eager warmup rebuilds it."""
+        self._staged_sfa_capture_state = _StagedSFACaptureState()
+        self._dsa_idx_cache_t = None
+        self._staged_sfa_bridge_buffers = None
+
+    def seal_staged_sfa_capture(
+        self,
+        graph_keys: tuple[Any, ...],
+    ) -> None:
+        """Seal all expected graph keys after capture completes."""
+        self._staged_sfa_capture_state.seal(graph_keys)
+
+    def _ensure_staged_sfa_bridge_buffers(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Allocate the six fixed-address staged bridge slots in warmup.
+
+        Allocation is deliberately forbidden once graph capture/replay starts:
+        Python allocation is not replayed, so a late tensor would either be
+        absent from the graph or replace the address recorded by capture.
+        """
+        buffers = self._staged_sfa_bridge_buffers
+        capture_sizes = self._staged_sfa_graph_capture_sizes
+        if not capture_sizes:
+            raise RuntimeError(
+                "staged SFA graph capture sizes are unavailable; configure "
+                "them before eager warmup allocates bridge storage"
+            )
+        max_tokens = int(capture_sizes[-1])
+        decode_threshold = 1 + int(
+            self.vllm_config.speculative_config.num_speculative_tokens
+            if self.vllm_config.speculative_config is not None
+            else 0
+        )
+        if decode_threshold <= 0 or max_tokens % decode_threshold != 0:
+            raise RuntimeError(
+                "staged SFA maximum token capacity must be divisible by the "
+                "decode row width: "
+                f"max_tokens={max_tokens}, rows={decode_threshold}"
+            )
+        max_requests = max_tokens // decode_threshold
+        scratch_capacity = decode_threshold * self.dsa_index_topk
+        if buffers is None:
+            context = get_forward_context()
+            if (
+                getattr(context, "cudagraph_runtime_mode", CUDAGraphMode.NONE)
+                != CUDAGraphMode.NONE
+            ):
+                raise RuntimeError(
+                    "staged SFA bridge storage was not allocated by eager "
+                    "warmup before graph capture/replay"
+                )
+            buffers = (
+                hidden_states.new_empty(
+                    (
+                        max_tokens,
+                        self.local_num_heads,
+                        self.kv_lora_rank,
+                    )
+                ),
+                hidden_states.new_empty(
+                    (
+                        max_tokens,
+                        self.local_num_heads,
+                        self.qk_rope_head_dim,
+                    )
+                ),
+                torch.empty(
+                    (max_tokens, 1, self.dsa_index_topk),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                torch.empty(
+                    (max_requests, scratch_capacity),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                torch.empty(
+                    (max_requests,),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                torch.empty(
+                    (max_requests, scratch_capacity),
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                ),
+            )
+            self._staged_sfa_bridge_buffers = buffers
+        if any(tensor.device != hidden_states.device for tensor in buffers):
+            raise RuntimeError(
+                "staged SFA bridge storage moved to a different device"
+            )
+        if buffers[0].dtype != hidden_states.dtype:
+            raise RuntimeError(
+                "staged SFA bridge storage dtype differs from hidden states"
+            )
+        return buffers
+
+    def _copy_to_staged_sfa_bridge(
+        self,
+        hidden_states: torch.Tensor,
+        outputs: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Copy graph-A outputs into their fixed bridge slots."""
+        buffers = self._ensure_staged_sfa_bridge_buffers(hidden_states)
+        if len(outputs) != len(buffers):
+            raise RuntimeError(
+                "staged SFA pre returned an unexpected bridge arity: "
+                f"{len(outputs)}"
+            )
+        for source, destination in zip(outputs, buffers, strict=True):
+            rows = int(source.shape[0])
+            if (
+                rows > int(destination.shape[0])
+                or tuple(source.shape[1:])
+                != tuple(destination.shape[1:])
+            ):
+                raise RuntimeError(
+                    "staged SFA bridge output exceeds its fixed storage: "
+                    f"source={tuple(source.shape)}, "
+                    f"destination={tuple(destination.shape)}"
+                )
+            destination[:rows].copy_(source)
+        return buffers
 
     @staticmethod
     def update_graph_params(
