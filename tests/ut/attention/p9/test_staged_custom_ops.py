@@ -124,10 +124,14 @@ class TestGraphPreNonStagedEarlyReturn(unittest.TestCase):
 
         impl.forward = mock_forward
         impl._cross_layer_empty_outputs = lambda hs: impl._staged_sfa_bridge_buffers
-        result = impl.cross_layer_graph_pre(
-            "layer0", torch.zeros(1, 8), (torch.zeros(1),) * 3,
-            None, False, torch.zeros(1, 4),
-        )
+        with patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(),
+        ):
+            result = impl.cross_layer_graph_pre(
+                "layer0", torch.zeros(1, 8), (torch.zeros(1),) * 3,
+                None, False, torch.zeros(1, 4),
+            )
         self.assertEqual(len(called), 1)
         self.assertEqual(
             len(result), 6
