@@ -221,6 +221,10 @@ class TestRetrieveWindowEarlyReturn(unittest.TestCase):
         from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_index_topk = 8
+        impl._staged_sfa_capture_state = type(
+            "State", (), {"producer_event": None, "runtime": None}
+        )()
         next_metadata = _staged_metadata()
         next_metadata.req_ids = ["req-0", "req-1"]
         context = SimpleNamespace(

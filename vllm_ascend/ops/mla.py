@@ -209,3 +209,202 @@ direct_register_custom_op(
     fake_impl=mla_forward_fake,
     dispatch_key="PrivateUse1",
 )
+
+
+# ---------------------------------------------------------------------------
+# P9 staged SFA graph (Batch 4): three custom ops that form the graph-A /
+# retrieve-window / graph-B split boundaries. The compiler treats each op as
+# an opaque unit; pre/post carry the bridge outputs as inputs/outputs (the
+# data-flow anchor that prevents reordering — 03-4 §3.4), while the retrieve
+# op's fake returns nothing and naturally becomes the eager hole between the
+# two captured pieces. Provenance: fork ops/mla.py:245-445.
+# ---------------------------------------------------------------------------
+
+StagedSFABridge = tuple[
+    torch.Tensor,  # 0: ql_nope (max_tokens, heads, kv_lora_rank)
+    torch.Tensor,  # 1: q_pe (max_tokens, heads, qk_rope_head_dim)
+    torch.Tensor,  # 2: topk_indices (max_tokens, 1, index_topk) int32
+    torch.Tensor,  # 3: selected_packed (max_requests, scratch) int32
+    torch.Tensor,  # 4: selected_counts (max_requests,) int32
+    torch.Tensor,  # 5: target_slots (max_requests, scratch) int64
+]
+
+
+def _mla_runtime_metadata(layer_name: str):
+    """Resolve forward_context → layer → attn_metadata."""
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    attn_metadata = (
+        forward_context.attn_metadata[layer.mla_attn.layer_name]
+        if forward_context.attn_metadata
+        else forward_context.attn_metadata
+    )
+    return forward_context, layer, attn_metadata
+
+
+def _mla_runtime_state(layer_name: str):
+    """Resolve impl + kv_cache from the layer's runtime state."""
+    forward_context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    return (
+        layer.mla_attn.impl,
+        layer.mla_attn.layer_name,
+        layer.mla_attn.kv_cache,
+        attn_metadata,
+    )
+
+
+def sfa_forward_pre(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+) -> StagedSFABridge:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+    )
+
+
+def sfa_forward_pre_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+) -> StagedSFABridge:
+    # Shape inference for the graph-A split: six empty tensors whose shapes
+    # exactly match the bridge slots (03-4 §3.2). The scalar capacity
+    # parameters are baked into the captured graph by value — this is why
+    # one graph key serves one capacity and shape changes route to a
+    # different entry.
+    return (
+        hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
+        torch.empty(
+            (token_capacity, 1, index_topk),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity, scratch_capacity),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity,),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity, scratch_capacity),
+            dtype=torch.long,
+            device=hidden_states.device,
+        ),
+    )
+
+
+def sfa_lmcache_retrieve(
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    layer.mla_attn.impl.cross_layer_lmcache_retrieve(
+        layer.mla_attn.layer_name,
+        next_layer_name,
+        selected_packed,
+        selected_counts,
+        target_slots,
+        attn_metadata,
+        context,
+    )
+
+
+def sfa_lmcache_retrieve_fake(
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    return
+
+
+def sfa_forward_post(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    impl.cross_layer_graph_post(
+        attn_layer_name,
+        ql_nope,
+        q_pe,
+        topk_indices,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+
+def sfa_forward_post_fake(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="sfa_forward_pre",
+    op_func=sfa_forward_pre,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_pre_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_lmcache_retrieve",
+    op_func=sfa_lmcache_retrieve,
+    mutates_args=["output"],
+    fake_impl=sfa_lmcache_retrieve_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_post",
+    op_func=sfa_forward_post,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_post_fake,
+    dispatch_key="PrivateUse1",
+)

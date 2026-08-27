@@ -124,6 +124,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE": lambda: (
         os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1") != "0"
     ),
+    # P9 staged SFA graph (Batch 4). When enabled, exact-Q1 decode steps are
+    # captured across layers with selective LMCache retrieval as the eager
+    # split operation. Unsupported shapes fall back to the native eager path.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))
+    ),
+    # P9: comma-separated positive capture sizes (token capacities), bounded
+    # by scheduler max_num_batched_tokens. Default singleton capture.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
+        "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
+        "1",
+    ),
     # DSA replay diagnostics: 1 = one-shot runtime log in SFA forward showing
     # the two-group block tables / slot mappings (evidence that the indexer
     # group's own tables are live). Default off; first forward per process
