@@ -528,6 +528,75 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+def staged_sfa_metadata_sparse_route(
+    metadata: Any,
+    request_ids: Any,
+) -> tuple[Any, tuple[int, ...], tuple[bool, ...]]:
+    """Classify active connector metadata in one request-list scan.
+
+    Returns ``(reason, frontiers, cold_compact_resumes)``. Only an
+    all-sparse-decode batch (every active request carrying a sparse
+    frontier) is eligible for the staged path; dense prefix hits and
+    mixed loads route to the native eager forward. cold_compact_resumes
+    is always empty in this slice (P11+ cut; the field is kept for
+    shape parity with the fork contract).
+
+    Provenance: fork attention/utils.py:412-492 (cold-resume logic
+    trimmed per the P9 plan).
+    """
+    from vllm_ascend.utils import StagedSFARouteReason
+
+    if metadata is None or request_ids is None:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
+    active_request_ids = [str(req_id) for req_id in request_ids]
+    if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
+        return StagedSFARouteReason.INVALID_REQUEST_IDS, (), ()
+    active_request_id_set = set(active_request_ids)
+    sparse_frontiers: dict[str, int] = {}
+    dense_request_ids: set[str] = set()
+    matched_request_ids: set[str] = set()
+    for request in getattr(metadata, "requests", ()):
+        req_id = str(getattr(request, "req_id", ""))
+        if req_id not in active_request_id_set:
+            continue
+        matched_request_ids.add(req_id)
+        load_spec = getattr(request, "load_spec", None)
+        if getattr(request, "is_sparse_decode", False):
+            if req_id in sparse_frontiers:
+                return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, (), ()
+            sparse_frontiers[req_id] = int(
+                getattr(load_spec, "dsa_committed_end", None)
+                if getattr(load_spec, "dsa_committed_end", None)
+                is not None
+                else (
+                    getattr(load_spec, "lmcache_cached_tokens", 0)
+                    if getattr(load_spec, "can_load", False)
+                    else 0
+                )
+                or 0
+            )
+            continue
+        if getattr(load_spec, "can_load", False):
+            dense_request_ids.add(req_id)
+
+    if dense_request_ids.intersection(sparse_frontiers):
+        return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, (), ()
+    loadable_request_ids = dense_request_ids.union(sparse_frontiers)
+    if loadable_request_ids == active_request_id_set:
+        if dense_request_ids and sparse_frontiers:
+            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (), ()
+        if sparse_frontiers:
+            return (
+                StagedSFARouteReason.ELIGIBLE,
+                tuple(sparse_frontiers[req_id] for req_id in active_request_ids),
+                (),
+            )
+        return StagedSFARouteReason.DENSE_PREFIX_HIT, (), ()
+    if matched_request_ids != active_request_id_set:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
+    return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
+
+
 def get_lmcache_sparse_cached_tokens(request_ids) -> list[int]:
     """Return a proven remap frontier for every active request (B2c).
 

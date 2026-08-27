@@ -5519,11 +5519,305 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    def _staged_sfa_local_route(
+        self,
+        *,
+        num_tokens_unpadded: int,
+        num_reqs: int,
+        num_scheduled_tokens,
+        index_topk: int,
+        request_ids,
+        kv_connector_metadata,
+    ):
+        """Classify local scheduler/connector state for staged routing.
+
+        Returns a StagedSFARouteDecision: STAGED (with frontiers) when every
+        active request carries a sparse connector frontier and the batch has
+        the fixed decode layout; SAFE_NATIVE for graceful fallbacks.
+
+        Provenance: fork model_runner_v1.py:2980-3083 (DSA-CP/cold-resume
+        branches trimmed per the P9 plan).
+        """
+        from vllm_ascend.utils import (
+            StagedSFARouteAction,
+            StagedSFARouteDecision,
+            StagedSFARouteReason,
+        )
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.attention.utils import (
+            staged_sfa_metadata_sparse_route,
+        )
+
+        def native(reason):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE, reason
+            )
+
+        if not self._staged_sfa_graph_capture_sizes:
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        query_width = 1 + int(
+            getattr(
+                self.speculative_config, "num_speculative_tokens", 0
+            )
+            if self.speculative_config is not None
+            else 0
+        )
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return native(StagedSFARouteReason.LORA)
+        expected_state = (
+            AscendAttentionState.DecodeOnly
+            if query_width == 1
+            else AscendAttentionState.SpecDecoding
+        )
+        if self.attn_state != expected_state:
+            return native(StagedSFARouteReason.NOT_DECODE)
+        batch_size = int(num_tokens_unpadded)
+        capture_sizes = self._staged_sfa_graph_capture_sizes
+        if (
+            batch_size <= 0
+            or batch_size > capture_sizes[-1]
+            or num_reqs * query_width != batch_size
+        ):
+            return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
+        scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
+        if scheduled.shape != (num_reqs,) or not np.all(
+            scheduled == query_width
+        ):
+            return native(StagedSFARouteReason.NON_Q1)
+        metadata_reason, frontiers, _ = staged_sfa_metadata_sparse_route(
+            kv_connector_metadata,
+            request_ids,
+        )
+        if metadata_reason in (
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return native(metadata_reason)
+        if metadata_reason != StagedSFARouteReason.ELIGIBLE:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
+        if len(frontiers) != num_reqs:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
+            )
+        scratch_capacity = query_width * index_topk
+        if any(
+            frontier != 0 and frontier < scratch_capacity
+            for frontier in frontiers
+        ):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                StagedSFARouteReason.FRONTIER_TOO_SHORT,
+            )
+        return StagedSFARouteDecision(
+            StagedSFARouteAction.STAGED,
+            StagedSFARouteReason.ELIGIBLE,
+            frontiers=frontiers,
+        )
+
+    def _staged_sfa_live_route(
+        self,
+        *,
+        local_route,
+        cudagraph_mode,
+        batch_descriptor,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        should_ubatch: bool,
+    ):
+        """Bind a local route to one captured graph capacity.
+
+        Provenance: fork model_runner_v1.py:3086-3160 (DP coordination
+        branch trimmed; single-DP is the P9 production shape).
+        """
+        from vllm.config import CUDAGraphMode
+        from vllm_ascend.utils import (
+            StagedSFARouteAction,
+            StagedSFARouteDecision,
+            StagedSFARouteReason,
+        )
+        from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
+
+        if local_route.action != StagedSFARouteAction.STAGED:
+            return local_route
+        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                StagedSFARouteReason.RUNTIME_MODE,
+            )
+        if should_ubatch:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                StagedSFARouteReason.UBATCH,
+            )
+        batch_size = int(num_tokens_unpadded)
+        capacity = int(num_tokens_padded)
+        query_width = self.decode_threshold
+        if capacity % query_width:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                StagedSFARouteReason.PADDED_BATCH,
+            )
+        graph_key = (
+            StagedSFAGraphKey.exact_q1(capacity)
+            if query_width == 1
+            else StagedSFAGraphKey.fixed_spec(
+                capacity // query_width,
+                query_width,
+            )
+        )
+        if (
+            batch_size <= 0
+            or batch_size != num_reqs * query_width
+            or batch_size > capacity
+            or capacity not in self._staged_sfa_graph_capture_sizes
+        ):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                StagedSFARouteReason.PADDED_BATCH,
+            )
+        if batch_descriptor != graph_key.to_legacy_batch_descriptor():
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                StagedSFARouteReason.BATCH_DESCRIPTOR,
+            )
+        return StagedSFARouteDecision(
+            StagedSFARouteAction.STAGED,
+            StagedSFARouteReason.ELIGIBLE,
+            graph_key=graph_key,
+            frontiers=local_route.frontiers,
+        )
+
+    def _collect_staged_sfa_impls(self):
+        """Return each target-model staged SFA implementation exactly once.
+
+        Excludes non-target attention layers (MTP draft) whose layer index
+        is at or beyond the target model's hidden layer count.
+        Provenance: fork model_runner_v1.py:4913-4952.
+        """
+        from vllm.model_executor.layers.attention import AttentionLayerBase
+        from vllm.v1.attention import get_layers_from_vllm_config
+        from vllm_ascend.utils import parse_layer_idx
+
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+        )
+        target_layer_count = getattr(
+            self.vllm_config.model_config.hf_text_config,
+            "num_hidden_layers",
+            None,
+        )
+        staged_impls: dict[int, tuple[str, Any]] = {}
+        for layer_name, attn_layer in attn_layers.items():
+            impl = getattr(attn_layer, "impl", None)
+            if impl is None or not getattr(
+                impl, "enable_staged_sfa_graph", False
+            ):
+                continue
+            canonical_name = getattr(
+                attn_layer, "layer_name", layer_name
+            )
+            layer_index = parse_layer_idx(canonical_name)
+            if (
+                isinstance(target_layer_count, int)
+                and layer_index is not None
+                and layer_index >= target_layer_count
+            ):
+                logger.info(
+                    "[SFA cross-layer graph] excluding non-target attention "
+                    "from the target capture registry: layer=%s index=%d "
+                    "target_layers=%d",
+                    canonical_name,
+                    layer_index,
+                    target_layer_count,
+                )
+                continue
+            staged_impls.setdefault(
+                id(impl), (canonical_name, impl)
+            )
+        return tuple(staged_impls.values())
+
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)
+
+        # P9 staged SFA graph (Batch 5): seal every captured layer and the
+        # aclgraph islands after the official capture completes. Fail loudly
+        # when any layer is incomplete so an explicitly requested staged
+        # graph cannot silently remain inactive. Provenance: fork
+        # model_runner_v1.py:4969-5045.
+        staged_impls = getattr(self, "_staged_sfa_impls", None)
+        if staged_impls is None:
+            staged_impls = self._collect_staged_sfa_impls()
+            self._staged_sfa_impls = staged_impls
+        if staged_impls:
+            from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
+            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+            query_width = 1 + int(
+                getattr(
+                    self.vllm_config.speculative_config,
+                    "num_speculative_tokens",
+                    0,
+                )
+                if self.vllm_config.speculative_config is not None
+                else 0
+            )
+            runtime_query_width = int(
+                getattr(self, "decode_threshold", query_width)
+            )
+            if runtime_query_width != query_width:
+                raise RuntimeError(
+                    "[SFA cross-layer graph] configured and runtime query "
+                    f"widths differ: configured={query_width}, "
+                    f"runtime={runtime_query_width}"
+                )
+            capture_sizes = self._staged_sfa_graph_capture_sizes
+            if query_width > 1 and any(
+                size % query_width for size in capture_sizes
+            ):
+                raise RuntimeError(
+                    "[SFA cross-layer graph] fixed-width MTP capture sizes "
+                    f"must be divisible by query_width={query_width}: "
+                    f"sizes={capture_sizes}"
+                )
+            graph_keys = tuple(
+                (
+                    StagedSFAGraphKey.exact_q1(size)
+                    if query_width == 1
+                    else StagedSFAGraphKey.fixed_spec(
+                        size // query_width,
+                        query_width,
+                    )
+                )
+                for size in capture_sizes
+            )
+            for layer_name, impl in staged_impls:
+                try:
+                    impl.seal_staged_sfa_capture(graph_keys)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "[SFA cross-layer graph] eager warmup/capture was "
+                        f"incomplete for {layer_name}: {exc}"
+                    ) from exc
+            graph_entry_count = ACLGraphWrapper.seal_staged_entries(
+                graph_keys,
+                len(staged_impls) + 1,
+            )
+            logger.info(
+                "[SFA cross-layer graph] staged capture sealed: "
+                "layers=%d keys=%s aclgraph_entries=%d",
+                len(staged_impls),
+                [key.token_capacity for key in graph_keys],
+                graph_entry_count,
+            )
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):

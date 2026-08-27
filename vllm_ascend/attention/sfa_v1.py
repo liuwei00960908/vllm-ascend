@@ -2234,7 +2234,41 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             return self._cross_layer_empty_outputs(hidden_states)
 
-        # Batch 5 will insert eligibility and route validation here.
+        # P9 Batch 5: simplified eligibility check — the runner authorized
+        # a graph key, so this step has the fixed decode layout; verify the
+        # impl-side invariants that the runner cannot see. Only checks for
+        # features that exist on this baseline (DSA-CP/C8/MLAPO/weight
+        # prefetch/adapter-cache are absent and not checked here).
+        # Provenance: fork sfa_v1.py:2390-2608 (~25 conditions → ~12 kept).
+        if self.dsa_shrink_latent != 2:
+            raise RuntimeError(
+                "[SFA cross-layer graph] staged path requires SHRINK_LATENT=2"
+            )
+        if not staged_sfa_connector_supports_sparse_load():
+            raise RuntimeError(
+                "[SFA cross-layer graph] the active connector does not "
+                "support staged sparse selective loads"
+            )
+        if len(kv_cache) != 3:
+            raise RuntimeError(
+                "[SFA cross-layer graph] requires exactly three KV tensors"
+            )
+        if any(cache.ndim != 4 for cache in kv_cache):
+            raise RuntimeError(
+                "[SFA cross-layer graph] requires rank-4 PA_BSND KV tensors"
+            )
+        expected_hidden_dims = (
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.head_dim,
+        )
+        if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(
+            int(dim) for dim in expected_hidden_dims
+        ):
+            raise RuntimeError(
+                "[SFA cross-layer graph] KV cache hidden dimensions do "
+                "not match SFA"
+            )
 
         is_dummy = bool(
             getattr(context, "staged_sfa_graph_dummy_run", False)
