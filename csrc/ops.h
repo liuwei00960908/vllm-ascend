@@ -46,6 +46,32 @@ namespace vllm_ascend {
     bool need_packed,
     bool clear_invalid_rows);
 
+  // P9 staged graph: fixed-layout variant for graph replay. Outputs are
+  // caller-owned fixed-address buffers; local_to_union doubles as the
+  // compact-stage row-count workspace before the union conversion.
+  // Provenance: vllm-ascend-sparse@c7c4a4ac csrc/ops.h:77-97.
+  extern void dsa_prepare_sparse_indices_staged_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* request_block_table,
+    void* selected_packed,
+    void* selected_counts,
+    void* target_slots,
+    void* local_to_union,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t rows_per_request,
+    uint32_t scratch_capacity,
+    uint32_t block_table_width,
+    uint32_t selected_count_stride,
+    uint32_t block_size,
+    uint32_t core_count,
+    bool need_packed,
+    bool clear_invalid_rows);
+
   extern void get_masked_input_and_mask_impl(
     void* stream,
     void* input,
