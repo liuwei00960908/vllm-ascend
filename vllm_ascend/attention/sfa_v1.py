@@ -2377,11 +2377,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # the whole scratch capacity.
         table_width = int(attn_metadata.block_table.shape[1])
         block_size = int(self.vllm_config.cache_config.block_size)
-        if self.scratch_capacity > table_width * block_size:
+        if self.dsa_scratch_capacity > table_width * block_size:
             raise RuntimeError(
                 "[SFA cross-layer graph] scratch capacity exceeds the "
                 f"block-table logical capacity: scratch="
-                f"{self.scratch_capacity}, capacity="
+                f"{self.dsa_scratch_capacity}, capacity="
                 f"{table_width * block_size}"
             )
         if len(kv_cache) != 3:
