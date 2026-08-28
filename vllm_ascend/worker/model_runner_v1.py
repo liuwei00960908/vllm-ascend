@@ -579,16 +579,33 @@ class NPUModelRunner(GPUModelRunner):
         set_potential_max_tokens(vllm_config)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
-        # P9 batch 5: the model runner reads staged capture sizes for routing
-        # decisions (the AscendSFAImpl reads them independently in its own
-        # __init__ for bridge allocation). Single-DP is the P9 production
-        # shape, so _staged_sfa_dp_route_action stays None. Provenance: fork
-        # model_runner_v1.py:1709-1714.
-        self.enable_staged_sfa_graph = bool(envs.VLLM_ASCEND_SFA_STAGED_GRAPH)
+        # P9 batch 5: the runner consumes the SAME validated predicate and
+        # capture-size list as the platform (staged_sfa_graph_capture_sizes
+        # returns token capacities; request-count env entries are multiplied
+        # by the query width there). An explicitly requested but unsupported
+        # config logs its typed reasons instead of crashing startup capture.
+        # Single-DP is the P9 production shape, so _staged_sfa_dp_route_action
+        # stays None. Provenance: fork model_runner_v1.py:1709-1714/:4970.
+        from vllm_ascend.utils import (
+            staged_sfa_graph_capture_sizes,
+            staged_sfa_graph_configuration_errors,
+            staged_sfa_graph_configured,
+        )
+
+        self.enable_staged_sfa_graph = staged_sfa_graph_configured(
+            self.vllm_config
+        )
+        if (
+            bool(envs.VLLM_ASCEND_SFA_STAGED_GRAPH)
+            and not self.enable_staged_sfa_graph
+        ):
+            logger.warning(
+                "[SFA cross-layer graph] staged graph requested but not "
+                "configured, staying on the native path: %s",
+                "; ".join(staged_sfa_graph_configuration_errors(self.vllm_config)),
+            )
         self._staged_sfa_graph_capture_sizes: tuple[int, ...] = (
-            self._parse_staged_capture_sizes()
-            if self.enable_staged_sfa_graph
-            else ()
+            staged_sfa_graph_capture_sizes(self.vllm_config)
         )
         self._staged_sfa_impls: tuple | None = None
         self._staged_sfa_dp_route_action = None
@@ -3915,9 +3932,14 @@ class NPUModelRunner(GPUModelRunner):
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
             )
             if not is_graph_capturing:
-                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                    blk_table = self.input_batch.block_table[kv_cache_gid]
-                    blk_table.slot_mapping.gpu.fill_(-1)
+                # Staged dummy runs keep the synthetic non-aliasing slots
+                # committed by _prepare_staged_sfa_dummy_block_tables (the
+                # fork has no equivalent wipe; clearing them would silently
+                # discard the warmup's KV/indexer writes).
+                if not staged_sfa_graph_dummy_run:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -5792,26 +5814,6 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
-    @staticmethod
-    def _parse_staged_capture_sizes() -> tuple[int, ...]:
-        """Parse and validate the staged graph capture size list."""
-        raw = envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
-        try:
-            sizes = tuple(sorted({
-                int(s.strip()) for s in raw.split(",") if s.strip()
-            }))
-        except ValueError as exc:
-            raise ValueError(
-                "Invalid VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES: "
-                f"{raw!r} ({exc})"
-            ) from exc
-        if not sizes or any(s <= 0 for s in sizes):
-            raise ValueError(
-                "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
-                f"at least one positive integer, got {raw!r}"
-            )
-        return sizes
-
     def _staged_sfa_local_route(
         self,
         *,
@@ -5858,6 +5860,11 @@ class NPUModelRunner(GPUModelRunner):
         # are rank-local, so ranks could disagree on staged admission. Fail
         # closed instead of coordinating.
         if self.parallel_config.data_parallel_size > 1:
+            return native(StagedSFARouteReason.RUNTIME_PARALLELISM)
+        # Sequence parallelism / FlashComm sharding changes what Graph A must
+        # compute (the staged pre ignores need_gather_q_kv); fail closed
+        # until the gather is ported into the captured region.
+        if enable_sp(self.vllm_config):
             return native(StagedSFARouteReason.RUNTIME_PARALLELISM)
         # The startup capture must have sealed every layer and ACL island
         # before live steps may authorize a staged graph key.
@@ -6330,11 +6337,14 @@ class NPUModelRunner(GPUModelRunner):
         # P9 staged SFA graph: exactly one startup capture is supported; a
         # retry would reuse stale outer-graph entries. Reset every staged
         # implementation before the official capture so the warmup rebuilds
-        # bridge storage, events, and bindings from scratch. Provenance:
-        # fork model_runner_v1.py:4969-5045.
-        staged_configured = (
-            self.enable_staged_sfa_graph
-            and bool(self._staged_sfa_graph_capture_sizes)
+        # bridge storage, events, and bindings from scratch. The gate is the
+        # SAME shared predicate the platform used (never the raw env flag,
+        # so an unsupported config stays on the native path instead of
+        # crashing here). Provenance: fork model_runner_v1.py:4969-5045.
+        from vllm_ascend.utils import staged_sfa_graph_configured
+
+        staged_configured = staged_sfa_graph_configured(self.vllm_config) and bool(
+            self._staged_sfa_graph_capture_sizes
         )
         if staged_configured and self._staged_sfa_startup_capture_attempted:
             raise RuntimeError(

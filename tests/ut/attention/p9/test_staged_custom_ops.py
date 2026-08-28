@@ -15,6 +15,7 @@
 #
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -71,44 +72,106 @@ class TestCustomOpRegistration(unittest.TestCase):
         )
 
 
+def _staged_vllm_config(**overrides):
+    """A minimal config on which the staged predicate evaluates enabled."""
+    from vllm.config import CUDAGraphMode
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_mla=True,
+            hf_text_config=SimpleNamespace(index_topk=8),
+            hf_config=SimpleNamespace(),
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=64,
+            max_num_batched_tokens=256,
+        ),
+        speculative_config=None,
+        lora_config=None,
+        kv_transfer_config=SimpleNamespace(),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE
+        ),
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def _staged_envs(**overrides):
+    envs = {
+        "VLLM_ASCEND_SFA_STAGED_GRAPH": True,
+        "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "4",
+        "VLLM_ASCEND_DSA_UNBUNDLE": True,
+        "VLLM_ASCEND_DSA_TWO_GROUPS": True,
+        "VLLM_ASCEND_DSA_SHRINK_LATENT": 2,
+    }
+    envs.update(overrides)
+    return envs
+
+
 class TestCaptureSizeParsing(unittest.TestCase):
-    def test_single_size(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES", "4"
-        ):
-            self.assertEqual(
-                AscendSFAImpl._parse_staged_capture_sizes(), (4,)
+    """staged_sfa_graph_capture_sizes: request-count env -> token output."""
+
+    def _sizes(self, raw, **config_overrides):
+        from vllm_ascend.utils import staged_sfa_graph_capture_sizes
+
+        envs = _staged_envs(
+            VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES=raw
+        )
+        patches = [
+            patch(f"vllm_ascend.envs.{name}", value)
+            for name, value in envs.items()
+        ]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            return staged_sfa_graph_capture_sizes(
+                _staged_vllm_config(**config_overrides)
             )
+
+    def test_single_size_width_one(self):
+        self.assertEqual(self._sizes("4"), (4,))
 
     def test_multiple_sizes_deduped_and_sorted(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
-            "32,8,16,8",
-        ):
-            self.assertEqual(
-                AscendSFAImpl._parse_staged_capture_sizes(), (8, 16, 32)
-            )
+        self.assertEqual(self._sizes("32,8,16,8"), (8, 16, 32))
+
+    def test_request_counts_scale_by_query_width(self):
+        spec = SimpleNamespace(num_speculative_tokens=1, method="mtp")
+        # 4 requests x width 2 = 8 tokens; 5 requests x 2 = 10 tokens.
+        self.assertEqual(
+            self._sizes("4,5", speculative_config=spec), (8, 10)
+        )
 
     def test_empty_rejected(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES", ","
-        ):
-            with self.assertRaisesRegex(ValueError, "positive integer"):
-                AscendSFAImpl._parse_staged_capture_sizes()
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            self._sizes(",")
 
     def test_non_positive_rejected(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES", "0,8"
-        ):
-            with self.assertRaisesRegex(ValueError, "positive integer"):
-                AscendSFAImpl._parse_staged_capture_sizes()
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            self._sizes("0,8")
 
     def test_non_numeric_rejected(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES", "abc"
-        ):
-            with self.assertRaisesRegex(ValueError, "Invalid"):
-                AscendSFAImpl._parse_staged_capture_sizes()
+        with self.assertRaisesRegex(ValueError, "comma-separated"):
+            self._sizes("abc")
+
+    def test_oversize_requests_rejected(self):
+        spec = SimpleNamespace(num_speculative_tokens=1, method="mtp")
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            # 100 requests > max_num_seqs=64.
+            self._sizes("100", speculative_config=spec)
+
+    def test_oversize_tokens_rejected(self):
+        spec = SimpleNamespace(num_speculative_tokens=1, method="mtp")
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            # 200 requests x 2 = 400 tokens > max_num_batched_tokens=256.
+            self._sizes("200", speculative_config=spec)
 
 
 class TestGraphPreNonStagedEarlyReturn(unittest.TestCase):

@@ -605,22 +605,25 @@ class NPUPlatform(Platform):
                 "cudagraph_mode=%s",
                 compilation_config.cudagraph_mode,
             )
-            compilation_config.set_splitting_ops_for_v1(
-                all2all_backend=vllm_config.parallel_config.all2all_backend,
-                data_parallel_size=vllm_config.parallel_config.data_parallel_size,
-            )
             # P9 staged SFA graph: when the staged graph is configured, the
             # eager split point moves from the per-layer mla_forward to the
             # cross-layer sfa_lmcache_retrieve window, and official capture
             # sizes are restricted to the staged keys so the dispatcher
-            # actually visits every configured capacity. Provenance: fork
-            # platform.py:376-388 / utils.py:760-785.
+            # actually visits every configured capacity. The partitioning
+            # toggle precedes set_splitting_ops_for_v1 (fork order) so the
+            # split-op composition never depends on a later mutation.
+            # Provenance: fork platform.py:376-388 / utils.py:760-785.
             staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
             if staged_sfa_sizes:
                 if hasattr(
                     compilation_config, "use_inductor_graph_partition"
                 ):
                     compilation_config.use_inductor_graph_partition = False
+            compilation_config.set_splitting_ops_for_v1(
+                all2all_backend=vllm_config.parallel_config.all2all_backend,
+                data_parallel_size=vllm_config.parallel_config.data_parallel_size,
+            )
+            if staged_sfa_sizes:
                 if (
                     "vllm::sfa_lmcache_retrieve"
                     not in compilation_config.splitting_ops

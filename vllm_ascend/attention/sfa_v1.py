@@ -331,6 +331,31 @@ def _staged_prompt_lens_rows(plens: Any, query_width: int) -> np.ndarray:
     return np.repeat(plens_np, int(query_width))
 
 
+def _staged_fixed_layout(
+    num_input_tokens: int,
+    num_reqs_padded: int,
+    num_decode_rows: int,
+    active_requests: int,
+    query_width: int,
+) -> bool:
+    """Whether the batch carries the padded request-major staged layout.
+
+    Two-part fork semantics (:1256-1266): the padded token view matches the
+    padded request count (``num_input_tokens == num_reqs * width``) AND the
+    active decode rows match the ACTIVE request count
+    (``num_decode_rows == active * width``). Exact-capacity capture batches
+    satisfy both with ``active == num_reqs``; a live batch padded to a
+    captured capacity (the common case, e.g. 3 requests on capacity 4)
+    satisfies them with fewer active requests — which the historical
+    ``num_decode_rows == num_reqs * width`` check wrongly rejected, leaving
+    the staged buffers unattached and crashing graph pre.
+    """
+    return (
+        num_input_tokens == num_reqs_padded * query_width
+        and num_decode_rows == active_requests * query_width
+    )
+
+
 class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -673,14 +698,23 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
 
             # P9 staged graph (Batch 3): wire the staged metadata channels
-            # when the batch carries the request-major fixed layout (pure
-            # decode with exactly decode_threshold rows per request). Mixed
-            # batches keep the B2c-only channels above untouched.
-            # Provenance: fork sfa_v1.py:1415-1576 (staged subset). Batch 5
-            # fix: prompt rows are expanded per token row and the fixed
-            # request-union buffers/scratch capacity are attached so the
-            # captured graph A has stable channels.
-            if num_decode_rows == num_reqs * self.decode_threshold:
+            # when the batch carries the request-major fixed layout. The
+            # two-part condition (padded view matches padded requests AND
+            # decode rows match ACTIVE requests) admits batches padded to a
+            # captured capacity; all row-indexed channels are full padded
+            # length with pad rows owned by -1/0 (the general per-row
+            # expansion above already built that ownership), and the union
+            # buffers are sliced at the padded request capacity.
+            # Provenance: fork sfa_v1.py:1256-1266/:1415-1576 (staged
+            # subset). Batch 5 fix: padded live batches used to fall off
+            # this branch and crash graph pre on missing buffers.
+            if _staged_fixed_layout(
+                num_input_tokens,
+                num_reqs,
+                num_decode_rows,
+                len(plens),
+                self.decode_threshold,
+            ):
                 shrink_kwargs.update(
                     decode_union_mapping_workspace=(
                         self._dsa_union_mapping[:num_reqs]
@@ -690,11 +724,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         if req_ids is not None
                         else None
                     ),
-                    prompt_lens_cpu_rows=_staged_prompt_lens_rows(
-                        plens, self.decode_threshold
-                    ),
+                    # Full padded per-row array (pad rows stay 0): the
+                    # boundary validator and graph A read token_capacity
+                    # rows, not just the active ones.
+                    prompt_lens_cpu_rows=boundary_rows,
                     decode_remap_boundary=(
-                        self.decode_remap_boundary[:num_decode_rows]
+                        self.decode_remap_boundary[:num_input_tokens]
                     ),
                     decode_remap_boundary_ready=False,
                     decode_scratch_capacity=self.scratch_capacity,
@@ -881,6 +916,26 @@ def _dsa_indexer_layer_name(layer_name: str) -> str:
     ``...self_attn.indexer.k_cache`` layer's own KV cache.
     """
     return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+
+
+def _dsa_index_lmcache_enabled() -> bool:
+    """Whether the connector supports the indexer KV namespace specifically.
+
+    Generic sparse-latent support does not imply the sibling indexer
+    namespace is loadable; waits/saves for ``...indexer.k_cache`` must be
+    gated on this separate capability. Provenance: fork
+    sfa_v1.py:781-787 (the diagnostic kill-switch env is not ported).
+    """
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+        is_v1_kv_transfer_group,
+    )
+
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    connector = get_kv_transfer_group()
+    return bool(getattr(connector, "supports_dsa_index_lmcache", False))
 
 
 # ---------------------------------------------------------------------------
@@ -1601,17 +1656,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             or 0
         )
         self.dsa_scratch_capacity = decode_threshold * self.dsa_index_topk
-        # P9 batch 4: read the staged capture sizes from the env gate. An
-        # empty tuple when staged graph is disabled (fail-closed for bridge
-        # allocation, leaves staged=0 behavior untouched).
+        # P9 batch 4: the impl consumes the SAME shared predicate and
+        # validated capture-size list as the platform and the runner (token
+        # capacities). An empty tuple when staged is not configured
+        # (fail-closed for bridge allocation, leaves staged=0 untouched).
         # Provenance: fork sfa_v1.py:1709-1714.
-        self.enable_staged_sfa_graph = bool(
-            envs.VLLM_ASCEND_SFA_STAGED_GRAPH
+        from vllm_ascend.utils import (
+            staged_sfa_graph_capture_sizes,
+            staged_sfa_graph_configured,
+        )
+
+        self.enable_staged_sfa_graph = staged_sfa_graph_configured(
+            self.vllm_config
         )
         self._staged_sfa_graph_capture_sizes: tuple[int, ...] = (
-            self._parse_staged_capture_sizes()
-            if self.enable_staged_sfa_graph
-            else ()
+            staged_sfa_graph_capture_sizes(self.vllm_config)
         )
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._staged_sfa_bridge_buffers: tuple[torch.Tensor, ...] | None = None
@@ -1874,30 +1933,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             destination[:rows].copy_(source)
         return buffers
 
-    @staticmethod
-    def _parse_staged_capture_sizes() -> tuple[int, ...]:
-        """Parse and validate the staged graph capture size list.
-
-        Provenance: fork envs VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
-        consumer logic (inlined here per the batch-4 plan).
-        """
-        raw = envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES
-        try:
-            sizes = tuple(sorted({
-                int(s.strip()) for s in raw.split(",") if s.strip()
-            }))
-        except ValueError as exc:
-            raise ValueError(
-                "Invalid VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES: "
-                f"{raw!r} ({exc})"
-            ) from exc
-        if not sizes or any(s <= 0 for s in sizes):
-            raise ValueError(
-                "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
-                f"at least one positive integer, got {raw!r}"
-            )
-        return sizes
-
     def _cross_layer_kv_cache(
         self,
         layer_name: str,
@@ -1912,8 +1947,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             _dsa_indexer_layer_name(layer_name) if self.dsa_unbundle else None
         )
         index_enabled = bool(
-            index_layer_name is not None
-            and staged_sfa_connector_supports_sparse_load()
+            index_layer_name is not None and _dsa_index_lmcache_enabled()
         )
         if self.dsa_unbundle and len(kv_cache) < 3:
             index_cache = getattr(self, "_dsa_idx_cache_t", None)
@@ -1945,38 +1979,18 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         """Run the indexer top-k for the staged pre-compute path.
 
-        The staged fixed layout carries its own per-request block tables, so
-        this helper wraps the override table in the lightweight namespace the
-        device operator reads (``indexer_block_table`` with a shared-table
-        fallback) instead of a full attention metadata. Semantics match fork
-        ``indexer_block_table_override`` (:2746-2760).
+        .. deprecated::
+            Historical helper that passed the key projection as the query
+            with ``weights=None`` — semantically invalid. Kept only as a
+            fail-loud tombstone; the staged pre-compute now calls the
+            production :meth:`indexer_select_post_process` with the
+            block-table override. Provenance: fork sfa_v1.py:2730-2740.
         """
-        if not self.has_indexer:
-            raise RuntimeError(
-                f"indexer is required for the staged path. layer_name={self.layer_name}."
-            )
-        k_li, _ = self.indexer_select_pre_process(
-            x=hidden_states, cos=cos, sin=sin
-        )
-        # The device operator only reads the two block-table fields from the
-        # metadata argument; supply the fixed-layout override table.
-        table_namespace = SimpleNamespace(
-            indexer_block_table=indexer_block_table,
-            block_table=indexer_block_table,
-        )
-        # Call the device operator directly, bypassing the metadata arg.
-        return DeviceOperator.indexer_select_post_process(
-            self,
-            k_li.view(-1, 1, k_li.shape[-1]),
-            None,  # k_li_scale
-            None,  # k_li_shape_ori
-            None,  # weights — recomputed inside; fork passes the same.
-            kv_cache,
-            table_namespace,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            False,  # enable_sparse_li_c8 — staged rejects C8 (eligibility).
-            False,  # use_torch_npu_lightning_indexer
+        raise NotImplementedError(
+            "the staged indexer top-k must go through "
+            "indexer_select_post_process with indexer_block_table_override; "
+            "this helper computed an invalid query and is retained only to "
+            "fail loudly if anything still calls it"
         )
 
     def _cross_layer_pre_compute(
@@ -2040,15 +2054,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_slot_mapping.view(-1, 1),
             k_li.view(-1, k_li.shape[-1]),
         )
-        topk_indices = self._indexer_topk_for_staged(
-            hidden_states,
-            q_c,
-            kv_cache,
-            cos,
-            sin,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            indexer_block_table,
+        # Production indexer top-k (weights from hidden states, multi-head
+        # query from q_c, RoPE) with the fixed-layout block-table override
+        # and the model's index_topk as the kernel width. The historical
+        # bug passed the key projection as the query with weights=None.
+        # Provenance: fork sfa_v1.py:2730-2740.
+        topk_indices = self.indexer_select_post_process(
+            x=hidden_states,
+            q_c=q_c,
+            kv_cache=kv_cache,
+            attn_metadata=None,
+            cos=cos,
+            sin=sin,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            indexer_block_table_override=indexer_block_table,
+            sparse_count=self.dsa_index_topk,
         )
 
         from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
@@ -2326,6 +2347,30 @@ class AscendSFAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 "[SFA cross-layer graph] the active connector does not "
                 "support staged sparse selective loads"
+            )
+        # Two-group indexer tables: the staged pre dereferences the indexer
+        # group's own table/slots below; an unbundle-only configuration
+        # leaves them None and must fail before graph execution.
+        # Provenance: fork sfa_v1.py:2554-2605 (eligibility subset).
+        if (
+            getattr(attn_metadata, "indexer_block_table", None) is None
+            or getattr(attn_metadata, "indexer_slot_mapping", None) is None
+        ):
+            raise RuntimeError(
+                "[SFA cross-layer graph] requires two-group indexer tables "
+                "(VLLM_ASCEND_DSA_TWO_GROUPS=1)"
+            )
+        # Scratch reservation must fit inside one request's logical table:
+        # the fused remap kernel gathers through logical positions across
+        # the whole scratch capacity.
+        table_width = int(attn_metadata.block_table.shape[1])
+        block_size = int(self.vllm_config.cache_config.block_size)
+        if self.scratch_capacity > table_width * block_size:
+            raise RuntimeError(
+                "[SFA cross-layer graph] scratch capacity exceeds the "
+                f"block-table logical capacity: scratch="
+                f"{self.scratch_capacity}, capacity="
+                f"{table_width * block_size}"
             )
         if len(kv_cache) != 3:
             raise RuntimeError(
@@ -3333,12 +3378,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         x: torch.Tensor,
         q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: M,
+        attn_metadata: M | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        indexer_block_table_override: torch.Tensor | None = None,
+        sparse_count: int | None = None,
     ):
+        """Production indexer top-k (weights + multi-head query + RoPE).
+
+        P9 staged SFA: the fixed layout passes ``attn_metadata=None`` with
+        ``indexer_block_table_override`` carrying the indexer group's table
+        (wrapped in the lightweight namespace the device operator reads);
+        ``sparse_count`` defaults to the native 2048 and the staged caller
+        passes the model's index_topk. Provenance: fork
+        sfa_v1.py:2209-2231 (override design).
+        """
         if not self.has_indexer:
             raise RuntimeError(
                 f"indexer_select_post_process should not be called when indexer is None. layer_name={self.layer_name}."
@@ -3346,6 +3402,15 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
+
+        if indexer_block_table_override is not None:
+            indexer_block_table = indexer_block_table_override
+            # The device operator only reads the two block-table fields from
+            # the metadata argument; supply the fixed-layout override table.
+            attn_metadata = SimpleNamespace(
+                indexer_block_table=indexer_block_table,
+                block_table=indexer_block_table,
+            )  # type: ignore[assignment]
 
         kw, _ = self.wk_weights_proj(x)
         weights = kw[:, self.head_dim :]
@@ -3411,6 +3476,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
             self.enable_sparse_li_c8,
             self.use_torch_npu_lightning_indexer,
+            sparse_count=sparse_count,
         )
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:

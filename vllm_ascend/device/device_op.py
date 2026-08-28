@@ -585,6 +585,7 @@ class BaseDeviceAdaptor:
         actual_seq_lengths_key: torch.Tensor,
         enable_sparse_li_c8: bool,
         use_torch_npu_lightning_indexer: bool,
+        sparse_count: int = 2048,
     ) -> torch.Tensor:
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
@@ -623,7 +624,7 @@ class BaseDeviceAdaptor:
                 key_quant_mode=0,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
         elif sfa_impl.use_torch_npu_lightning_indexer:
@@ -636,7 +637,7 @@ class BaseDeviceAdaptor:
                 block_table=topk_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
         else:
@@ -649,7 +650,7 @@ class BaseDeviceAdaptor:
                 block_table=topk_block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
         return topk_indices
@@ -1917,6 +1918,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         actual_seq_lengths_key: torch.Tensor,
         enable_sparse_li_c8: bool,
         use_torch_npu_lightning_indexer: bool,
+        sparse_count: int = 2048,
     ) -> torch.Tensor:
         packed_kv_cache = getattr(sfa_impl, "enable_sparse_sfa_c8", False)
         indexer_cache_idx = 1 if packed_kv_cache else 2
@@ -1943,7 +1945,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     key_quant_mode=0,
                     layout_query="TND",
                     layout_key="PA_BSND",
-                    sparse_count=2048,
+                    sparse_count=sparse_count,
                     sparse_mode=3,
                 )
             else:
@@ -1956,7 +1958,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     block_table=attn_metadata.block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
-                    sparse_count=2048,
+                    sparse_count=sparse_count,
                     sparse_mode=3,
                 )
         else:
@@ -1969,7 +1971,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 block_table=attn_metadata.block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
         return topk_indices
