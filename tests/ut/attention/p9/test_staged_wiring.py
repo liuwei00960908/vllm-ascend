@@ -651,37 +651,66 @@ class TestStagedFixedLayout(unittest.TestCase):
     def test_exact_capacity_q1(self):
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
-        self.assertTrue(_staged_fixed_layout(4, 4, 4, 4, 1))
+        self.assertTrue(_staged_fixed_layout(4, 4, 4, 4, 1, True))
 
     def test_padded_live_batch_q1(self):
         # 3 active requests padded to capacity 4 (the common live case the
         # historical num_decode_rows == num_reqs * width check rejected).
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
-        self.assertTrue(_staged_fixed_layout(4, 4, 3, 3, 1))
+        self.assertTrue(_staged_fixed_layout(4, 4, 3, 3, 1, True))
 
     def test_exact_capacity_mtp1(self):
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
         # 4 requests x 2 rows = 8 tokens.
-        self.assertTrue(_staged_fixed_layout(8, 4, 8, 4, 2))
+        self.assertTrue(_staged_fixed_layout(8, 4, 8, 4, 2, True))
 
     def test_padded_live_batch_mtp1(self):
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
         # 3 active requests on capacity 4: 6 active rows, 8 padded tokens.
-        self.assertTrue(_staged_fixed_layout(8, 4, 6, 3, 2))
+        self.assertTrue(_staged_fixed_layout(8, 4, 6, 3, 2, True))
 
     def test_mixed_batch_rejected(self):
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
         # A decode row is missing (mixed prefill/decode): not fixed layout.
-        self.assertFalse(_staged_fixed_layout(4, 4, 3, 4, 1))
+        self.assertFalse(_staged_fixed_layout(4, 4, 3, 4, 1, True))
 
     def test_non_multiple_token_view_rejected(self):
         from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
 
-        self.assertFalse(_staged_fixed_layout(5, 4, 4, 4, 1))
+        self.assertFalse(_staged_fixed_layout(5, 4, 4, 4, 1, True))
+
+    def test_prefix_hit_prefill_tail_rejected(self):
+        # log32 regression: a cached-prompt tail scheduling exactly
+        # width tokens satisfies the token-view equation coincidentally,
+        # but carries zero decode rows — must never enter the staged
+        # branch (the prompt-row expansion crashes on the shape mismatch).
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        # 1 request, 2 remaining prompt tokens, width 2: decode rows 0
+        # while ALL-active counting (1) rejects 0 != 1 * 2.
+        self.assertFalse(
+            _staged_fixed_layout(2, 1, 0, 1, 2, False)
+        )
+
+    def test_mixed_prefill_decode_coincidence_rejected(self):
+        # 1 decode request (2 rows) + 1 prefill request (2 prompt tokens):
+        # token view 4 == 2 * 2 holds, decode rows 2 == decode-reqs * 2
+        # would hold under the weaker count — the all-active count (2)
+        # rejects 2 != 2 * 2.
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        self.assertFalse(_staged_fixed_layout(4, 2, 2, 2, 2, True))
+
+    def test_uncomputed_prompt_rejected(self):
+        # Fork's third condition: even a shape-perfect decode batch is
+        # rejected while any prompt is not fully computed.
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        self.assertFalse(_staged_fixed_layout(4, 4, 4, 4, 1, False))
 
 
 class TestIndexerProductionCallSite(unittest.TestCase):

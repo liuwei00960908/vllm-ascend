@@ -337,22 +337,33 @@ def _staged_fixed_layout(
     num_decode_rows: int,
     active_requests: int,
     query_width: int,
+    prompts_all_computed: bool,
 ) -> bool:
     """Whether the batch carries the padded request-major staged layout.
 
-    Two-part fork semantics (:1256-1266): the padded token view matches the
-    padded request count (``num_input_tokens == num_reqs * width``) AND the
-    active decode rows match the ACTIVE request count
-    (``num_decode_rows == active * width``). Exact-capacity capture batches
-    satisfy both with ``active == num_reqs``; a live batch padded to a
-    captured capacity (the common case, e.g. 3 requests on capacity 4)
-    satisfies them with fewer active requests — which the historical
+    Fork semantics (:1256-1266), three conditions: the padded token view
+    matches the padded request count (``num_input_tokens == num_reqs *
+    width``), EVERY active request contributes exactly ``width`` decode
+    rows (``num_decode_rows == active * width`` with ``active`` counting
+    all active requests, not just decode ones), and every prompt is fully
+    computed (decode phase). Exact-capacity capture batches satisfy all
+    three with ``active == num_reqs``; a live batch padded to a captured
+    capacity (the common case, e.g. 3 requests on capacity 4) satisfies
+    them with fewer active requests — which the historical
     ``num_decode_rows == num_reqs * width`` check wrongly rejected, leaving
     the staged buffers unattached and crashing graph pre.
+
+    The second condition must count ALL active requests: a prefix-hit
+    prefill tail (log32: 2 remaining prompt tokens on one request) or a
+    mixed batch can coincidentally satisfy the token-view equation, and
+    counting only decode requests would let ``0 == 0 * width`` open the
+    staged branch for a batch with zero decode rows — the prompt-row
+    expansion then crashes on the shape mismatch.
     """
     return (
         num_input_tokens == num_reqs_padded * query_width
         and num_decode_rows == active_requests * query_width
+        and prompts_all_computed
     )
 
 
@@ -698,24 +709,23 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
 
             # P9 staged graph (Batch 3): wire the staged metadata channels
-            # when the batch carries the request-major fixed layout. The
-            # two-part condition (padded view matches padded requests AND
-            # decode rows match ACTIVE requests) admits batches padded to a
-            # captured capacity; all row-indexed channels are full padded
-            # length with pad rows owned by -1/0 (the general per-row
-            # expansion above already built that ownership), and the union
-            # buffers are sliced at the padded request capacity.
+            # when the batch carries the request-major fixed layout. All
+            # three fork conditions must hold: padded view matches padded
+            # requests, EVERY active request contributes width decode rows,
+            # and every prompt is fully computed (decode phase). The
+            # every-active-request form rejects prefix-hit prefill tails
+            # and mixed batches whose token counts coincidentally match the
+            # fixed-layout equation (log32: a 2-token cached-prompt tail
+            # crashed the prompt-row expansion before this hardening).
             # Provenance: fork sfa_v1.py:1256-1266/:1415-1576 (staged
-            # subset). Batch 5 fix: padded live batches used to fall off
-            # this branch and crash graph pre on missing buffers.
+            # subset).
             if _staged_fixed_layout(
                 num_input_tokens,
                 num_reqs,
                 num_decode_rows,
-                # The row builder's own active-request count — never inferred
-                # from the injected prompt-lens container length.
-                num_decode_reqs,
+                len(plens),
                 self.decode_threshold,
+                bool(np.all(computed >= plens)),
             ):
                 # Dedicated full-padded prompt-row array (fresh storage, not
                 # the split-boundary view also exported below): pad rows
