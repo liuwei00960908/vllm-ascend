@@ -3907,7 +3907,7 @@ class NPUModelRunner(GPUModelRunner):
             # metadata reads block_table[:num_reqs_padded] below. Sync padded
             # rows as well so device-side metadata does not see stale block ids.
             # Staged dummy runs commit both groups inside
-            # _prepare_staged_sfa_dummy_block_tables (force=True).
+            # _prepare_staged_sfa_dummy_block_tables.
             if not staged_sfa_graph_dummy_run:
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
@@ -6256,9 +6256,28 @@ class NPUModelRunner(GPUModelRunner):
             block_table.num_blocks_per_row[:batch_size] = (
                 block_table.max_num_blocks_per_req
             )
-            block_table.commit_block_table(batch_size, force=True)
-            block_table.compute_slot_mapping(req_indices, positions)
-            block_table.commit_slot_mapping(positions.size)
+            # Official v0.23 BlockTable API: commit is an unconditional
+            # copy_to_gpu (no `force` kwarg — the fork-only form crashed
+            # startup in log27), slot computation is a triton kernel with a
+            # different signature, and commit_slot_mapping does not exist.
+            # Inline the fork's host-side numpy slot computation instead
+            # (fork block_table.py:133-192, CP branch omitted: the staged
+            # predicate rejects context parallelism).
+            block_table.commit_block_table(batch_size)
+            block_table_indices = (
+                req_indices * block_table.max_num_blocks_per_req
+                + positions // block_table.block_size
+            )
+            block_numbers = block_table.block_table.np.ravel()[
+                block_table_indices
+            ]
+            block_offsets = positions % block_table.block_size
+            np.add(
+                block_numbers * block_table.block_size,
+                block_offsets,
+                out=block_table.slot_mapping.np[: positions.size],
+            )
+            block_table.slot_mapping.copy_to_gpu(positions.size)
 
             slots = block_table.slot_mapping.np[: positions.size]
             if (
