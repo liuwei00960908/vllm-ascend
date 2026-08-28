@@ -1962,9 +1962,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             if index_cache is None:
                 context = get_forward_context()
                 assert index_layer_name is not None
-                registered = context.no_compile_layers[index_layer_name].kv_cache[
-                    context.virtual_engine
-                ]
+                # Official ForwardContext has no virtual_engine (the fork
+                # indexed kv_cache by it); take the sibling cache as-is —
+                # the same resolution as the native unbundle replay path
+                # (see _dsa_reassemble_kv_cache below).
+                registered = (
+                    context.no_compile_layers[index_layer_name].kv_cache
+                )
                 index_cache = (
                     registered[0]
                     if isinstance(registered, (tuple, list))
