@@ -209,6 +209,12 @@ def set_ascend_forward_context(
         )
         forward_context.staged_sfa_route = staged_sfa_route
         forward_context.staged_sfa_graph_key = staged_sfa_graph_key
+        # Async staged PIECEWISE replay fences only the first graph island
+        # in one model forward. ForwardContext is the ownership boundary for
+        # that state: all layer islands in this forward share it, while the
+        # next scheduler step must start unfenced. Provenance: fork
+        # ascend_forward_context.py:178-182.
+        forward_context.staged_sfa_replay_fenced = False
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8

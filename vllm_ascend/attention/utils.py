@@ -456,6 +456,7 @@ def wait_for_kv_layer_from_connector(
     request_ids=None,
     target_slot_mapping=None,
     selected_token_counts=None,
+    payload_event=None,
 ):
     """Wait for this layer's KV to be loadable; selective when selected given.
 
@@ -464,6 +465,10 @@ def wait_for_kv_layer_from_connector(
     scatters them into the request's scratch slots via ``target_slot_mapping``
     instead of loading the whole prefix. Without selected tokens the official
     dense whole-layer wait is preserved verbatim.
+
+    P9 staged SFA: ``payload_event`` forwards the graph-A producer event so
+    the eager retrieve window can order the LMCache payload against the
+    captured pre-compute stream. Provenance: fork attention/utils.py:486-506.
     """
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -474,6 +479,8 @@ def wait_for_kv_layer_from_connector(
         wait_kwargs["target_slot_mapping"] = target_slot_mapping
     if selected_token_counts is not None:
         wait_kwargs["selected_token_counts"] = selected_token_counts
+    if payload_event is not None:
+        wait_kwargs["payload_event"] = payload_event
 
     if selected_tokens is not None and request_ids is not None:
         connector.wait_for_layer_load(
