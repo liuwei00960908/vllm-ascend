@@ -119,6 +119,7 @@ class StagedSFAConfigReason(str, Enum):
     SHRINK_LATENT = "shrink_latent"
     CUDAGRAPH_MODE = "cudagraph_mode"
     MODEL_NOT_MLA = "model_not_mla"
+    MODEL_NOT_SFA_SPARSE = "model_not_sfa_sparse"
     INDEX_TOPK_MISSING = "index_topk_missing"
     CONNECTOR_MISSING = "connector_missing"
     SPECULATIVE_DECODE = "speculative_decode"
@@ -229,6 +230,11 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.CUDAGRAPH_MODE)
     if not bool(getattr(model_config, "use_mla", False)):
         reasons.append(StagedSFAConfigReason.MODEL_NOT_MLA)
+    # model_uses_sfa_sparse also excludes compress-ratios models: their
+    # attention is not AscendSFAImpl, so the staged lifecycle would only
+    # surface a misleading "no local SFA layers" error at capture time.
+    if model_config is not None and not model_uses_sfa_sparse(model_config):
+        reasons.append(StagedSFAConfigReason.MODEL_NOT_SFA_SPARSE)
     if hf_text_config is None or not hasattr(hf_text_config, "index_topk"):
         reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
     if getattr(vllm_config, "kv_transfer_config", None) is None:
@@ -272,6 +278,10 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.SHRINK_LATENT: "VLLM_ASCEND_DSA_SHRINK_LATENT must be 2",
     StagedSFAConfigReason.CUDAGRAPH_MODE: "cudagraph_mode must be PIECEWISE",
     StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA attention",
+    StagedSFAConfigReason.MODEL_NOT_SFA_SPARSE: (
+        "the model must be an SFA sparse model (compress-ratios models are "
+        "not supported)"
+    ),
     StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must define index_topk",
     StagedSFAConfigReason.CONNECTOR_MISSING: "a kv transfer connector must be configured",
     StagedSFAConfigReason.SPECULATIVE_DECODE: "only MTP speculative decoding is supported",
@@ -362,7 +372,10 @@ def staged_sfa_graph_capture_sizes(vllm_config: VllmConfig | None) -> tuple[int,
     if oversized:
         raise ValueError(
             "Staged SFA capture request sizes exceed scheduler capacity "
-            f"for query_width={query_width}: {oversized}."
+            f"for query_width={query_width}: {oversized}. Bounds: "
+            "requests <= max_num_seqs and requests x query_width <= "
+            f"max_num_batched_tokens (current: max_num_seqs={max_requests}, "
+            f"max_num_batched_tokens={max_tokens})."
         )
     return tuple(size * query_width for size in request_sizes)
 
