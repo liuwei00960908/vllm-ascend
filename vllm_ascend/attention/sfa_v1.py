@@ -712,9 +712,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 num_input_tokens,
                 num_reqs,
                 num_decode_rows,
-                len(plens),
+                # The row builder's own active-request count — never inferred
+                # from the injected prompt-lens container length.
+                num_decode_reqs,
                 self.decode_threshold,
             ):
+                # Dedicated full-padded prompt-row array (fresh storage, not
+                # the split-boundary view also exported below): pad rows
+                # stay 0, active rows carry their request's prompt length.
+                staged_prompt_rows = np.zeros(
+                    num_input_tokens, dtype=np.int32
+                )
+                staged_prompt_rows[:num_decode_rows] = (
+                    _staged_prompt_lens_rows(plens, self.decode_threshold)
+                )
                 shrink_kwargs.update(
                     decode_union_mapping_workspace=(
                         self._dsa_union_mapping[:num_reqs]
@@ -724,10 +735,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         if req_ids is not None
                         else None
                     ),
-                    # Full padded per-row array (pad rows stay 0): the
-                    # boundary validator and graph A read token_capacity
-                    # rows, not just the active ones.
-                    prompt_lens_cpu_rows=boundary_rows,
+                    prompt_lens_cpu_rows=staged_prompt_rows,
                     decode_remap_boundary=(
                         self.decode_remap_boundary[:num_input_tokens]
                     ),
@@ -3384,15 +3392,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table_override: torch.Tensor | None = None,
-        sparse_count: int | None = None,
+        sparse_count: int = 2048,
     ):
         """Production indexer top-k (weights + multi-head query + RoPE).
 
         P9 staged SFA: the fixed layout passes ``attn_metadata=None`` with
         ``indexer_block_table_override`` carrying the indexer group's table
         (wrapped in the lightweight namespace the device operator reads);
-        ``sparse_count`` defaults to the native 2048 and the staged caller
-        passes the model's index_topk. Provenance: fork
+        ``sparse_count`` defaults to the native 2048 (an explicit None would
+        override the device adaptor's own default and crash the kernel) and
+        the staged caller passes the model's index_topk. Provenance: fork
         sfa_v1.py:2209-2231 (override design).
         """
         if not self.has_indexer:
