@@ -50,6 +50,7 @@ from vllm_ascend.utils import (
     is_moe_model,
     model_uses_sfa_sparse,
     refresh_block_size,
+    staged_sfa_graph_capture_sizes,
     update_cudagraph_capture_sizes,
     is_310p,
     enable_sp,
@@ -608,18 +609,46 @@ class NPUPlatform(Platform):
                 all2all_backend=vllm_config.parallel_config.all2all_backend,
                 data_parallel_size=vllm_config.parallel_config.data_parallel_size,
             )
-            # NOTE: Theoretically, we should also add this in the attention ops.
-            # Since the process is created in the spawn mode, the value of the class attribute
-            # attention ops transmitted is still the one before modification, so it has not been modified.
-            # This will cause in scenarios where both piecewise and splitting ops are configured simultaneously,
-            # If splitting ops does not contain the this value, this configuration issue will
-            # not be detected in advance assert.
-            compilation_config.splitting_ops.extend(
-                [
-                    "vllm::mla_forward",
-                    "vllm::dsa_forward",
-                ]
-            )
+            # P9 staged SFA graph: when the staged graph is configured, the
+            # eager split point moves from the per-layer mla_forward to the
+            # cross-layer sfa_lmcache_retrieve window, and official capture
+            # sizes are restricted to the staged keys so the dispatcher
+            # actually visits every configured capacity. Provenance: fork
+            # platform.py:376-388 / utils.py:760-785.
+            staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
+            if staged_sfa_sizes:
+                if hasattr(
+                    compilation_config, "use_inductor_graph_partition"
+                ):
+                    compilation_config.use_inductor_graph_partition = False
+                if (
+                    "vllm::sfa_lmcache_retrieve"
+                    not in compilation_config.splitting_ops
+                ):
+                    compilation_config.splitting_ops.append(
+                        "vllm::sfa_lmcache_retrieve"
+                    )
+                update_cudagraph_capture_sizes(
+                    vllm_config,
+                    list(staged_sfa_sizes),
+                )
+                logger.info(
+                    "Restricted ACL graph batch sizes to staged SFA keys %s",
+                    list(staged_sfa_sizes),
+                )
+            else:
+                # NOTE: Theoretically, we should also add this in the attention ops.
+                # Since the process is created in the spawn mode, the value of the class attribute
+                # attention ops transmitted is still the one before modification, so it has not been modified.
+                # This will cause in scenarios where both piecewise and splitting ops are configured simultaneously,
+                # If splitting ops does not contain the this value, this configuration issue will
+                # not be detected in advance assert.
+                compilation_config.splitting_ops.extend(
+                    [
+                        "vllm::mla_forward",
+                        "vllm::dsa_forward",
+                    ]
+                )
             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
             if get_ascend_device_type() == AscendDeviceType.A5:
                 prune_capture_sizes_for_950(vllm_config)

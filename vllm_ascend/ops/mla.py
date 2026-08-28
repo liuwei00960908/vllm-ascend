@@ -20,6 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -145,6 +147,28 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         _layer_idx = parse_layer_idx(prefix)
         self.is_vl_first_layer = bool(_is_vl and _layer_idx == 0)
 
+        # P9 staged SFA graph (Batch 5): resolve the successor attention
+        # layer once and freeze the staged branch selection at init so it is
+        # a constant to dynamo. The three staged operators split the layer
+        # into graph A (pre) / eager retrieve window / graph B (post).
+        # Provenance: fork ops/mla.py:148-153.
+        self.layers = int(
+            getattr(
+                vllm_config.model_config.hf_text_config,
+                "num_hidden_layers",
+                0,
+            )
+            or 0
+        )
+        self.next_layer_name = (
+            re.sub(r"layers\.\d+", f"layers.{_layer_idx + 1}", prefix, count=1) + ".attn"
+            if _layer_idx is not None and _layer_idx + 1 < self.layers
+            else ""
+        )
+        self.use_cross_layer_sfa = (
+            getattr(self.mla_attn.impl, "enable_staged_sfa_graph", False) is True
+        )
+
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -169,7 +193,56 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 (hidden_states.shape[0], hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
             )
 
-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+        if self.use_cross_layer_sfa:
+            # P9 staged SFA graph: the three operators carry the bridge
+            # tensors as data-flow anchors so the compiler cannot reorder
+            # them across the eager retrieve window. Capacity scalars are
+            # baked per key by the fake impl. Provenance: fork
+            # ops/mla.py:177-221.
+            impl = self.mla_attn.impl
+            (
+                ql_nope,
+                q_pe,
+                topk_indices,
+                selected_packed,
+                selected_counts,
+                target_slots,
+            ) = torch.ops.vllm.sfa_forward_pre(
+                hidden_states,
+                need_gather_q_kv,
+                output,
+                self.prefix,
+                impl.local_num_heads,
+                impl.kv_lora_rank,
+                impl.qk_rope_head_dim,
+                impl.dsa_index_topk,
+                impl._staged_sfa_graph_capture_sizes[-1],
+                (
+                    impl._staged_sfa_graph_capture_sizes[-1]
+                    // impl.decode_threshold
+                ),
+                impl.decode_threshold * impl.dsa_index_topk,
+            )
+            torch.ops.vllm.sfa_lmcache_retrieve(
+                selected_packed,
+                selected_counts,
+                target_slots,
+                output,
+                self.prefix,
+                self.next_layer_name,
+            )
+            torch.ops.vllm.sfa_forward_post(
+                ql_nope,
+                q_pe,
+                topk_indices,
+                selected_packed,
+                selected_counts,
+                target_slots,
+                output,
+                self.prefix,
+            )
+        else:
+            torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
         output = output.view(-1, hidden_dim)
         return output
 

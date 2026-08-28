@@ -301,6 +301,33 @@ class ACLGraphWrapper:
             )
 
         logger.info_once("Replaying aclgraph")
+        # P9 staged SFA: in async scheduling, CPU input updates for step i
+        # can race the staged PIECEWISE replay of step i-1. The first staged
+        # island in one model forward keeps the full synchronize fence; the
+        # remaining islands are stream-ordered around the eager LMCache
+        # retrieve window (the context flag resets each forward).
+        # Provenance: fork compilation/acl_graph.py:257-292.
+        staged_piecewise_replay = (
+            staged_graph_key is not None
+            and self.runtime_mode == CUDAGraphMode.PIECEWISE
+        )
+        if staged_piecewise_replay:
+            async_scheduling = bool(
+                getattr(
+                    getattr(
+                        forward_context.vllm_config,
+                        "scheduler_config",
+                        None,
+                    ),
+                    "async_scheduling",
+                    False,
+                )
+            )
+            if async_scheduling and not getattr(
+                forward_context, "staged_sfa_replay_fenced", False
+            ):
+                torch.npu.current_stream().synchronize()
+                forward_context.staged_sfa_replay_fenced = True
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

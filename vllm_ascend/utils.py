@@ -78,6 +78,8 @@ class StagedSFARouteReason(str, Enum):
     NOT_CONFIGURED = "not_configured"
     RUNTIME_MODE = "runtime_mode"
     RUNTIME_PARALLELISM = "runtime_parallelism"
+    CAPTURE_PENDING = "capture_pending"
+    CASCADE = "cascade"
     LORA = "lora"
     NOT_DECODE = "not_decode"
     UBATCH = "ubatch"
@@ -170,6 +172,92 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
         and not hasattr(hf_text_config, "compress_ratios")
         and not hasattr(hf_config, "compress_ratios")
     )
+
+
+def staged_sfa_graph_configured(vllm_config: VllmConfig | None) -> bool:
+    """Whether this config can run the staged SFA graph (P9).
+
+    One predicate shared by platform budgeting and the runner routing gate,
+    so merely exporting the flag never shrinks unrelated models' graph-size
+    budgets. P9 production shape: MLA + SFA sparse model, single DP.
+    Provenance: fork utils.py:617-678 (simplified: the adapter-cache and
+    legacy-offload reasons target fork-only features).
+    """
+    if not envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH:
+        return False
+    if vllm_config is None or getattr(vllm_config, "model_config", None) is None:
+        return False
+    if not getattr(vllm_config.model_config, "use_mla", False):
+        return False
+    if not model_uses_sfa_sparse(vllm_config.model_config):
+        return False
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return (
+        parallel_config is not None
+        and parallel_config.data_parallel_size <= 1
+    )
+
+
+def staged_sfa_graph_capture_sizes(vllm_config: VllmConfig | None) -> tuple[int, ...]:
+    """Return validated staged capture token capacities.
+
+    Sizes are token capacities bounded by the scheduler limits and, for
+    fixed-width speculation, must be divisible by the query width.
+    Provenance: fork utils.py:627-678 (token-capacity semantics kept).
+    """
+    if not staged_sfa_graph_configured(vllm_config):
+        return ()
+
+    raw_sizes = str(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES)
+    try:
+        sizes = tuple(
+            sorted({int(s.strip()) for s in raw_sizes.split(",") if s.strip()})
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must be a "
+            "comma-separated list of positive integers."
+        ) from exc
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError(
+            "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
+            "positive integers."
+        )
+
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    query_width = 1 + int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+        if speculative_config is not None
+        else 0
+    )
+    if any(size % query_width for size in sizes):
+        raise ValueError(
+            "Staged SFA capture sizes must be divisible by the query width "
+            f"({query_width}): {sizes}."
+        )
+    max_requests = getattr(scheduler_config, "max_num_seqs", None)
+    max_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
+    oversized = [
+        size
+        for size in sizes
+        if (
+            isinstance(max_tokens, int)
+            and max_tokens > 0
+            and size > max_tokens
+        )
+        or (
+            isinstance(max_requests, int)
+            and max_requests > 0
+            and size // query_width > max_requests
+        )
+    ]
+    if oversized:
+        raise ValueError(
+            "Staged SFA capture sizes exceed scheduler capacity for "
+            f"query_width={query_width}: {oversized}."
+        )
+    return sizes
 
 
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:

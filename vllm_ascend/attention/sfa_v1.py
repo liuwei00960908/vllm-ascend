@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import numpy as np
@@ -318,6 +319,18 @@ class AscendSFAMetadata:
 M = TypeVar("M", bound=AscendSFAMetadata)
 
 
+def _staged_prompt_lens_rows(plens: Any, query_width: int) -> np.ndarray:
+    """Expand per-request prompt lengths to the fixed-layout row array.
+
+    The staged boundary validator requires one prompt length per token row
+    (num_reqs x query_width); slicing the per-request array silently
+    truncates for MTP widths greater than one. Provenance: fork
+    sfa_v1.py:1276-1280 (fixed-layout reshape).
+    """
+    plens_np = np.asarray(plens, dtype=np.int32).reshape(-1)
+    return np.repeat(plens_np, int(query_width))
+
+
 class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -469,6 +482,25 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
             self.decode_remap_boundary = torch.empty(
                 max_rows, dtype=torch.int32, device=self.device
+            )
+            # P9 batch 5 fix: the request-union fixed buffers the staged
+            # pre-compute requires (selected tokens / counts / target
+            # slots). Without them every captured graph A reads None
+            # channels. Provenance: fork sfa_v1.py:1033-1041.
+            self._dsa_selected_tokens = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dsa_selected_counts = torch.empty(
+                (max_num_reqs, 16),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dsa_target_slots = torch.empty(
+                (max_num_reqs, self.scratch_capacity),
+                dtype=torch.long,
+                device=self.device,
             )
 
     @staticmethod
@@ -644,7 +676,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # when the batch carries the request-major fixed layout (pure
             # decode with exactly decode_threshold rows per request). Mixed
             # batches keep the B2c-only channels above untouched.
-            # Provenance: fork sfa_v1.py:1415-1576 (staged subset).
+            # Provenance: fork sfa_v1.py:1415-1576 (staged subset). Batch 5
+            # fix: prompt rows are expanded per token row and the fixed
+            # request-union buffers/scratch capacity are attached so the
+            # captured graph A has stable channels.
             if num_decode_rows == num_reqs * self.decode_threshold:
                 shrink_kwargs.update(
                     decode_union_mapping_workspace=(
@@ -655,11 +690,23 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         if req_ids is not None
                         else None
                     ),
-                    prompt_lens_cpu_rows=plens_cpu[:num_decode_rows],
+                    prompt_lens_cpu_rows=_staged_prompt_lens_rows(
+                        plens, self.decode_threshold
+                    ),
                     decode_remap_boundary=(
                         self.decode_remap_boundary[:num_decode_rows]
                     ),
                     decode_remap_boundary_ready=False,
+                    decode_scratch_capacity=self.scratch_capacity,
+                    decode_target_slot_mapping=(
+                        self._dsa_target_slots[:num_reqs]
+                    ),
+                    decode_selected_tokens=(
+                        self._dsa_selected_tokens[:num_reqs]
+                    ),
+                    decode_selected_counts=(
+                        self._dsa_selected_counts[:num_reqs]
+                    ),
                 )
 
         block_size = self.kernel_block_size
@@ -1536,6 +1583,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.vllm_config.speculative_config is not None
             else 0
         )
+        # P9 batch 5: the staged custom-op call site reads the row width from
+        # the implementation. Provenance: fork sfa_v1.py:1709-1714.
+        self.decode_threshold = decode_threshold
         if self.dsa_shrink_latent:
             if decode_threshold > 2:
                 raise ValueError(
@@ -1859,13 +1909,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         for the unbundle mode. Provenance: fork sfa_v1.py:2808-2827.
         """
         index_layer_name = (
-            _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
+            _dsa_indexer_layer_name(layer_name) if self.dsa_unbundle else None
         )
         index_enabled = bool(
             index_layer_name is not None
             and staged_sfa_connector_supports_sparse_load()
         )
-        if self.dsa_offload_unbundle and len(kv_cache) < 3:
+        if self.dsa_unbundle and len(kv_cache) < 3:
             index_cache = getattr(self, "_dsa_idx_cache_t", None)
             if index_cache is None:
                 context = get_forward_context()
@@ -1895,11 +1945,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         """Run the indexer top-k for the staged pre-compute path.
 
-        The baseline ``indexer_select_post_process`` requires a positional
-        ``attn_metadata`` argument; the staged path has none to give (the
-        fixed layout carries its own per-request tables), so this helper
-        calls ``DeviceOperator.indexer_select_post_process`` directly with
-        the override block table — the same semantic as fork
+        The staged fixed layout carries its own per-request block tables, so
+        this helper wraps the override table in the lightweight namespace the
+        device operator reads (``indexer_block_table`` with a shared-table
+        fallback) instead of a full attention metadata. Semantics match fork
         ``indexer_block_table_override`` (:2746-2760).
         """
         if not self.has_indexer:
@@ -1909,6 +1958,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         k_li, _ = self.indexer_select_pre_process(
             x=hidden_states, cos=cos, sin=sin
         )
+        # The device operator only reads the two block-table fields from the
+        # metadata argument; supply the fixed-layout override table.
+        table_namespace = SimpleNamespace(
+            indexer_block_table=indexer_block_table,
+            block_table=indexer_block_table,
+        )
         # Call the device operator directly, bypassing the metadata arg.
         return DeviceOperator.indexer_select_post_process(
             self,
@@ -1917,7 +1972,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             None,  # k_li_shape_ori
             None,  # weights — recomputed inside; fork passes the same.
             kv_cache,
-            None,  # attn_metadata — fixed layout carries its own tables.
+            table_namespace,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             False,  # enable_sparse_li_c8 — staged rejects C8 (eligibility).
@@ -2126,11 +2181,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 next_metadata.req_ids,
                 is_dummy_run=False,
                 index_topk=self.dsa_index_topk,
-                cached_tokens=getattr(
-                    getattr(route, "frontiers", None), "frontiers", None
-                )
-                if route is not None
-                else None,
+                # route.frontiers is already the immutable frontier tuple;
+                # a nested lookup would silently discard it (route propagation
+                # regression). Provenance: fork sfa_v1.py:3120-3127.
+                cached_tokens=(
+                    getattr(route, "frontiers", None)
+                    if route is not None
+                    else None
+                ),
             )
             if index_enabled:
                 wait_for_kv_layer_from_connector(
@@ -2152,6 +2210,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             metadata.req_ids,
             is_dummy_run=is_dummy,
             index_topk=self.dsa_index_topk,
+            # Two legitimate hops: context.staged_sfa_route is the decision
+            # object and .frontiers is its tuple field (unlike the retrieve
+            # path where route was already the decision).
             cached_tokens=(
                 None
                 if is_dummy
@@ -2236,13 +2297,30 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # P9 Batch 5: simplified eligibility check — the runner authorized
         # a graph key, so this step has the fixed decode layout; verify the
-        # impl-side invariants that the runner cannot see. Only checks for
-        # features that exist on this baseline (DSA-CP/C8/MLAPO/weight
-        # prefetch/adapter-cache are absent and not checked here).
-        # Provenance: fork sfa_v1.py:2390-2608 (~25 conditions → ~12 kept).
+        # impl-side invariants that the runner cannot see. C8 (both SFA
+        # packed-KV and indexer variants), MLAPO, and DSA-CP all build
+        # layouts the staged fixed data plane does not represent and must
+        # be rejected here — they exist on this baseline.
+        # Provenance: fork sfa_v1.py:2390-2608 (~25 conditions → the
+        # baseline-applicable subset).
         if self.dsa_shrink_latent != 2:
             raise RuntimeError(
                 "[SFA cross-layer graph] staged path requires SHRINK_LATENT=2"
+            )
+        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+            raise RuntimeError(
+                "[SFA cross-layer graph] sparse C8 layouts are not "
+                "supported by the staged path"
+            )
+        if self.enable_mlapo:
+            raise RuntimeError(
+                "[SFA cross-layer graph] MLAPO is not supported by the "
+                "staged path"
+            )
+        if self.enable_dsa_cp:
+            raise RuntimeError(
+                "[SFA cross-layer graph] DSA-CP is not supported by the "
+                "staged path"
             )
         if not staged_sfa_connector_supports_sparse_load():
             raise RuntimeError(
