@@ -5928,10 +5928,17 @@ class NPUModelRunner(GPUModelRunner):
             frontier != 0 and frontier < scratch_capacity
             for frontier in frontiers
         ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                StagedSFARouteReason.FRONTIER_TOO_SHORT,
-            )
+            # Defense-in-depth downgrade: a frontier inside the scratch
+            # reservation aliases live KV positions in the remap kernel's
+            # unified index space, so this step cannot use the staged graph —
+            # but it is a normal runtime state (decode-window saves advance
+            # the frontier one window at a time), not a config contradiction.
+            # Route native per the fork production doc's "retain a correct
+            # resident route" exit; the LMCache side gates sub-scratch
+            # frontiers to 0 at the source, so this fires only for
+            # unexpected producers. Provenance: fork
+            # STAGED_SFA_GRAPH_PRODUCTION.md:581.
+            return native(StagedSFARouteReason.FRONTIER_TOO_SHORT)
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
