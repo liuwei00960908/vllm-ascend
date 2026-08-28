@@ -314,20 +314,18 @@ class ACLGraphWrapper:
         # island in one model forward keeps the full synchronize fence; the
         # remaining islands are stream-ordered around the eager LMCache
         # retrieve window (the context flag resets each forward).
-        # Provenance: fork compilation/acl_graph.py:257-292 (the fork read
-        # the wrapper's own vllm_config; the official ForwardContext carries
-        # no such attribute — log29 crashed on it — so read the process-wide
-        # current config, which is fixed for the worker lifetime and
-        # equivalent for this startup-time flag).
+        # Provenance: fork compilation/acl_graph.py:257-292 — identical form:
+        # the wrapper holds its vllm_config from construction (baseline
+        # acl_graph __init__ also receives and stores it), so no runtime
+        # global lookup is needed (log29 ForwardContext attribute and log30
+        # get_current_vllm_config context were both unavailable here).
         staged_piecewise_replay = (
             staged_graph_key is not None
             and self.runtime_mode == CUDAGraphMode.PIECEWISE
         )
         if staged_piecewise_replay:
-            from vllm.config import get_current_vllm_config
-
             async_scheduling = bool(
-                get_current_vllm_config().scheduler_config.async_scheduling
+                self.vllm_config.scheduler_config.async_scheduling
             )
             if async_scheduling and not getattr(
                 forward_context, "staged_sfa_replay_fenced", False
