@@ -130,8 +130,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))
     ),
-    # P9: comma-separated positive capture sizes (token capacities), bounded
-    # by scheduler max_num_batched_tokens. Default singleton capture.
+    # P9: comma-separated positive capture sizes (REQUEST capacities, fork
+    # semantics; the effective token capacity is requests x query width),
+    # bounded by scheduler max_num_seqs / max_num_batched_tokens. Default
+    # singleton capture.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
         "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
         "1",

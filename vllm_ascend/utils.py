@@ -105,6 +105,27 @@ class StagedSFARouteDecision:
     graph_key: Any = None
     frontiers: tuple[int, ...] = ()
     cold_compact_resumes: tuple[bool, ...] = ()
+
+
+class StagedSFAConfigReason(str, Enum):
+    """Typed reasons an explicitly requested staged graph is invalid.
+
+    Provenance: fork utils.py:72-135 (the legacy-offload and adapter-cache
+    reasons target fork-only features and are not ported).
+    """
+
+    DSA_UNBUNDLE = "dsa_unbundle"
+    DSA_TWO_GROUPS = "dsa_two_groups"
+    SHRINK_LATENT = "shrink_latent"
+    CUDAGRAPH_MODE = "cudagraph_mode"
+    MODEL_NOT_MLA = "model_not_mla"
+    INDEX_TOPK_MISSING = "index_topk_missing"
+    CONNECTOR_MISSING = "connector_missing"
+    SPECULATIVE_DECODE = "speculative_decode"
+    LORA = "lora"
+    DATA_PARALLEL = "data_parallel"
+    PIPELINE_PARALLEL = "pipeline_parallel"
+    CONTEXT_PARALLEL = "context_parallel"
 ACL_FORMAT_FRACTAL_NZ = 29
 
 _CUSTOM_OP_ENABLED = None
@@ -174,51 +195,142 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     )
 
 
+def staged_sfa_graph_configuration_reasons(
+    vllm_config: VllmConfig | None,
+) -> tuple[StagedSFAConfigReason, ...]:
+    """Return typed reasons an explicitly requested staged graph is invalid.
+
+    One predicate source for platform budgeting, the runner routing gate,
+    and the attention implementation, so merely exporting the flag never
+    engages the staged lifecycle on an unsupported config. Provenance: fork
+    utils.py:521-589 (baseline-applicable subset; DP is rejected for any
+    size, not only external launcher, matching the routing fail-closed).
+    """
+    from vllm.config import CUDAGraphMode
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    reasons: list[StagedSFAConfigReason] = []
+    if not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE:
+        reasons.append(StagedSFAConfigReason.DSA_UNBUNDLE)
+    if not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
+        reasons.append(StagedSFAConfigReason.DSA_TWO_GROUPS)
+    if envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2:
+        reasons.append(StagedSFAConfigReason.SHRINK_LATENT)
+    if (
+        getattr(
+            getattr(vllm_config, "compilation_config", None),
+            "cudagraph_mode",
+            None,
+        )
+        != CUDAGraphMode.PIECEWISE
+    ):
+        reasons.append(StagedSFAConfigReason.CUDAGRAPH_MODE)
+    if not bool(getattr(model_config, "use_mla", False)):
+        reasons.append(StagedSFAConfigReason.MODEL_NOT_MLA)
+    if hf_text_config is None or not hasattr(hf_text_config, "index_topk"):
+        reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        reasons.append(StagedSFAConfigReason.CONNECTOR_MISSING)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    speculative_method = getattr(speculative_config, "method", None)
+    if (
+        speculative_config is not None
+        and speculative_method is not None
+        and "mtp" not in str(speculative_method).lower()
+    ):
+        reasons.append(StagedSFAConfigReason.SPECULATIVE_DECODE)
+    if getattr(vllm_config, "lora_config", None) is not None:
+        reasons.append(StagedSFAConfigReason.LORA)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    if isinstance(data_parallel_size, int) and data_parallel_size > 1:
+        reasons.append(StagedSFAConfigReason.DATA_PARALLEL)
+    pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+    if isinstance(pipeline_parallel_size, int) and pipeline_parallel_size != 1:
+        reasons.append(StagedSFAConfigReason.PIPELINE_PARALLEL)
+    prefill_context_parallel_size = getattr(
+        parallel_config, "prefill_context_parallel_size", 1
+    )
+    decode_context_parallel_size = getattr(
+        parallel_config, "decode_context_parallel_size", 1
+    )
+    if any(
+        isinstance(size, int) and size != 1
+        for size in (
+            prefill_context_parallel_size,
+            decode_context_parallel_size,
+        )
+    ):
+        reasons.append(StagedSFAConfigReason.CONTEXT_PARALLEL)
+    return tuple(reasons)
+
+
+_STAGED_SFA_CONFIG_MESSAGES = {
+    StagedSFAConfigReason.DSA_UNBUNDLE: "VLLM_ASCEND_DSA_UNBUNDLE must be 1",
+    StagedSFAConfigReason.DSA_TWO_GROUPS: "VLLM_ASCEND_DSA_TWO_GROUPS must be 1",
+    StagedSFAConfigReason.SHRINK_LATENT: "VLLM_ASCEND_DSA_SHRINK_LATENT must be 2",
+    StagedSFAConfigReason.CUDAGRAPH_MODE: "cudagraph_mode must be PIECEWISE",
+    StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA attention",
+    StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must define index_topk",
+    StagedSFAConfigReason.CONNECTOR_MISSING: "a kv transfer connector must be configured",
+    StagedSFAConfigReason.SPECULATIVE_DECODE: "only MTP speculative decoding is supported",
+    StagedSFAConfigReason.LORA: "LoRA is not supported by staged graphs",
+    StagedSFAConfigReason.DATA_PARALLEL: "data_parallel_size must be 1",
+    StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline_parallel_size must be 1",
+    StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallelism is not supported",
+}
+
+
+def staged_sfa_graph_configuration_errors(
+    vllm_config: VllmConfig | None,
+) -> tuple[str, ...]:
+    """Render typed staged-SFA configuration reasons for user-facing errors.
+
+    Provenance: fork utils.py:610-614.
+    """
+    return tuple(
+        _STAGED_SFA_CONFIG_MESSAGES[reason]
+        for reason in staged_sfa_graph_configuration_reasons(vllm_config)
+    )
+
+
 def staged_sfa_graph_configured(vllm_config: VllmConfig | None) -> bool:
     """Whether this config can run the staged SFA graph (P9).
 
-    One predicate shared by platform budgeting and the runner routing gate,
-    so merely exporting the flag never shrinks unrelated models' graph-size
-    budgets. P9 production shape: MLA + SFA sparse model, single DP.
-    Provenance: fork utils.py:617-678 (simplified: the adapter-cache and
-    legacy-offload reasons target fork-only features).
+    One predicate shared by platform budgeting, the runner routing gate,
+    and the attention implementation, so merely exporting the flag never
+    shrinks unrelated models' graph budgets or crashes startup capture.
+    Provenance: fork utils.py:617-624.
     """
-    if not envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH:
-        return False
-    if vllm_config is None or getattr(vllm_config, "model_config", None) is None:
-        return False
-    if not getattr(vllm_config.model_config, "use_mla", False):
-        return False
-    if not model_uses_sfa_sparse(vllm_config.model_config):
-        return False
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    return (
-        parallel_config is not None
-        and parallel_config.data_parallel_size <= 1
+    return bool(
+        envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
+        and not staged_sfa_graph_configuration_reasons(vllm_config)
     )
 
 
 def staged_sfa_graph_capture_sizes(vllm_config: VllmConfig | None) -> tuple[int, ...]:
     """Return validated staged capture token capacities.
 
-    Sizes are token capacities bounded by the scheduler limits and, for
-    fixed-width speculation, must be divisible by the query width.
-    Provenance: fork utils.py:627-678 (token-capacity semantics kept).
+    Each env entry is a REQUEST capacity (fork semantics); the returned
+    tuple multiplies by the query width so every consumer sees token
+    capacities. Bounds: requests <= max_num_seqs and tokens <=
+    max_num_batched_tokens. Provenance: fork utils.py:627-678.
     """
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
     raw_sizes = str(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES)
     try:
-        sizes = tuple(
+        request_sizes = tuple(
             sorted({int(s.strip()) for s in raw_sizes.split(",") if s.strip()})
         )
     except ValueError as exc:
         raise ValueError(
             "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must be a "
-            "comma-separated list of positive integers."
+            "comma-separated list of positive integers (request capacities)."
         ) from exc
-    if not sizes or any(size <= 0 for size in sizes):
+    if not request_sizes or any(size <= 0 for size in request_sizes):
         raise ValueError(
             "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain "
             "positive integers."
@@ -231,33 +343,28 @@ def staged_sfa_graph_capture_sizes(vllm_config: VllmConfig | None) -> tuple[int,
         if speculative_config is not None
         else 0
     )
-    if any(size % query_width for size in sizes):
-        raise ValueError(
-            "Staged SFA capture sizes must be divisible by the query width "
-            f"({query_width}): {sizes}."
-        )
     max_requests = getattr(scheduler_config, "max_num_seqs", None)
     max_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
     oversized = [
         size
-        for size in sizes
+        for size in request_sizes
         if (
-            isinstance(max_tokens, int)
-            and max_tokens > 0
-            and size > max_tokens
-        )
-        or (
             isinstance(max_requests, int)
             and max_requests > 0
-            and size // query_width > max_requests
+            and size > max_requests
+        )
+        or (
+            isinstance(max_tokens, int)
+            and max_tokens > 0
+            and size * query_width > max_tokens
         )
     ]
     if oversized:
         raise ValueError(
-            "Staged SFA capture sizes exceed scheduler capacity for "
-            f"query_width={query_width}: {oversized}."
+            "Staged SFA capture request sizes exceed scheduler capacity "
+            f"for query_width={query_width}: {oversized}."
         )
-    return sizes
+    return tuple(size * query_width for size in request_sizes)
 
 
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:

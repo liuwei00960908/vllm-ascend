@@ -141,9 +141,14 @@ class ACLGraphWrapper:
         keys: tuple,
         expected_islands: int,
     ) -> int:
-        """Validate every captured island before live staged admission.
+        """Validate every captured staged island before live admission.
 
-        Provenance: fork compilation/acl_graph.py:110-160.
+        Extra FX split points (kv-cache-update ops etc.) can legitimately
+        create MORE staged islands than layers+1, so ``expected_islands``
+        is treated as a minimum (every island must still hold every key
+        completely). Legacy ``BatchDescriptor`` entries may coexist in a
+        wrapper and are ignored. Provenance: fork
+        compilation/acl_graph.py:110-160 (baseline hardening).
         """
         expected = set(keys)
         if not expected or expected_islands <= 0:
@@ -157,15 +162,20 @@ class ACLGraphWrapper:
                 for key in wrapper.concrete_aclgraph_entries
             )
         ]
-        if len(wrappers) != expected_islands:
+        if len(wrappers) < expected_islands:
             raise RuntimeError(
                 "staged ACL graph island count is incomplete: "
-                f"expected={expected_islands}, captured={len(wrappers)}"
+                f"expected_at_least={expected_islands}, "
+                f"captured={len(wrappers)}"
             )
+        staged_entry_count = 0
         for wrapper in wrappers:
-            actual = set(wrapper.concrete_aclgraph_entries)
-            missing = expected - actual
-            unexpected = actual - expected
+            staged_keys_in_wrapper = {
+                key
+                for key in wrapper.concrete_aclgraph_entries
+                if isinstance(key, key_type)
+            }
+            missing = expected - staged_keys_in_wrapper
             incomplete = tuple(
                 key
                 for key, entry in wrapper.concrete_aclgraph_entries.items()
@@ -175,16 +185,14 @@ class ACLGraphWrapper:
                     or entry.input_addresses is None
                 )
             )
-            if missing or unexpected or incomplete:
+            if missing or incomplete:
                 raise RuntimeError(
                     "staged ACL graph island is incomplete: "
                     f"missing={tuple(missing)}, "
-                    f"unexpected={tuple(unexpected)}, "
                     f"incomplete={incomplete}"
                 )
-        return sum(
-            len(wrapper.concrete_aclgraph_entries) for wrapper in wrappers
-        )
+            staged_entry_count += len(staged_keys_in_wrapper)
+        return staged_entry_count
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()

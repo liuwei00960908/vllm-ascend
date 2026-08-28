@@ -66,6 +66,16 @@ def _route_runner(**overrides):
 class TestLocalRouteGates(unittest.TestCase):
     """Every gate must return SAFE_NATIVE before any staged authorization."""
 
+    def setUp(self):
+        model_runner_v1 = _load_model_runner()
+        # enable_sp reads the real parallel/additional config; the routing
+        # tests exercise unrelated gates, so pin it off.
+        sp_patcher = patch.object(
+            model_runner_v1, "enable_sp", return_value=False
+        )
+        sp_patcher.start()
+        self.addCleanup(sp_patcher.stop)
+
     def _route(self, runner, **kwargs):
         model_runner_v1 = _load_model_runner()
         call_kwargs = dict(
@@ -97,6 +107,17 @@ class TestLocalRouteGates(unittest.TestCase):
             parallel_config=SimpleNamespace(data_parallel_size=2)
         )
         decision = self._route(runner)
+        self.assertEqual(
+            decision.reason, StagedSFARouteReason.RUNTIME_PARALLELISM
+        )
+
+    def test_sequence_parallelism_fails_closed(self):
+        model_runner_v1 = _load_model_runner()
+        runner = _route_runner()
+        with patch.object(
+            model_runner_v1, "enable_sp", return_value=True
+        ):
+            decision = self._route(runner)
         self.assertEqual(
             decision.reason, StagedSFARouteReason.RUNTIME_PARALLELISM
         )
@@ -138,6 +159,14 @@ class TestRunnerWiringInvariants(unittest.TestCase):
         self.assertIn("self._staged_sfa_impls: tuple | None = None", source)
         self.assertIn("self.dsa_index_topk = 0", source)
 
+    def test_init_consumes_shared_predicate(self):
+        # The runner must never gate on the raw env flag: platform, runner,
+        # and impl all key off staged_sfa_graph_configured/_capture_sizes.
+        source = self._method_source("__init__")
+        self.assertIn("staged_sfa_graph_configured", source)
+        self.assertIn("staged_sfa_graph_capture_sizes", source)
+        self.assertIn("staged_sfa_graph_configuration_errors", source)
+
     def test_execute_model_gates_routing_on_enable_flag(self):
         source = self._method_source("execute_model")
         self.assertIn("if self.enable_staged_sfa_graph", source)
@@ -166,6 +195,9 @@ class TestRunnerWiringInvariants(unittest.TestCase):
         self.assertNotIn(
             'getattr(self, "_staged_sfa_impls", None) is None', source
         )
+        # The capture lifecycle gates on the shared predicate, never the
+        # raw env flag.
+        self.assertIn("staged_sfa_graph_configured", source)
 
     def test_dummy_run_threads_staged_context(self):
         source = self._method_source("_dummy_run")
@@ -356,81 +388,220 @@ class TestPayloadEventForwarding(unittest.TestCase):
 
 
 class TestStagedConfigPredicate(unittest.TestCase):
-    def _vllm_config(self, *, use_mla=True, dp=1, spec_tokens=0,
-                     max_seqs=8, max_tokens=16):
-        hf_text = SimpleNamespace(
-            index_topk=8,
-        )
-        return SimpleNamespace(
+    def _vllm_config(self, **overrides):
+        from vllm.config import CUDAGraphMode
+
+        config = SimpleNamespace(
             model_config=SimpleNamespace(
-                use_mla=use_mla,
-                hf_text_config=hf_text,
+                use_mla=True,
+                hf_text_config=SimpleNamespace(index_topk=8),
                 hf_config=SimpleNamespace(),
             ),
-            parallel_config=SimpleNamespace(data_parallel_size=dp),
-            scheduler_config=SimpleNamespace(
-                max_num_seqs=max_seqs,
-                max_num_batched_tokens=max_tokens,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
             ),
-            speculative_config=(
-                SimpleNamespace(num_speculative_tokens=spec_tokens)
-                if spec_tokens
-                else None
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=64,
+                max_num_batched_tokens=256,
+            ),
+            speculative_config=None,
+            lora_config=None,
+            kv_transfer_config=SimpleNamespace(),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.PIECEWISE
             ),
         )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def _env(self, **overrides):
+        env = {
+            "VLLM_ASCEND_SFA_STAGED_GRAPH": True,
+            "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "4,8",
+            "VLLM_ASCEND_DSA_UNBUNDLE": True,
+            "VLLM_ASCEND_DSA_TWO_GROUPS": True,
+            "VLLM_ASCEND_DSA_SHRINK_LATENT": 2,
+        }
+        env.update(overrides)
+        return env
+
+    def _configured(self, config=None, **env_overrides):
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for name, value in self._env(**env_overrides).items():
+                stack.enter_context(
+                    patch(f"vllm_ascend.envs.{name}", value)
+                )
+            return staged_sfa_graph_configured(
+                config if config is not None else self._vllm_config()
+            )
+
+    def test_configured_on_the_production_shape(self):
+        self.assertTrue(self._configured())
 
     def test_not_configured_when_env_off(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH", False
-        ):
-            self.assertFalse(
-                staged_sfa_graph_configured(self._vllm_config())
-            )
-            self.assertEqual(
-                staged_sfa_graph_capture_sizes(self._vllm_config()), ()
-            )
+        self.assertFalse(
+            self._configured(VLLM_ASCEND_SFA_STAGED_GRAPH=False)
+        )
+        self.assertEqual(
+            self._sizes_with_env(VLLM_ASCEND_SFA_STAGED_GRAPH=False),
+            (),
+        )
 
-    def test_not_configured_for_non_mla_or_multi_dp(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH", True
-        ):
-            self.assertFalse(
-                staged_sfa_graph_configured(
-                    self._vllm_config(use_mla=False)
+    def _sizes_with_env(self, raw="4,8", config=None, **env_overrides):
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for name, value in self._env(
+                VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES=raw,
+                **env_overrides,
+            ).items():
+                stack.enter_context(
+                    patch(f"vllm_ascend.envs.{name}", value)
                 )
-            )
-            self.assertFalse(
-                staged_sfa_graph_configured(self._vllm_config(dp=2))
+            return staged_sfa_graph_capture_sizes(
+                config if config is not None else self._vllm_config()
             )
 
-    def test_capture_sizes_validated(self):
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH", True
-        ), patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
-            "4,8",
-        ):
-            self.assertEqual(
-                staged_sfa_graph_capture_sizes(self._vllm_config()),
-                (4, 8),
+    def test_reasons_matrix(self):
+        from contextlib import ExitStack
+
+        from vllm.config import CUDAGraphMode
+
+        from vllm_ascend.utils import (
+            StagedSFAConfigReason,
+            staged_sfa_graph_configuration_reasons,
+        )
+
+        def reasons(config, **env_overrides):
+            with ExitStack() as stack:
+                for name, value in self._env(**env_overrides).items():
+                    stack.enter_context(
+                        patch(f"vllm_ascend.envs.{name}", value)
+                    )
+                return set(staged_sfa_graph_configuration_reasons(config))
+
+        self.assertIn(
+            StagedSFAConfigReason.DSA_UNBUNDLE,
+            reasons(self._vllm_config(), VLLM_ASCEND_DSA_UNBUNDLE=False),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.DSA_TWO_GROUPS,
+            reasons(self._vllm_config(), VLLM_ASCEND_DSA_TWO_GROUPS=False),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.SHRINK_LATENT,
+            reasons(
+                self._vllm_config(), VLLM_ASCEND_DSA_SHRINK_LATENT=0
+            ),
+        )
+        non_piecewise = self._vllm_config()
+        non_piecewise.compilation_config = SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL
+        )
+        self.assertIn(
+            StagedSFAConfigReason.CUDAGRAPH_MODE, reasons(non_piecewise)
+        )
+        self.assertIn(
+            StagedSFAConfigReason.MODEL_NOT_MLA,
+            reasons(self._vllm_config(use_mla=False)),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.CONNECTOR_MISSING,
+            reasons(self._vllm_config(kv_transfer_config=None)),
+        )
+        eagle = self._vllm_config(
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=2, method="eagle"
             )
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH", True
-        ), patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
-            "4,5",
-        ), self.assertRaisesRegex(ValueError, "divisible"):
-            # query width 2 (MTP1): 5 is not divisible.
-            staged_sfa_graph_capture_sizes(
-                self._vllm_config(spec_tokens=1)
+        )
+        self.assertIn(
+            StagedSFAConfigReason.SPECULATIVE_DECODE, reasons(eagle)
+        )
+        mtp = self._vllm_config(
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=1, method="mtp"
             )
-        with patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH", True
-        ), patch(
-            "vllm_ascend.envs.VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
-            "32",
-        ), self.assertRaisesRegex(ValueError, "exceed"):
-            staged_sfa_graph_capture_sizes(self._vllm_config())
+        )
+        self.assertNotIn(
+            StagedSFAConfigReason.SPECULATIVE_DECODE, reasons(mtp)
+        )
+        self.assertIn(
+            StagedSFAConfigReason.LORA,
+            reasons(self._vllm_config(lora_config=object())),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.DATA_PARALLEL,
+            reasons(
+                self._vllm_config(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=2,
+                        pipeline_parallel_size=1,
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                    )
+                )
+            ),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.PIPELINE_PARALLEL,
+            reasons(
+                self._vllm_config(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=1,
+                        pipeline_parallel_size=2,
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                    )
+                )
+            ),
+        )
+        self.assertIn(
+            StagedSFAConfigReason.CONTEXT_PARALLEL,
+            reasons(
+                self._vllm_config(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=1,
+                        pipeline_parallel_size=1,
+                        prefill_context_parallel_size=2,
+                        decode_context_parallel_size=1,
+                    )
+                )
+            ),
+        )
+        # MTP keeps the production shape eligible.
+        self.assertEqual(reasons(mtp), set())
+
+    def test_capture_sizes_request_units(self):
+        # Width 1: env request counts pass through as token capacities.
+        self.assertEqual(self._sizes_with_env("4,8"), (4, 8))
+        # Width 2 (MTP1): request counts scale by the query width.
+        spec = SimpleNamespace(num_speculative_tokens=1, method="mtp")
+        self.assertEqual(
+            self._sizes_with_env(
+                "4,5",
+                config=self._vllm_config(speculative_config=spec),
+            ),
+            (8, 10),
+        )
+
+    def test_capture_sizes_bounds(self):
+        spec = SimpleNamespace(num_speculative_tokens=1, method="mtp")
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            # 100 requests > max_num_seqs=64.
+            self._sizes_with_env(
+                "100", config=self._vllm_config(speculative_config=spec)
+            )
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            # 200 requests x 2 = 400 tokens > max_num_batched_tokens=256.
+            self._sizes_with_env(
+                "200", config=self._vllm_config(speculative_config=spec)
+            )
 
 
 class TestPlatformAndFenceInvariants(unittest.TestCase):
@@ -462,6 +633,292 @@ class TestPlatformAndFenceInvariants(unittest.TestCase):
         self.assertIn("enable_sparse_sfa_c8", source)
         self.assertIn("enable_mlapo", source)
         self.assertIn("enable_dsa_cp", source)
+        self.assertIn("two-group indexer tables", source)
+        self.assertIn("block-table logical capacity", source)
+
+
+    def test_impl_eligibility_requires_two_group_tables(self):
+        source = inspect.getsource(
+            AscendSFAImpl.cross_layer_graph_pre
+        )
+        self.assertIn("indexer_block_table", source)
+        self.assertIn("indexer_slot_mapping", source)
+
+
+class TestStagedFixedLayout(unittest.TestCase):
+    """Executable matrix for the padded fixed-layout predicate (P0 fix)."""
+
+    def test_exact_capacity_q1(self):
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        self.assertTrue(_staged_fixed_layout(4, 4, 4, 4, 1))
+
+    def test_padded_live_batch_q1(self):
+        # 3 active requests padded to capacity 4 (the common live case the
+        # historical num_decode_rows == num_reqs * width check rejected).
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        self.assertTrue(_staged_fixed_layout(4, 4, 3, 3, 1))
+
+    def test_exact_capacity_mtp1(self):
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        # 4 requests x 2 rows = 8 tokens.
+        self.assertTrue(_staged_fixed_layout(8, 4, 8, 4, 2))
+
+    def test_padded_live_batch_mtp1(self):
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        # 3 active requests on capacity 4: 6 active rows, 8 padded tokens.
+        self.assertTrue(_staged_fixed_layout(8, 4, 6, 3, 2))
+
+    def test_mixed_batch_rejected(self):
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        # A decode row is missing (mixed prefill/decode): not fixed layout.
+        self.assertFalse(_staged_fixed_layout(4, 4, 3, 4, 1))
+
+    def test_non_multiple_token_view_rejected(self):
+        from vllm_ascend.attention.sfa_v1 import _staged_fixed_layout
+
+        self.assertFalse(_staged_fixed_layout(5, 4, 4, 4, 1))
+
+
+class TestIndexerProductionCallSite(unittest.TestCase):
+    """The staged pre must run the production top-k (weights + q_c query),
+    not the historical key-projection-as-query shortcut."""
+
+    def _impl(self):
+        impl = SimpleNamespace(
+            fused_qkv_a_proj=lambda h: (torch.zeros(4, 12),),
+            q_a_layernorm=lambda t: t,
+            indexer_select_pre_process=lambda **kw: (
+                torch.zeros(4, 1, 8),
+                None,
+            ),
+            exec_kv=MagicMock(),
+            _q_proj_and_k_up_proj=lambda q: (
+                torch.zeros(4, 2, 4),
+                torch.zeros(4, 2, 2),
+            ),
+            rope_single=lambda q, cos, sin: q,
+            indexer_select_post_process=MagicMock(
+                return_value=torch.zeros(4, 1, 8, dtype=torch.int32)
+            ),
+            dsa_index_topk=2048,
+            q_lora_rank=6,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(block_size=128)
+            ),
+        )
+        return impl
+
+    def test_pre_compute_uses_production_topk(self):
+        import vllm_ascend.attention.sfa_v1 as sfa_mod
+
+        impl = self._impl()
+        hidden = torch.zeros(4, 16)
+        kv_cache = (
+            torch.zeros(2, 4, 1, 4),
+            torch.zeros(2, 4, 1, 2),
+            torch.zeros(2, 4, 1, 8),
+        )
+        indexer_block_table = torch.zeros((4, 10), dtype=torch.int64)
+
+        def fake_prepare(topk, boundary, *args, **kwargs):
+            # Pure stand-in: return shapes matching the dispatch contract.
+            return (
+                topk,
+                torch.zeros((4, 8), dtype=torch.int32),
+                torch.zeros((4, 8), dtype=torch.int32),
+                torch.zeros((4, 8), dtype=torch.int64),
+            )
+
+        with patch.object(
+            sfa_mod.torch_npu, "npu_scatter_nd_update_", MagicMock()
+        ), patch(
+            "vllm_ascend.distributed.kv_transfer.sparse_offload."
+            "prepare_sparse_indices.prepare_sparse_indices",
+            side_effect=fake_prepare,
+        ):
+            outputs = AscendSFAImpl._cross_layer_pre_compute(
+                impl,
+                hidden,
+                kv_cache[0],
+                kv_cache[1],
+                kv_cache[2],
+                torch.zeros(4, 2),
+                torch.zeros(4, 2),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                indexer_block_table,
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                indexer_block_table,
+                torch.zeros((4, 8), dtype=torch.int32),
+                torch.zeros((4, 8), dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros((4, 8), dtype=torch.int64),
+                SimpleNamespace(),
+            )
+        call = impl.indexer_select_post_process.call_args
+        self.assertEqual(call.kwargs["x"].data_ptr(), hidden.data_ptr())
+        # q_c is the layer-normed compressed query, NOT the key projection.
+        self.assertEqual(call.kwargs["q_c"].shape, (4, 6))
+        self.assertIsNone(call.kwargs["attn_metadata"])
+        self.assertIs(
+            call.kwargs["indexer_block_table_override"], indexer_block_table
+        )
+        self.assertEqual(call.kwargs["sparse_count"], 2048)
+        # Six bridge outputs came back from the pre-compute.
+        self.assertEqual(len(outputs), 6)
+
+    def test_dead_helper_fails_loudly(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        with self.assertRaises(NotImplementedError):
+            impl._indexer_topk_for_staged(
+                torch.zeros(1), torch.zeros(1), (), None, None,
+                None, None, None,
+            )
+
+    def test_impl_post_process_substitutes_override_table(self):
+        import vllm_ascend.attention.sfa_v1 as sfa_mod
+
+        impl = SimpleNamespace(
+            has_indexer=True,
+            wk_weights_proj=lambda x: (torch.zeros(4, 16),),
+            wq_b=lambda q: (torch.zeros(4, 64),),
+            n_head=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            is_rope_neox_style=True,
+            enable_sparse_li_c8=False,
+            use_torch_npu_lightning_indexer=False,
+            layer_name="l0",
+        )
+        override = torch.zeros((4, 10), dtype=torch.int64)
+        with patch.object(sfa_mod, "HAS_TRITON", False), patch.object(
+            sfa_mod.torch_npu,
+            "npu_rotary_mul",
+            lambda pe, cos, sin: pe,
+        ), patch.object(
+            sfa_mod, "record_attention_compute_start", lambda: None
+        ), patch.object(
+            sfa_mod.DeviceOperator,
+            "indexer_select_post_process",
+            return_value=torch.zeros(4, 1, 8, dtype=torch.int32),
+        ) as device_op:
+            AscendSFAImpl.indexer_select_post_process(
+                impl,
+                x=torch.zeros(4, 16),
+                q_c=torch.zeros(4, 6),
+                kv_cache=(torch.zeros(1), torch.zeros(1), torch.zeros(1)),
+                attn_metadata=None,
+                cos=torch.zeros(4, 4),
+                sin=torch.zeros(4, 4),
+                actual_seq_lengths_query=torch.zeros(4, dtype=torch.int32),
+                actual_seq_lengths_key=torch.zeros(4, dtype=torch.int32),
+                indexer_block_table_override=override,
+                sparse_count=2048,
+            )
+        device_op_kwargs = device_op.call_args
+        metadata = device_op_kwargs.args[6]
+        self.assertIs(metadata.indexer_block_table, override)
+        self.assertIs(metadata.block_table, override)
+        self.assertEqual(device_op_kwargs.kwargs["sparse_count"], 2048)
+
+
+class TestSealStagedEntries(unittest.TestCase):
+    """Executable seal rework: minimum island count + per-key completeness."""
+
+    def _key(self, capacity):
+        from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
+
+        return StagedSFAGraphKey.exact_q1(capacity)
+
+    def _entry(self, complete=True):
+        entry = SimpleNamespace(
+            aclgraph=object() if complete else None,
+            input_addresses=[1] if complete else None,
+        )
+        return entry
+
+    def test_extra_islands_tolerated(self):
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        keys = (self._key(1), self._key(2))
+        # Three islands (layers+1 = 3 minimum) plus one EXTRA island from a
+        # kv-cache-update split — tolerated, every island complete.
+        wrappers = {
+            SimpleNamespace(
+                concrete_aclgraph_entries={
+                    key: self._entry() for key in keys
+                }
+            )
+            for _ in range(4)
+        }
+        with patch(
+            "vllm_ascend.compilation.acl_graph._acl_graph_wrappers",
+            wrappers,
+        ):
+            count = ACLGraphWrapper.seal_staged_entries(keys, 3)
+        self.assertEqual(count, 8)
+
+    def test_legacy_entries_coexist(self):
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        keys = (self._key(1),)
+        legacy = SimpleNamespace(num_tokens=8)
+        wrappers = {
+            SimpleNamespace(
+                concrete_aclgraph_entries={
+                    keys[0]: self._entry(),
+                    legacy: self._entry(),
+                }
+            )
+        }
+        with patch(
+            "vllm_ascend.compilation.acl_graph._acl_graph_wrappers",
+            wrappers,
+        ):
+            # Legacy BatchDescriptor coexistence is no longer "unexpected".
+            self.assertEqual(
+                ACLGraphWrapper.seal_staged_entries(keys, 1), 1
+            )
+
+    def test_missing_key_still_fails(self):
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        keys = (self._key(1), self._key(2))
+        wrappers = {
+            SimpleNamespace(
+                concrete_aclgraph_entries={keys[0]: self._entry()}
+            )
+        }
+        with patch(
+            "vllm_ascend.compilation.acl_graph._acl_graph_wrappers",
+            wrappers,
+        ), self.assertRaisesRegex(RuntimeError, "incomplete"):
+            ACLGraphWrapper.seal_staged_entries(keys, 1)
+
+    def test_too_few_islands_fails(self):
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        keys = (self._key(1),)
+        wrappers = {
+            SimpleNamespace(
+                concrete_aclgraph_entries={keys[0]: self._entry()}
+            )
+        }
+        with patch(
+            "vllm_ascend.compilation.acl_graph._acl_graph_wrappers",
+            wrappers,
+        ), self.assertRaisesRegex(RuntimeError, "expected_at_least"):
+            ACLGraphWrapper.seal_staged_entries(keys, 2)
 
 
 if __name__ == "__main__":
