@@ -24,6 +24,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -707,7 +708,20 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         w2_bias = update_bias_compressed_tensors(layer.w2_weight.data, layer.w2_weight_scale.data, self.weight_strategy)
 
-        layer.w13_weight_scale.data = process_scale_compressed_tensors(layer.w13_weight_scale.data)
+        # The per-channel fused W4A8 GMM+SwiGLU V2 op consumes a squeezed
+        # w13 scale ([E,N]), while the unfused GMM1 fallback consumes the
+        # ordinary grouped-matmul scale layout ([E,1,N]), the same layout
+        # already preserved for w2 below. Keep loader and runtime selection
+        # in lockstep: the opt-out is a server-start configuration, so the
+        # scale layout must be selected before graph capture/model execution.
+        keep_w13_scale_unsqueezed = (
+            self.is_per_channel_weight
+            and envs.VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION
+        )
+        layer.w13_weight_scale.data = process_scale_compressed_tensors(
+            layer.w13_weight_scale.data,
+            squeeze=not keep_w13_scale_unsqueezed,
+        )
         # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
         layer.w2_weight_scale.data = process_scale_compressed_tensors(layer.w2_weight_scale.data, False)
 
@@ -747,7 +761,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         self.update_bias(layer, w13_bias, w2_bias)
 
-        if self.is_per_channel_weight:
+        # See the compressed-tensors path above: the unfused GMM1 fallback
+        # requires the unsqueezed [E,1,N] w13 scale contract.
+        if (
+            self.is_per_channel_weight
+            and not envs.VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION
+        ):
             layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
         layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
         layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)

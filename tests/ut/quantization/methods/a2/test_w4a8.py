@@ -311,6 +311,26 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertEqual(new_layer.w13_scale_bias.data.shape, (self.experts, 2 * self.input_size))
         self.assertEqual(per_channel_layer.w13_weight_scale.data.shape, (self.experts, 2 * self.input_size))
 
+    @patch("vllm_ascend.quantization.methods.w4a8.envs.VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION", True)
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
+    def test_modelslim_unfused_per_channel_keeps_w13_scale_unsqueezed(self, mock_maybe_trans_nz):
+        """The unfused GMM1 fallback requires the legacy [E, 1, N] scale."""
+        mock_maybe_trans_nz.side_effect = identity
+        self.quant_method.new_quant_version = True
+        self.quant_method.is_per_channel_weight = True
+        layer = self.build_layer(is_new_quant_version=True, is_per_channel_weight=True)
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        self.assertEqual(
+            layer.w13_weight_scale.data.shape,
+            (self.experts, 1, 2 * self.input_size),
+        )
+        self.assertEqual(
+            layer.w2_weight_scale.data.shape,
+            (self.experts, 1, self.output_size),
+        )
+
     def test_pack_to_int32_asserts_new_quant_packed_dim(self):
         self.quant_method.new_quant_version = True
         weight = torch.zeros((self.experts, self.output_size, 10), dtype=torch.int8)
@@ -359,6 +379,34 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.quant_method.process_weights_after_loading(per_channel_layer)
         self.assertEqual(per_channel_layer.w13_weight_scale.data.shape, (self.experts, 2 * self.input_size))
         self.assertEqual(per_channel_layer.w2_weight_scale.data.shape, (self.experts, 1, self.output_size))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.envs.VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION", True)
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
+    @patch("torch_npu.npu_format_cast")
+    @patch("torch_npu.npu_quantize")
+    @patch("torch.Tensor.npu", new=lambda self: self)
+    def test_compressed_unfused_per_channel_keeps_w13_scale_unsqueezed(
+        self, mock_npu_quantize, mock_npu_format_cast, mock_maybe_trans_nz
+    ):
+        """Compressed-tensors must use the same GMM1 scale contract."""
+        mock_npu_quantize.return_value = torch.Tensor()
+        mock_npu_format_cast.side_effect = identity
+        mock_maybe_trans_nz.side_effect = identity
+        self.quant_method.quant_method = COMPRESSED_TENSORS_METHOD
+        self.quant_method.weight_strategy = "channel"
+        self.quant_method.is_per_channel_weight = True
+        layer = self.build_layer(is_new_quant_version=False)
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        self.assertEqual(
+            layer.w13_weight_scale.data.shape,
+            (self.experts, 1, 2 * self.input_size),
+        )
+        self.assertEqual(
+            layer.w2_weight_scale.data.shape,
+            (self.experts, 1, self.output_size),
+        )
 
     @patch("vllm_ascend.quantization.methods.w4a8._EXTRA_CTX")
     @patch("vllm_ascend.quantization.methods.w4a8.select_experts")
