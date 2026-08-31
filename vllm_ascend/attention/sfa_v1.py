@@ -2047,6 +2047,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.fused_qkv_a_proj is not None
         assert self.q_a_layernorm is not None
 
+        # Overlap the weight fetch with the preceding compute inside the
+        # captured graph A. Provenance: fork sfa_v1.py:2694-2698.
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+            inputs=self.fused_qkv_a_proj.weight,
+            dependency=hidden_states,
+        )
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_no_split = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -2161,6 +2168,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
         attn_output = self._v_up_proj(attn_output)
+        # Overlap the o_proj weight fetch with the v_up_proj compute inside
+        # the captured graph B. Provenance: fork sfa_v1.py:2800-2806.
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+            inputs=self.o_proj.weight,
+            dependency=attn_output,
+            max_size=MAX_O_PROJ_PREFETCH_SIZE,
+            linear_layer=self.o_proj,
+        )
         output[...] = self.o_proj(attn_output)[0]
         return output
 
@@ -3982,14 +3998,37 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
             if self.dsa_shrink_latent != 3:
-                _cached = _resolve_sparse_cached_tokens_by_request(
-                    attn_metadata, attn_metadata.req_ids
-                )
-                _update_dsa_split_boundary_in_place(
-                    attn_metadata,
-                    _cached,
-                    _decode_window_save_window_size(),
-                )
+                _cached_split_boundary = attn_metadata.decode_split_boundary
+                if (
+                    _cached_split_boundary is not None
+                    and _cached_split_boundary.shape == attn_metadata.split_boundary.shape
+                    and _cached_split_boundary.device == attn_metadata.split_boundary.device
+                    and _cached_split_boundary.dtype == attn_metadata.split_boundary.dtype
+                ):
+                    # Step metadata, not layer data: the request set and
+                    # frontier resolution are identical for every SFA layer
+                    # in this step, so reuse the tensor cached by the first
+                    # SFA layer. Provenance: fork sfa_v1.py:3479-3496.
+                    attn_metadata.split_boundary = _cached_split_boundary
+                else:
+                    _cached = _resolve_sparse_cached_tokens_by_request(
+                        attn_metadata, attn_metadata.req_ids
+                    )
+                    _decode_window_size = _decode_window_save_window_size()
+                    if _cached is not None or _decode_window_size > 0:
+                        _update_dsa_split_boundary_in_place(
+                            attn_metadata,
+                            _cached,
+                            _decode_window_size,
+                        )
+                    else:
+                        # Cache the static boundary (no LMCache or decode
+                        # window component) so the remaining SFA layers in
+                        # this step skip the resolution entirely.
+                        # Provenance: fork sfa_v1.py:3510-3511.
+                        attn_metadata.decode_split_boundary = (
+                            attn_metadata.split_boundary
+                        )
             # Stage 3 is an isolation diagnostic by design: keep the
             # builder's prompt boundary, remap and run FA on uninitialized
             # scratch, but do NOT query/call LMCache. Crash => remap/FA;
