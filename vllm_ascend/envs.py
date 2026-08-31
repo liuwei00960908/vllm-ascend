@@ -98,8 +98,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_ffn_combine` can be used only for moe layer with W8A8, EP<=32, non-mtp, non-dynamic-eplb.
     # 2: MC2 might be replaced by `dispatch_gmm_combine_decode` operator.
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
-    # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # W4A8 per-channel MoE: 0 (default) keeps the fused
+    # grouped_matmul_swiglu_quant_v2 path; 1 routes per-channel W4A8 to the
+    # unfused npu_grouped_matmul + swiglu_quant + gmm2 chain. The fused path
+    # captures ~28 extra in-graph dependency waits per layer, which costs
+    # ~85us/layer at decode batch<=2 where ops are only a few us each; small-
+    # batch deployments can set this to recover the unfused latency.
+    "VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION", "0"))
+    ),
     # DSA KV-organization replay gates (replay Step 1 / A1). Semantics ported
     # from the internal fork (vllm-ascend-sparse@sparse, envs.py:126-154):
     # unbundle splits latent/indexer into separate specs; two_groups requires

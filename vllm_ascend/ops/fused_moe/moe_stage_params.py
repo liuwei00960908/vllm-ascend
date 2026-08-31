@@ -86,7 +86,13 @@ class MoEQuantParams:
 
     @property
     def use_w4a8_per_channel_gmm_swiglu(self) -> bool:
-        return self.quant_type == QuantType.W4A8 and self.is_per_channel_weight
+        from vllm_ascend import envs
+
+        return (
+            self.quant_type == QuantType.W4A8
+            and self.is_per_channel_weight
+            and not envs.VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION
+        )
 
     @property
     def dispatch_with_quant(self) -> bool:
