@@ -23,6 +23,7 @@ vllm_ascend.ops.fused_moe.fused_moe only.
 
 from __future__ import annotations
 
+from vllm_ascend import envs
 from vllm_ascend.ops.fused_moe.fused_moe import (
     _EXTRA_CTX,
     AllGatherCommImpl,
@@ -569,7 +570,11 @@ class AscendFusedMoE(FusedMoE):
             has_quantized_shared = hasattr(self._shared_experts.gate_up_proj, "weight_scale") and hasattr(
                 self._shared_experts.down_proj, "weight_scale"
             )
-            if has_quantized_shared and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
+            if (
+                has_quantized_shared
+                and self.quant_type in (QuantType.W8A8, QuantType.W4A8)
+                and not envs.VLLM_ASCEND_DISABLE_SHARED_EXPERT_QUANT_PIPELINE
+            ):
                 original_dtype = hidden_states.dtype
                 # Execute dynamic quant concurrently with MoE gate.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)

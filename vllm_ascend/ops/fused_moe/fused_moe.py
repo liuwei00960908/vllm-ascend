@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     MoERunner,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -736,7 +737,11 @@ else:
                 has_quantized_shared = hasattr(self._shared_experts.gate_up_proj, "weight_scale") and hasattr(
                     self._shared_experts.down_proj, "weight_scale"
                 )
-                if has_quantized_shared and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
+                if (
+                    has_quantized_shared
+                    and self.quant_type in (QuantType.W8A8, QuantType.W4A8)
+                    and not envs.VLLM_ASCEND_DISABLE_SHARED_EXPERT_QUANT_PIPELINE
+                ):
                     original_dtype = hidden_states.dtype
                     # Execute dynamic quant concurrently with MoE gate.
                     torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)

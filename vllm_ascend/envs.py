@@ -108,6 +108,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DISABLE_W4A8_GMM_SWIGLU_FUSION", "0"))
     ),
+    # Whether to bypass the explicit quantized shared-expert pipeline.
+    # 0 (default) keeps the v0.23 dynamic-quant / quant-matmul pipeline;
+    # 1 uses the existing shared-expert module linear path for A/B profiling.
+    "VLLM_ASCEND_DISABLE_SHARED_EXPERT_QUANT_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DISABLE_SHARED_EXPERT_QUANT_PIPELINE", "0"))
+    ),
     # DSA KV-organization replay gates (replay Step 1 / A1). Semantics ported
     # from the internal fork (vllm-ascend-sparse@sparse, envs.py:126-154):
     # unbundle splits latent/indexer into separate specs; two_groups requires
