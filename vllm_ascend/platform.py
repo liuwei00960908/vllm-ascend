@@ -343,7 +343,13 @@ class NPUPlatform(Platform):
             return
 
         kv_transfer_config = vllm_config.kv_transfer_config
-        if kv_transfer_config is None or kv_transfer_config.kv_role != "kv_producer":
+        # The dev-qzy deployment convention runs kv_both on both P and D
+        # (the P/D split lives in the LMCache config, not in kv_role), so
+        # accept any producing role (kv_producer | kv_both) instead of the
+        # exact kv_producer match. The fork installed layer_sharding with
+        # no role validation at all; this keeps the fail-fast value for
+        # pure-consumer configs.
+        if kv_transfer_config is None or not kv_transfer_config.is_kv_producer:
             raise ValueError("additional_config.layer_sharding can only be enabled in PD-disaggregated's P node.")
 
     @classmethod
@@ -730,7 +736,11 @@ class NPUPlatform(Platform):
                 )
                 ascend_config.recompute_scheduler_enable = False
                 vllm_config.additional_config["recompute_scheduler_enable"] = False
-            elif kv_transfer_config is None or kv_role != "kv_consumer":
+            elif kv_transfer_config is None or not kv_transfer_config.is_kv_consumer:
+                # The dev-qzy convention runs kv_both on both sides, so any
+                # consuming role (kv_consumer | kv_both) installs the
+                # recompute scheduler. The fork installed it with no role
+                # validation at all.
                 raise ValueError(
                     "recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes "
                     f"(kv_role='kv_consumer', but got kv_role={kv_role!r}), and is not supported in PD-mixed mode."

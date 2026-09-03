@@ -562,20 +562,27 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.core.recompute_scheduler.RecomputeSchedulerConfig.initialize_from_config")
-    def test_check_and_update_config_recompute_scheduler_rejects_pd_mixed_kv_both(
+    def test_check_and_update_config_recompute_scheduler_accepts_kv_both(
         self, mock_init_recompute, mock_init_ascend, mock_soc_version, mock_auto_detect
     ):
         mock_ascend_config = TestNPUPlatform.mock_vllm_ascend_config()
         mock_ascend_config.recompute_scheduler_enable = True
+        mock_ascend_config.profiling_chunk_config.enabled = False
         mock_init_ascend.return_value = mock_ascend_config
 
+        recompute_scheduler_config = MagicMock()
+        mock_init_recompute.return_value = recompute_scheduler_config
+
         vllm_config = TestNPUPlatform.mock_vllm_config()
-        vllm_config.kv_transfer_config = MagicMock(kv_role="kv_both", engine_id="engine0")
+        vllm_config.kv_transfer_config = MagicMock(
+            is_kv_consumer=True, kv_role="kv_both", engine_id="engine0"
+        )
         vllm_config.parallel_config.decode_context_parallel_size = 1
         vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+        vllm_config.cache_config.block_size = 1
         vllm_config.scheduler_config = MagicMock()
-        mock_init_recompute.return_value = MagicMock()
 
         from vllm_ascend import platform
 
@@ -583,13 +590,13 @@ class TestNPUPlatform(TestBase):
         self.platform = platform.NPUPlatform()
 
         with (
-            pytest.raises(ValueError, match=r"recompute_scheduler_enable.*PD-disaggregated.*PD-mixed"),
             patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
             patch.object(platform, "check_kv_extra_config"),
         ):
             self.platform.check_and_update_config(vllm_config)
 
-        mock_init_recompute.assert_not_called()
+        mock_init_recompute.assert_called_once_with(vllm_config)
+        self.assertIs(vllm_config.scheduler_config, recompute_scheduler_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
@@ -786,13 +793,12 @@ class TestNPUPlatform(TestBase):
         with pytest.raises(ValueError, match="layer_sharding can only be enabled in PD-disaggregated's P node"):
             self.platform._validate_layer_sharding_config(vllm_config)
 
-    def test_validate_layer_sharding_config_rejects_kv_both(self):
+    def test_validate_layer_sharding_config_accepts_kv_both(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.additional_config = {"layer_sharding": ["q_b_proj", "o_proj"]}
         vllm_config.kv_transfer_config = MagicMock(is_kv_producer=True, kv_role="kv_both")
 
-        with pytest.raises(ValueError, match="layer_sharding can only be enabled in PD-disaggregated's P node"):
-            self.platform._validate_layer_sharding_config(vllm_config)
+        self.platform._validate_layer_sharding_config(vllm_config)
 
     def test_validate_parallel_config_rejects_pcp_plus_dp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
