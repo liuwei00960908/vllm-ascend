@@ -204,8 +204,9 @@ def staged_sfa_graph_configuration_reasons(
     One predicate source for platform budgeting, the runner routing gate,
     and the attention implementation, so merely exporting the flag never
     engages the staged lifecycle on an unsupported config. Provenance: fork
-    utils.py:521-589 (baseline-applicable subset; DP is rejected for any
-    size, not only external launcher, matching the routing fail-closed).
+    utils.py:521-589 (baseline-applicable subset; DP beyond the
+    external-launcher backend is allowed and coordinated through the DP
+    route sync in the model runner).
     """
     from vllm.config import CUDAGraphMode
 
@@ -250,7 +251,21 @@ def staged_sfa_graph_configuration_reasons(
     if getattr(vllm_config, "lora_config", None) is not None:
         reasons.append(StagedSFAConfigReason.LORA)
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
-    if isinstance(data_parallel_size, int) and data_parallel_size > 1:
+    # Internal/external-LB DP coordinates the staged verdict through the
+    # route row of the DP metadata all-reduce (every rank converges on the
+    # strongest downgrade), so only the external-launcher backend — which
+    # exposes a DP-global rank/world the route chain cannot qualify — is
+    # rejected. Provenance: fork utils.py:562-575.
+    if (
+        isinstance(data_parallel_size, int)
+        and data_parallel_size != 1
+        and getattr(
+            parallel_config,
+            "distributed_executor_backend",
+            None,
+        )
+        == "external_launcher"
+    ):
         reasons.append(StagedSFAConfigReason.DATA_PARALLEL)
     pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
     if isinstance(pipeline_parallel_size, int) and pipeline_parallel_size != 1:
@@ -286,7 +301,9 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.CONNECTOR_MISSING: "a kv transfer connector must be configured",
     StagedSFAConfigReason.SPECULATIVE_DECODE: "only MTP speculative decoding is supported",
     StagedSFAConfigReason.LORA: "LoRA is not supported by staged graphs",
-    StagedSFAConfigReason.DATA_PARALLEL: "data_parallel_size must be 1",
+    StagedSFAConfigReason.DATA_PARALLEL: (
+        "external-launcher data parallel staged graphs are not implemented"
+    ),
     StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline_parallel_size must be 1",
     StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallelism is not supported",
 }

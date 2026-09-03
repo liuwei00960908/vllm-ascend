@@ -102,14 +102,32 @@ class TestLocalRouteGates(unittest.TestCase):
         decision = self._route(runner)
         self.assertEqual(decision.reason, StagedSFARouteReason.RUNTIME_MODE)
 
-    def test_dp_greater_than_one_fails_closed(self):
+    def test_dp_greater_than_one_no_longer_fails_closed_locally(self):
+        # DP divergence is resolved by the route row of the DP metadata
+        # all-reduce, not by a local verdict: with metadata reporting an
+        # eligible sparse route, a dp=2 rank still authorizes STAGED and
+        # leaves the downgrade to the collective. Provenance: fork
+        # model_runner_v1.py:2980+ (no local DP gate).
+        model_runner_v1 = _load_model_runner()
         runner = _route_runner(
             parallel_config=SimpleNamespace(data_parallel_size=2)
         )
-        decision = self._route(runner)
-        self.assertEqual(
-            decision.reason, StagedSFARouteReason.RUNTIME_PARALLELISM
-        )
+        with (
+            patch.object(
+                model_runner_v1, "enable_sp", return_value=False
+            ),
+            patch.object(
+                model_runner_v1,
+                "staged_sfa_metadata_sparse_route",
+                return_value=(
+                    StagedSFARouteReason.ELIGIBLE,
+                    (0, 0, 0, 0),
+                    None,
+                ),
+            ),
+        ):
+            decision = self._route(runner)
+        self.assertEqual(decision.action, StagedSFARouteAction.STAGED)
 
     def test_sequence_parallelism_fails_closed(self):
         model_runner_v1 = _load_model_runner()
@@ -948,6 +966,150 @@ class TestSealStagedEntries(unittest.TestCase):
             wrappers,
         ), self.assertRaisesRegex(RuntimeError, "expected_at_least"):
             ACLGraphWrapper.seal_staged_entries(keys, 2)
+
+
+class TestDPRouteSync(unittest.TestCase):
+    """The route row of the DP metadata all-reduce converges on the
+    strongest downgrade across ranks.
+
+    Provenance: fork model_runner_v1.py:2435-2470 (row layout),
+    :2587 (verdict landing), :3099-3108 (live-route merge).
+    """
+
+    def _runner(self, dp_rank=0):
+        model_runner_v1 = _load_model_runner()
+        runner = model_runner_v1.NPUModelRunner.__new__(
+            model_runner_v1.NPUModelRunner
+        )
+        runner.dp_size = 2
+        runner.dp_rank = dp_rank
+        runner.vllm_config = SimpleNamespace()
+        runner.ascend_config = SimpleNamespace(dp_allreduce_on_npu=False)
+        return runner
+
+    def _sync(self, runner, action, peer_action):
+        from vllm.config import CUDAGraphMode
+
+        model_runner_v1 = _load_model_runner()
+        peer_index = list(StagedSFARouteAction).index(peer_action)
+
+        def fake_all_reduce(tensor, group=None):
+            # Rank 1 reports the peer verdict before the max-reduce.
+            if tensor.shape[0] > 2:
+                tensor[2][1] = peer_index
+            for row in tensor:
+                row.fill_(int(row.max().item()))
+
+        cpu_group = SimpleNamespace()
+        with (
+            patch.object(
+                model_runner_v1,
+                "should_skip_allreduce_across_dp_group",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_v1, "get_dp_group", return_value=cpu_group
+            ),
+            patch.object(
+                model_runner_v1.dist, "all_reduce", side_effect=fake_all_reduce
+            ),
+        ):
+            return runner._sync_metadata_across_dp(
+                num_tokens=4,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                staged_sfa_route_action=action,
+            )
+
+    def test_sync_downgrades_to_strongest(self):
+        runner = self._runner(dp_rank=0)
+        _, _, _, synced = self._sync(
+            runner,
+            StagedSFARouteAction.STAGED,
+            peer_action=StagedSFARouteAction.SAFE_NATIVE,
+        )
+        self.assertIs(synced, StagedSFARouteAction.SAFE_NATIVE)
+
+    def test_sync_keeps_staged_when_all_ranks_agree(self):
+        runner = self._runner(dp_rank=0)
+        _, _, _, synced = self._sync(
+            runner,
+            StagedSFARouteAction.STAGED,
+            peer_action=StagedSFARouteAction.STAGED,
+        )
+        self.assertIs(synced, StagedSFARouteAction.STAGED)
+
+    def test_sync_without_route_row_returns_none(self):
+        from vllm.config import CUDAGraphMode
+
+        model_runner_v1 = _load_model_runner()
+        runner = self._runner(dp_rank=0)
+
+        def fake_all_reduce(tensor, group=None):
+            for row in tensor:
+                row.fill_(int(row.max().item()))
+
+        with (
+            patch.object(
+                model_runner_v1,
+                "should_skip_allreduce_across_dp_group",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_v1, "get_dp_group", SimpleNamespace()
+            ),
+            patch.object(
+                model_runner_v1.dist, "all_reduce", side_effect=fake_all_reduce
+            ),
+        ):
+            result = runner._sync_metadata_across_dp(
+                num_tokens=4,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            )
+        self.assertIsNone(result[3])
+
+    def test_live_route_honors_dp_downgrade(self):
+        from vllm_ascend.utils import StagedSFARouteDecision
+
+        runner = self._runner(dp_rank=0)
+        local = StagedSFARouteDecision(
+            StagedSFARouteAction.STAGED,
+            StagedSFARouteReason.ELIGIBLE,
+            frontiers=(0,),
+        )
+        decision = runner._staged_sfa_live_route(
+            local_route=local,
+            dp_route_action=StagedSFARouteAction.SAFE_NATIVE,
+            cudagraph_mode=None,
+            batch_descriptor=SimpleNamespace(),
+            num_tokens_unpadded=4,
+            num_tokens_padded=4,
+            num_reqs=4,
+            should_ubatch=False,
+        )
+        self.assertIs(decision.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(
+            decision.reason, StagedSFARouteReason.RUNTIME_PARALLELISM
+        )
+
+    def test_live_route_identity_when_actions_match(self):
+        from vllm_ascend.utils import StagedSFARouteDecision
+
+        runner = self._runner(dp_rank=0)
+        local = StagedSFARouteDecision(
+            StagedSFARouteAction.SAFE_NATIVE,
+            StagedSFARouteReason.NOT_DECODE,
+        )
+        decision = runner._staged_sfa_live_route(
+            local_route=local,
+            dp_route_action=StagedSFARouteAction.SAFE_NATIVE,
+            cudagraph_mode=None,
+            batch_descriptor=SimpleNamespace(),
+            num_tokens_unpadded=4,
+            num_tokens_padded=4,
+            num_reqs=4,
+            should_ubatch=False,
+        )
+        self.assertIs(decision, local)
 
 
 if __name__ == "__main__":

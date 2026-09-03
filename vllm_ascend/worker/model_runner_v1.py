@@ -151,6 +151,7 @@ from vllm_ascend.spec_decode.utils import (
 )
 from vllm_ascend.utils import (
     AscendDeviceType,
+    StagedSFARouteAction,
     calc_split_factor,
     check_gdn_layer,
     embedding_tp_enable,
@@ -208,6 +209,12 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+# Packing order for the staged-SFA row of the DP metadata all-reduce.
+# Enum order (STAGED < SAFE_NATIVE < RECOMPUTE < FATAL) is severity
+# order, so max() over the reduced indices is the strongest downgrade.
+# Provenance: fork model_runner_v1.py:274, fork utils.py:69-76.
+_STAGED_SFA_ROUTE_ACTIONS = tuple(StagedSFARouteAction)
 
 
 @dataclass
@@ -792,7 +799,10 @@ class NPUModelRunner(GPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
-    ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
+        staged_sfa_route_action: StagedSFARouteAction | None = None,
+    ) -> tuple[
+        int, torch.Tensor | None, CUDAGraphMode, StagedSFARouteAction | None
+    ]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
         # include them in the all_reduce operation, and more over, we CANNOT skip it
@@ -800,13 +810,18 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
-            return num_tokens, None, cudagraph_mode
+            return num_tokens, None, cudagraph_mode, staged_sfa_route_action
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
-            return num_tokens, num_tokens_after_padding, cudagraph_mode
+            return (
+                num_tokens,
+                num_tokens_after_padding,
+                cudagraph_mode,
+                staged_sfa_route_action,
+            )
 
-        # On certain devices, CPU-side all_reduce may return dirty data. 
+        # On certain devices, CPU-side all_reduce may return dirty data.
         # When dp_allreduce_on_npu is True, route DP metadata
         # synchronization through the NPU device group to avoid data corruption.
         device_str, group = (
@@ -814,9 +829,20 @@ class NPUModelRunner(GPUModelRunner):
             if self.ascend_config.dp_allreduce_on_npu
             else ("cpu", get_dp_group().cpu_group)
         )
-        packed_tensor = torch.zeros(2, self.dp_size, device=device_str, dtype=torch.int32)
+        rows = 3 if staged_sfa_route_action is not None else 2
+        packed_tensor = torch.zeros(
+            rows, self.dp_size, device=device_str, dtype=torch.int32
+        )
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        if staged_sfa_route_action is not None:
+            # Pack the local staged-SFA verdict; the reduced max index is
+            # the strongest downgrade across DP ranks. Provenance: fork
+            # model_runner_v1.py:2435-2470 (row layout replayed onto the
+            # v0.23 packed-tensor form).
+            packed_tensor[2][self.dp_rank] = _STAGED_SFA_ROUTE_ACTIONS.index(
+                staged_sfa_route_action
+            )
         dist.all_reduce(packed_tensor, group=group)
         if device_str == "npu":
             packed_tensor = packed_tensor.cpu()
@@ -825,6 +851,11 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+        synced_staged_sfa_route_action = (
+            _STAGED_SFA_ROUTE_ACTIONS[int(packed_tensor[2, :].max().item())]
+            if staged_sfa_route_action is not None
+            else None
+        )
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
@@ -834,7 +865,12 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
-        return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
+        return (
+            max_tokens_across_dp,
+            num_tokens_after_padding,
+            synced_cudagraph_mode,
+            synced_staged_sfa_route_action,
+        )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -2266,7 +2302,15 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    staged_sfa_route_action=(
+                        staged_sfa_local_route.action
+                        if staged_sfa_local_route is not None
+                        else None
+                    ),
                 )
+                # DP-coordinated verdict landed by the dispatch (fork
+                # model_runner_v1.py:1556).
+                dp_route_action = self._staged_sfa_dp_route_action
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2289,6 +2333,7 @@ class NPUModelRunner(GPUModelRunner):
                 if staged_sfa_local_route is not None:
                     staged_sfa_route = self._staged_sfa_live_route(
                         local_route=staged_sfa_local_route,
+                        dp_route_action=dp_route_action,
                         cudagraph_mode=cudagraph_mode,
                         batch_descriptor=batch_desc,
                         num_tokens_unpadded=num_tokens_unpadded,
@@ -3147,6 +3192,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        staged_sfa_route_action: StagedSFARouteAction | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         # A one-token chunk can still be a prefill, notably at a PD handoff.
@@ -3195,14 +3241,26 @@ class NPUModelRunner(GPUModelRunner):
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
+            (
+                _,
+                num_tokens_across_dp,
+                synced_cudagraph_mode,
+                synced_route_action,
+            ) = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
                 allow_dp_padding=((cudagraph_mode != CUDAGraphMode.NONE)
                                   or enable_sp(self.vllm_config)
                                   or oproj_tp_enable()
                                   or embedding_tp_enable()),
+                staged_sfa_route_action=staged_sfa_route_action,
             )
+            if staged_sfa_route_action is not None:
+                # Strongest staged-SFA verdict across DP ranks: any rank
+                # that must fall back takes every rank with it, so the DP
+                # collectives never straddle a staged/native split step.
+                # Provenance: fork model_runner_v1.py:2587.
+                self._staged_sfa_dp_route_action = synced_route_action
 
             # Extract DP padding if there is any
             if num_tokens_across_dp is not None:
@@ -5856,11 +5914,12 @@ class NPUModelRunner(GPUModelRunner):
         # Provenance: fork model_runner_v1.py:3001-3002.
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
-        # P9 production shape is single-DP: connector metadata and frontiers
-        # are rank-local, so ranks could disagree on staged admission. Fail
-        # closed instead of coordinating.
-        if self.parallel_config.data_parallel_size > 1:
-            return native(StagedSFARouteReason.RUNTIME_PARALLELISM)
+        # DP divergence is resolved by the route row of the DP metadata
+        # all-reduce (_sync_metadata_across_dp), not by a local fail-closed
+        # verdict: every rank converges on the strongest downgrade before
+        # any graph key is bound. Provenance: fork model_runner_v1.py:2980+
+        # (no local DP gate; the external_launcher backend is rejected at
+        # config time instead).
         # Sequence parallelism / FlashComm sharding changes what Graph A must
         # compute (the staged pre ignores need_gather_q_kv); fail closed
         # until the gather is ported into the captured region.
@@ -5955,11 +6014,13 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded: int,
         num_reqs: int,
         should_ubatch: bool,
+        dp_route_action=None,
     ):
-        """Bind a local route to one captured graph capacity.
+        """Bind a DP-agreed local route to one captured graph capacity.
 
         Provenance: fork model_runner_v1.py:3086-3160 (DP coordination
-        branch trimmed; single-DP is the P9 production shape).
+        branch restored for external-DP staged deployments; the
+        external_launcher backend stays rejected at config time).
         """
         from vllm.config import CUDAGraphMode
         from vllm_ascend.utils import (
@@ -5969,6 +6030,19 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
 
+        if (
+            dp_route_action is not None
+            and dp_route_action != StagedSFARouteAction.STAGED
+        ):
+            # The DP collective already agreed on a downgrade; honor it
+            # before any local binding. Provenance: fork
+            # model_runner_v1.py:3099-3108.
+            if local_route.action == dp_route_action:
+                return local_route
+            return StagedSFARouteDecision(
+                dp_route_action,
+                StagedSFARouteReason.RUNTIME_PARALLELISM,
+            )
         if local_route.action != StagedSFARouteAction.STAGED:
             return local_route
         if cudagraph_mode != CUDAGraphMode.PIECEWISE:
