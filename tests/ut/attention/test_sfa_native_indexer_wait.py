@@ -77,12 +77,16 @@ class TestNativeIndexerWait(unittest.TestCase):
         wait.assert_not_called()
 
     def test_forward_wires_the_wait_before_producer_event(self):
-        # The forward() body must route through the helper (wiring check:
-        # the call sits in the native path, before the producer event).
+        # The forward() body must route through the helper BEFORE the
+        # producer-event record (fork order: wait -> producer event ->
+        # indexer scatter), so a PD cold-start decode never races the
+        # top-k selection against the in-flight prompt rows.
         import inspect
 
         source = inspect.getsource(AscendSFAImpl.forward)
-        self.assertIn("_dsa_maybe_wait_indexer_rows", source)
+        wait_pos = source.index("_dsa_maybe_wait_indexer_rows")
+        event_pos = source.index("reshape_cache_event = torch.npu.Event()")
+        self.assertLess(wait_pos, event_pos)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,8 @@ class TestLocalRouteGates(unittest.TestCase):
         # eligible sparse route, a dp=2 rank still authorizes STAGED and
         # leaves the downgrade to the collective. Provenance: fork
         # model_runner_v1.py:2980+ (no local DP gate).
+        from vllm_ascend.attention import utils as attn_utils
+
         model_runner_v1 = _load_model_runner()
         runner = _route_runner(
             parallel_config=SimpleNamespace(data_parallel_size=2)
@@ -116,8 +118,11 @@ class TestLocalRouteGates(unittest.TestCase):
             patch.object(
                 model_runner_v1, "enable_sp", return_value=False
             ),
+            # _staged_sfa_local_route imports the helper from its source
+            # module at call time, so the patch target is the source
+            # module, not model_runner_v1.
             patch.object(
-                model_runner_v1,
+                attn_utils,
                 "staged_sfa_metadata_sparse_route",
                 return_value=(
                     StagedSFARouteReason.ELIGIBLE,
@@ -553,6 +558,21 @@ class TestStagedConfigPredicate(unittest.TestCase):
             StagedSFAConfigReason.LORA,
             reasons(self._vllm_config(lora_config=object())),
         )
+        # Plain DP2 coordinates the staged verdict through the DP route
+        # sync, so it stays allowed; only the external-launcher backend
+        # (a DP-global rank/world the route chain cannot qualify) is
+        # rejected. Provenance: fork utils.py:562-575.
+        plain_dp2 = reasons(
+            self._vllm_config(
+                parallel_config=SimpleNamespace(
+                    data_parallel_size=2,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                    decode_context_parallel_size=1,
+                )
+            )
+        )
+        self.assertNotIn(StagedSFAConfigReason.DATA_PARALLEL, plain_dp2)
         self.assertIn(
             StagedSFAConfigReason.DATA_PARALLEL,
             reasons(
@@ -562,6 +582,7 @@ class TestStagedConfigPredicate(unittest.TestCase):
                         pipeline_parallel_size=1,
                         prefill_context_parallel_size=1,
                         decode_context_parallel_size=1,
+                        distributed_executor_backend="external_launcher",
                     )
                 )
             ),
@@ -970,10 +991,12 @@ class TestSealStagedEntries(unittest.TestCase):
 
 class TestDPRouteSync(unittest.TestCase):
     """The route row of the DP metadata all-reduce converges on the
-    strongest downgrade across ranks.
+    strongest downgrade across ranks, landed on the runner state.
 
-    Provenance: fork model_runner_v1.py:2435-2470 (row layout),
-    :2587 (verdict landing), :3099-3108 (live-route merge).
+    The return ABI stays the v0.23 3-tuple; the synced verdict is read
+    from _staged_sfa_dp_route_action. Provenance: fork
+    model_runner_v1.py:2435-2470 (row layout), :2587 (verdict landing),
+    :3099-3108 (live-route merge).
     """
 
     def _runner(self, dp_rank=0):
@@ -985,22 +1008,26 @@ class TestDPRouteSync(unittest.TestCase):
         runner.dp_rank = dp_rank
         runner.vllm_config = SimpleNamespace()
         runner.ascend_config = SimpleNamespace(dp_allreduce_on_npu=False)
+        runner._staged_sfa_dp_route_action = None
         return runner
 
     def _sync(self, runner, action, peer_action):
         from vllm.config import CUDAGraphMode
 
         model_runner_v1 = _load_model_runner()
-        peer_index = list(StagedSFARouteAction).index(peer_action)
+        peer_route_index = list(StagedSFARouteAction).index(peer_action)
 
         def fake_all_reduce(tensor, group=None):
-            # Rank 1 reports the peer verdict before the max-reduce.
+            # Emulate a SUM all-reduce over the two-rank group: this rank
+            # already wrote its column; rank 1 contributes its values into
+            # the other column. No row-level collapsing — the production
+            # unpack keeps the per-row max/min semantics under test.
+            tensor[0][1] += 4
+            tensor[1][1] += int(CUDAGraphMode.PIECEWISE.value)
             if tensor.shape[0] > 2:
-                tensor[2][1] = peer_index
-            for row in tensor:
-                row.fill_(int(row.max().item()))
+                tensor[2][1] += peer_route_index
 
-        cpu_group = SimpleNamespace()
+        cpu_group = SimpleNamespace(cpu_group=object())
         with (
             patch.object(
                 model_runner_v1,
@@ -1014,39 +1041,43 @@ class TestDPRouteSync(unittest.TestCase):
                 model_runner_v1.dist, "all_reduce", side_effect=fake_all_reduce
             ),
         ):
-            return runner._sync_metadata_across_dp(
+            result = runner._sync_metadata_across_dp(
                 num_tokens=4,
                 cudagraph_mode=CUDAGraphMode.PIECEWISE,
                 staged_sfa_route_action=action,
             )
+        # The return ABI is the v0.23 3-tuple (spec-decode proposers
+        # unpack it positionally).
+        self.assertEqual(len(result), 3)
+        return result, runner._staged_sfa_dp_route_action
 
     def test_sync_downgrades_to_strongest(self):
         runner = self._runner(dp_rank=0)
-        _, _, _, synced = self._sync(
+        _, landed = self._sync(
             runner,
             StagedSFARouteAction.STAGED,
             peer_action=StagedSFARouteAction.SAFE_NATIVE,
         )
-        self.assertIs(synced, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertIs(landed, StagedSFARouteAction.SAFE_NATIVE)
 
     def test_sync_keeps_staged_when_all_ranks_agree(self):
         runner = self._runner(dp_rank=0)
-        _, _, _, synced = self._sync(
+        _, landed = self._sync(
             runner,
             StagedSFARouteAction.STAGED,
             peer_action=StagedSFARouteAction.STAGED,
         )
-        self.assertIs(synced, StagedSFARouteAction.STAGED)
+        self.assertIs(landed, StagedSFARouteAction.STAGED)
 
-    def test_sync_without_route_row_returns_none(self):
+    def test_sync_without_route_row_leaves_state_alone(self):
         from vllm.config import CUDAGraphMode
 
         model_runner_v1 = _load_model_runner()
         runner = self._runner(dp_rank=0)
 
         def fake_all_reduce(tensor, group=None):
-            for row in tensor:
-                row.fill_(int(row.max().item()))
+            tensor[0][1] += 4
+            tensor[1][1] += int(CUDAGraphMode.PIECEWISE.value)
 
         with (
             patch.object(
@@ -1055,7 +1086,9 @@ class TestDPRouteSync(unittest.TestCase):
                 return_value=False,
             ),
             patch.object(
-                model_runner_v1, "get_dp_group", SimpleNamespace()
+                model_runner_v1,
+                "get_dp_group",
+                return_value=SimpleNamespace(cpu_group=object()),
             ),
             patch.object(
                 model_runner_v1.dist, "all_reduce", side_effect=fake_all_reduce
@@ -1065,7 +1098,8 @@ class TestDPRouteSync(unittest.TestCase):
                 num_tokens=4,
                 cudagraph_mode=CUDAGraphMode.PIECEWISE,
             )
-        self.assertIsNone(result[3])
+        self.assertEqual(len(result), 3)
+        self.assertIsNone(runner._staged_sfa_dp_route_action)
 
     def test_live_route_honors_dp_downgrade(self):
         from vllm_ascend.utils import StagedSFARouteDecision

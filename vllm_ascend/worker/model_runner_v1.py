@@ -800,9 +800,11 @@ class NPUModelRunner(GPUModelRunner):
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
         staged_sfa_route_action: StagedSFARouteAction | None = None,
-    ) -> tuple[
-        int, torch.Tensor | None, CUDAGraphMode, StagedSFARouteAction | None
-    ]:
+    ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
+        # The synced staged-SFA verdict lands on
+        # self._staged_sfa_dp_route_action as a side effect; the return
+        # ABI stays the v0.23 3-tuple so the route-less spec-decode
+        # proposers keep their unpacking contract untouched.
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
         # include them in the all_reduce operation, and more over, we CANNOT skip it
@@ -810,16 +812,15 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
-            return num_tokens, None, cudagraph_mode, staged_sfa_route_action
+            if staged_sfa_route_action is not None:
+                self._staged_sfa_dp_route_action = staged_sfa_route_action
+            return num_tokens, None, cudagraph_mode
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
-            return (
-                num_tokens,
-                num_tokens_after_padding,
-                cudagraph_mode,
-                staged_sfa_route_action,
-            )
+            if staged_sfa_route_action is not None:
+                self._staged_sfa_dp_route_action = staged_sfa_route_action
+            return num_tokens, num_tokens_after_padding, cudagraph_mode
 
         # On certain devices, CPU-side all_reduce may return dirty data.
         # When dp_allreduce_on_npu is True, route DP metadata
@@ -851,11 +852,12 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
-        synced_staged_sfa_route_action = (
-            _STAGED_SFA_ROUTE_ACTIONS[int(packed_tensor[2, :].max().item())]
-            if staged_sfa_route_action is not None
-            else None
-        )
+        if staged_sfa_route_action is not None:
+            # Land the strongest verdict on the runner state. Provenance:
+            # fork model_runner_v1.py:2587.
+            self._staged_sfa_dp_route_action = _STAGED_SFA_ROUTE_ACTIONS[
+                int(packed_tensor[2, :].max().item())
+            ]
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
@@ -865,12 +867,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
-        return (
-            max_tokens_across_dp,
-            num_tokens_after_padding,
-            synced_cudagraph_mode,
-            synced_staged_sfa_route_action,
-        )
+        return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -3245,7 +3242,6 @@ class NPUModelRunner(GPUModelRunner):
                 _,
                 num_tokens_across_dp,
                 synced_cudagraph_mode,
-                synced_route_action,
             ) = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
@@ -3255,12 +3251,11 @@ class NPUModelRunner(GPUModelRunner):
                                   or embedding_tp_enable()),
                 staged_sfa_route_action=staged_sfa_route_action,
             )
-            if staged_sfa_route_action is not None:
-                # Strongest staged-SFA verdict across DP ranks: any rank
-                # that must fall back takes every rank with it, so the DP
-                # collectives never straddle a staged/native split step.
-                # Provenance: fork model_runner_v1.py:2587.
-                self._staged_sfa_dp_route_action = synced_route_action
+            # The strongest staged-SFA verdict across DP ranks landed on
+            # _staged_sfa_dp_route_action inside the sync: any rank that
+            # must fall back takes every rank with it, so the DP
+            # collectives never straddle a staged/native split step.
+            # Provenance: fork model_runner_v1.py:2587.
 
             # Extract DP padding if there is any
             if num_tokens_across_dp is not None:
