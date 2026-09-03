@@ -591,8 +591,9 @@ class NPUModelRunner(GPUModelRunner):
         # returns token capacities; request-count env entries are multiplied
         # by the query width there). An explicitly requested but unsupported
         # config logs its typed reasons instead of crashing startup capture.
-        # Single-DP is the P9 production shape, so _staged_sfa_dp_route_action
-        # stays None. Provenance: fork model_runner_v1.py:1709-1714/:4970.
+        # Under DP the synced verdict lands on _staged_sfa_dp_route_action
+        # inside _sync_metadata_across_dp each step. Provenance: fork
+        # model_runner_v1.py:1709-1714/:4970.
         from vllm_ascend.utils import (
             staged_sfa_graph_capture_sizes,
             staged_sfa_graph_configuration_errors,
@@ -819,6 +820,11 @@ class NPUModelRunner(GPUModelRunner):
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             if staged_sfa_route_action is not None:
+                # Skipped-coordination shapes keep their local verdict: those
+                # DP groups perform no coupled collectives, so divergent
+                # per-rank routes cannot straddle a shared step (fork
+                # _sync_batch_sizes_across_dp skip path keeps the verdict
+                # unchanged the same way).
                 self._staged_sfa_dp_route_action = staged_sfa_route_action
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
