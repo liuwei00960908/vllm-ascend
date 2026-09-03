@@ -2742,6 +2742,30 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._dsa_idx_cache_t = _idx_t
         return (kv_cache[0], kv_cache[1], _idx_t)
 
+    def _dsa_maybe_wait_indexer_rows(
+        self,
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...] | None,
+    ) -> None:
+        """Wait for remote indexer rows before top-k selection (PD decode).
+
+        A cold shared-cache decode needs prompt index rows before top-k
+        selection. The group-1 wait is a no-op when resident and does not
+        advance the group-0 latent-layer cursor. Without it, the native
+        path can run top-k while the prompt indexer rows are still in
+        flight from the peer (PD cold start), reading uninitialized rows.
+        Provenance: fork sfa_v1.py:3416-3421.
+        """
+        if (
+            kv_cache is not None
+            and self.dsa_unbundle
+            and self.has_indexer
+            and _dsa_index_lmcache_enabled()
+        ):
+            wait_for_kv_layer_from_connector(
+                _dsa_indexer_layer_name(layer_name)
+            )
+
     def _maybe_save_unbundled_kv_cache(
         self,
         layer_name: str,
@@ -3898,6 +3922,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.has_indexer:
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
+
+        self._dsa_maybe_wait_indexer_rows(layer_name, kv_cache)
 
         if kv_cache is not None and self.is_kv_producer:
             attn_metadata.reshape_cache_event = torch.npu.Event()
