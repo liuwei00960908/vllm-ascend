@@ -725,7 +725,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 num_decode_rows,
                 len(plens),
                 self.decode_threshold,
-                bool(np.all(computed >= plens)),
+                # computed includes padded request rows while plens only
+                # describes active requests. Padding rows are zero and must
+                # not make an otherwise valid decode layout look like an
+                # unfinished prompt (log53 DP-idle dummy regression).
+                bool(np.all(computed[: len(plens)] >= plens)),
             ):
                 # Dedicated full-padded prompt-row array (fresh storage, not
                 # the split-boundary view also exported below): pad rows

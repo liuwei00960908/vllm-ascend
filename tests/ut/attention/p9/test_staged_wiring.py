@@ -1147,13 +1147,10 @@ class TestDPRouteSync(unittest.TestCase):
 
 
 class TestDPIdleDummyStagedGuard(unittest.TestCase):
-    """A DP-padded idle dummy must not engage the staged bootstrap unless
-    its row geometry fully fills the captured capacity (log53: the staged
-    bootstrap raised "boundary storage is unavailable" on the idle rank).
+    """A DP-padded idle dummy follows the DP-synced route verdict.
 
     Provenance: fork model_runner_v1.py:3426-3434/:3499-3514 (dp_idle STAGED
-    declaration + eager fallback), plus the full-capacity requirement the
-    P9-simplified builder branch imposes.
+    declaration + eager fallback) and :2942/:2958 (synced verdict gate).
     """
 
     def _runner(self, **overrides):
@@ -1172,7 +1169,15 @@ class TestDPIdleDummyStagedGuard(unittest.TestCase):
             setattr(runner, key, value)
         return runner
 
-    def _dummy_size(self, runner, *, num_reqs, batch_size, unpadded):
+    def _dummy_size(
+        self,
+        runner,
+        *,
+        num_reqs,
+        batch_size,
+        unpadded,
+        dp_route_action=StagedSFARouteAction.STAGED,
+    ):
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import BatchDescriptor
 
@@ -1186,15 +1191,29 @@ class TestDPIdleDummyStagedGuard(unittest.TestCase):
             num_reqs=num_reqs,
             num_scheduled_tokens=np.full(num_reqs, 2, dtype=np.int32),
             batch_descriptor=BatchDescriptor(num_tokens=batch_size),
+            dp_route_action=dp_route_action,
         )
 
-    def test_partial_fill_idle_dummy_rejected(self):
+    def test_partial_fill_idle_dummy_accepted_when_dp_agrees(self):
         # DP padding raised a 1-request idle dummy (2 tokens) to capacity
-        # 10: the row geometry no longer fills the capacity, so the staged
-        # dummy must be refused (the builder cannot attach the boundary).
+        # 10. Padding rows are legal once the builder only checks prompt
+        # completion for the active request slice.
+        runner = self._runner()
+        self.assertEqual(
+            self._dummy_size(runner, num_reqs=1, batch_size=10, unpadded=2),
+            10,
+        )
+
+    def test_dummy_rejected_when_dp_downgrades(self):
         runner = self._runner()
         self.assertIsNone(
-            self._dummy_size(runner, num_reqs=1, batch_size=10, unpadded=2)
+            self._dummy_size(
+                runner,
+                num_reqs=5,
+                batch_size=10,
+                unpadded=10,
+                dp_route_action=StagedSFARouteAction.SAFE_NATIVE,
+            )
         )
 
     def test_full_fill_capture_dummy_accepted(self):

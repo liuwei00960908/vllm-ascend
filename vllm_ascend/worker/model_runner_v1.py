@@ -3869,8 +3869,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # P9 staged SFA: decide whether this dummy run carries the staged
         # fixed geometry (eager warmup or PIECEWISE capture of one key).
-        # Provenance: fork model_runner_v1.py:3486-3514 (single-DP: no
-        # DP-idle dummy and no runtime-parallelism fallback).
+        # The synced DP verdict gates the engagement: partial-fill DP-idle
+        # dummies replay the staged graph when (and only when) the group
+        # agreed on STAGED. Provenance: fork model_runner_v1.py
+        # :2942/:2958/:3486-3514.
         staged_sfa_dummy_batch_size = self._staged_sfa_dummy_batch_size(
             is_profile=is_profile,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -3881,6 +3883,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_scheduled_tokens=num_scheduled_tokens,
             batch_descriptor=batch_desc,
+            dp_route_action=self._staged_sfa_dp_route_action,
         )
         staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
         # A route-declaring dummy that cannot run staged (e.g. a DP-padded
@@ -4108,11 +4111,14 @@ class NPUModelRunner(GPUModelRunner):
             # Provenance: fork model_runner_v1.py:3688-3727.
             staged_dummy_key = None
             if staged_sfa_dummy_batch_size is not None:
+                # NOTE: StagedSFARouteAction stays module-level here — a
+                # function-local import would shadow it for the whole of
+                # _dummy_run and turn the dp-idle declaration above into
+                # an UnboundLocalError.
                 from vllm_ascend.ascend_forward_context import (
                     StagedSFAGraphKey,
                 )
                 from vllm_ascend.utils import (
-                    StagedSFARouteAction,
                     StagedSFARouteDecision,
                     StagedSFARouteReason,
                 )
@@ -6231,6 +6237,7 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
         batch_descriptor: BatchDescriptor,
+        dp_route_action: StagedSFARouteAction | None,
     ) -> int | None:
         """Return the fixed token capacity for a staged decode dummy batch.
 
@@ -6253,6 +6260,7 @@ class NPUModelRunner(GPUModelRunner):
                 and not allow_eager
             )
             or num_active_loras != 0
+            or dp_route_action != StagedSFARouteAction.STAGED
         ):
             return None
 
@@ -6262,17 +6270,7 @@ class NPUModelRunner(GPUModelRunner):
             or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
             or num_tokens_unpadded <= 0
             or num_tokens_unpadded != num_reqs * query_width
-            # Full-capacity row fill is required: the baseline staged
-            # metadata branch attaches its fixed-layout channels (remap
-            # boundary included) only when the padded token view equals
-            # num_reqs * width, so a DP-padded idle dummy that fills the
-            # capacity only partially would engage the staged bootstrap
-            # without boundary storage (log53 crash). Capture warmups call
-            # this with num_tokens == capacity and satisfy the equality;
-            # partial runtime dummies take the eager fallback instead.
-            # The fork tolerates partial fills through its signature-cache
-            # builder path, which is not ported (P9 simplified subset).
-            or num_reqs * query_width != batch_size
+            or num_reqs * query_width > batch_size
         ):
             return None
 
