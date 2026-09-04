@@ -3802,6 +3802,20 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        staged_capture = staged_capture_candidate
+        # DP-idle dummies (uniform_decode, no explicit runtime mode, DP>1)
+        # declare STAGED so the dummy joins the DP route all-reduce: the
+        # verdict stays fresh on idle ranks and the group never straddles a
+        # staged/native split through a dummy step. Provenance: fork
+        # model_runner_v1.py:3426-3434.
+        dp_idle = uniform_decode and cudagraph_runtime_mode is None and self.dp_size > 1
+        dummy_route_action = (
+            StagedSFARouteAction.STAGED
+            if self._staged_sfa_graph_capture_sizes
+            and not is_profile
+            and (staged_capture or dp_idle)
+            else None
+        )
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -3820,6 +3834,7 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
+            staged_sfa_route_action=dummy_route_action,
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -3868,6 +3883,28 @@ class NPUModelRunner(GPUModelRunner):
             batch_descriptor=batch_desc,
         )
         staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
+        # A route-declaring dummy that cannot run staged (e.g. a DP-padded
+        # idle dummy whose row geometry only partially fills the capacity)
+        # downgrades to eager instead of crashing the staged bootstrap: the
+        # DP collective already carried its STAGED declaration, so record
+        # the downgrade through the routing chain. Provenance: fork
+        # model_runner_v1.py:3499-3514.
+        fallback_action = self._staged_sfa_dummy_fallback_action(
+            dummy_route_action, staged_sfa_graph_dummy_run
+        )
+        if fallback_action is not None:
+            from vllm_ascend.utils import (
+                StagedSFARouteDecision,
+                StagedSFARouteReason,
+            )
+
+            self._apply_staged_sfa_route(
+                StagedSFARouteDecision(
+                    fallback_action,
+                    StagedSFARouteReason.RUNTIME_PARALLELISM,
+                )
+            )
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
 
         # Build attention metadata for dummy_run
         if (
@@ -6161,6 +6198,27 @@ class NPUModelRunner(GPUModelRunner):
             for request_index in range(batch_size)
         ]
 
+    def _staged_sfa_dummy_fallback_action(
+        self,
+        dummy_route_action: StagedSFARouteAction | None,
+        staged_sfa_graph_dummy_run: bool,
+    ) -> StagedSFARouteAction | None:
+        """Downgrade action for a route-declaring dummy that cannot run staged.
+
+        None keeps the dummy on its computed path. Provenance: fork
+        model_runner_v1.py:3499-3514.
+        """
+        if dummy_route_action is None or staged_sfa_graph_dummy_run:
+            return None
+        dp_route_action = self._staged_sfa_dp_route_action
+        if (
+            dp_route_action is not None
+            and dp_route_action != StagedSFARouteAction.STAGED
+        ):
+            # The DP collective already agreed on a stronger downgrade.
+            return dp_route_action
+        return StagedSFARouteAction.SAFE_NATIVE
+
     def _staged_sfa_dummy_batch_size(
         self,
         *,
@@ -6204,7 +6262,17 @@ class NPUModelRunner(GPUModelRunner):
             or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
             or num_tokens_unpadded <= 0
             or num_tokens_unpadded != num_reqs * query_width
-            or num_reqs * query_width > batch_size
+            # Full-capacity row fill is required: the baseline staged
+            # metadata branch attaches its fixed-layout channels (remap
+            # boundary included) only when the padded token view equals
+            # num_reqs * width, so a DP-padded idle dummy that fills the
+            # capacity only partially would engage the staged bootstrap
+            # without boundary storage (log53 crash). Capture warmups call
+            # this with num_tokens == capacity and satisfy the equality;
+            # partial runtime dummies take the eager fallback instead.
+            # The fork tolerates partial fills through its signature-cache
+            # builder path, which is not ported (P9 simplified subset).
+            or num_reqs * query_width != batch_size
         ):
             return None
 

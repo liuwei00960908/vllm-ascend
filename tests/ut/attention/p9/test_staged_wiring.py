@@ -1146,5 +1146,96 @@ class TestDPRouteSync(unittest.TestCase):
         self.assertIs(decision, local)
 
 
+class TestDPIdleDummyStagedGuard(unittest.TestCase):
+    """A DP-padded idle dummy must not engage the staged bootstrap unless
+    its row geometry fully fills the captured capacity (log53: the staged
+    bootstrap raised "boundary storage is unavailable" on the idle rank).
+
+    Provenance: fork model_runner_v1.py:3426-3434/:3499-3514 (dp_idle STAGED
+    declaration + eager fallback), plus the full-capacity requirement the
+    P9-simplified builder branch imposes.
+    """
+
+    def _runner(self, **overrides):
+        model_runner_v1 = _load_model_runner()
+        runner = model_runner_v1.NPUModelRunner.__new__(
+            model_runner_v1.NPUModelRunner
+        )
+        defaults = dict(
+            _staged_sfa_graph_capture_sizes=(10, 20),
+            speculative_config=SimpleNamespace(num_speculative_tokens=1),
+            dp_size=4,
+            _staged_sfa_dp_route_action=None,
+        )
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(runner, key, value)
+        return runner
+
+    def _dummy_size(self, runner, *, num_reqs, batch_size, unpadded):
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import BatchDescriptor
+
+        return runner._staged_sfa_dummy_batch_size(
+            is_profile=False,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            allow_eager=False,
+            num_active_loras=0,
+            num_tokens_unpadded=unpadded,
+            num_tokens_padded=batch_size,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=np.full(num_reqs, 2, dtype=np.int32),
+            batch_descriptor=BatchDescriptor(num_tokens=batch_size),
+        )
+
+    def test_partial_fill_idle_dummy_rejected(self):
+        # DP padding raised a 1-request idle dummy (2 tokens) to capacity
+        # 10: the row geometry no longer fills the capacity, so the staged
+        # dummy must be refused (the builder cannot attach the boundary).
+        runner = self._runner()
+        self.assertIsNone(
+            self._dummy_size(runner, num_reqs=1, batch_size=10, unpadded=2)
+        )
+
+    def test_full_fill_capture_dummy_accepted(self):
+        # Capture warmups carry num_tokens == capacity: 5 requests x 2.
+        runner = self._runner()
+        self.assertEqual(
+            self._dummy_size(runner, num_reqs=5, batch_size=10, unpadded=10),
+            10,
+        )
+
+    def test_fallback_none_when_staged_or_undeclared(self):
+        runner = self._runner()
+        self.assertIsNone(
+            runner._staged_sfa_dummy_fallback_action(None, False)
+        )
+        self.assertIsNone(
+            runner._staged_sfa_dummy_fallback_action(
+                StagedSFARouteAction.STAGED, True
+            )
+        )
+
+    def test_fallback_safe_native_when_declared_but_not_staged(self):
+        runner = self._runner()
+        self.assertIs(
+            runner._staged_sfa_dummy_fallback_action(
+                StagedSFARouteAction.STAGED, False
+            ),
+            StagedSFARouteAction.SAFE_NATIVE,
+        )
+
+    def test_fallback_honors_stronger_dp_verdict(self):
+        runner = self._runner(
+            _staged_sfa_dp_route_action=StagedSFARouteAction.RECOMPUTE
+        )
+        self.assertIs(
+            runner._staged_sfa_dummy_fallback_action(
+                StagedSFARouteAction.STAGED, False
+            ),
+            StagedSFARouteAction.RECOMPUTE,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
