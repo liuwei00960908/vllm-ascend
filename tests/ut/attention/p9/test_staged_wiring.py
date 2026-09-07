@@ -165,6 +165,83 @@ class TestLocalRouteGates(unittest.TestCase):
         decision = self._route(runner)
         self.assertEqual(decision.reason, StagedSFARouteReason.LORA)
 
+    def test_boundary_recompute_routes_native(self):
+        """A PD cold-start boundary recompute (computed < prompt) must not
+        enter the staged path: the fixed-layout builder correctly refuses
+        to attach the boundary channels for it (log56 regression).
+
+        Provenance: fork model_runner_v1.py:2990-2991/:3052-3067 (the
+        parameter surface; this guard covers every query width).
+        """
+        model_runner_v1 = _load_model_runner()
+        runner = _route_runner()
+        with patch.object(
+            model_runner_v1, "enable_sp", return_value=False
+        ):
+            decision = self._route(
+                runner,
+                num_computed_tokens=np.array([8377], dtype=np.int64),
+                prompt_lens=np.array([8378], dtype=np.int64),
+            )
+        self.assertEqual(decision.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(decision.reason, StagedSFARouteReason.NOT_DECODE)
+
+    def test_fully_computed_keeps_staged_path(self):
+        """computed == prompt passes the guard and continues to the normal
+        staged authorization chain."""
+        model_runner_v1 = _load_model_runner()
+        from vllm_ascend.attention import utils as attn_utils
+
+        runner = _route_runner()
+        with (
+            patch.object(
+                model_runner_v1, "enable_sp", return_value=False
+            ),
+            patch.object(
+                attn_utils,
+                "staged_sfa_metadata_sparse_route",
+                return_value=(
+                    StagedSFARouteReason.ELIGIBLE,
+                    (0, 0, 0, 0),
+                    None,
+                ),
+            ),
+        ):
+            decision = self._route(
+                runner,
+                num_computed_tokens=np.array(
+                    [8378, 8378, 8378, 8378], dtype=np.int64
+                ),
+                prompt_lens=np.array(
+                    [8378, 8378, 8378, 8378], dtype=np.int64
+                ),
+            )
+        self.assertEqual(decision.action, StagedSFARouteAction.STAGED)
+
+    def test_no_computed_prompt_fields_keeps_existing_behavior(self):
+        """Without the new fields the guard is inert: routing proceeds
+        exactly as before the parameter surface was restored."""
+        model_runner_v1 = _load_model_runner()
+        from vllm_ascend.attention import utils as attn_utils
+
+        runner = _route_runner()
+        with (
+            patch.object(
+                model_runner_v1, "enable_sp", return_value=False
+            ),
+            patch.object(
+                attn_utils,
+                "staged_sfa_metadata_sparse_route",
+                return_value=(
+                    StagedSFARouteReason.ELIGIBLE,
+                    (0, 0, 0, 0),
+                    None,
+                ),
+            ),
+        ):
+            decision = self._route(runner)
+        self.assertEqual(decision.action, StagedSFARouteAction.STAGED)
+
 
 class TestRunnerWiringInvariants(unittest.TestCase):
     """AST/source invariants for the fixes that integration tests cannot

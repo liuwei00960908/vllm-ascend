@@ -2285,6 +2285,10 @@ class NPUModelRunner(GPUModelRunner):
                         kv_connector_metadata=(
                             scheduler_output.kv_connector_metadata
                         ),
+                        num_computed_tokens=(
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                        ),
+                        prompt_lens=self.input_batch.num_prompt_tokens[:num_reqs],
                         has_cascade_attention=cascade_attn_prefix_lens is not None,
                     )
                     if self.enable_staged_sfa_graph
@@ -5925,6 +5929,8 @@ class NPUModelRunner(GPUModelRunner):
         index_topk: int,
         request_ids,
         kv_connector_metadata,
+        num_computed_tokens=None,
+        prompt_lens=None,
         has_cascade_attention: bool = False,
     ):
         """Classify local scheduler/connector state for staged routing.
@@ -5934,7 +5940,8 @@ class NPUModelRunner(GPUModelRunner):
         the fixed decode layout; SAFE_NATIVE for graceful fallbacks.
 
         Provenance: fork model_runner_v1.py:2980-3083 (DSA-CP/cold-resume
-        branches trimmed per the P9 plan).
+        branches trimmed per the P9 plan; the num_computed_tokens /
+        prompt_lens surface is restored for the PD boundary-recompute guard).
         """
         from vllm_ascend.utils import (
             StagedSFARouteAction,
@@ -6007,6 +6014,32 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
+        # A PD cold-start boundary recompute (computed < prompt on any
+        # active request) is not a pure decode step: the fixed-layout
+        # builder correctly refuses to attach the staged channels for
+        # it, so routing it STAGED crashes the bootstrap (log56). The
+        # fork passes the same fields for its cold-resume validation
+        # (:2990-2991/:3052-3067); this guard is deliberately more
+        # conservative — it covers every query width and only allows
+        # STAGED when the batch is positively all-computed.
+        computed_rows = (
+            np.asarray(num_computed_tokens).reshape(-1)
+            if num_computed_tokens is not None
+            else None
+        )
+        prompt_rows = (
+            np.asarray(prompt_lens).reshape(-1)
+            if prompt_lens is not None
+            else None
+        )
+        if (
+            computed_rows is not None
+            and prompt_rows is not None
+            and computed_rows.shape == (num_reqs,)
+            and prompt_rows.shape == (num_reqs,)
+            and bool(np.any(computed_rows < prompt_rows))
+        ):
+            return native(StagedSFARouteReason.NOT_DECODE)
         metadata_reason, frontiers, _ = staged_sfa_metadata_sparse_route(
             kv_connector_metadata,
             request_ids,
