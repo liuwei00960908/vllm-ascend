@@ -1333,5 +1333,60 @@ class TestDPIdleDummyStagedGuard(unittest.TestCase):
         )
 
 
+class TestFIARequestCapacity(unittest.TestCase):
+    """The FIA request-capacity helper feeds the request padding with the
+    staged graph key's request count, so PIECEWISE live steps fill the
+    capture capacity (log57: without it the builder refuses to attach
+    the staged channels and the bootstrap crashes).
+
+    Provenance: fork model_runner_v1.py:835-842/:1617-1636.
+    """
+
+    def test_staged_key_returns_request_capacity(self):
+        from vllm_ascend.ascend_forward_context import (
+            StagedSFAGraphKey,
+            StagedSFAQueryProfile,
+        )
+        from vllm.forward_context import BatchDescriptor
+
+        model_runner_v1 = _load_model_runner()
+        key = StagedSFAGraphKey(
+            token_capacity=10,
+            request_capacity=5,
+            query_profile=StagedSFAQueryProfile.SPEC_FIXED,
+            max_query_len=2,
+        )
+        batch_desc = BatchDescriptor(num_tokens=10)
+        self.assertEqual(
+            model_runner_v1.NPUModelRunner._fia_request_capacity(
+                key, batch_desc
+            ),
+            5,
+        )
+
+    def test_none_key_returns_batch_desc_reqs(self):
+        from vllm.forward_context import BatchDescriptor
+
+        model_runner_v1 = _load_model_runner()
+        batch_desc = BatchDescriptor(num_tokens=10, num_reqs=3)
+        self.assertEqual(
+            model_runner_v1.NPUModelRunner._fia_request_capacity(
+                None, batch_desc
+            ),
+            3,
+        )
+
+    def test_none_key_and_none_batch_desc(self):
+        from vllm.forward_context import BatchDescriptor
+
+        model_runner_v1 = _load_model_runner()
+        batch_desc = BatchDescriptor(num_tokens=10)
+        self.assertIsNone(
+            model_runner_v1.NPUModelRunner._fia_request_capacity(
+                None, batch_desc
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

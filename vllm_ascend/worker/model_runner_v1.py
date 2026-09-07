@@ -965,6 +965,19 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
 
+    @staticmethod
+    def _fia_request_capacity(
+        staged_sfa_graph_key: Any,
+        batch_desc: "BatchDescriptor",
+    ) -> int | None:
+        """Return the request, rather than token, capacity for FIA padding.
+
+        Provenance: fork model_runner_v1.py:835-842.
+        """
+        if staged_sfa_graph_key is not None:
+            return staged_sfa_graph_key.request_capacity
+        return batch_desc.num_reqs
+
     def _pad_query_start_loc_for_fia(
         self,
         query_start_loc: torch.Tensor,
@@ -2432,19 +2445,30 @@ class NPUModelRunner(GPUModelRunner):
 
                 if (
                     cudagraph_mode == CUDAGraphMode.FULL
+                    or staged_sfa_graph_key is not None
                     or (enable_sp() and not self.model_config.use_mla)
                     and self.pcp_size * self.dcp_size == 1
                 ):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
+                    # Staged SFA graphs also need the request padding: DP sync pads
+                    # the token count to a capture capacity, but PIECEWISE mode does
+                    # not otherwise run this path, leaving num_reqs_padded at the
+                    # real count. The fixed-layout builder then refuses to attach
+                    # the staged channels (num_input_tokens != num_reqs * width)
+                    # and the bootstrap crashes (log57). Provenance: fork
+                    # model_runner_v1.py:1617-1636.
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
                         num_reqs_padded,
                         num_reqs,
                         cudagraph_mode,
-                        batch_desc.num_reqs,
+                        self._fia_request_capacity(
+                            staged_sfa_graph_key,
+                            batch_desc,
+                        ),
                     )
 
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
