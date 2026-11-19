@@ -100,6 +100,31 @@ def test_historical_recovery_is_not_relabelled_as_speculative_decode():
         prompt_lens=[3000],
     )
     assert outcome.reason.value == "not_decode"
+    assert outcome.non_decode_cause == "attention_state"
+
+
+def test_unmarked_prompt_tail_reports_distinct_non_decode_cause():
+    ns = route_api(full_graph=True)
+    runner = NS(
+        _staged_sfa_graph_capture_sizes=[8],
+        speculative_config=NS(num_speculative_tokens=1),
+        attn_state="decode",
+        vllm_config=NS(lora_config=None),
+    )
+    result = ns["_staged_sfa_local_route"](
+        runner,
+        num_tokens_unpadded=1,
+        num_reqs=1,
+        num_scheduled_tokens=np.array([1]),
+        index_topk=1024,
+        has_cascade_attention=False,
+        request_ids=["r"],
+        kv_connector_metadata=((), ()),
+        num_computed_tokens=[2999],
+        prompt_lens=[3000],
+    )
+    assert result.reason.value == "not_decode"
+    assert result.non_decode_cause == "unfinished_prompt"
 
 
 def test_cold_marker_proof_survives_existing_metadata_unpadding_and_copy():

@@ -969,6 +969,15 @@ class RecomputeScheduler(Scheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        checkpoint_resumes = {}
+        if self._checkpoint_capture_enabled:
+            checkpoint_resumes = {
+                meta.req_id: spec
+                for meta in getattr(scheduler_output.kv_connector_metadata, "requests", ())
+                if (spec := getattr(meta, "load_spec", None)) is not None
+                and getattr(spec, "dsa_cold_compact_resume", False)
+                and getattr(spec, "checkpoint_generation", None) is not None
+            }
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1022,6 +1031,13 @@ class RecomputeScheduler(Scheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if new_token_ids and (spec := checkpoint_resumes.get(req_id)) is not None:
+                    logger.info(
+                        "[CHECKPOINT_DECODE_OUTPUT] req=%s generation=%d "
+                        "load_generation=%d output_tokens=%d",
+                        req_id, spec.checkpoint_generation, spec.dsa_cold_load_generation,
+                        len(new_token_ids),
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

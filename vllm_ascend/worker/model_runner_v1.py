@@ -679,6 +679,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._staged_sfa_dp_route_action: StagedSFARouteAction | None = None
         self._staged_sfa_dp_bounded_decode = True
         self._dp_batch_sync_buffers: dict[int, torch.Tensor] = {}
+        self._sfa_trace_round = 0
         self._staged_sfa_startup_capture_attempted = False
         self._profiling_cudagraph_memory = False
 
@@ -2439,6 +2440,32 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     and staged_sfa_graph_key is None
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
+                checkpoint_resumes = ()
+                if (
+                    self._staged_sfa_graph_capture_sizes
+                    and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+                    and get_tp_group().rank_in_group == 0
+                ):
+                    if self.dp_size == 1:
+                        self._sfa_trace_round += 1
+                    self._log_sfa_route_transition(
+                        staged_sfa_local_route,
+                        staged_sfa_route,
+                        cudagraph_mode,
+                        scheduler_output,
+                        num_reqs,
+                    )
+                    trace_metadata = unwrap_staged_sfa_connector_metadata(
+                        scheduler_output.kv_connector_metadata
+                    )
+                    checkpoint_resumes = tuple(
+                        (req.req_id, spec.checkpoint_generation, spec.dsa_cold_load_generation)
+                        for req in getattr(trace_metadata, "requests", ())
+                        if (spec := getattr(req, "load_spec", None)) is not None
+                        and getattr(spec, "dsa_cold_compact_resume", False)
+                        and getattr(spec, "checkpoint_generation", None) is not None
+                        and req.req_id in scheduler_output.num_scheduled_tokens
+                    )
                 if cold_perf_req_ids:
                     log_cold_perf_event(
                         "decoder_execution_route",
@@ -2831,6 +2858,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     dp_rank=cold_perf_dp_rank,
                 )
             self._cold_perf_forward_interval = None
+            replay_before = self._sfa_full_graph.replay_count if checkpoint_resumes else 0
             if self._cold_perf_sample_trace_req_ids:
                 self._cold_perf_last_npu_interval = None
                 hidden_states = self._run_cold_perf_npu_stage(
@@ -2849,6 +2877,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
+            if checkpoint_resumes:
+                replayed = self._sfa_full_graph.replay_count > replay_before
+                for req_id, generation, load_generation in checkpoint_resumes:
+                    logger.info(
+                        "[CHECKPOINT_DECODE_FORWARD] dp=%d round=%d req=%s generation=%d "
+                        "load_generation=%d runtime_graph_mode=%s replayed=%s reason=%s",
+                        self.dp_rank, self._sfa_trace_round, req_id, generation,
+                        load_generation, cudagraph_mode, replayed, staged_sfa_route.reason.value,
+                    )
             if cold_perf_req_ids:
                 cold_perf_forward_end = time.perf_counter()
                 log_cold_perf_event(
@@ -4122,6 +4159,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         with record_function_or_nullcontext("ascend::dp_layout_agreement"):
             dist.all_reduce(tensor, group=get_dp_group().cpu_group)
         if full_layout_protocol:
+            self._sfa_trace_round = getattr(self, "_sfa_trace_round", 0) + 1
             self._staged_sfa_dp_bounded_decode = bool(tensor[3].max().item())
 
         max_num_tokens = int(num_tokens_across_dp.max().item())
@@ -4919,12 +4957,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             frontiers = ()
             cold_resumes = ()
 
-        def native(reason):
+        def native(reason, non_decode_cause=None):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
                 frontiers=frontiers if cold_resumes else (),
                 cold_compact_resumes=cold_resumes,
+                non_decode_cause=non_decode_cause,
             )
 
         if not graph_configured:
@@ -4939,7 +4978,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and not (i < len(cold_resumes) and cold_resumes[i])
                 for i in range(num_reqs)
             ):
-                return native(StagedSFARouteReason.NOT_DECODE)
+                return native(StagedSFARouteReason.NOT_DECODE, "unfinished_prompt")
         if is_decode_state:
             if any(cold_resumes):
                 cold_computed_ends = getattr(cold_resumes, "computed_ends", frontiers)
@@ -5004,7 +5043,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if getattr(self.vllm_config, "lora_config", None) is not None:
             return native(StagedSFARouteReason.LORA)
         if not is_decode_state:
-            return native(StagedSFARouteReason.NOT_DECODE)
+            return native(StagedSFARouteReason.NOT_DECODE, "attention_state")
         if query_width not in (1, 2):
             return native(StagedSFARouteReason.SPECULATIVE_DECODE)
         if has_cascade_attention:
@@ -5225,6 +5264,47 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             frontiers=local_route.frontiers,
             cold_compact_resumes=local_route.cold_compact_resumes,
             uniform_query_len=local_route.uniform_query_len,
+        )
+
+    def _log_sfa_route_transition(
+        self,
+        local_route: StagedSFARouteDecision,
+        route: StagedSFARouteDecision,
+        runtime_mode: CUDAGraphMode,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+    ) -> None:
+        """Log rank-local reasons and DP-agreed mode without reading device data."""
+        verdict = (
+            local_route.reason,
+            local_route.non_decode_cause,
+            route.reason,
+            runtime_mode,
+        )
+        previous = getattr(self, "_sfa_trace_verdict", None)
+        if verdict == previous:
+            return
+        self._sfa_trace_verdict = verdict
+        if previous is None and route.action == StagedSFARouteAction.STAGED:
+            return  # Do not log the initial healthy route.
+        rows = []
+        if local_route.reason == StagedSFARouteReason.NOT_DECODE:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                drafts = len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+                computed = int(self.input_batch.num_computed_tokens_cpu[i])
+                prompt = int(self.input_batch.num_prompt_tokens[i])
+                marker = i < len(local_route.cold_compact_resumes) and bool(
+                    local_route.cold_compact_resumes[i]
+                )
+                rows.append((req_id, computed, prompt, scheduled, drafts, marker))
+        logger.info(
+            "[SFA_ROUTE_TRANSITION] dp=%d round=%d local_reason=%s "
+            "non_decode_cause=%s action=%s reason=%s runtime_graph_mode=%s "
+            "attn_state=%s rows(req,computed,prompt,scheduled,draft,cold_resume)=%s",
+            self.dp_rank, self._sfa_trace_round, local_route.reason.value,
+            local_route.non_decode_cause, route.action.value, route.reason.value,
+            runtime_mode, self.attn_state, rows,
         )
 
     def _apply_staged_sfa_route(

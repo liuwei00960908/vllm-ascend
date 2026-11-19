@@ -132,6 +132,7 @@ class StagedSFARouteDecision:
     cold_compact_resumes: tuple[bool, ...] = ()
     # CPU scheduler verdict; 0 means not the configured uniform query width.
     uniform_query_len: int = 0
+    non_decode_cause: str | None = None
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
